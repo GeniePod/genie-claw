@@ -83,16 +83,18 @@ deploy-binaries:
 	)
 
 deploy-config:
-	ssh $(JETSON_TARGET) 'sudo mkdir -p /etc/geniepod $(INSTALL_DIR)/data'
+	ssh $(JETSON_TARGET) 'sudo mkdir -p /etc/geniepod $(INSTALL_DIR)/data && \
+		sudo chown -R $(JETSON_USER):$(JETSON_USER) $(INSTALL_DIR)/data'
 	scp deploy/config/geniepod.toml $(JETSON_TARGET):/tmp/geniepod.toml
 	scp deploy/config/mosquitto.conf $(JETSON_TARGET):/tmp/mosquitto.conf
 	ssh $(JETSON_TARGET) 'sudo cp -n /tmp/geniepod.toml /etc/geniepod/ && \
-		sudo cp -n /tmp/mosquitto.conf /etc/geniepod/'
+		sudo cp -n /tmp/mosquitto.conf /etc/geniepod/ && \
+		sudo chmod 600 /etc/geniepod/geniepod.toml /etc/geniepod/mosquitto.conf'
 	@echo "Config deployed (existing files NOT overwritten — using cp -n)"
 
 deploy-systemd:
 	scp deploy/systemd/*.service deploy/systemd/*.target $(JETSON_TARGET):/tmp/
-	ssh $(JETSON_TARGET) 'sudo cp /tmp/geniepod*.service /tmp/geniepod*.target /etc/systemd/system/ 2>/dev/null; \
+	ssh $(JETSON_TARGET) 'sudo cp /tmp/genie-*.service /tmp/geniepod*.target /etc/systemd/system/ 2>/dev/null; \
 		sudo systemctl daemon-reload'
 
 deploy-setup:

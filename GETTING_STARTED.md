@@ -159,6 +159,14 @@ wget "https://huggingface.co/nvidia/Nemotron-Mini-4B-Instruct-GGUF/resolve/main/
 # wget "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin" -O whisper-small.bin
 ```
 
+If you already have the Nemotron model under an older OpenClaw path, move it instead of downloading again:
+
+```bash
+sudo mkdir -p /opt/geniepod/models
+sudo mv /opt/orinclaw/models/nemotron-4b-q4_k_m.gguf /opt/geniepod/models/
+ls -lh /opt/geniepod/models/nemotron-4b-q4_k_m.gguf
+```
+
 ### 3. Install llama.cpp on the Jetson
 
 ```bash
@@ -183,6 +191,20 @@ This copies:
 - Config to `/etc/geniepod/` (won't overwrite existing)
 - systemd units to `/etc/systemd/system/`
 
+Run the first-boot setup on the Jetson before starting `genie-core`. This fixes directory ownership for `/opt/geniepod/data`, secures config permissions, verifies the model path, and enables the systemd units.
+
+```bash
+ssh geniepod@<jetson-ip> 'bash /opt/geniepod/setup-jetson.sh'
+```
+
+If you already tried starting `genie-core` and saw `unable to open database file: /opt/geniepod/data/memory.db`, fix the deployed permissions and retry:
+
+```bash
+ssh geniepod@<jetson-ip>
+sudo chown -R $(whoami):$(whoami) /opt/geniepod /run/geniepod
+sudo chmod 600 /etc/geniepod/geniepod.toml
+```
+
 ### 5. Start services
 
 ```bash
@@ -191,8 +213,14 @@ ssh geniepod@<jetson-ip>
 # Start llama.cpp manually first to verify:
 /opt/geniepod/bin/llama-server \
   --model /opt/geniepod/models/nemotron-4b-q4_k_m.gguf \
-  --host 127.0.0.1 --port 8080 --ctx-size 8192 \
-  --n-gpu-layers 999 --flash-attn --threads 4
+  --host 127.0.0.1 \
+  --port 8080 \
+  --ctx-size 2048 \
+  --n-gpu-layers 999 \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --threads 4
 
 # In another SSH session, start genie-core:
 /opt/geniepod/bin/genie-core

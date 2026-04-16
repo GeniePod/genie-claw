@@ -33,6 +33,9 @@ done
 echo "[3/6] Checking config..."
 if [ -f "$CONFIG_DIR/geniepod.toml" ]; then
     echo "  OK: $CONFIG_DIR/geniepod.toml"
+    sudo chmod 600 "$CONFIG_DIR/geniepod.toml"
+    [ -f "$CONFIG_DIR/mosquitto.conf" ] && sudo chmod 600 "$CONFIG_DIR/mosquitto.conf"
+    echo "  Secured config permissions"
 else
     echo "  MISSING: config — run 'make deploy' from your dev machine"
     exit 1
