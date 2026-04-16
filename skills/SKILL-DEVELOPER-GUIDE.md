@@ -78,7 +78,7 @@ edition = "2024"
 crate-type = ["cdylib"]  # IMPORTANT: produces a .so shared library
 
 [dependencies]
-genie-skill-sdk = { git = "https://github.com/GeniePod/genie-core", package = "genie-skill-sdk" }
+genie-skill-sdk = { git = "https://github.com/GeniePod/genie-claw", package = "genie-skill-sdk" }
 serde_json = "1"
 ```
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=GeniePod Core — Local Home AI Engine
-Documentation=https://github.com/GeniePod/genie-core
+Documentation=https://github.com/GeniePod/genie-claw
 After=network.target genie-llm.service genie-mqtt.service
 Wants=genie-llm.service genie-mqtt.service
 

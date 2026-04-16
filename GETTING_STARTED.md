@@ -14,8 +14,8 @@ Step-by-step guide from zero to a working local GeniePod Home runtime.
 ### 1. Clone and build
 
 ```bash
-git clone https://github.com/GeniePod/genie-core.git
-cd genie-core
+git clone https://github.com/GeniePod/genie-claw.git
+cd genie-claw
 make test     # 45 tests should pass
 make release  # builds optimized binaries
 ```
@@ -63,7 +63,7 @@ curl http://127.0.0.1:8080/health
 ### 4. Start genie-core
 
 ```bash
-cd genie-core
+cd genie-claw
 GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml cargo run --release --bin genie-core
 ```
 
@@ -111,7 +111,7 @@ GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml cargo run --release --bin genie-
 ## Option B: Docker compose (no Rust needed)
 
 ```bash
-cd genie-core
+cd genie-claw
 
 # Download a model
 mkdir -p models
@@ -138,7 +138,7 @@ docker compose -f docker-compose.dev.yml up --build
 ### 1. Cross-compile
 
 ```bash
-cd genie-core
+cd genie-claw
 make jetson
 ```
 
@@ -182,7 +182,7 @@ sudo cp build/bin/llama-server /opt/geniepod/bin/
 
 ```bash
 # From your dev machine:
-cd genie-core
+cd genie-claw
 make deploy JETSON_HOST=<jetson-ip> JETSON_USER=geniepod
 ```
 

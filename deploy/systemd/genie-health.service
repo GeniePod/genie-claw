@@ -1,6 +1,6 @@
 [Unit]
 Description=GeniePod Health Monitor
-Documentation=https://github.com/GeniePod/genie-core
+Documentation=https://github.com/GeniePod/genie-claw
 After=network.target genie-core.service
 
 [Service]

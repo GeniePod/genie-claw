@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// - Rollback if new binary fails health check within 60s
 /// - Governor pauses mode switching during update
 
-const GITHUB_REPO: &str = "GeniePod/genie-core";
+const GITHUB_REPO: &str = "GeniePod/genie-claw";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -15,7 +15,7 @@ members = [
 version = "1.0.0-alpha.3"
 edition = "2024"
 license = "AGPL-3.0-only"
-repository = "https://github.com/GeniePod/genie-core"
+repository = "https://github.com/GeniePod/genie-claw"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt", "macros", "signal", "time", "process", "io-util", "io-std", "fs", "net", "sync"] }

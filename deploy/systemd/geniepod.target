@@ -1,6 +1,6 @@
 [Unit]
 Description=GeniePod Core Services
-Documentation=https://github.com/GeniePod/genie-core
+Documentation=https://github.com/GeniePod/genie-claw
 Requires=genie-audio.service
 After=network.target genie-audio.service
 

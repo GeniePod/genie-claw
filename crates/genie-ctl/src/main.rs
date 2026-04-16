@@ -275,7 +275,7 @@ async fn cmd_update_check() -> Result<()> {
             "Accept: application/vnd.github+json",
             "-H",
             "User-Agent: GeniePod-OTA",
-            "https://api.github.com/repos/GeniePod/genie-core/releases/latest",
+            "https://api.github.com/repos/GeniePod/genie-claw/releases/latest",
         ])
         .output()
         .await;
@@ -311,7 +311,7 @@ async fn cmd_update_check() -> Result<()> {
             if latest_clean > current_clean {
                 println!("\n  Update available! Download from:");
                 println!(
-                    "  https://github.com/GeniePod/genie-core/releases/tag/{}",
+                    "  https://github.com/GeniePod/genie-claw/releases/tag/{}",
                     tag
                 );
             } else {

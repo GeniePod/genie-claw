@@ -1,6 +1,6 @@
 [Unit]
 Description=GeniePod Memory Governor
-Documentation=https://github.com/GeniePod/genie-core
+Documentation=https://github.com/GeniePod/genie-claw
 After=network.target
 Wants=genie-core.service genie-llm.service
 
