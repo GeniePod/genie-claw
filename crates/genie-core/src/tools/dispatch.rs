@@ -5,6 +5,7 @@ use std::sync::Arc;
 use super::home;
 use super::timer;
 use crate::ha::HomeAutomationProvider;
+use crate::skills::SkillLoader;
 
 /// Tool definition for LLM function calling.
 ///
@@ -12,8 +13,8 @@ use crate::ha::HomeAutomationProvider;
 /// via the `tools` parameter (OpenAI function-calling format).
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolDef {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub parameters: serde_json::Value,
 }
 
@@ -39,6 +40,7 @@ pub struct ToolCall {
 pub struct ToolDispatcher {
     ha: Option<Arc<dyn HomeAutomationProvider>>,
     memory: Option<Arc<std::sync::Mutex<crate::memory::Memory>>>,
+    skills: Option<Arc<std::sync::Mutex<SkillLoader>>>,
     pub(crate) timers: timer::TimerManager,
 }
 
@@ -47,6 +49,7 @@ impl ToolDispatcher {
         Self {
             ha,
             memory: None,
+            skills: None,
             timers: timer::TimerManager::new(),
         }
     }
@@ -61,14 +64,20 @@ impl ToolDispatcher {
         self
     }
 
+    /// Set the dynamic skill loader for loadable skill modules.
+    pub fn with_skill_loader(mut self, skill_loader: SkillLoader) -> Self {
+        self.skills = Some(Arc::new(std::sync::Mutex::new(skill_loader)));
+        self
+    }
+
     /// All available tool definitions (for the LLM system prompt).
     pub fn tool_defs(&self) -> Vec<ToolDef> {
         let mut defs = Vec::new();
 
         if self.has_home_automation() {
             defs.push(ToolDef {
-                name: "home_control",
-                description: "Control Home Assistant devices, scenes, and voice-safe routines. Use for lights, switches, climate, covers, locks, and scene activation.",
+                name: "home_control".into(),
+                description: "Control Home Assistant devices, scenes, and voice-safe routines. Use for lights, switches, climate, covers, locks, and scene activation.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -80,8 +89,8 @@ impl ToolDispatcher {
                 }),
             });
             defs.push(ToolDef {
-                name: "home_status",
-                description: "Get the current status of a smart home device, room lights, thermostat, lock, cover, scene, or other Home Assistant target.",
+                name: "home_status".into(),
+                description: "Get the current status of a smart home device, room lights, thermostat, lock, cover, scene, or other Home Assistant target.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -94,8 +103,8 @@ impl ToolDispatcher {
 
         defs.extend([
             ToolDef {
-                name: "set_timer",
-                description: "Set a countdown timer. Use for 'set a timer for 10 minutes', 'remind me in 5 minutes'.",
+                name: "set_timer".into(),
+                description: "Set a countdown timer. Use for 'set a timer for 10 minutes', 'remind me in 5 minutes'.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -106,15 +115,15 @@ impl ToolDispatcher {
                 }),
             },
             ToolDef {
-                name: "get_time",
-                description: "Get the current date and time.",
+                name: "get_time".into(),
+                description: "Get the current date and time.".into(),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             },
         ]);
 
         defs.push(ToolDef {
-            name: "get_weather",
-            description: "Get current weather or forecast for a location. Use for any weather question.",
+            name: "get_weather".into(),
+            description: "Get current weather or forecast for a location. Use for any weather question.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -126,14 +135,15 @@ impl ToolDispatcher {
         });
 
         defs.push(ToolDef {
-            name: "system_info",
-            description: "Get GeniePod system status: memory, uptime, governor mode, load average.",
+            name: "system_info".into(),
+            description: "Get GeniePod system status: memory, uptime, governor mode, load average."
+                .into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         });
 
         defs.push(ToolDef {
-            name: "calculate",
-            description: "Evaluate a math expression. Supports +, -, *, /, parentheses, decimals.",
+            name: "calculate".into(),
+            description: "Evaluate a math expression. Supports +, -, *, /, parentheses, decimals.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -144,8 +154,8 @@ impl ToolDispatcher {
         });
 
         defs.push(ToolDef {
-            name: "play_media",
-            description: "Play media on the TV/HDMI output. Triggers media mode (unloads LLM, launches mpv).",
+            name: "play_media".into(),
+            description: "Play media on the TV/HDMI output. Triggers media mode (unloads LLM, launches mpv).".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -156,8 +166,8 @@ impl ToolDispatcher {
         });
 
         defs.push(ToolDef {
-            name: "memory_recall",
-            description: "Recall what you know about a topic. Use when the user asks 'what do you know about me', 'do you remember my name', etc.",
+            name: "memory_recall".into(),
+            description: "Recall what you know about a topic. Use when the user asks 'what do you know about me', 'do you remember my name', etc.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -168,8 +178,8 @@ impl ToolDispatcher {
         });
 
         defs.push(ToolDef {
-            name: "memory_forget",
-            description: "Forget a specific piece of information. Use ONLY when the user explicitly asks to forget something, like 'forget my age' or 'delete what you know about X'.",
+            name: "memory_forget".into(),
+            description: "Forget a specific piece of information. Use ONLY when the user explicitly asks to forget something, like 'forget my age' or 'delete what you know about X'.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -180,8 +190,8 @@ impl ToolDispatcher {
         });
 
         defs.push(ToolDef {
-            name: "memory_store",
-            description: "Explicitly store a fact about the user. Use when the user says 'remember that...' or asks you to save something.",
+            name: "memory_store".into(),
+            description: "Explicitly store a fact about the user. Use when the user says 'remember that...' or asks you to save something.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -191,6 +201,10 @@ impl ToolDispatcher {
                 "required": ["content"]
             }),
         });
+
+        if let Some(skill_defs) = self.skill_tool_defs() {
+            defs.extend(skill_defs);
+        }
 
         defs
     }
@@ -209,7 +223,7 @@ impl ToolDispatcher {
             "memory_recall" => self.exec_memory_recall(&call.arguments),
             "memory_forget" => self.exec_memory_forget(&call.arguments),
             "memory_store" => self.exec_memory_store(&call.arguments),
-            other => Err(anyhow::anyhow!("unknown tool: {}", other)),
+            other => self.exec_skill(other, &call.arguments),
         };
 
         match result {
@@ -325,6 +339,53 @@ impl ToolDispatcher {
 
         mem.store(category, content)?;
         Ok(format!("Remembered: [{}] {}", category, content))
+    }
+
+    fn skill_tool_defs(&self) -> Option<Vec<ToolDef>> {
+        let skills = self.skills.as_ref()?;
+        let loader = skills.lock().ok()?;
+        Some(
+            loader
+                .loaded()
+                .iter()
+                .map(|skill| ToolDef {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    parameters: serde_json::from_str(&skill.parameters_json).unwrap_or_else(
+                        |_| serde_json::json!({"type": "object", "properties": {}}),
+                    ),
+                })
+                .collect(),
+        )
+    }
+
+    fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
+        let skills = self
+            .skills
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
+        let mut loader = skills
+            .lock()
+            .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
+
+        let args_json = serde_json::to_string(args)?;
+        let (success, output) = {
+            let skill = loader
+                .get_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
+            skill.execute_parsed(&args_json)
+        };
+
+        let pruned = loader.prune_faulted();
+        if pruned.iter().any(|skill_name| skill_name == name) {
+            tracing::warn!(skill = name, "skill auto-unloaded after repeated faults");
+        }
+
+        if success {
+            Ok(output)
+        } else {
+            Err(anyhow::anyhow!("{}", output))
+        }
     }
 
     async fn exec_play_media(&self, args: &serde_json::Value) -> Result<String> {
@@ -456,8 +517,73 @@ mod tests {
         ActionResult, DeviceRef, HomeAction, HomeAutomationProvider, HomeGraph, HomeState,
         HomeTarget, IntegrationHealth, SceneRef,
     };
+    use crate::skills::SkillLoader;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct StubHomeProvider;
+
+    fn workspace_root() -> PathBuf {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        manifest.parent().unwrap().parent().unwrap().to_path_buf()
+    }
+
+    fn sample_skill_path() -> &'static Path {
+        static SAMPLE_SKILL_PATH: OnceLock<PathBuf> = OnceLock::new();
+        SAMPLE_SKILL_PATH.get_or_init(|| {
+            let root = workspace_root();
+            let build_dir = std::env::temp_dir().join(format!(
+                "geniepod-sample-skill-build-dispatch-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&build_dir);
+            std::fs::create_dir_all(&build_dir).unwrap();
+            let output = Command::new("cargo")
+                .args(["build", "-p", "genie-skill-hello", "--target-dir"])
+                .arg(&build_dir)
+                .current_dir(&root)
+                .output()
+                .expect("failed to build sample skill");
+
+            assert!(
+                output.status.success(),
+                "sample skill build failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let candidates = [
+                build_dir.join("debug/libgenie_skill_hello.so"),
+                build_dir.join("debug/libgenie_skill_hello.dylib"),
+                build_dir.join("debug/genie_skill_hello.dll"),
+            ];
+
+            candidates
+                .into_iter()
+                .find(|path| path.exists())
+                .expect("sample skill artifact not found")
+        })
+    }
+
+    fn sample_skill_loader() -> SkillLoader {
+        static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let skill_path = sample_skill_path();
+        let dir = std::env::temp_dir().join(format!(
+            "geniepod-dispatch-skill-test-{}-{}",
+            std::process::id(),
+            TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let installed_path = dir.join(skill_path.file_name().unwrap());
+        std::fs::copy(skill_path, &installed_path).unwrap();
+
+        let mut loader = SkillLoader::new(&dir);
+        let loaded = loader.load_skill(&installed_path).unwrap();
+        assert_eq!(loaded, "hello_world");
+        loader
+    }
 
     #[async_trait::async_trait]
     impl HomeAutomationProvider for StubHomeProvider {
@@ -552,5 +678,27 @@ mod tests {
         let result = dispatcher.execute(&call).await;
         assert!(result.success);
         assert!(!result.output.is_empty());
+    }
+
+    #[test]
+    fn tool_defs_include_loaded_skills() {
+        let dispatcher = ToolDispatcher::new(None).with_skill_loader(sample_skill_loader());
+        let defs = dispatcher.tool_defs();
+
+        assert!(defs.iter().any(|d| d.name == "hello_world"));
+    }
+
+    #[tokio::test]
+    async fn execute_loaded_skill() {
+        let dispatcher = ToolDispatcher::new(None).with_skill_loader(sample_skill_loader());
+        let call = ToolCall {
+            name: "hello_world".into(),
+            arguments: serde_json::json!({"name": "Jared"}),
+        };
+
+        let result = dispatcher.execute(&call).await;
+        assert!(result.success);
+        assert!(result.output.contains("Jared"));
+        assert!(result.output.contains("loadable skill module"));
     }
 }

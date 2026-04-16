@@ -6,15 +6,28 @@
 //!   genie-ctl chat <MESSAGE>  Send a chat message and print the response
 //!   genie-ctl history         Show conversation history
 //!   genie-ctl tools           List available tools
+//!   genie-ctl skill ...       Manage loadable skill modules
 //!   genie-ctl health          Check service health
 //!   genie-ctl conversations   List all conversations
 //!   genie-ctl version         Show version info
 
 use anyhow::Result;
+use genie_core::skills::{SkillLoader, skills_dir as runtime_skills_dir};
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const CORE_URL: &str = "127.0.0.1:3000";
 const GOVERNOR_SOCK: &str = "/run/geniepod/governor.sock";
+const SKILL_RESTART_HINT: &str =
+    "Restart genie-core to load skill changes, or wait until the next startup.";
+
+#[derive(Debug, Clone)]
+struct InstalledSkillInfo {
+    name: String,
+    version: String,
+    description: String,
+    path: PathBuf,
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -44,6 +57,13 @@ async fn main() -> Result<()> {
         }
         "history" => cmd_history().await?,
         "tools" => cmd_tools().await?,
+        "skill" | "skills" => {
+            if args.len() < 3 {
+                print_skill_usage();
+                std::process::exit(1);
+            }
+            cmd_skill(&args[2..])?;
+        }
         "health" => cmd_health().await?,
         "conversations" | "convos" => cmd_conversations().await?,
         "update-check" | "update" => cmd_update_check().await?,
@@ -74,6 +94,7 @@ COMMANDS:
     chat <MESSAGE>      Send a chat message
     history             Show conversation history
     tools               List available tools
+    skill <SUBCOMMAND>  Manage loadable skill modules
     health              Service health check
     conversations       List all conversations
     update-check        Check for OTA updates
@@ -84,10 +105,226 @@ COMMANDS:
     );
 }
 
+fn print_skill_usage() {
+    println!(
+        "\
+USAGE:
+    genie-ctl skill list
+    genie-ctl skill install <SOURCE.so> [DEST_NAME]
+    genie-ctl skill remove <SKILL_NAME|FILE_NAME>
+    genie-ctl skill dir
+
+SUBCOMMANDS:
+    list                List loadable skills from the runtime skills directory
+    install             Validate and copy a skill into the runtime skills directory
+    remove              Remove an installed skill by tool name or filename
+    dir                 Show the runtime skills directory"
+    );
+}
+
 fn cmd_version() {
     println!("genie-ctl v{}", env!("CARGO_PKG_VERSION"));
     println!("  core: {}", CORE_URL);
     println!("  governor: {}", GOVERNOR_SOCK);
+}
+
+fn cmd_skill(args: &[String]) -> Result<()> {
+    match args[0].as_str() {
+        "list" | "ls" => cmd_skill_list(),
+        "install" => {
+            if args.len() < 2 {
+                anyhow::bail!("Usage: genie-ctl skill install <SOURCE.so> [DEST_NAME]");
+            }
+            cmd_skill_install(Path::new(&args[1]), args.get(2).map(String::as_str))
+        }
+        "remove" | "rm" | "uninstall" => {
+            if args.len() < 2 {
+                anyhow::bail!("Usage: genie-ctl skill remove <SKILL_NAME|FILE_NAME>");
+            }
+            cmd_skill_remove(&args[1])
+        }
+        "dir" | "path" => {
+            println!("{}", runtime_skills_path().display());
+            Ok(())
+        }
+        other => {
+            anyhow::bail!("Unknown skill subcommand: {}", other);
+        }
+    }
+}
+
+fn cmd_skill_list() -> Result<()> {
+    let skills_dir = runtime_skills_path();
+    let skills = load_installed_skills(&skills_dir)?;
+
+    if skills.is_empty() {
+        println!("(no loadable skills found in {})", skills_dir.display());
+        return Ok(());
+    }
+
+    println!(
+        "{} loadable skills in {}:\n",
+        skills.len(),
+        skills_dir.display()
+    );
+    for skill in skills {
+        let file_name = skill
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| skill.path.display().to_string());
+        println!("  {} v{} ({})", skill.name, skill.version, file_name);
+        println!("    {}", skill.description);
+    }
+
+    Ok(())
+}
+
+fn cmd_skill_install(source: &Path, dest_name: Option<&str>) -> Result<()> {
+    let skills_dir = runtime_skills_path();
+    let (installed, bytes_copied) = install_skill(source, &skills_dir, dest_name)?;
+
+    println!(
+        "Installed skill '{}' v{} to {} ({:.1} KB)",
+        installed.name,
+        installed.version,
+        installed.path.display(),
+        bytes_copied as f64 / 1024.0
+    );
+    println!("{}", SKILL_RESTART_HINT);
+    Ok(())
+}
+
+fn cmd_skill_remove(target: &str) -> Result<()> {
+    let skills_dir = runtime_skills_path();
+    let removed_path = remove_skill(target, &skills_dir)?;
+
+    println!("Removed {}", removed_path.display());
+    println!("{}", SKILL_RESTART_HINT);
+    Ok(())
+}
+
+fn runtime_skills_path() -> PathBuf {
+    runtime_skills_dir()
+}
+
+fn load_installed_skills(skills_dir: &Path) -> Result<Vec<InstalledSkillInfo>> {
+    let mut loader = SkillLoader::new(skills_dir);
+    let _ = loader.load_all();
+
+    let mut skills = loader
+        .loaded()
+        .iter()
+        .map(|skill| InstalledSkillInfo {
+            name: skill.name.clone(),
+            version: skill.version.clone(),
+            description: skill.description.clone(),
+            path: skill.path.clone(),
+        })
+        .collect::<Vec<_>>();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(skills)
+}
+
+fn validate_skill_file(path: &Path) -> Result<InstalledSkillInfo> {
+    if !path.exists() {
+        anyhow::bail!("skill file not found: {}", path.display());
+    }
+    if !path.is_file() {
+        anyhow::bail!("skill path is not a file: {}", path.display());
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut loader = SkillLoader::new(parent);
+    let loaded_name = loader.load_skill(path)?;
+    let skill = loader
+        .loaded()
+        .iter()
+        .find(|skill| skill.name == loaded_name)
+        .ok_or_else(|| anyhow::anyhow!("validated skill '{}' disappeared", loaded_name))?;
+
+    Ok(InstalledSkillInfo {
+        name: skill.name.clone(),
+        version: skill.version.clone(),
+        description: skill.description.clone(),
+        path: skill.path.clone(),
+    })
+}
+
+fn normalize_skill_filename(source: &Path, dest_name: Option<&str>) -> Result<String> {
+    let file_name = match dest_name {
+        Some(name) if !name.trim().is_empty() => {
+            let trimmed = name.trim();
+            if Path::new(trimmed).extension().is_some() {
+                trimmed.to_string()
+            } else {
+                format!("{}.so", trimmed)
+            }
+        }
+        _ => source
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow::anyhow!("cannot determine filename for {}", source.display()))?,
+    };
+
+    if file_name.contains('/') {
+        anyhow::bail!("destination name must be a filename, not a path");
+    }
+
+    Ok(file_name)
+}
+
+fn install_skill(
+    source: &Path,
+    skills_dir: &Path,
+    dest_name: Option<&str>,
+) -> Result<(InstalledSkillInfo, u64)> {
+    let skill = validate_skill_file(source)?;
+    std::fs::create_dir_all(skills_dir)?;
+
+    let file_name = normalize_skill_filename(source, dest_name)?;
+    let dest_path = skills_dir.join(file_name);
+    let bytes_copied = std::fs::copy(source, &dest_path)?;
+
+    Ok((
+        InstalledSkillInfo {
+            path: dest_path,
+            ..skill
+        },
+        bytes_copied,
+    ))
+}
+
+fn remove_skill(target: &str, skills_dir: &Path) -> Result<PathBuf> {
+    let installed = load_installed_skills(skills_dir)?;
+    if let Some(skill) = installed.iter().find(|skill| {
+        skill.name == target
+            || skill
+                .path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy() == target)
+    }) {
+        std::fs::remove_file(&skill.path)?;
+        return Ok(skill.path.clone());
+    }
+
+    let direct_candidates = if Path::new(target).extension().is_some() {
+        vec![skills_dir.join(target)]
+    } else {
+        vec![
+            skills_dir.join(target),
+            skills_dir.join(format!("{}.so", target)),
+        ]
+    };
+
+    for candidate in direct_candidates {
+        if candidate.exists() {
+            std::fs::remove_file(&candidate)?;
+            return Ok(candidate);
+        }
+    }
+
+    anyhow::bail!("skill '{}' not found in {}", target, skills_dir.display())
 }
 
 async fn cmd_status() -> Result<()> {
@@ -570,10 +807,97 @@ async fn governor_cmd(json: &str) -> Option<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn workspace_root() -> PathBuf {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        manifest.parent().unwrap().parent().unwrap().to_path_buf()
+    }
+
+    fn sample_skill_path() -> &'static Path {
+        static SAMPLE_SKILL_PATH: OnceLock<PathBuf> = OnceLock::new();
+        SAMPLE_SKILL_PATH.get_or_init(|| {
+            let root = workspace_root();
+            let build_dir = std::env::temp_dir().join(format!(
+                "geniepod-sample-skill-build-ctl-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&build_dir);
+            std::fs::create_dir_all(&build_dir).unwrap();
+            let output = Command::new("cargo")
+                .args(["build", "-p", "genie-skill-hello", "--target-dir"])
+                .arg(&build_dir)
+                .current_dir(&root)
+                .output()
+                .expect("failed to build sample skill");
+
+            assert!(
+                output.status.success(),
+                "sample skill build failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let candidates = [
+                build_dir.join("debug/libgenie_skill_hello.so"),
+                build_dir.join("debug/libgenie_skill_hello.dylib"),
+                build_dir.join("debug/genie_skill_hello.dll"),
+            ];
+
+            candidates
+                .into_iter()
+                .find(|path| path.exists())
+                .expect("sample skill artifact not found")
+        })
+    }
+
+    fn temp_skills_dir() -> PathBuf {
+        static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "geniepod-ctl-skill-test-{}-{}",
+            std::process::id(),
+            TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn version_string() {
         let version = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty());
         assert!(version.contains('.')); // Semver: x.y.z
+    }
+
+    #[test]
+    fn install_and_list_skill() {
+        let skills_dir = temp_skills_dir();
+        let sample_skill = sample_skill_path();
+
+        let (installed, _) = install_skill(sample_skill, &skills_dir, Some("hello")).unwrap();
+        assert_eq!(installed.name, "hello_world");
+        assert_eq!(
+            installed.path.file_name().unwrap().to_string_lossy(),
+            "hello.so"
+        );
+
+        let installed_skills = load_installed_skills(&skills_dir).unwrap();
+        assert_eq!(installed_skills.len(), 1);
+        assert_eq!(installed_skills[0].name, "hello_world");
+        assert!(installed_skills[0].description.contains("greeting"));
+    }
+
+    #[test]
+    fn remove_skill_by_name() {
+        let skills_dir = temp_skills_dir();
+        let sample_skill = sample_skill_path();
+        let _ = install_skill(sample_skill, &skills_dir, Some("hello")).unwrap();
+
+        let removed = remove_skill("hello_world", &skills_dir).unwrap();
+        assert_eq!(removed.file_name().unwrap().to_string_lossy(), "hello.so");
+        assert!(load_installed_skills(&skills_dir).unwrap().is_empty());
     }
 }

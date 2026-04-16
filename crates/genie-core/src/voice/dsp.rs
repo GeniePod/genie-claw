@@ -226,7 +226,8 @@ mod tests {
         // Verify output is valid S16.
         for i in 0..num_samples {
             let sample = i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]);
-            assert!(sample.abs() <= 32767, "Output should be valid S16");
+            let magnitude = i32::from(sample).abs();
+            assert!(magnitude <= i16::MAX as i32, "Output should be valid S16");
         }
     }
 

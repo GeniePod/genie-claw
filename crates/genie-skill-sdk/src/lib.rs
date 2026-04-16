@@ -80,7 +80,7 @@ macro_rules! skill {
         execute: |$args:ident| $body:expr
     ) => {
         // Build parameter JSON schema at compile time.
-        fn __skill_params_json() -> &'static str {
+        fn __skill_params_json_ptr() -> *const std::ffi::c_char {
             let mut props = serde_json::Map::new();
             $(
                 props.insert(
@@ -92,9 +92,10 @@ macro_rules! skill {
                 "type": "object",
                 "properties": props,
             });
-            let s = schema.to_string();
+            let s = std::ffi::CString::new(schema.to_string())
+                .expect("skill parameter schema must not contain interior nulls");
             // Leak into 'static — intentional for C ABI interop.
-            Box::leak(s.into_boxed_str())
+            s.into_raw() as *const std::ffi::c_char
         }
 
         fn __skill_execute(
@@ -145,7 +146,7 @@ macro_rules! skill {
                     name: concat!($name, "\0").as_ptr() as *const std::ffi::c_char,
                     description: concat!($desc, "\0").as_ptr() as *const std::ffi::c_char,
                     version: concat!($ver, "\0").as_ptr() as *const std::ffi::c_char,
-                    parameters_json: __skill_params_json().as_ptr() as *const std::ffi::c_char,
+                    parameters_json: __skill_params_json_ptr(),
                     execute: __c_execute,
                     destroy: __c_destroy,
                 }

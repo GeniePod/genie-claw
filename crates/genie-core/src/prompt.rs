@@ -260,8 +260,8 @@ mod tests {
     fn capable_prompt_has_json_format() {
         let builder = PromptBuilder::new(ModelFamily::Nemotron);
         let tools = vec![crate::tools::dispatch::ToolDef {
-            name: "get_time",
-            description: "Get current time",
+            name: "get_time".into(),
+            description: "Get current time".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
         let mem_path = std::env::temp_dir().join("prompt-test.db");
@@ -277,8 +277,8 @@ mod tests {
     fn small_prompt_has_examples() {
         let builder = PromptBuilder::new(ModelFamily::Small);
         let tools = vec![crate::tools::dispatch::ToolDef {
-            name: "get_time",
-            description: "Get current time",
+            name: "get_time".into(),
+            description: "Get current time".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
         let mem_path = std::env::temp_dir().join("prompt-test-small.db");
@@ -294,8 +294,8 @@ mod tests {
     fn prompt_without_home_tools_marks_home_control_unavailable() {
         let builder = PromptBuilder::new(ModelFamily::Small);
         let tools = vec![crate::tools::dispatch::ToolDef {
-            name: "get_time",
-            description: "Get current time",
+            name: "get_time".into(),
+            description: "Get current time".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
         let mem_path = std::env::temp_dir().join("prompt-test-no-home.db");

@@ -152,6 +152,7 @@ version = "1.0.0-alpha.3"
 dependencies = [
  "anyhow",
  "genie-common",
+ "genie-core",
  "serde",
  "serde_json",
  "tokio",

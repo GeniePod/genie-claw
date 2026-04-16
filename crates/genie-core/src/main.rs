@@ -52,8 +52,11 @@ async fn main() -> Result<()> {
     tracing::info!(memories = mem.count()?, "memory loaded");
 
     let mem_arc = Arc::new(std::sync::Mutex::new(memory::Memory::open(&mem_path)?));
+    let skill_loader = skills::load_all();
 
-    let tool_dispatcher = tools::ToolDispatcher::new(ha).with_memory(Arc::clone(&mem_arc));
+    let tool_dispatcher = tools::ToolDispatcher::new(ha)
+        .with_memory(Arc::clone(&mem_arc))
+        .with_skill_loader(skill_loader);
 
     // Load user profile from /opt/geniepod/data/profile/.
     let profile_dir = config.data_dir.join("profile");

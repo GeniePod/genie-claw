@@ -199,6 +199,12 @@ impl SkillLoader {
         if name.is_empty() {
             anyhow::bail!("skill in {} has empty name", path.display());
         }
+        if description.is_empty() {
+            anyhow::bail!("skill '{}' has empty description", name);
+        }
+        if serde_json::from_str::<serde_json::Value>(&parameters_json).is_err() {
+            anyhow::bail!("skill '{}' has invalid parameters_json", name);
+        }
 
         // Check for duplicate skill name.
         if self.loaded.iter().any(|s| s.name == name) {
@@ -270,6 +276,50 @@ impl SkillLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::OnceLock;
+
+    fn workspace_root() -> PathBuf {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        manifest.parent().unwrap().parent().unwrap().to_path_buf()
+    }
+
+    fn sample_skill_path() -> &'static Path {
+        static SAMPLE_SKILL_PATH: OnceLock<PathBuf> = OnceLock::new();
+        SAMPLE_SKILL_PATH.get_or_init(|| {
+            let root = workspace_root();
+            let build_dir = std::env::temp_dir().join(format!(
+                "geniepod-sample-skill-build-loader-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&build_dir);
+            std::fs::create_dir_all(&build_dir).unwrap();
+            let output = Command::new("cargo")
+                .args(["build", "-p", "genie-skill-hello", "--target-dir"])
+                .arg(&build_dir)
+                .current_dir(&root)
+                .output()
+                .expect("failed to build sample skill");
+
+            assert!(
+                output.status.success(),
+                "sample skill build failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let candidates = [
+                build_dir.join("debug/libgenie_skill_hello.so"),
+                build_dir.join("debug/libgenie_skill_hello.dylib"),
+                build_dir.join("debug/genie_skill_hello.dll"),
+            ];
+
+            candidates
+                .into_iter()
+                .find(|path| path.exists())
+                .expect("sample skill artifact not found")
+        })
+    }
 
     #[test]
     fn loader_empty_dir() {
@@ -296,6 +346,30 @@ mod tests {
         let mut loader = SkillLoader::new(&dir);
         let names = loader.load_all();
         assert!(names.is_empty()); // Should fail gracefully
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loader_loads_and_executes_real_skill() {
+        let skill_path = sample_skill_path();
+        let dir = std::env::temp_dir().join("geniepod-skills-test-real");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let installed_path = dir.join(skill_path.file_name().unwrap());
+        std::fs::copy(skill_path, &installed_path).unwrap();
+
+        let mut loader = SkillLoader::new(&dir);
+        let name = loader.load_skill(&installed_path).unwrap();
+        assert_eq!(name, "hello_world");
+        assert_eq!(loader.count(), 1);
+
+        let skill = loader.get_mut("hello_world").unwrap();
+        let (success, output) = skill.execute_parsed(r#"{"name":"Jared"}"#);
+        assert!(success);
+        assert!(output.contains("Jared"));
+        assert!(output.contains("loadable skill module"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
