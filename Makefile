@@ -94,7 +94,7 @@ deploy-config:
 
 deploy-systemd:
 	scp deploy/systemd/*.service deploy/systemd/*.target $(JETSON_TARGET):/tmp/
-	ssh $(JETSON_TARGET) 'sudo cp /tmp/genie-*.service /tmp/geniepod*.target /etc/systemd/system/ 2>/dev/null; \
+	ssh $(JETSON_TARGET) 'sudo cp /tmp/genie-*.service /tmp/homeassistant.service /tmp/geniepod*.target /etc/systemd/system/ 2>/dev/null; \
 		sudo systemctl daemon-reload'
 
 deploy-docker:
