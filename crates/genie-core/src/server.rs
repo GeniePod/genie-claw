@@ -262,18 +262,20 @@ async fn handle_chat(
             None,
         );
 
-        // Get summary from LLM.
-        let recent = conversations.get_recent(&conv_id, 6).unwrap_or_default();
-        let mut summary_msgs = vec![Message {
-            role: "system".into(),
-            content: "Summarize the tool result in one natural sentence.".into(),
-        }];
-        summary_msgs.extend(recent);
+        let summary = if should_summarize_tool_result(&tool_result.tool) {
+            let recent = conversations.get_recent(&conv_id, 6).unwrap_or_default();
+            let mut summary_msgs = vec![Message {
+                role: "system".into(),
+                content: "Summarize the tool result in one natural sentence without changing numbers, measurements, or facts.".into(),
+            }];
+            summary_msgs.extend(recent);
 
-        let summary = llm
-            .chat(&summary_msgs, Some(128))
-            .await
-            .unwrap_or_else(|_| tool_result.output.clone());
+            llm.chat(&summary_msgs, Some(128))
+                .await
+                .unwrap_or_else(|_| tool_result.output.clone())
+        } else {
+            tool_result.output.clone()
+        };
         let sanitized_summary = crate::security::sandbox::sanitize_output(&summary);
 
         let _ = conversations.append(&conv_id, "assistant", &sanitized_summary, None);
@@ -469,15 +471,16 @@ async fn handle_openai_chat(
     };
 
     // Handle tool calls.
-    let final_response =
-        if let Some(tool_result) = crate::tools::try_tool_call(&llm_response, tools).await {
-            tracing::info!(
-                tool = %tool_result.tool,
-                success = tool_result.success,
-                "tool executed via OpenAI bridge"
-            );
+    let final_response = if let Some(tool_result) =
+        crate::tools::try_tool_call(&llm_response, tools).await
+    {
+        tracing::info!(
+            tool = %tool_result.tool,
+            success = tool_result.success,
+            "tool executed via OpenAI bridge"
+        );
 
-            // Get natural language summary.
+        if should_summarize_tool_result(&tool_result.tool) {
             let mut summary_msgs = llm_messages.clone();
             summary_msgs.push(Message {
                 role: "assistant".into(),
@@ -488,16 +491,20 @@ async fn handle_openai_chat(
                 content: format!("Tool result: {}", tool_result.output),
             });
             summary_msgs.push(Message {
-                role: "system".into(),
-                content: "Summarize the tool result in one natural sentence.".into(),
-            });
+                    role: "system".into(),
+                    content:
+                        "Summarize the tool result in one natural sentence without changing numbers, measurements, or facts.".into(),
+                });
 
             llm.chat(&summary_msgs, Some(128))
                 .await
                 .unwrap_or_else(|_| tool_result.output.clone())
         } else {
-            llm_response
-        };
+            tool_result.output
+        }
+    } else {
+        llm_response
+    };
 
     // Security: sanitize output (redact secrets).
     let sanitized = crate::security::sandbox::sanitize_output(&final_response);
@@ -596,6 +603,10 @@ fn handle_list_models() -> (u16, &'static str, String) {
     (200, "application/json", response.to_string())
 }
 
+fn should_summarize_tool_result(tool_name: &str) -> bool {
+    !matches!(tool_name, "system_info")
+}
+
 fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
@@ -603,5 +614,21 @@ fn status_text(code: u16) -> &'static str {
         404 => "Not Found",
         500 => "Internal Server Error",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_summarize_tool_result;
+
+    #[test]
+    fn system_info_tool_preserves_raw_output() {
+        assert!(!should_summarize_tool_result("system_info"));
+    }
+
+    #[test]
+    fn other_tools_can_still_be_summarized() {
+        assert!(should_summarize_tool_result("home_control"));
+        assert!(should_summarize_tool_result("hello_world"));
     }
 }

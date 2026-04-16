@@ -111,6 +111,7 @@ Available tools:
 - For math, always use the calculate tool.
 - For weather, always use the get_weather tool.
 - For time, always use the get_time tool.
+- For system status, memory, uptime, governor mode, or load average, always use the system_info tool.
 - Assume replies may be heard in a shared room. Do not volunteer secrets or highly sensitive details.
 
 ## Household Context
@@ -160,6 +161,9 @@ You: {{"tool": "get_time", "arguments": {{}}}}
 {home_examples}
 User: "what's 15 percent of 200"
 You: {{"tool": "calculate", "arguments": {{"expression": "200 * 0.15"}}}}
+
+User: "get current system status"
+You: {{"tool": "system_info", "arguments": {{}}}}
 
 User: "weather in Tokyo"
 You: {{"tool": "get_weather", "arguments": {{"location": "Tokyo"}}}}
@@ -274,6 +278,22 @@ mod tests {
     }
 
     #[test]
+    fn capable_prompt_requires_system_info_for_status_questions() {
+        let builder = PromptBuilder::new(ModelFamily::Nemotron);
+        let tools = vec![crate::tools::dispatch::ToolDef {
+            name: "system_info".into(),
+            description: "Get system status".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let mem_path = std::env::temp_dir().join("prompt-test-system-info.db");
+        let _ = std::fs::remove_file(&mem_path);
+        let memory = Memory::open(&mem_path).unwrap();
+
+        let prompt = builder.build(&tools, &memory);
+        assert!(prompt.contains("always use the system_info tool"));
+    }
+
+    #[test]
     fn small_prompt_has_examples() {
         let builder = PromptBuilder::new(ModelFamily::Small);
         let tools = vec![crate::tools::dispatch::ToolDef {
@@ -288,6 +308,8 @@ mod tests {
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("EXAMPLES:"));
         assert!(prompt.contains("what time is it"));
+        assert!(prompt.contains("get current system status"));
+        assert!(prompt.contains("\"system_info\""));
     }
 
     #[test]
