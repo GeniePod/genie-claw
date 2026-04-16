@@ -9,13 +9,49 @@ use super::dispatch::{ToolCall, ToolDispatcher, ToolResult};
 /// 4. With extra fields: `{"tool": "set_timer", "arguments": {"seconds": 300}, "reasoning": "..."}`
 pub async fn try_tool_call(response: &str, tools: &ToolDispatcher) -> Option<ToolResult> {
     let json_str = extract_json(response)?;
-    let call: ToolCall = serde_json::from_str(&json_str).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+    let call = parse_tool_call_value(value, tools)?;
 
     if call.name.is_empty() {
         return None;
     }
 
     Some(tools.execute(&call).await)
+}
+
+fn parse_tool_call_value(value: serde_json::Value, tools: &ToolDispatcher) -> Option<ToolCall> {
+    if let Ok(call) = serde_json::from_value::<ToolCall>(value.clone()) {
+        return Some(call);
+    }
+
+    normalize_single_key_tool_call(value, tools)
+}
+
+fn normalize_single_key_tool_call(
+    value: serde_json::Value,
+    tools: &ToolDispatcher,
+) -> Option<ToolCall> {
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+
+    let (tool_name, nested) = object.iter().next()?;
+    let known_tool = tools.tool_defs().iter().any(|tool| tool.name == *tool_name);
+    if !known_tool {
+        return None;
+    }
+
+    let arguments = if nested.is_object() {
+        nested.clone()
+    } else {
+        serde_json::json!({})
+    };
+
+    Some(ToolCall {
+        name: tool_name.clone(),
+        arguments,
+    })
 }
 
 /// Extract the first valid JSON object from LLM output.
@@ -113,6 +149,7 @@ fn extract_embedded_json(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::dispatch::ToolDispatcher;
 
     #[test]
     fn parse_raw_json() {
@@ -175,5 +212,43 @@ mod tests {
         let json = extract_json(input).unwrap();
         let call: ToolCall = serde_json::from_str(&json).unwrap();
         assert!(call.name.is_empty()); // Parser returns it, but try_tool_call filters it
+    }
+
+    #[test]
+    fn normalize_single_key_tool_call_for_known_tool() {
+        let dispatcher = ToolDispatcher::new(None);
+        let value = serde_json::json!({
+            "system_info": {
+                "uptime": 100,
+                "memory": 1024
+            }
+        });
+
+        let call = normalize_single_key_tool_call(value, &dispatcher).unwrap();
+        assert_eq!(call.name, "system_info");
+        assert_eq!(call.arguments["uptime"], 100);
+    }
+
+    #[test]
+    fn normalize_single_key_tool_call_rejects_unknown_tool_name() {
+        let dispatcher = ToolDispatcher::new(None);
+        let value = serde_json::json!({
+            "not_a_real_tool": {
+                "foo": "bar"
+            }
+        });
+
+        assert!(normalize_single_key_tool_call(value, &dispatcher).is_none());
+    }
+
+    #[tokio::test]
+    async fn try_tool_call_executes_single_key_system_info_shape() {
+        let dispatcher = ToolDispatcher::new(None);
+        let input = r#"{"system_info":{"uptime":100,"memory":1024,"governor_mode":"user","load_average":0.0}}"#;
+
+        let result = try_tool_call(input, &dispatcher).await.unwrap();
+        assert_eq!(result.tool, "system_info");
+        assert!(result.success);
+        assert!(result.output.contains("Memory available:"));
     }
 }

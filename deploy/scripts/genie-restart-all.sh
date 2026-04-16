@@ -12,7 +12,6 @@ fi
 UNITS=(
     genie-audio.service
     genie-mqtt.service
-    genie-llm.service
     genie-core.service
     genie-governor.service
     genie-health.service

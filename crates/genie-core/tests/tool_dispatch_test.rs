@@ -146,6 +146,18 @@ fn makefile_deploys_restart_helper() {
     );
 }
 
+/// Verify the restart helper does not bounce llama.cpp on routine app updates.
+#[test]
+fn restart_helper_skips_llm_service() {
+    let path = workspace_root().join("deploy/scripts/genie-restart-all.sh");
+    let contents = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        !contents.contains("genie-llm.service"),
+        "restart helper should not restart genie-llm.service"
+    );
+}
+
 fn workspace_root() -> std::path::PathBuf {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest.parent().unwrap().parent().unwrap().to_path_buf()
