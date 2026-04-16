@@ -51,6 +51,10 @@ impl ToolDispatcher {
         }
     }
 
+    pub fn has_home_automation(&self) -> bool {
+        self.ha.is_some()
+    }
+
     /// Set the memory store for memory tools (recall, forget, store).
     pub fn with_memory(mut self, memory: Arc<std::sync::Mutex<crate::memory::Memory>>) -> Self {
         self.memory = Some(memory);
@@ -59,8 +63,10 @@ impl ToolDispatcher {
 
     /// All available tool definitions (for the LLM system prompt).
     pub fn tool_defs(&self) -> Vec<ToolDef> {
-        let mut defs = vec![
-            ToolDef {
+        let mut defs = Vec::new();
+
+        if self.has_home_automation() {
+            defs.push(ToolDef {
                 name: "home_control",
                 description: "Control Home Assistant devices, scenes, and voice-safe routines. Use for lights, switches, climate, covers, locks, and scene activation.",
                 parameters: serde_json::json!({
@@ -72,8 +78,8 @@ impl ToolDispatcher {
                     },
                     "required": ["entity", "action"]
                 }),
-            },
-            ToolDef {
+            });
+            defs.push(ToolDef {
                 name: "home_status",
                 description: "Get the current status of a smart home device, room lights, thermostat, lock, cover, scene, or other Home Assistant target.",
                 parameters: serde_json::json!({
@@ -83,7 +89,10 @@ impl ToolDispatcher {
                     },
                     "required": ["entity"]
                 }),
-            },
+            });
+        }
+
+        defs.extend([
             ToolDef {
                 name: "set_timer",
                 description: "Set a countdown timer. Use for 'set a timer for 10 minutes', 'remind me in 5 minutes'.",
@@ -101,7 +110,7 @@ impl ToolDispatcher {
                 description: "Get the current date and time.",
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             },
-        ];
+        ]);
 
         defs.push(ToolDef {
             name: "get_weather",
@@ -443,14 +452,76 @@ async fn governor_command(json_cmd: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ha::{
+        ActionResult, DeviceRef, HomeAction, HomeAutomationProvider, HomeGraph, HomeState,
+        HomeTarget, IntegrationHealth, SceneRef,
+    };
+
+    struct StubHomeProvider;
+
+    #[async_trait::async_trait]
+    impl HomeAutomationProvider for StubHomeProvider {
+        async fn health(&self) -> IntegrationHealth {
+            IntegrationHealth {
+                connected: true,
+                cached_graph: true,
+                message: "ok".into(),
+            }
+        }
+
+        async fn sync_structure(&self) -> Result<HomeGraph> {
+            Ok(HomeGraph {
+                areas: Vec::new(),
+                devices: Vec::new(),
+                entities: Vec::new(),
+                scenes: Vec::new(),
+                scripts: Vec::new(),
+                aliases: Vec::new(),
+                domains: Vec::new(),
+                capabilities: Vec::new(),
+            })
+        }
+
+        async fn resolve_target(
+            &self,
+            _query: &str,
+            _action_hint: Option<crate::ha::HomeActionKind>,
+        ) -> Result<HomeTarget> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn get_state(&self, _target: &HomeTarget) -> Result<HomeState> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn execute(&self, _action: HomeAction) -> Result<ActionResult> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn list_scenes(&self, _room: Option<&str>) -> Result<Vec<SceneRef>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_devices(&self, _room: Option<&str>) -> Result<Vec<DeviceRef>> {
+            Ok(Vec::new())
+        }
+    }
 
     #[test]
-    fn tool_defs_not_empty() {
+    fn tool_defs_hide_home_tools_when_unavailable() {
         let dispatcher = ToolDispatcher::new(None);
         let defs = dispatcher.tool_defs();
         assert!(defs.len() >= 4);
-        assert!(defs.iter().any(|d| d.name == "home_control"));
+        assert!(!defs.iter().any(|d| d.name == "home_control"));
         assert!(defs.iter().any(|d| d.name == "set_timer"));
+    }
+
+    #[test]
+    fn tool_defs_include_home_tools_when_available() {
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(StubHomeProvider)));
+        let defs = dispatcher.tool_defs();
+        assert!(defs.iter().any(|d| d.name == "home_control"));
+        assert!(defs.iter().any(|d| d.name == "home_status"));
     }
 
     #[test]

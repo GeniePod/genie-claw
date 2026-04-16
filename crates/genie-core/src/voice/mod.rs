@@ -41,23 +41,7 @@ impl VoiceOrchestrator {
         let llm_url = &config.services.llm.url;
         let llm = LlmClient::from_url(llm_url);
 
-        // Try to connect HA (optional — may not be running during dev).
-        let ha_token = std::env::var("HA_TOKEN").unwrap_or_default();
-        let ha = if !ha_token.is_empty() {
-            match crate::ha::HomeAssistantProvider::from_url(
-                &config.services.homeassistant.url,
-                &ha_token,
-            ) {
-                Ok(provider) => Some(crate::ha::into_provider(provider)),
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to configure Home Assistant integration");
-                    None
-                }
-            }
-        } else {
-            tracing::warn!("HA_TOKEN not set — Home Assistant integration disabled");
-            None
-        };
+        let ha = crate::ha::provider_from_config(&config);
 
         let tools = ToolDispatcher::new(ha);
 
@@ -67,9 +51,14 @@ impl VoiceOrchestrator {
 
         // Build system prompt with tool definitions.
         let tool_json = serde_json::to_string_pretty(&tools.tool_defs())?;
+        let role_summary = if tools.has_home_automation() {
+            "You help with home control, timers, questions, and useful household context."
+        } else {
+            "You help with timers, questions, and useful household context. Home control is currently unavailable."
+        };
         let system_prompt = format!(
             "You are GeniePod Home, a local home AI for a shared living space. \
-             You help with home control, timers, questions, and useful household context.\n\n\
+             {}\n\n\
              You have these tools available. To use a tool, respond with a JSON object:\n\
              {{\"tool\": \"tool_name\", \"arguments\": {{...}}}}\n\n\
              Available tools:\n{}\n\n\
@@ -77,6 +66,7 @@ impl VoiceOrchestrator {
              conversational voice. Keep responses under 3 sentences for voice output. \
              Assume replies may be heard in a shared room.\n\n\
              Current household context:\n{}",
+            role_summary,
             tool_json,
             format_memories(&memory),
         );

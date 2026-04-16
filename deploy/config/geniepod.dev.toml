@@ -6,7 +6,7 @@ data_dir = "./data"
 
 [core]
 port = 3000
-ha_token = ""
+ha_token = ""                      # Only needed when Home Assistant service is enabled below.
 llm_model_name = "tinyllama"        # Change to "nemotron-4b" on Jetson
 whisper_model = "./models/whisper-small.bin"
 whisper_port = 0
@@ -38,6 +38,7 @@ systemd_unit = "genie-core.service"
 url = "http://127.0.0.1:8080/health"
 systemd_unit = "genie-llm.service"
 
-[services.homeassistant]
-url = "http://127.0.0.1:8123/"
-systemd_unit = "homeassistant.service"
+# Uncomment to enable Home Assistant integration during development:
+# [services.homeassistant]
+# url = "http://127.0.0.1:8123/"
+# systemd_unit = "homeassistant.service"

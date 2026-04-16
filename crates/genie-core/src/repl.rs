@@ -25,10 +25,15 @@ pub async fn run(
     let conv_id = conversations.create()?;
     tracing::info!(conv_id = %conv_id, "REPL conversation started");
 
+    let tool_names = tools_dispatch
+        .tool_defs()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+
     eprintln!("\nGeniePod REPL — type a message (Ctrl+C to quit)");
-    eprintln!(
-        "  Tools: get_time, get_weather, calculate, home_control, set_timer, system_info, play_media\n"
-    );
+    eprintln!("  Tools: {}\n", tool_names);
 
     loop {
         eprint!("> ");

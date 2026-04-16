@@ -59,22 +59,39 @@ impl PromptBuilder {
     pub fn build(&self, tools: &[ToolDef], memory: &Memory) -> String {
         let tool_section = self.format_tools(tools);
         let memory_section = format_memories(memory);
+        let home_tools_available = tools.iter().any(|tool| tool.name == "home_control");
 
         match self.model_family {
             ModelFamily::Nemotron | ModelFamily::Llama | ModelFamily::Qwen => {
-                self.prompt_capable_model(&tool_section, &memory_section)
+                self.prompt_capable_model(&tool_section, &memory_section, home_tools_available)
             }
             ModelFamily::Phi | ModelFamily::Small | ModelFamily::Generic => {
-                self.prompt_simple_model(&tool_section, &memory_section)
+                self.prompt_simple_model(&tool_section, &memory_section, home_tools_available)
             }
         }
     }
 
     /// Prompt for models with good instruction following (Nemotron, Llama 3, Qwen).
-    fn prompt_capable_model(&self, tools: &str, memories: &str) -> String {
+    fn prompt_capable_model(
+        &self,
+        tools: &str,
+        memories: &str,
+        home_tools_available: bool,
+    ) -> String {
+        let role_summary = if home_tools_available {
+            "You help the household control the home, answer everyday questions, manage timers, check weather, and handle simple calculations."
+        } else {
+            "You help the household answer everyday questions, manage timers, check weather, and handle simple calculations. Home control is currently unavailable."
+        };
+        let home_rule = if home_tools_available {
+            "- For smart home commands, always use the home_control or home_status tool."
+        } else {
+            "- Home control is currently unavailable. If asked to control or check a device, say Home Assistant is not connected."
+        };
+
         format!(
             r#"You are GeniePod Home, a local home AI for a shared living space.
-You help the household control the home, answer everyday questions, manage timers, check weather, and handle simple calculations.
+{role_summary}
 Your tone should be calm, concise, and natural for spoken replies.
 
 ## Tool Calling
@@ -90,7 +107,7 @@ Available tools:
 ## Rules
 - If no tool is needed, respond naturally in 1-3 short sentences (optimized for voice).
 - Never make up information. If unsure, say so.
-- For smart home commands, always use the home_control or home_status tool.
+{home_rule}
 - For math, always use the calculate tool.
 - For weather, always use the get_weather tool.
 - For time, always use the get_time tool.
@@ -102,7 +119,29 @@ Available tools:
     }
 
     /// Prompt for smaller/simpler models that need more explicit guidance.
-    fn prompt_simple_model(&self, tools: &str, memories: &str) -> String {
+    fn prompt_simple_model(
+        &self,
+        tools: &str,
+        memories: &str,
+        home_tools_available: bool,
+    ) -> String {
+        let home_note = if home_tools_available {
+            ""
+        } else {
+            "Home control is currently unavailable. If asked to control or check a device, say Home Assistant is not connected.\n\n"
+        };
+        let home_examples = if home_tools_available {
+            r#"User: "turn on the kitchen light"
+You: {"tool": "home_control", "arguments": {"entity": "kitchen light", "action": "turn_on"}}
+
+User: "set movie night"
+You: {"tool": "home_control", "arguments": {"entity": "movie night", "action": "activate"}}
+
+"#
+        } else {
+            ""
+        };
+
         format!(
             r#"You are GeniePod Home, a local home AI for a shared household.
 Keep your tone concise and natural for voice.
@@ -118,18 +157,14 @@ EXAMPLES:
 User: "what time is it"
 You: {{"tool": "get_time", "arguments": {{}}}}
 
-User: "turn on the kitchen light"
-You: {{"tool": "home_control", "arguments": {{"entity": "kitchen light", "action": "turn_on"}}}}
-
-User: "set movie night"
-You: {{"tool": "home_control", "arguments": {{"entity": "movie night", "action": "activate"}}}}
-
+{home_examples}
 User: "what's 15 percent of 200"
 You: {{"tool": "calculate", "arguments": {{"expression": "200 * 0.15"}}}}
 
 User: "weather in Tokyo"
 You: {{"tool": "get_weather", "arguments": {{"location": "Tokyo"}}}}
 
+{home_note}
 If no tool is needed, just answer briefly (1-2 sentences).
 Assume replies may be heard in a shared room. Do not volunteer secrets or highly sensitive details.
 
@@ -253,5 +288,22 @@ mod tests {
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("EXAMPLES:"));
         assert!(prompt.contains("what time is it"));
+    }
+
+    #[test]
+    fn prompt_without_home_tools_marks_home_control_unavailable() {
+        let builder = PromptBuilder::new(ModelFamily::Small);
+        let tools = vec![crate::tools::dispatch::ToolDef {
+            name: "get_time",
+            description: "Get current time",
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let mem_path = std::env::temp_dir().join("prompt-test-no-home.db");
+        let _ = std::fs::remove_file(&mem_path);
+        let memory = Memory::open(&mem_path).unwrap();
+
+        let prompt = builder.build(&tools, &memory);
+        assert!(prompt.contains("Home control is currently unavailable"));
+        assert!(!prompt.contains("turn on the kitchen light"));
     }
 }

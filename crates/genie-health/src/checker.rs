@@ -137,8 +137,11 @@ impl HealthMonitor {
         let mut endpoints = vec![
             ("core".into(), &self.config.services.core),
             ("llm".into(), &self.config.services.llm),
-            ("homeassistant".into(), &self.config.services.homeassistant),
         ];
+
+        if let Some(ref ha) = self.config.services.homeassistant {
+            endpoints.push(("homeassistant".into(), ha));
+        }
 
         if let Some(ref nc) = self.config.services.nextcloud {
             endpoints.push(("nextcloud".into(), nc));
@@ -176,6 +179,42 @@ impl HealthMonitor {
         if let Err(e) = send_http_post(&url, &payload.to_string()).await {
             tracing::warn!(error = %e, "failed to send alert to local webhook");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use genie_common::config::{
+        CoreConfig, GovernorConfig, HealthConfig, PressureConfig, ServicesConfig,
+    };
+    use std::path::PathBuf;
+
+    fn test_config() -> Config {
+        Config {
+            data_dir: PathBuf::from("/tmp/geniepod-health-test"),
+            core: CoreConfig::default(),
+            governor: GovernorConfig {
+                poll_interval_ms: 1000,
+                night_start_hour: 23,
+                day_start_hour: 6,
+                night_model_swap: false,
+                pressure: PressureConfig::default(),
+            },
+            health: HealthConfig::default(),
+            services: ServicesConfig::default(),
+        }
+    }
+
+    #[test]
+    fn collect_endpoints_skips_unconfigured_homeassistant() {
+        let monitor = HealthMonitor::new(test_config()).unwrap();
+        let endpoints = monitor.collect_endpoints();
+        let names: Vec<&str> = endpoints.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert!(names.contains(&"core"));
+        assert!(names.contains(&"llm"));
+        assert!(!names.contains(&"homeassistant"));
     }
 }
 

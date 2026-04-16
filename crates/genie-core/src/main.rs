@@ -45,24 +45,7 @@ async fn main() -> Result<()> {
     let llm_url = &config.services.llm.url;
     let llm = llm::LlmClient::from_url(llm_url);
 
-    let ha_token = if config.core.ha_token.is_empty() {
-        std::env::var("HA_TOKEN").unwrap_or_default()
-    } else {
-        config.core.ha_token.clone()
-    };
-
-    let ha = if !ha_token.is_empty() {
-        match ha::HomeAssistantProvider::from_url(&config.services.homeassistant.url, &ha_token) {
-            Ok(provider) => Some(ha::into_provider(provider)),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to configure Home Assistant integration");
-                None
-            }
-        }
-    } else {
-        tracing::warn!("HA_TOKEN not set — Home Assistant disabled");
-        None
-    };
+    let ha = ha::provider_from_config(&config);
 
     let mem_path = config.data_dir.join("memory.db");
     let mem = memory::Memory::open(&mem_path)?;

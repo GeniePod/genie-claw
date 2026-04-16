@@ -188,6 +188,9 @@ impl Governor {
 
         // Stop services not needed in target mode.
         for unit in target.stopped_services() {
+            if !self.should_manage_service(unit) {
+                continue;
+            }
             let _ = ServiceCtl::stop(unit).await;
         }
 
@@ -220,6 +223,9 @@ impl Governor {
 
         // Start services required by target mode.
         for unit in target.required_services() {
+            if !self.should_manage_service(unit) {
+                continue;
+            }
             if !ServiceCtl::is_active(unit).await {
                 let _ = ServiceCtl::start(unit).await;
             }
@@ -241,11 +247,19 @@ impl Governor {
         }
 
         if mem_avail_mb < pressure.stop_optins_mb {
-            let _ = ServiceCtl::docker_stop("nextcloud").await;
-            let _ = ServiceCtl::docker_stop("jellyfin").await;
+            if self.should_manage_service("nextcloud") {
+                let _ = ServiceCtl::docker_stop("nextcloud").await;
+            }
+            if self.should_manage_service("jellyfin") {
+                let _ = ServiceCtl::docker_stop("jellyfin").await;
+            }
         }
 
         Ok(())
+    }
+
+    fn should_manage_service(&self, alias: &str) -> bool {
+        self.config.manages_service_alias(alias)
     }
 }
 
@@ -401,5 +415,15 @@ mod tests {
             let mode = gov.determine_mode(3000);
             assert_eq!(mode, Mode::NightB);
         }
+    }
+
+    #[test]
+    fn skips_unconfigured_optional_services() {
+        let gov = make_governor();
+
+        assert!(gov.should_manage_service("genie-core"));
+        assert!(!gov.should_manage_service("homeassistant"));
+        assert!(!gov.should_manage_service("nextcloud"));
+        assert!(!gov.should_manage_service("jellyfin"));
     }
 }

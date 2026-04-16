@@ -185,7 +185,7 @@ pub struct HealthConfig {
 pub struct ServicesConfig {
     pub core: ServiceEndpoint,
     pub llm: ServiceEndpoint,
-    pub homeassistant: ServiceEndpoint,
+    pub homeassistant: Option<ServiceEndpoint>,
 
     #[serde(default)]
     pub nextcloud: Option<ServiceEndpoint>,
@@ -214,6 +214,33 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("failed to read config {}: {}", path.display(), e))?;
         let config: Config = toml::from_str(&contents)?;
         Ok(config)
+    }
+
+    /// Resolve the configured Home Assistant endpoint, if this deployment uses one.
+    pub fn homeassistant_service(&self) -> Option<&ServiceEndpoint> {
+        self.services.homeassistant.as_ref()
+    }
+
+    /// Resolve the Home Assistant token from config first, then the environment.
+    pub fn homeassistant_token(&self) -> Option<String> {
+        let token = if self.core.ha_token.is_empty() {
+            std::env::var("HA_TOKEN").unwrap_or_default()
+        } else {
+            self.core.ha_token.clone()
+        };
+
+        let token = token.trim().to_string();
+        if token.is_empty() { None } else { Some(token) }
+    }
+
+    /// Whether the current deployment should manage a given service alias.
+    pub fn manages_service_alias(&self, alias: &str) -> bool {
+        match alias {
+            "homeassistant" => self.services.homeassistant.is_some(),
+            "nextcloud" => self.services.nextcloud.is_some(),
+            "jellyfin" => self.services.jellyfin.is_some(),
+            _ => true,
+        }
     }
 }
 
@@ -261,13 +288,57 @@ impl Default for ServicesConfig {
                 url: "http://127.0.0.1:8080/health".into(),
                 systemd_unit: "genie-llm.service".into(),
             },
-            homeassistant: ServiceEndpoint {
-                url: "http://127.0.0.1:8123/api/".into(),
-                systemd_unit: "homeassistant.service".into(),
-            },
+            homeassistant: None,
             nextcloud: None,
             jellyfin: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            data_dir: defaults::data_dir(),
+            core: CoreConfig::default(),
+            governor: GovernorConfig::default(),
+            health: HealthConfig::default(),
+            services: ServicesConfig::default(),
+        }
+    }
+
+    #[test]
+    fn homeassistant_is_optional_by_default() {
+        let config = test_config();
+        assert!(config.homeassistant_service().is_none());
+        assert!(!config.manages_service_alias("homeassistant"));
+    }
+
+    #[test]
+    fn configured_homeassistant_token_is_used() {
+        let mut config = test_config();
+        config.core.ha_token = "secret-token".into();
+
+        assert_eq!(
+            config.homeassistant_token().as_deref(),
+            Some("secret-token")
+        );
+    }
+
+    #[test]
+    fn only_configured_optional_services_are_managed() {
+        let mut config = test_config();
+        config.services.nextcloud = Some(ServiceEndpoint {
+            url: "http://127.0.0.1:8180/status.php".into(),
+            systemd_unit: "nextcloud.service".into(),
+        });
+
+        assert!(config.manages_service_alias("genie-core"));
+        assert!(!config.manages_service_alias("homeassistant"));
+        assert!(config.manages_service_alias("nextcloud"));
+        assert!(!config.manages_service_alias("jellyfin"));
     }
 }
 

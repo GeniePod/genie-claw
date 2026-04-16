@@ -5,7 +5,7 @@ data_dir = "/opt/geniepod/data"
 
 [core]
 port = 3000
-ha_token = ""                     # Or set HA_TOKEN env var.
+ha_token = ""                     # Only needed when Home Assistant service is enabled below. Or set HA_TOKEN env var.
 llm_model_name = "nemotron-4b"    # For prompt optimization. Options: nemotron-4b, tinyllama, llama, qwen, phi
 whisper_model = "/opt/geniepod/models/ggml-small.bin"
 whisper_port = 0                  # 0 = CLI mode; set to 8178 for server mode.
@@ -48,9 +48,10 @@ systemd_unit = "genie-core.service"
 url = "http://127.0.0.1:8080/health"
 systemd_unit = "genie-llm.service"
 
-[services.homeassistant]
-url = "http://127.0.0.1:8123/"
-systemd_unit = "homeassistant.service"
+# Uncomment to enable Home Assistant integration:
+# [services.homeassistant]
+# url = "http://127.0.0.1:8123/"
+# systemd_unit = "homeassistant.service"
 
 # Uncomment after enabling via first-boot wizard:
 # [services.nextcloud]

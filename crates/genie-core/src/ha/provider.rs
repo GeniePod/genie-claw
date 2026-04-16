@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -15,6 +16,8 @@ const AREA_TEMPLATE: &str = r#"
 {% endfor %}
 {{ ns.items | to_json }}
 "#;
+
+const GRAPH_CACHE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrationHealth {
@@ -167,7 +170,7 @@ pub trait HomeAutomationProvider: Send + Sync {
 #[derive(Debug)]
 pub struct HomeAssistantProvider {
     client: HaClient,
-    cache: RwLock<Option<HomeGraph>>,
+    cache: RwLock<Option<CachedGraph>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,6 +179,12 @@ struct AreaTemplateEntry {
     name: String,
     #[serde(default)]
     entities: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedGraph {
+    graph: HomeGraph,
+    synced_at: Instant,
 }
 
 impl HomeAssistantProvider {
@@ -190,11 +199,13 @@ impl HomeAssistantProvider {
         Ok(Self::new(HaClient::from_url(url, token)?))
     }
 
-    async fn graph(&self) -> Result<HomeGraph> {
-        if let Some(graph) = self.cache.read().await.clone() {
-            return Ok(graph);
+    async fn graph(&self) -> Result<(HomeGraph, bool)> {
+        if let Some(cached) = self.cache.read().await.clone()
+            && cached.synced_at.elapsed() < GRAPH_CACHE_TTL
+        {
+            return Ok((cached.graph, true));
         }
-        self.sync_structure().await
+        Ok((self.sync_structure().await?, false))
     }
 
     async fn load_areas(&self) -> Result<Vec<AreaTemplateEntry>> {
@@ -314,6 +325,34 @@ impl HomeAssistantProvider {
             domains: domains.into_iter().collect(),
             capabilities: capabilities.into_iter().collect(),
         }
+    }
+
+    fn resolve_target_in_graph(
+        graph: &HomeGraph,
+        query: &str,
+        action_hint: Option<HomeActionKind>,
+    ) -> Option<HomeTarget> {
+        let query_lower = normalize(query);
+
+        let area_match = best_area_match(&graph.areas, &query_lower);
+        let domain_match = infer_domain(&query_lower);
+
+        if let (Some((area_name, area_score)), Some(domain)) = (area_match.clone(), domain_match)
+            && let Some(target) =
+                Self::resolve_group_target(graph, query, &domain, &area_name, area_score)
+        {
+            return Some(target);
+        }
+
+        if action_hint.is_none()
+            && let Some((area_name, area_score)) = area_match
+            && let Some(target) =
+                Self::resolve_group_target(graph, query, "light", &area_name, area_score * 0.8)
+        {
+            return Some(target);
+        }
+
+        Self::resolve_named_entity(graph, query, action_hint)
     }
 
     fn resolve_group_target(
@@ -467,7 +506,10 @@ impl HomeAutomationProvider for HomeAssistantProvider {
         });
 
         let graph = Self::build_graph(&states, &areas);
-        *self.cache.write().await = Some(graph.clone());
+        *self.cache.write().await = Some(CachedGraph {
+            graph: graph.clone(),
+            synced_at: Instant::now(),
+        });
         Ok(graph)
     }
 
@@ -481,29 +523,28 @@ impl HomeAutomationProvider for HomeAssistantProvider {
             anyhow::bail!("missing Home Assistant target");
         }
 
-        let graph = self.graph().await?;
-        let query_lower = normalize(query);
-
-        let area_match = best_area_match(&graph.areas, &query_lower);
-        let domain_match = infer_domain(&query_lower);
-
-        if let (Some((area_name, area_score)), Some(domain)) = (area_match.clone(), domain_match)
-            && let Some(target) =
-                Self::resolve_group_target(&graph, query, &domain, &area_name, area_score)
-        {
+        let (graph, from_cache) = self.graph().await?;
+        if let Some(target) = Self::resolve_target_in_graph(&graph, query, action_hint) {
             return Ok(target);
         }
 
-        if action_hint.is_none()
-            && let Some((area_name, area_score)) = area_match
-            && let Some(target) =
-                Self::resolve_group_target(&graph, query, "light", &area_name, area_score * 0.8)
-        {
-            return Ok(target);
-        }
-
-        if let Some(target) = Self::resolve_named_entity(&graph, query, action_hint) {
-            return Ok(target);
+        if from_cache {
+            match self.sync_structure().await {
+                Ok(refreshed_graph) => {
+                    if let Some(target) =
+                        Self::resolve_target_in_graph(&refreshed_graph, query, action_hint)
+                    {
+                        return Ok(target);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        query,
+                        "failed to refresh Home Assistant graph after cache miss"
+                    );
+                }
+            }
         }
 
         anyhow::bail!("no Home Assistant target matched '{}'", query)
@@ -649,7 +690,7 @@ impl HomeAutomationProvider for HomeAssistantProvider {
     }
 
     async fn list_scenes(&self, room: Option<&str>) -> Result<Vec<SceneRef>> {
-        let graph = self.graph().await?;
+        let (graph, _) = self.graph().await?;
         let room = room.map(normalize);
         Ok(graph
             .scenes
@@ -663,7 +704,7 @@ impl HomeAutomationProvider for HomeAssistantProvider {
     }
 
     async fn list_devices(&self, room: Option<&str>) -> Result<Vec<DeviceRef>> {
-        let graph = self.graph().await?;
+        let (graph, _) = self.graph().await?;
         let room = room.map(normalize);
         Ok(graph
             .devices
