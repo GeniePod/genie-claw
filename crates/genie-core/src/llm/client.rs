@@ -77,6 +77,12 @@ pub struct Delta {
     pub content: Option<String>,
 }
 
+#[derive(Debug)]
+struct HttpResponse {
+    status: u16,
+    body: String,
+}
+
 impl LlmClient {
     pub fn new(host: &str, port: u16) -> Self {
         Self {
@@ -116,6 +122,26 @@ impl LlmClient {
         max_tokens: Option<u32>,
         response_format: Option<ResponseFormat>,
     ) -> Result<String> {
+        match self
+            .chat_with_format_once(messages, max_tokens, response_format.clone())
+            .await
+        {
+            Ok(content) => Ok(content),
+            Err(err) if should_retry_without_system_role(messages, &err.to_string()) => {
+                let flattened = flatten_system_into_first_user(messages);
+                self.chat_with_format_once(&flattened, max_tokens, response_format)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn chat_with_format_once(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        response_format: Option<ResponseFormat>,
+    ) -> Result<String> {
         let request = ChatRequest {
             model: "default".into(),
             messages: messages.to_vec(),
@@ -127,8 +153,21 @@ impl LlmClient {
 
         let body = serde_json::to_string(&request)?;
         let response = self.http_post("/v1/chat/completions", &body).await?;
+        if response.status != 200 {
+            anyhow::bail!(
+                "llama.cpp {}: {}",
+                response.status,
+                llama_error_message(&response.body)
+            );
+        }
 
-        let chat_resp: ChatResponse = serde_json::from_str(&response)?;
+        let chat_resp: ChatResponse = serde_json::from_str(&response.body).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse llama.cpp response: {}; body: {}",
+                e,
+                truncate_body(&response.body)
+            )
+        })?;
         let content = chat_resp
             .choices
             .first()
@@ -175,13 +214,25 @@ impl LlmClient {
 
         let mut lines = BufReader::new(reader).lines();
         let mut full_response = String::new();
+        let mut status = 200;
         let mut headers_done = false;
 
         while let Some(line) = lines.next_line().await? {
             // Skip HTTP headers.
             if !headers_done {
+                if line.starts_with("HTTP/") {
+                    status = parse_status_line(&line);
+                    continue;
+                }
                 if line.is_empty() {
                     headers_done = true;
+                    if status != 200 {
+                        let mut error_body = String::new();
+                        while let Some(line) = lines.next_line().await? {
+                            error_body.push_str(&line);
+                        }
+                        anyhow::bail!("llama.cpp {}: {}", status, llama_error_message(&error_body));
+                    }
                 }
                 continue;
             }
@@ -213,10 +264,10 @@ impl LlmClient {
 
     /// Check if the LLM server is reachable.
     pub async fn health(&self) -> bool {
-        self.http_get("/health").await.is_ok()
+        matches!(self.http_get("/health").await, Ok(resp) if resp.status == 200)
     }
 
-    async fn http_post(&self, path: &str, body: &str) -> Result<String> {
+    async fn http_post(&self, path: &str, body: &str) -> Result<HttpResponse> {
         let addr = format!("{}:{}", self.host, self.port);
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -240,11 +291,16 @@ impl LlmClient {
         let mut response = String::new();
         let mut headers_done = false;
         let mut content_length: usize = 0;
+        let mut status = 0;
 
         // Read headers.
         loop {
             let mut line = String::new();
             buf_reader.read_line(&mut line).await?;
+            if line.starts_with("HTTP/") {
+                status = parse_status_line(&line);
+                continue;
+            }
             if line.trim().is_empty() {
                 headers_done = true;
                 break;
@@ -263,10 +319,13 @@ impl LlmClient {
             tokio::io::AsyncReadExt::read_to_string(&mut buf_reader, &mut response).await?;
         }
 
-        Ok(response)
+        Ok(HttpResponse {
+            status,
+            body: response,
+        })
     }
 
-    async fn http_get(&self, path: &str) -> Result<String> {
+    async fn http_get(&self, path: &str) -> Result<HttpResponse> {
         let addr = format!("{}:{}", self.host, self.port);
         let stream =
             tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))
@@ -280,9 +339,107 @@ impl LlmClient {
         );
         writer.write_all(request.as_bytes()).await?;
 
-        let mut response = String::new();
-        tokio::io::AsyncReadExt::read_to_string(&mut BufReader::new(reader), &mut response).await?;
-        Ok(response)
+        let mut buf_reader = BufReader::new(reader);
+        let mut body = String::new();
+        let mut status = 0;
+
+        loop {
+            let mut line = String::new();
+            buf_reader.read_line(&mut line).await?;
+            if line.starts_with("HTTP/") {
+                status = parse_status_line(&line);
+                continue;
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+
+        tokio::io::AsyncReadExt::read_to_string(&mut buf_reader, &mut body).await?;
+        Ok(HttpResponse { status, body })
+    }
+}
+
+fn parse_status_line(line: &str) -> u16 {
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+fn should_retry_without_system_role(messages: &[Message], err: &str) -> bool {
+    messages.iter().any(|m| m.role == "system") && system_role_not_supported(err)
+}
+
+fn system_role_not_supported(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("only user and assistant roles are supported")
+        || lower.contains("system role not supported")
+        || lower.contains("unsupported role") && lower.contains("system")
+        || lower.contains("does not support") && lower.contains("system")
+}
+
+fn flatten_system_into_first_user(messages: &[Message]) -> Vec<Message> {
+    let system_text = messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .map(|m| m.content.trim())
+        .filter(|m| !m.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let mut flattened = messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if system_text.is_empty() {
+        return flattened;
+    }
+
+    if let Some(first_user) = flattened.iter_mut().find(|m| m.role == "user") {
+        first_user.content = format!(
+            "System instructions:\n{}\n\n{}",
+            system_text, first_user.content
+        );
+    } else {
+        flattened.insert(
+            0,
+            Message {
+                role: "user".into(),
+                content: format!("System instructions:\n{}", system_text),
+            },
+        );
+    }
+
+    flattened
+}
+
+fn llama_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("error")
+                .and_then(|v| v.get("message"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    json.get("message")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_else(|| truncate_body(body))
+}
+
+fn truncate_body(body: &str) -> String {
+    const MAX_LEN: usize = 240;
+    let trimmed = body.trim();
+    if trimmed.len() <= MAX_LEN {
+        trimmed.to_string()
+    } else {
+        format!("{}...", &trimmed[..MAX_LEN])
     }
 }
 
@@ -323,5 +480,41 @@ mod tests {
             resp.choices[0].message.as_ref().unwrap().content,
             "Done! Lights are on."
         );
+    }
+
+    #[test]
+    fn parse_http_status() {
+        assert_eq!(parse_status_line("HTTP/1.1 200 OK"), 200);
+        assert_eq!(parse_status_line("HTTP/1.1 503 Service Unavailable"), 503);
+    }
+
+    #[test]
+    fn flatten_system_prompt_into_first_user_message() {
+        let messages = vec![
+            Message {
+                role: "system".into(),
+                content: "Be concise.".into(),
+            },
+            Message {
+                role: "user".into(),
+                content: "What time is it?".into(),
+            },
+        ];
+
+        let flattened = flatten_system_into_first_user(&messages);
+        assert_eq!(flattened.len(), 1);
+        assert_eq!(flattened[0].role, "user");
+        assert!(flattened[0].content.contains("Be concise."));
+        assert!(flattened[0].content.contains("What time is it?"));
+    }
+
+    #[test]
+    fn detect_system_role_error_message() {
+        assert!(system_role_not_supported(
+            "llama.cpp 400: Only user and assistant roles are supported!"
+        ));
+        assert!(system_role_not_supported(
+            "Error rendering prompt: system role not supported"
+        ));
     }
 }
