@@ -1,10 +1,14 @@
 use anyhow::Result;
 use genie_common::tegrastats;
 
+use crate::ha::HomeAutomationProvider;
+
 /// Get system status: memory, uptime, governor mode.
-pub async fn system_info() -> Result<String> {
+pub async fn system_info(ha: Option<&dyn HomeAutomationProvider>) -> Result<String> {
     let mut info = Vec::new();
     let governor_status = query_governor_status().await;
+
+    info.push(home_assistant_status(ha).await);
 
     // Prefer the governor's latest reading when available.
     if let Some(avail) = governor_status
@@ -68,6 +72,36 @@ fn format_load_average(contents: &str) -> Option<String> {
     Some(format!("{} {} {}", parts[0], parts[1], parts[2]))
 }
 
+async fn home_assistant_status(ha: Option<&dyn HomeAutomationProvider>) -> String {
+    let Some(ha) = ha else {
+        return "Home Assistant: integration disabled".to_string();
+    };
+
+    let health = ha.health().await;
+    if health.connected {
+        let message = health.message.trim();
+        if message.is_empty()
+            || message.eq_ignore_ascii_case("ok")
+            || message.eq_ignore_ascii_case("healthy")
+        {
+            "Home Assistant: connected".to_string()
+        } else if let Some(rest) = message.strip_prefix("connected to Home Assistant at ") {
+            format!("Home Assistant: connected ({})", rest)
+        } else {
+            format!("Home Assistant: connected ({})", message)
+        }
+    } else {
+        let message = health.message.trim();
+        if message.is_empty() {
+            "Home Assistant: unavailable".to_string()
+        } else if let Some(rest) = message.strip_prefix("Home Assistant unavailable: ") {
+            format!("Home Assistant: unavailable ({})", rest)
+        } else {
+            format!("Home Assistant: unavailable ({})", message)
+        }
+    }
+}
+
 async fn query_governor_status() -> Option<serde_json::Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
@@ -91,6 +125,91 @@ async fn query_governor_status() -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ha::{
+        ActionResult, DeviceRef, HomeAction, HomeAutomationProvider, HomeGraph, HomeState,
+        HomeTarget, IntegrationHealth, SceneRef,
+    };
+
+    struct ConnectedStub;
+    struct DisconnectedStub;
+
+    #[async_trait::async_trait]
+    impl HomeAutomationProvider for ConnectedStub {
+        async fn health(&self) -> IntegrationHealth {
+            IntegrationHealth {
+                connected: true,
+                cached_graph: true,
+                message: "ok".into(),
+            }
+        }
+
+        async fn sync_structure(&self) -> Result<HomeGraph> {
+            anyhow::bail!("unused")
+        }
+
+        async fn resolve_target(
+            &self,
+            _query: &str,
+            _action_hint: Option<crate::ha::HomeActionKind>,
+        ) -> Result<HomeTarget> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_state(&self, _target: &HomeTarget) -> Result<HomeState> {
+            anyhow::bail!("unused")
+        }
+
+        async fn execute(&self, _action: HomeAction) -> Result<ActionResult> {
+            anyhow::bail!("unused")
+        }
+
+        async fn list_scenes(&self, _room: Option<&str>) -> Result<Vec<SceneRef>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_devices(&self, _room: Option<&str>) -> Result<Vec<DeviceRef>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HomeAutomationProvider for DisconnectedStub {
+        async fn health(&self) -> IntegrationHealth {
+            IntegrationHealth {
+                connected: false,
+                cached_graph: false,
+                message: "Home Assistant unavailable: timeout".into(),
+            }
+        }
+
+        async fn sync_structure(&self) -> Result<HomeGraph> {
+            anyhow::bail!("unused")
+        }
+
+        async fn resolve_target(
+            &self,
+            _query: &str,
+            _action_hint: Option<crate::ha::HomeActionKind>,
+        ) -> Result<HomeTarget> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_state(&self, _target: &HomeTarget) -> Result<HomeState> {
+            anyhow::bail!("unused")
+        }
+
+        async fn execute(&self, _action: HomeAction) -> Result<ActionResult> {
+            anyhow::bail!("unused")
+        }
+
+        async fn list_scenes(&self, _room: Option<&str>) -> Result<Vec<SceneRef>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_devices(&self, _room: Option<&str>) -> Result<Vec<DeviceRef>> {
+            Ok(Vec::new())
+        }
+    }
 
     #[test]
     fn prefers_live_governor_memory() {
@@ -115,5 +234,23 @@ mod tests {
             Some("0.00 0.01 0.05")
         );
         assert_eq!(format_load_average("bad"), None);
+    }
+
+    #[tokio::test]
+    async fn reports_home_assistant_connected() {
+        let status = home_assistant_status(Some(&ConnectedStub)).await;
+        assert!(status.contains("Home Assistant: connected"));
+    }
+
+    #[tokio::test]
+    async fn reports_home_assistant_disabled_when_absent() {
+        let status = home_assistant_status(None).await;
+        assert_eq!(status, "Home Assistant: integration disabled");
+    }
+
+    #[tokio::test]
+    async fn reports_home_assistant_unavailable_when_disconnected() {
+        let status = home_assistant_status(Some(&DisconnectedStub)).await;
+        assert!(status.contains("Home Assistant: unavailable"));
     }
 }

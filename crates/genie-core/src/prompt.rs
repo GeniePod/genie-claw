@@ -127,7 +127,7 @@ Available tools:
 - For math, always use the calculate tool.
 - For weather, always use the get_weather tool.
 - For time, always use the get_time tool.
-- For system status, memory, uptime, governor mode, or load average, always use the system_info tool.
+- For system status, Home Assistant connection status, memory, uptime, governor mode, or load average, always use the system_info tool.
 - When the user asks what you remember, what you know about them, or asks for their name back, use the memory_recall tool.
 - Only use memory_store when the user explicitly asks you to remember or save something.
 - If the user casually shares a fact like "my name is Jared", answer naturally and do not call memory_store just for that. The memory system can capture that automatically.
@@ -188,6 +188,9 @@ User: "what's 15 percent of 200"
 You: {{"tool": "calculate", "arguments": {{"expression": "200 * 0.15"}}}}
 
 User: "get current system status"
+You: {{"tool": "system_info", "arguments": {{}}}}
+
+User: "is Home Assistant connected?"
 You: {{"tool": "system_info", "arguments": {{}}}}
 
 User: "did you remember my name?"
@@ -336,6 +339,7 @@ mod tests {
 
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("always use the system_info tool"));
+        assert!(prompt.contains("Home Assistant connection status"));
     }
 
     #[test]
@@ -354,6 +358,7 @@ mod tests {
         assert!(prompt.contains("EXAMPLES:"));
         assert!(prompt.contains("what time is it"));
         assert!(prompt.contains("get current system status"));
+        assert!(prompt.contains("is Home Assistant connected?"));
         assert!(prompt.contains("\"system_info\""));
     }
 

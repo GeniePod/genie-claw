@@ -136,8 +136,9 @@ impl ToolDispatcher {
 
         defs.push(ToolDef {
             name: "system_info".into(),
-            description: "Get GeniePod system status: memory, uptime, governor mode, load average."
-                .into(),
+            description:
+                "Get GeniePod system status: Home Assistant connection state, memory, uptime, governor mode, and load average."
+                    .into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         });
 
@@ -217,7 +218,7 @@ impl ToolDispatcher {
             "set_timer" => self.exec_set_timer(&call.arguments),
             "get_time" => Ok(get_current_time()),
             "get_weather" => exec_weather(&call.arguments).await,
-            "system_info" => super::system::system_info().await,
+            "system_info" => super::system::system_info(self.ha.as_deref()).await,
             "calculate" => exec_calculate(&call.arguments),
             "play_media" => self.exec_play_media(&call.arguments).await,
             "memory_recall" => self.exec_memory_recall(&call.arguments),
@@ -787,6 +788,19 @@ mod tests {
         let result = dispatcher.execute(&call).await;
         assert!(result.success);
         assert!(!result.output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_system_info_reports_home_assistant_health() {
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(StubHomeProvider)));
+        let call = ToolCall {
+            name: "system_info".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let result = dispatcher.execute(&call).await;
+        assert!(result.success);
+        assert!(result.output.contains("Home Assistant: connected"));
     }
 
     #[test]
