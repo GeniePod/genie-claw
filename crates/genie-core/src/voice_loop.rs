@@ -14,6 +14,8 @@ use crate::conversation::ConversationStore;
 use crate::llm::LlmClient;
 use crate::memory::Memory;
 use crate::memory::{extract, inject};
+use crate::prompt::ModelFamily;
+use crate::reasoning::InteractionKind;
 use crate::tools::ToolDispatcher;
 use crate::voice::{aec, format, streaming, stt, tts};
 
@@ -43,6 +45,7 @@ pub async fn run(
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
+    model_family: ModelFamily,
 ) -> Result<()> {
     // Auto-detect audio device if not specified or set to "auto".
     let audio_device = if voice_cfg.audio_device.is_empty() || voice_cfg.audio_device == "auto" {
@@ -101,6 +104,7 @@ pub async fn run(
             conversations,
             system_prompt,
             max_history,
+            model_family,
             &conv_id,
         )
         .await
@@ -121,6 +125,7 @@ pub async fn run(
             conversations,
             system_prompt,
             max_history,
+            model_family,
             &conv_id,
         )
         .await
@@ -139,6 +144,7 @@ async fn run_with_wakeword(
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
+    model_family: ModelFamily,
     conv_id: &str,
 ) -> Result<()> {
     // Outer loop: restarts the wake word listener if it crashes or pipe breaks.
@@ -221,6 +227,7 @@ async fn run_with_wakeword(
                 conversations,
                 system_prompt,
                 max_history,
+                model_family,
                 conv_id,
             )
             .await;
@@ -353,6 +360,7 @@ async fn run_push_to_talk(
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
+    model_family: ModelFamily,
     conv_id: &str,
 ) -> Result<()> {
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -382,6 +390,7 @@ async fn run_push_to_talk(
             conversations,
             system_prompt,
             max_history,
+            model_family,
             conv_id,
         )
         .await;
@@ -503,6 +512,7 @@ async fn voice_cycle(
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
+    model_family: ModelFamily,
     conv_id: &str,
 ) -> bool {
     // Step 1: Record (fixed duration — reliable).
@@ -569,6 +579,13 @@ async fn voice_cycle(
         content: full_prompt,
     }];
     messages.extend(history);
+    let (messages, decision) = crate::reasoning::apply_reasoning_mode(
+        model_family,
+        &messages,
+        &text,
+        InteractionKind::Voice,
+    );
+    tracing::debug!(?model_family, ?decision, "applied reasoning mode for voice");
 
     // Step 4: LLM → streaming TTS (speak each sentence as it completes).
     eprintln!("[voice] Thinking...");
@@ -620,6 +637,12 @@ async fn voice_cycle(
             content: "Summarize the tool result in one natural sentence for voice.".into(),
         }];
         summary_msgs.extend(recent);
+        let (summary_msgs, _) = crate::reasoning::apply_reasoning_mode(
+            model_family,
+            &summary_msgs,
+            "",
+            InteractionKind::ToolSummary,
+        );
 
         let summary = match streaming::stream_and_speak(llm, &summary_msgs, 128, tts_engine).await {
             Ok(s) => s,

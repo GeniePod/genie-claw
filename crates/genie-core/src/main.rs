@@ -83,11 +83,12 @@ async fn main() -> Result<()> {
 
     // Build system prompt optimized for the LLM model.
     let model_name = &config.core.llm_model_name;
+    let model_family = prompt::ModelFamily::from_model_name(model_name);
     let prompt_builder = prompt::PromptBuilder::from_model_name(model_name);
     let system_prompt = prompt_builder.build(&tool_dispatcher.tool_defs(), &mem);
     tracing::info!(
         model = model_name,
-        family = ?prompt::ModelFamily::from_model_name(model_name),
+        family = ?model_family,
         "system prompt built"
     );
 
@@ -128,6 +129,7 @@ async fn main() -> Result<()> {
             &conversations,
             &system_prompt,
             config.core.max_history_turns,
+            model_family,
         )
         .await
     } else if interactive {
@@ -139,6 +141,7 @@ async fn main() -> Result<()> {
             &conversations,
             &system_prompt,
             config.core.max_history_turns,
+            model_family,
         )
         .await
     } else {
@@ -150,6 +153,7 @@ async fn main() -> Result<()> {
             conversations,
             system_prompt,
             config.core.max_history_turns,
+            model_family,
         )?;
 
         tracing::info!(port, "starting HTTP chat API");

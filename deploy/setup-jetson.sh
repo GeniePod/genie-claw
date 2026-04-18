@@ -103,9 +103,15 @@ else
     echo "    Required for Home Assistant container on this Ubuntu-based install"
 fi
 
-# 5b. Set GPU performance mode.
-echo "[5b/6] Setting GPU performance mode..."
-sudo nvpmodel -m 0 2>/dev/null && echo "  Set to MAX performance (25W)" || echo "  nvpmodel not available"
+# 5b. Set Jetson power/performance mode.
+echo "[5b/6] Setting Jetson performance mode..."
+if sudo nvpmodel -m 1 2>/dev/null; then
+    echo "  Set nvpmodel to mode 1 (25W / max speed)"
+elif sudo nvpmodel -m 0 2>/dev/null; then
+    echo "  Fallback: set nvpmodel to mode 0"
+else
+    echo "  nvpmodel not available"
+fi
 sudo jetson_clocks 2>/dev/null && echo "  Clocks locked to max" || echo "  jetson_clocks not available"
 
 # 5c. Apply memory optimizations.

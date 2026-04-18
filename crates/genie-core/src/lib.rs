@@ -47,6 +47,7 @@ pub mod memory;
 pub mod ota;
 pub mod profile;
 pub mod prompt;
+pub mod reasoning;
 pub mod repl;
 pub mod security;
 pub mod server;

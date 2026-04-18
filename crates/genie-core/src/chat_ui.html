@@ -60,6 +60,10 @@ header button:hover { border-color: var(--accent); color: var(--accent); }
   align-self: flex-start; background: var(--bot-bg);
   border: 1px solid var(--border); border-bottom-left-radius: 4px;
 }
+.msg.bot.streaming:empty::before {
+  content: '...';
+  color: var(--text2);
+}
 .msg.tool {
   align-self: flex-start; background: var(--tool-bg);
   border: 1px solid var(--tool-border); border-radius: 8px;
@@ -177,18 +181,24 @@ function addMessage(role, content, toolName) {
   return div;
 }
 
-function showThinking() {
+function addStreamingMessage() {
   const div = document.createElement('div');
-  div.className = 'thinking';
-  div.id = 'thinking';
-  div.innerHTML = '<div class="dots"><span></span><span></span><span></span></div> Thinking...';
+  div.className = 'msg bot streaming';
   messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return div;
+}
+
+function setMessageText(div, content) {
+  div.className = 'msg bot';
+  div.textContent = content;
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function hideThinking() {
-  const el = document.getElementById('thinking');
-  if (el) el.remove();
+function setMessageTool(div, toolName, content) {
+  div.className = 'msg tool';
+  div.innerHTML = `<div class="label">Tool: <span class="tool-name">${esc(toolName)}</span></div>${esc(content)}`;
+  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 async function sendMessage() {
@@ -200,32 +210,101 @@ async function sendMessage() {
   inputEl.value = '';
 
   addMessage('user', text);
-  showThinking();
+  const replyEl = addStreamingMessage();
 
   try {
-    const r = await fetch('/api/chat', {
+    const r = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: text }),
     });
 
-    hideThinking();
-
     if (!r.ok) {
       const err = await r.text();
+      replyEl.remove();
       addMessage('system', 'Error: ' + err);
       return;
     }
 
-    const data = await r.json();
+    if (!r.body) {
+      const fallback = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text }),
+      });
+      const data = await fallback.json();
+      if (data.tool) {
+        setMessageTool(replyEl, data.tool, data.response);
+      } else {
+        setMessageText(replyEl, data.response);
+      }
+      return;
+    }
 
-    if (data.tool) {
-      addMessage('bot', data.response, data.tool);
-    } else {
-      addMessage('bot', data.response);
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let rendered = '';
+    let finalTool = null;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        let event;
+        try {
+          event = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+
+        if (event.type === 'token') {
+          rendered += event.content || '';
+          setMessageText(replyEl, rendered);
+        } else if (event.type === 'replace') {
+          rendered = event.content || '';
+          finalTool = event.tool || null;
+          if (finalTool) {
+            setMessageTool(replyEl, finalTool, rendered);
+          } else {
+            setMessageText(replyEl, rendered);
+          }
+        } else if (event.type === 'done') {
+          rendered = event.response || rendered;
+          finalTool = event.tool || finalTool;
+          if (finalTool) {
+            setMessageTool(replyEl, finalTool, rendered);
+          } else {
+            setMessageText(replyEl, rendered);
+          }
+        } else if (event.type === 'error') {
+          throw new Error(event.message || 'stream failed');
+        }
+      }
+    }
+
+    if (buffer.trim()) {
+      const event = JSON.parse(buffer.trim());
+      if (event.type === 'done') {
+        rendered = event.response || rendered;
+        finalTool = event.tool || finalTool;
+        if (finalTool) {
+          setMessageTool(replyEl, finalTool, rendered);
+        } else {
+          setMessageText(replyEl, rendered);
+        }
+      }
     }
   } catch (e) {
-    hideThinking();
+    replyEl.remove();
     addMessage('system', 'Connection error: ' + e.message);
   } finally {
     sending = false;

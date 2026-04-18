@@ -4,6 +4,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, Message};
 use crate::memory::{self, Memory};
+use crate::prompt::ModelFamily;
+use crate::reasoning::InteractionKind;
 use crate::tools;
 
 /// Interactive REPL for genie-core.
@@ -17,6 +19,7 @@ pub async fn run(
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
+    model_family: ModelFamily,
 ) -> Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -73,6 +76,13 @@ pub async fn run(
             content: full_prompt,
         }];
         messages.extend(history);
+        let (messages, decision) = crate::reasoning::apply_reasoning_mode(
+            model_family,
+            &messages,
+            text,
+            InteractionKind::Repl,
+        );
+        tracing::debug!(?model_family, ?decision, "applied reasoning mode for repl");
 
         // Stream LLM response.
         eprint!("\nGeniePod: ");
@@ -108,6 +118,12 @@ pub async fn run(
                         content: "Summarize the tool result in one sentence.".into(),
                     }];
                     summary_msgs.extend(recent);
+                    let (summary_msgs, _) = crate::reasoning::apply_reasoning_mode(
+                        model_family,
+                        &summary_msgs,
+                        "",
+                        InteractionKind::ToolSummary,
+                    );
 
                     eprint!("GeniePod: ");
                     match llm

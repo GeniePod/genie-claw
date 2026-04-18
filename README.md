@@ -75,6 +75,28 @@ At a high level:
 
 That means the user talks to GeniePod, not directly to Home Assistant internals.
 
+## Why Minimal-First On Jetson
+
+GenieClaw is intentionally narrower than a broad general-agent stack.
+
+That is a hardware decision as much as a product decision. In practical Jetson
+Orin Nano 8 GB testing, heavier agent shells can require very large context
+windows just to stay coherent, which drives up KV cache size, first-token
+latency, and overall memory pressure. Even `8192` context can already be tight
+on this class of device, and the result is often slower replies and worse
+appliance behavior.
+
+For GenieClaw, that means:
+
+- shorter prompts and shorter default context windows
+- fewer orchestration layers between the user and the model
+- tighter tool routing instead of general agent abstraction
+- model-specific tuning for Jetson-class hardware
+- treating larger Claw systems as idea sources, not as the runtime to ship
+
+The target is not “the most features.” The target is the best private local
+assistant that still feels fast and reliable on 8 GB unified memory.
+
 ## Repo Layout
 
 | Crate | Purpose |

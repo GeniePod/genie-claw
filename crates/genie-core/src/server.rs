@@ -1,17 +1,21 @@
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::Mutex;
 
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, Message};
 use crate::memory::Memory;
+use crate::prompt::ModelFamily;
+use crate::reasoning::InteractionKind;
 use crate::tools::ToolDispatcher;
 
 /// HTTP chat server for genie-core.
 ///
 /// Endpoints:
 ///   POST /api/chat              — send message, get response
+///   POST /api/chat/stream       — send message, stream response
 ///   GET  /api/chat/history      — current conversation messages
 ///   POST /api/chat/clear        — clear current conversation
 ///   GET  /api/conversations     — list all conversations
@@ -29,6 +33,7 @@ pub struct ChatServer {
     current_conv_id: Mutex<String>,
     system_prompt: String,
     max_history: usize,
+    model_family: ModelFamily,
 }
 
 pub struct ChatTurnResult {
@@ -45,6 +50,7 @@ impl ChatServer {
         conversations: ConversationStore,
         system_prompt: String,
         max_history: usize,
+        model_family: ModelFamily,
     ) -> Result<Self> {
         // Create initial conversation.
         let conv_id = conversations.create()?;
@@ -58,6 +64,7 @@ impl ChatServer {
             current_conv_id: Mutex::new(conv_id),
             system_prompt,
             max_history,
+            model_family,
         })
     }
 
@@ -88,6 +95,7 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
     let current_conv_id = &ctx.current_conv_id;
     let system_prompt = &ctx.system_prompt;
     let max_history = ctx.max_history;
+    let model_family = ctx.model_family;
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
 
@@ -124,6 +132,26 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
     };
 
     // Route.
+    if method == "POST" && path == "/api/chat/stream" {
+        if let Err(e) = handle_chat_stream(
+            &mut writer,
+            body.as_deref(),
+            llm,
+            tools,
+            memory,
+            conversations,
+            current_conv_id,
+            system_prompt,
+            max_history,
+            model_family,
+        )
+        .await
+        {
+            tracing::error!(error = %e, "streaming chat failed");
+        }
+        return Ok(());
+    }
+
     let (status, content_type, response_body) = match (method, path) {
         ("GET", "/" | "/index.html") => (
             200,
@@ -140,6 +168,7 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
                 current_conv_id,
                 system_prompt,
                 max_history,
+                model_family,
             )
             .await
         }
@@ -156,6 +185,7 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
                 memory,
                 system_prompt,
                 max_history,
+                model_family,
             )
             .await
         }
@@ -186,6 +216,218 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamMode {
+    Undecided,
+    Text,
+    Tool,
+}
+
+struct StreamState {
+    mode: StreamMode,
+    pending: String,
+    emitted_text: bool,
+}
+
+async fn handle_chat_stream(
+    writer: &mut OwnedWriteHalf,
+    body: Option<&str>,
+    llm: &LlmClient,
+    tools: &ToolDispatcher,
+    memory: &Memory,
+    conversations: &ConversationStore,
+    current_conv_id: &Mutex<String>,
+    system_prompt: &str,
+    max_history: usize,
+    model_family: ModelFamily,
+) -> Result<()> {
+    let Some(body) = body else {
+        write_stream_headers(writer, 400).await?;
+        write_stream_event(
+            writer,
+            &serde_json::json!({"type":"error","message":"missing body"}),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            write_stream_headers(writer, 400).await?;
+            write_stream_event(
+                writer,
+                &serde_json::json!({"type":"error","message": format!("invalid JSON: {}", e)}),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let user_text = parsed.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    if user_text.trim().is_empty() {
+        write_stream_headers(writer, 400).await?;
+        write_stream_event(
+            writer,
+            &serde_json::json!({"type":"error","message":"empty message"}),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let conv_id = parsed
+        .get("conversation_id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| String::new());
+    let conv_id = if conv_id.is_empty() {
+        current_conv_id.lock().await.clone()
+    } else {
+        conv_id
+    };
+
+    conversations.ensure(&conv_id, "New conversation")?;
+    conversations.append(&conv_id, "user", user_text, None)?;
+
+    let memory_context = crate::memory::inject::build_memory_context(memory, user_text);
+    let full_prompt = format!(
+        "{}\n\nRelevant household context:\n{}",
+        system_prompt, memory_context
+    );
+
+    let history = conversations.get_recent(&conv_id, max_history)?;
+    let mut messages = vec![Message {
+        role: "system".into(),
+        content: full_prompt,
+    }];
+    messages.extend(history);
+    let (messages, decision) = crate::reasoning::apply_reasoning_mode(
+        model_family,
+        &messages,
+        user_text,
+        InteractionKind::Chat,
+    );
+    tracing::debug!(
+        ?model_family,
+        ?decision,
+        "applied reasoning mode for streamed chat"
+    );
+
+    write_stream_headers(writer, 200).await?;
+    write_stream_event(
+        writer,
+        &serde_json::json!({"type":"start","conversation_id": conv_id}),
+    )
+    .await?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let producer = llm.chat_stream(&messages, Some(512), move |token| {
+        let _ = tx.send(token.to_string());
+    });
+
+    let consumer = async {
+        let mut state = StreamState {
+            mode: StreamMode::Undecided,
+            pending: String::new(),
+            emitted_text: false,
+        };
+
+        while let Some(token) = rx.recv().await {
+            match state.mode {
+                StreamMode::Text => {
+                    write_stream_event(
+                        writer,
+                        &serde_json::json!({"type":"token","content": token}),
+                    )
+                    .await?;
+                    state.emitted_text = true;
+                }
+                StreamMode::Undecided | StreamMode::Tool => {
+                    state.pending.push_str(&token);
+
+                    if state.mode == StreamMode::Undecided {
+                        match detect_stream_mode(&state.pending) {
+                            StreamMode::Text => {
+                                write_stream_event(
+                                    writer,
+                                    &serde_json::json!({"type":"token","content": state.pending}),
+                                )
+                                .await?;
+                                state.pending.clear();
+                                state.mode = StreamMode::Text;
+                                state.emitted_text = true;
+                            }
+                            StreamMode::Tool => state.mode = StreamMode::Tool,
+                            StreamMode::Undecided => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok::<StreamState, anyhow::Error>(state)
+    };
+
+    let (llm_result, state_result) = tokio::join!(producer, consumer);
+    let mut state = state_result?;
+    let llm_response = llm_result?;
+
+    let mut tool_name: Option<String> = None;
+    let final_response =
+        if let Some(tool_result) = crate::tools::try_tool_call(&llm_response, tools).await {
+            tool_name = Some(tool_result.tool.clone());
+            let summary = finalize_tool_turn(
+                llm,
+                conversations,
+                &conv_id,
+                &llm_response,
+                &tool_result,
+                model_family,
+            )
+            .await;
+
+            if !state.emitted_text {
+                write_stream_event(
+                    writer,
+                    &serde_json::json!({"type":"replace","content": summary, "tool": tool_name}),
+                )
+                .await?;
+            }
+            summary
+        } else {
+            let sanitized = crate::security::sandbox::sanitize_output(&llm_response);
+            if !state.pending.is_empty() {
+                if state.mode == StreamMode::Undecided {
+                    write_stream_event(
+                        writer,
+                        &serde_json::json!({"type":"token","content": state.pending}),
+                    )
+                    .await?;
+                    state.pending.clear();
+                    state.emitted_text = true;
+                }
+            }
+            let _ = conversations.append(&conv_id, "assistant", &sanitized, None);
+            sanitized
+        };
+
+    crate::memory::extract::extract_and_store(memory, user_text);
+
+    write_stream_event(
+        writer,
+        &serde_json::json!({
+            "type":"done",
+            "response": final_response,
+            "tool": tool_name,
+            "conversation_id": conv_id
+        }),
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// POST /api/chat
 pub async fn process_chat_turn(
     llm: &LlmClient,
@@ -196,6 +438,7 @@ pub async fn process_chat_turn(
     user_text: &str,
     system_prompt: &str,
     max_history: usize,
+    model_family: ModelFamily,
 ) -> Result<ChatTurnResult> {
     conversations.ensure(conv_id, "New conversation")?;
     conversations.append(conv_id, "user", user_text, None)?;
@@ -212,46 +455,38 @@ pub async fn process_chat_turn(
         content: full_prompt,
     }];
     messages.extend(history);
+    let (messages, decision) = crate::reasoning::apply_reasoning_mode(
+        model_family,
+        &messages,
+        user_text,
+        InteractionKind::Chat,
+    );
+    tracing::debug!(
+        ?model_family,
+        ?decision,
+        "applied reasoning mode for chat turn"
+    );
 
     let llm_response = llm.chat(&messages, Some(512)).await?;
 
     let mut tool_name: Option<String> = None;
-    let final_response = if let Some(tool_result) =
-        crate::tools::try_tool_call(&llm_response, tools).await
-    {
-        tool_name = Some(tool_result.tool.clone());
-
-        let _ = conversations.append(conv_id, "assistant", &llm_response, tool_name.as_deref());
-        let _ = conversations.append(
-            conv_id,
-            "system",
-            &format!("Tool result: {}", tool_result.output),
-            None,
-        );
-
-        let summary = if should_summarize_tool_result(&tool_result.tool) {
-            let recent = conversations.get_recent(conv_id, 6).unwrap_or_default();
-            let mut summary_msgs = vec![Message {
-                role: "system".into(),
-                content: "Summarize the tool result in one natural sentence without changing numbers, measurements, or facts.".into(),
-            }];
-            summary_msgs.extend(recent);
-
-            llm.chat(&summary_msgs, Some(128))
-                .await
-                .unwrap_or_else(|_| tool_result.output.clone())
+    let final_response =
+        if let Some(tool_result) = crate::tools::try_tool_call(&llm_response, tools).await {
+            tool_name = Some(tool_result.tool.clone());
+            finalize_tool_turn(
+                llm,
+                conversations,
+                conv_id,
+                &llm_response,
+                &tool_result,
+                model_family,
+            )
+            .await
         } else {
-            tool_result.output.clone()
+            let sanitized = crate::security::sandbox::sanitize_output(&llm_response);
+            let _ = conversations.append(conv_id, "assistant", &sanitized, None);
+            sanitized
         };
-        let sanitized_summary = crate::security::sandbox::sanitize_output(&summary);
-
-        let _ = conversations.append(conv_id, "assistant", &sanitized_summary, None);
-        sanitized_summary
-    } else {
-        let sanitized = crate::security::sandbox::sanitize_output(&llm_response);
-        let _ = conversations.append(conv_id, "assistant", &sanitized, None);
-        sanitized
-    };
 
     crate::memory::extract::extract_and_store(memory, user_text);
 
@@ -260,6 +495,115 @@ pub async fn process_chat_turn(
         tool: tool_name,
         conversation_id: conv_id.to_string(),
     })
+}
+
+async fn finalize_tool_turn(
+    llm: &LlmClient,
+    conversations: &ConversationStore,
+    conv_id: &str,
+    llm_response: &str,
+    tool_result: &crate::tools::ToolResult,
+    model_family: ModelFamily,
+) -> String {
+    let _ = conversations.append(conv_id, "assistant", llm_response, Some(&tool_result.tool));
+    let _ = conversations.append(
+        conv_id,
+        "system",
+        &format!("Tool result: {}", tool_result.output),
+        None,
+    );
+
+    let summary = if should_summarize_tool_result(&tool_result.tool) {
+        let recent = conversations.get_recent(conv_id, 6).unwrap_or_default();
+        let mut summary_msgs = vec![Message {
+            role: "system".into(),
+            content:
+                "Summarize the tool result in one natural sentence without changing numbers, measurements, or facts."
+                    .into(),
+        }];
+        summary_msgs.extend(recent);
+        let (summary_msgs, _) = crate::reasoning::apply_reasoning_mode(
+            model_family,
+            &summary_msgs,
+            "",
+            InteractionKind::ToolSummary,
+        );
+
+        llm.chat(&summary_msgs, Some(128))
+            .await
+            .unwrap_or_else(|_| tool_result.output.clone())
+    } else {
+        tool_result.output.clone()
+    };
+    let sanitized_summary = crate::security::sandbox::sanitize_output(&summary);
+
+    let _ = conversations.append(conv_id, "assistant", &sanitized_summary, None);
+    sanitized_summary
+}
+
+async fn write_stream_headers(writer: &mut OwnedWriteHalf, status: u16) -> Result<()> {
+    let http = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n",
+        status,
+        status_text(status),
+    );
+    writer.write_all(http.as_bytes()).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn write_stream_event(writer: &mut OwnedWriteHalf, event: &serde_json::Value) -> Result<()> {
+    writer.write_all(event.to_string().as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+fn detect_stream_mode(buffer: &str) -> StreamMode {
+    let trimmed = buffer.trim_start();
+    if trimmed.is_empty() {
+        return StreamMode::Undecided;
+    }
+
+    if let Some(inner) = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+    {
+        let inner = inner.trim_start();
+        if inner.is_empty() {
+            return StreamMode::Undecided;
+        }
+        if inner.starts_with('{') {
+            if looks_like_tool_json(inner) {
+                return StreamMode::Tool;
+            }
+            if inner.len() < 96 {
+                return StreamMode::Undecided;
+            }
+        }
+        return StreamMode::Text;
+    }
+
+    if trimmed.starts_with('{') {
+        if looks_like_tool_json(trimmed) {
+            return StreamMode::Tool;
+        }
+        if trimmed.len() < 96 {
+            return StreamMode::Undecided;
+        }
+    }
+
+    StreamMode::Text
+}
+
+fn looks_like_tool_json(text: &str) -> bool {
+    text.contains("\"tool\"")
+        || text.contains("\"arguments\"")
+        || text.contains("\"get_time\"")
+        || text.contains("\"get_weather\"")
+        || text.contains("\"system_info\"")
+        || text.contains("\"home_control\"")
+        || text.contains("\"set_timer\"")
 }
 
 async fn handle_chat(
@@ -271,6 +615,7 @@ async fn handle_chat(
     current_conv_id: &Mutex<String>,
     system_prompt: &str,
     max_history: usize,
+    model_family: ModelFamily,
 ) -> (u16, &'static str, String) {
     let Some(body) = body else {
         return (
@@ -315,6 +660,7 @@ async fn handle_chat(
         user_text,
         system_prompt,
         max_history,
+        model_family,
     )
     .await
     {
@@ -429,6 +775,7 @@ async fn handle_openai_chat(
     memory: &Memory,
     system_prompt: &str,
     max_history: usize,
+    model_family: ModelFamily,
 ) -> (u16, &'static str, String) {
     let Some(body) = body else {
         return (
@@ -493,6 +840,17 @@ async fn handle_openai_chat(
         content: full_prompt,
     }];
     llm_messages.extend(incoming_messages);
+    let (llm_messages, decision) = crate::reasoning::apply_reasoning_mode(
+        model_family,
+        &llm_messages,
+        &user_text,
+        InteractionKind::OpenAiBridge,
+    );
+    tracing::debug!(
+        ?model_family,
+        ?decision,
+        "applied reasoning mode for OpenAI bridge"
+    );
 
     // Call LLM.
     let llm_response = match llm.chat(&llm_messages, Some(max_tokens)).await {
@@ -531,10 +889,16 @@ async fn handle_openai_chat(
                 content: format!("Tool result: {}", tool_result.output),
             });
             summary_msgs.push(Message {
-                    role: "system".into(),
-                    content:
-                        "Summarize the tool result in one natural sentence without changing numbers, measurements, or facts.".into(),
-                });
+                role: "system".into(),
+                content:
+                    "Summarize the tool result in one natural sentence without changing numbers, measurements, or facts.".into(),
+            });
+            let (summary_msgs, _) = crate::reasoning::apply_reasoning_mode(
+                model_family,
+                &summary_msgs,
+                "",
+                InteractionKind::ToolSummary,
+            );
 
             llm.chat(&summary_msgs, Some(128))
                 .await
@@ -659,7 +1023,7 @@ fn status_text(code: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::should_summarize_tool_result;
+    use super::{StreamMode, detect_stream_mode, should_summarize_tool_result};
 
     #[test]
     fn system_info_tool_preserves_raw_output() {
@@ -670,5 +1034,23 @@ mod tests {
     fn other_tools_can_still_be_summarized() {
         assert!(should_summarize_tool_result("home_control"));
         assert!(should_summarize_tool_result("hello_world"));
+    }
+
+    #[test]
+    fn plain_text_streams_immediately() {
+        assert_eq!(detect_stream_mode("Hello there"), StreamMode::Text);
+    }
+
+    #[test]
+    fn tool_json_is_buffered_for_dispatch() {
+        assert_eq!(
+            detect_stream_mode(r#"{"tool":"get_time","arguments":{}}"#),
+            StreamMode::Tool
+        );
+    }
+
+    #[test]
+    fn short_json_waits_for_more_context() {
+        assert_eq!(detect_stream_mode(r#"{"fo"#), StreamMode::Undecided);
     }
 }
