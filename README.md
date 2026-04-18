@@ -139,6 +139,14 @@ GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml cargo run --bin genie-api
 For the full setup flow, including Jetson deploy and Home Assistant wiring, see
 [GETTING_STARTED.md](GETTING_STARTED.md).
 
+## Documentation
+
+- [GETTING_STARTED.md](GETTING_STARTED.md) for local dev, Docker, and Jetson bring-up
+- [ARCHITECTURE.md](ARCHITECTURE.md) for the higher-level systems view
+- [CODEBASE.md](CODEBASE.md) for the file-by-file code map
+- [skills/SKILL-DEVELOPER-GUIDE.md](skills/SKILL-DEVELOPER-GUIDE.md) for native skill authoring
+- [ROADMAP.md](ROADMAP.md) for the execution roadmap
+
 ## Deployment
 
 The main production target is Jetson Orin Nano 8 GB (67 TOPS) hardware.
