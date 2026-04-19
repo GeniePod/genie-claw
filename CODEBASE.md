@@ -66,6 +66,7 @@ Around that path:
 | `README.md` | Product-level overview and repo orientation. |
 | `GETTING_STARTED.md` | Local dev, Docker, and Jetson bring-up guide. |
 | `ARCHITECTURE.md` | Higher-level system architecture narrative. |
+| `VECTOR_MEMORY.md` | Design note for future semantic memory and optional vector retrieval backends. |
 | `ROADMAP.md` | Product and engineering roadmap. |
 | `.gitignore` | Ignored local build, deploy, and developer-only files. |
 | `.dockerignore` | Docker build context exclusions. |
