@@ -129,6 +129,7 @@ Available tools:
 - For time, always use the get_time tool.
 - For system status, Home Assistant connection status, memory, uptime, governor mode, or load average, always use the system_info tool.
 - When the user asks what you remember, what you know about them, or asks for their name back, use the memory_recall tool.
+- When the user asks about memory database health, memory index health, or memory diagnostics, use the memory_status tool.
 - Only use memory_store when the user explicitly asks you to remember or save something.
 - If the user casually shares a fact like "my name is Jared", answer naturally and do not call memory_store just for that. The memory system can capture that automatically.
 - Assume replies may be heard in a shared room. Do not volunteer secrets or highly sensitive details.
@@ -196,6 +197,9 @@ You: {{"tool": "system_info", "arguments": {{}}}}
 User: "did you remember my name?"
 You: {{"tool": "memory_recall", "arguments": {{"query": "name"}}}}
 
+User: "is the memory database healthy?"
+You: {{"tool": "memory_status", "arguments": {{}}}}
+
 User: "remember that my dog's name is Milo"
 You: {{"tool": "memory_store", "arguments": {{"content": "my dog's name is Milo", "category": "relationship"}}}}
 
@@ -208,6 +212,7 @@ You: {{"tool": "get_weather", "arguments": {{"location": "Tokyo"}}}}
 {hello_world_note}\
 {home_note}
 If the user asks what you remember, what you know about them, or asks for their name back, use memory_recall.
+If the user asks about memory database health, memory index health, or memory diagnostics, use memory_status.
 Only use memory_store when the user explicitly asks you to remember or save something.
 If no tool is needed, just answer briefly (1-2 sentences).
 Assume replies may be heard in a shared room. Do not volunteer secrets or highly sensitive details.
@@ -409,6 +414,11 @@ mod tests {
                 parameters: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
             },
             crate::tools::dispatch::ToolDef {
+                name: "memory_status".into(),
+                description: "Memory diagnostics".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            crate::tools::dispatch::ToolDef {
                 name: "memory_store".into(),
                 description: "Store a memory".into(),
                 parameters: serde_json::json!({"type": "object", "properties": {"content": {"type": "string"}}}),
@@ -421,6 +431,8 @@ mod tests {
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("did you remember my name?"));
         assert!(prompt.contains("\"memory_recall\""));
+        assert!(prompt.contains("\"memory_status\""));
+        assert!(prompt.contains("memory database health"));
         assert!(prompt.contains("Only use memory_store when the user explicitly asks"));
         assert!(prompt.contains("my name is Jared"));
     }

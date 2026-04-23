@@ -143,9 +143,16 @@ pub fn extract_and_store(memory: &Memory, user_text: &str) -> usize {
             Err(_) => continue,
         }
 
-        if memory.store(&fact.category, &fact.content).is_ok() {
-            tracing::debug!(category = %fact.category, content = %fact.content, "auto-captured memory");
-            stored += 1;
+        if let Ok(outcome) = memory.store_resolved(&fact.category, &fact.content) {
+            if !outcome.duplicate {
+                tracing::debug!(
+                    category = %fact.category,
+                    content = %fact.content,
+                    replaced = outcome.replaced,
+                    "auto-captured memory"
+                );
+                stored += 1;
+            }
         }
     }
 

@@ -4,8 +4,11 @@ pub mod inject;
 pub mod recall;
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags, params_from_iter};
 use std::path::Path;
+use std::time::Duration;
+
+const MAX_QUERY_HASHES: usize = 16;
 
 /// Persistent conversational memory with dreaming-inspired consolidation.
 ///
@@ -31,6 +34,21 @@ pub struct Memory {
     half_life_days: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryHealth {
+    pub quick_check_ok: bool,
+    pub memory_rows: usize,
+    pub fts_rows: usize,
+    pub fts_consistent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreOutcome {
+    pub id: Option<i64>,
+    pub replaced: usize,
+    pub duplicate: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryEntry {
     pub id: i64,
@@ -53,11 +71,19 @@ impl Memory {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open(path)?;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS memories (
                 id            INTEGER PRIMARY KEY,
@@ -85,6 +111,11 @@ impl Memory {
             CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
                 INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.id, old.content);
             END;
+
+            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.id, old.content);
+                INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+            END;
             ",
         )?;
 
@@ -109,6 +140,14 @@ impl Memory {
             "ALTER TABLE memories ADD COLUMN evergreen INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_kind_accessed ON memories(kind, accessed_ms DESC)", []);
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_promotion ON memories(promoted, recall_count, max_score)", []);
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_prune ON memories(evergreen, promoted, accessed_ms)", []);
+
+        // Older databases may predate the FTS update trigger or may have been
+        // edited by a recovery tool. Rebuild once at open so recall and forget
+        // do not silently miss rows.
+        let _ = rebuild_fts_index(&conn);
 
         Ok(Self {
             conn,
@@ -119,6 +158,7 @@ impl Memory {
     /// Store a new memory.
     pub fn store(&self, kind: &str, content: &str) -> Result<i64> {
         let now = now_ms();
+        let content = normalize_memory_content(content);
         self.conn.execute(
             "INSERT INTO memories (kind, content, created_ms, accessed_ms) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![kind, content, now, now],
@@ -129,11 +169,47 @@ impl Memory {
     /// Store an evergreen memory (never decays).
     pub fn store_evergreen(&self, kind: &str, content: &str) -> Result<i64> {
         let now = now_ms();
+        let content = normalize_memory_content(content);
         self.conn.execute(
             "INSERT INTO memories (kind, content, created_ms, accessed_ms, evergreen) VALUES (?1, ?2, ?3, ?4, 1)",
             rusqlite::params![kind, content, now, now],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Store a fact while resolving simple single-value conflicts.
+    ///
+    /// This keeps household memory coherent for facts that should have one
+    /// current answer, such as the user's name, age, location, workplace, or
+    /// favorite color. Free-form facts and broad preferences are still append-only.
+    pub fn store_resolved(&self, kind: &str, content: &str) -> Result<StoreOutcome> {
+        let content = normalize_memory_content(content);
+        if self.has_similar(&content)? {
+            return Ok(StoreOutcome {
+                id: None,
+                replaced: 0,
+                duplicate: true,
+            });
+        }
+
+        let mut replaced = 0;
+        if let Some(slot) = memory_slot(kind, &content) {
+            for existing in self.get_by_kind(kind, 100)? {
+                if existing.content != content
+                    && memory_slot(&existing.kind, &existing.content).as_deref() == Some(&slot)
+                    && self.delete_by_id(existing.id)?
+                {
+                    replaced += 1;
+                }
+            }
+        }
+
+        let id = self.store(kind, &content)?;
+        Ok(StoreOutcome {
+            id: Some(id),
+            replaced,
+            duplicate: false,
+        })
     }
 
     /// Search memories with temporal decay applied.
@@ -142,8 +218,12 @@ impl Memory {
     /// Evergreen memories are exempt from decay.
     /// Each search updates recall tracking (count, score, query hash).
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+        let limit = limit.max(1);
         let now = now_ms();
         let query_hash = hash_query(query);
+        let Some(fts_query) = build_fts_query(query) else {
+            return self.search_like_fallback(query, limit, now, &query_hash);
+        };
 
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.kind, m.content, m.created_ms, m.accessed_ms,
@@ -157,7 +237,7 @@ impl Memory {
         )?;
 
         let raw_entries: Vec<(MemoryEntry, f64, bool)> = stmt
-            .query_map(rusqlite::params![query, limit * 3], |row| {
+            .query_map(rusqlite::params![fts_query, limit * 3], |row| {
                 let entry = MemoryEntry {
                     id: row.get(0)?,
                     kind: row.get(1)?,
@@ -174,6 +254,10 @@ impl Memory {
             })?
             .filter_map(|r| r.ok())
             .collect();
+
+        if raw_entries.is_empty() {
+            return self.search_like_fallback(query, limit, now, &query_hash);
+        }
 
         // Apply temporal decay and BM25 normalization.
         let mut scored: Vec<(MemoryEntry, f64)> = raw_entries
@@ -197,17 +281,119 @@ impl Memory {
 
         // Update recall tracking for returned results.
         for (entry, score) in &scored {
-            let _ = self.conn.execute(
-                "UPDATE memories SET
-                    accessed_ms = ?1,
-                    recall_count = recall_count + 1,
-                    max_score = CASE WHEN ?2 > max_score THEN ?2 ELSE max_score END
-                 WHERE id = ?3",
-                rusqlite::params![now, score, entry.id],
-            );
+            let _ = self.update_recall_tracking(entry.id, now, *score, &query_hash);
         }
 
         Ok(scored.into_iter().map(|(e, _)| e).collect())
+    }
+
+    fn search_like_fallback(
+        &self,
+        query: &str,
+        limit: usize,
+        now: u64,
+        query_hash: &str,
+    ) -> Result<Vec<MemoryEntry>> {
+        let tokens = search_tokens(query);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let where_clause = tokens
+            .iter()
+            .map(|_| "LOWER(content) LIKE ?".to_string())
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT id, kind, content, created_ms, accessed_ms,
+                    recall_count, max_score, promoted
+             FROM memories
+             WHERE {where_clause}
+             ORDER BY accessed_ms DESC, id DESC
+             LIMIT ?"
+        );
+
+        let mut values = tokens
+            .iter()
+            .map(|token| format!("%{}%", token))
+            .collect::<Vec<_>>();
+        values.push((limit * 3).to_string());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut entries = stmt
+            .query_map(params_from_iter(values.iter()), |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    content: row.get(2)?,
+                    created_ms: row.get(3)?,
+                    accessed_ms: row.get(4)?,
+                    recall_count: row.get(5).unwrap_or(0),
+                    max_score: row.get(6).unwrap_or(0.0),
+                    promoted: row.get::<_, i64>(7).unwrap_or(0) != 0,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>();
+
+        entries.sort_by(|a, b| {
+            let a_score = lexical_overlap_score(query, &a.content);
+            let b_score = lexical_overlap_score(query, &b.content);
+            b_score
+                .partial_cmp(&a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        entries.truncate(limit);
+
+        for entry in &entries {
+            let score = lexical_overlap_score(query, &entry.content);
+            let _ = self.update_recall_tracking(entry.id, now, score, query_hash);
+        }
+
+        Ok(entries)
+    }
+
+    fn update_recall_tracking(
+        &self,
+        id: i64,
+        now: u64,
+        score: f64,
+        query_hash: &str,
+    ) -> Result<()> {
+        let mut hashes = self.query_hashes(id).unwrap_or_default();
+        if !hashes.iter().any(|hash| hash == query_hash) {
+            hashes.push(query_hash.to_string());
+            if hashes.len() > MAX_QUERY_HASHES {
+                let overflow = hashes.len() - MAX_QUERY_HASHES;
+                hashes.drain(0..overflow);
+            }
+        }
+        let hashes_json = serde_json::to_string(&hashes)?;
+
+        self.conn.execute(
+            "UPDATE memories SET
+                accessed_ms = ?1,
+                recall_count = recall_count + 1,
+                max_score = CASE WHEN ?2 > max_score THEN ?2 ELSE max_score END,
+                query_hashes = ?3
+             WHERE id = ?4",
+            rusqlite::params![now, score, hashes_json, id],
+        )?;
+        Ok(())
+    }
+
+    fn query_hashes(&self, id: i64) -> Result<Vec<String>> {
+        let hashes_json: String = self.conn.query_row(
+            "SELECT query_hashes FROM memories WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&hashes_json).unwrap_or_default())
+    }
+
+    /// Number of distinct query shapes that recalled this memory.
+    pub fn query_diversity(&self, id: i64) -> Result<usize> {
+        Ok(self.query_hashes(id)?.len())
     }
 
     /// Get recent memories for context injection.
@@ -387,29 +573,60 @@ impl Memory {
             "user", "users", "the", "is", "are", "was", "has", "have", "and", "for", "that",
             "this", "with", "from", "not",
         ];
-        let words: Vec<String> = clean
-            .to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| w.len() > 2 && !skip.contains(w))
-            .take(3)
-            .map(|w| w.to_string())
+        let words: Vec<String> = search_tokens(&clean)
+            .into_iter()
+            .filter(|w| !skip.contains(&w.as_str()))
+            .take(4)
             .collect();
 
         if words.is_empty() {
             return Ok(false);
         }
 
-        // Build a SQL query: content LIKE '%word1%' AND content LIKE '%word2%'
+        // Build a parameterized query: content LIKE '%word1%' AND content LIKE '%word2%'.
+        // This is intentionally not FTS; dedup needs stable substring behavior
+        // for apostrophes, short names, and partially normalized phrases.
         let conditions: Vec<String> = words
             .iter()
-            .map(|w| format!("LOWER(content) LIKE '%{}%'", w.replace('\'', "''")))
+            .map(|_| "LOWER(content) LIKE ?".to_string())
             .collect();
         let where_clause = conditions.join(" AND ");
 
         let query = format!("SELECT COUNT(*) FROM memories WHERE {}", where_clause);
+        let values = words
+            .iter()
+            .map(|word| format!("%{}%", word))
+            .collect::<Vec<_>>();
 
-        let count: i64 = self.conn.query_row(&query, [], |row| row.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row(&query, params_from_iter(values.iter()), |row| row.get(0))?;
         Ok(count > 0)
+    }
+
+    /// Rebuild FTS rows from the canonical memories table.
+    pub fn rebuild_fts(&self) -> Result<()> {
+        rebuild_fts_index(&self.conn)
+    }
+
+    /// Lightweight operator health check for the memory store.
+    pub fn health(&self) -> Result<MemoryHealth> {
+        let quick_check: String = self
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        let memory_rows: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+        let fts_rows: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM memories_fts", [], |row| row.get(0))?;
+
+        Ok(MemoryHealth {
+            quick_check_ok: quick_check.eq_ignore_ascii_case("ok"),
+            memory_rows: memory_rows as usize,
+            fts_rows: fts_rows as usize,
+            fts_consistent: memory_rows == fts_rows,
+        })
     }
 
     pub fn count(&self) -> Result<usize> {
@@ -451,6 +668,86 @@ fn word_overlap(a: &str, b: &str) -> f64 {
     let union = a_words.union(&b_words).count();
 
     intersection as f64 / union as f64
+}
+
+fn lexical_overlap_score(a: &str, b: &str) -> f64 {
+    word_overlap(a, b).max(0.05)
+}
+
+fn normalize_memory_content(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn memory_slot(kind: &str, content: &str) -> Option<String> {
+    let kind = kind.trim().to_lowercase();
+    let lower = content.trim().to_lowercase();
+
+    match kind.as_str() {
+        "identity" => {
+            if lower.starts_with("user's name is ") {
+                Some("identity:name".into())
+            } else if lower.starts_with("user is ") && lower.contains(" years old") {
+                Some("identity:age".into())
+            } else if lower.starts_with("user lives in ") {
+                Some("identity:location".into())
+            } else if lower.starts_with("user works at ") {
+                Some("identity:workplace".into())
+            } else if lower.starts_with("user is a ") || lower.starts_with("user is an ") {
+                Some("identity:occupation".into())
+            } else {
+                None
+            }
+        }
+        "preference" => favorite_slot(&lower).map(|slot| format!("preference:favorite:{slot}")),
+        _ => None,
+    }
+}
+
+fn favorite_slot(lower_content: &str) -> Option<String> {
+    let rest = lower_content.strip_prefix("user's favorite ")?;
+    let (thing, _) = rest.split_once(" is ")?;
+    let thing = thing.trim();
+    if thing.is_empty() {
+        None
+    } else {
+        Some(thing.to_string())
+    }
+}
+
+fn search_tokens(text: &str) -> Vec<String> {
+    let stop = [
+        "a", "an", "and", "are", "about", "can", "did", "do", "does", "for", "have", "how", "i",
+        "is", "it", "me", "my", "of", "on", "or", "please", "remember", "that", "the", "this",
+        "to", "what", "whats", "when", "where", "who", "you", "your",
+    ];
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| token.len() > 1 && !stop.contains(token))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn build_fts_query(query: &str) -> Option<String> {
+    let tokens = search_tokens(query);
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(
+            tokens
+                .into_iter()
+                .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
+    }
+}
+
+fn rebuild_fts_index(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')",
+        [],
+    )?;
+    Ok(())
 }
 
 /// Strip "(source: filename)" tags from memory content for comparison.
@@ -588,5 +885,105 @@ mod tests {
         // Promoted memories excluded from candidates.
         let candidates = mem.promotion_candidates(0, 0.0, 10).unwrap();
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn search_handles_question_words_and_apostrophes() {
+        let mem = temp_memory();
+        mem.store("identity", "User's name is Jared").unwrap();
+
+        let results = mem.search("did you remember my name?", 10).unwrap();
+        assert!(
+            results.iter().any(|entry| entry.content.contains("Jared")),
+            "expected name memory in {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn recall_tracking_records_query_diversity_without_duplicates() {
+        let mem = temp_memory();
+        let id = mem
+            .store("preference", "User likes spicy noodle soup")
+            .unwrap();
+
+        mem.search("spicy", 10).unwrap();
+        mem.search("spicy", 10).unwrap();
+        assert_eq!(mem.query_diversity(id).unwrap(), 1);
+
+        mem.search("noodle soup", 10).unwrap();
+        assert_eq!(mem.query_diversity(id).unwrap(), 2);
+    }
+
+    #[test]
+    fn store_resolved_replaces_single_value_identity() {
+        let mem = temp_memory();
+        mem.store_resolved("identity", "User's name is Jared")
+            .unwrap();
+        let outcome = mem
+            .store_resolved("identity", "User's name is Alice")
+            .unwrap();
+
+        assert_eq!(outcome.replaced, 1);
+
+        let identities = mem.get_by_kind("identity", 10).unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].content, "User's name is Alice");
+    }
+
+    #[test]
+    fn store_resolved_replaces_favorite_value_by_subject() {
+        let mem = temp_memory();
+        mem.store_resolved("preference", "User's favorite color is blue")
+            .unwrap();
+        let outcome = mem
+            .store_resolved("preference", "User's favorite color is green")
+            .unwrap();
+
+        assert_eq!(outcome.replaced, 1);
+
+        let preferences = mem.get_by_kind("preference", 10).unwrap();
+        assert_eq!(preferences.len(), 1);
+        assert_eq!(preferences[0].content, "User's favorite color is green");
+    }
+
+    #[test]
+    fn has_similar_is_parameterized_for_quotes() {
+        let mem = temp_memory();
+        mem.store("relationship", "User's dog is named O'Malley")
+            .unwrap();
+
+        assert!(
+            mem.has_similar("User's dog is named O'Malley").unwrap(),
+            "quoted names should not break duplicate detection"
+        );
+    }
+
+    #[test]
+    fn fts_rebuild_restores_consistency() {
+        let mem = temp_memory();
+        mem.store("fact", "GenieClaw runs locally").unwrap();
+
+        mem.rebuild_fts().unwrap();
+        let healthy = mem.health().unwrap();
+        assert!(healthy.quick_check_ok);
+        assert!(healthy.fts_consistent);
+        assert_eq!(healthy.memory_rows, healthy.fts_rows);
+    }
+
+    #[test]
+    fn fts_updates_when_content_changes() {
+        let mem = temp_memory();
+        let id = mem.store("fact", "old keyword").unwrap();
+        mem.conn
+            .execute(
+                "UPDATE memories SET content = 'new keyword' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+
+        let results = mem.search("new keyword", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "new keyword");
     }
 }

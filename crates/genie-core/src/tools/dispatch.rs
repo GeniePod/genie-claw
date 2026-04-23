@@ -179,6 +179,12 @@ impl ToolDispatcher {
         });
 
         defs.push(ToolDef {
+            name: "memory_status".into(),
+            description: "Check memory database health, row counts, FTS consistency, and promoted memory count. Use for memory system diagnostics, not for recalling personal facts.".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        });
+
+        defs.push(ToolDef {
             name: "memory_forget".into(),
             description: "Forget a specific piece of information. Use ONLY when the user explicitly asks to forget something, like 'forget my age' or 'delete what you know about X'.".into(),
             parameters: serde_json::json!({
@@ -222,6 +228,7 @@ impl ToolDispatcher {
             "calculate" => exec_calculate(&call.arguments),
             "play_media" => self.exec_play_media(&call.arguments).await,
             "memory_recall" => self.exec_memory_recall(&call.arguments),
+            "memory_status" => self.exec_memory_status(),
             "memory_forget" => self.exec_memory_forget(&call.arguments),
             "memory_store" => self.exec_memory_store(&call.arguments),
             other => self.exec_skill(other, &call.arguments),
@@ -323,6 +330,32 @@ impl ToolDispatcher {
         Ok(format!("I found these memories:\n{}", items.join("\n")))
     }
 
+    fn exec_memory_status(&self) -> Result<String> {
+        let mem = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memory system not available"))?;
+        let mem = mem
+            .lock()
+            .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
+        let health = mem.health()?;
+        let promoted = mem.promoted_count()?;
+        let state = if health.quick_check_ok && health.fts_consistent {
+            "ok"
+        } else {
+            "degraded"
+        };
+
+        Ok(format!(
+            "Memory status: {}. Rows: {}. FTS rows: {}. FTS consistent: {}. Promoted memories: {}.",
+            state,
+            health.memory_rows,
+            health.fts_rows,
+            if health.fts_consistent { "yes" } else { "no" },
+            promoted
+        ))
+    }
+
     fn exec_memory_forget(&self, args: &serde_json::Value) -> Result<String> {
         let mem = self
             .memory
@@ -359,22 +392,29 @@ impl ToolDispatcher {
         }
 
         let mut stored = Vec::new();
+        let mut replaced = 0;
         for (category, content) in memories {
-            if mem.has_similar(&content).unwrap_or(false) {
-                stored.push(content);
-                continue;
-            }
-            mem.store(&category, &content)?;
+            let outcome = mem.store_resolved(&category, &content)?;
+            replaced += outcome.replaced;
             stored.push(content);
         }
 
         if stored.len() == 1 {
-            Ok(format!("I'll remember that {}.", stored[0].to_lowercase()))
+            if replaced > 0 {
+                Ok(format!(
+                    "I've updated that memory: {}.",
+                    stored[0].to_lowercase()
+                ))
+            } else {
+                Ok(format!("I'll remember that {}.", stored[0].to_lowercase()))
+            }
         } else {
-            Ok(format!(
-                "I'll remember these details:\n- {}",
-                stored.join("\n- ")
-            ))
+            let prefix = if replaced > 0 {
+                "I've updated these details"
+            } else {
+                "I'll remember these details"
+            };
+            Ok(format!("{prefix}:\n- {}", stored.join("\n- ")))
         }
     }
 
@@ -854,6 +894,33 @@ mod tests {
     }
 
     #[test]
+    fn memory_store_updates_changed_name() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-store-update-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("identity", "User's name is Jared").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "my name is Alice",
+                "category": "identity"
+            }))
+            .unwrap();
+
+        assert!(result.to_lowercase().contains("updated"));
+
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        let results = mem.get_by_kind("identity", 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("Alice"));
+    }
+
+    #[test]
     fn memory_recall_formats_name_answers_naturally() {
         let db = std::env::temp_dir().join(format!("memory-recall-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&db);
@@ -867,5 +934,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "Your name is Jared");
+    }
+
+    #[test]
+    fn memory_status_reports_health() {
+        let db = std::env::temp_dir().join(format!("memory-status-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("fact", "GenieClaw has local memory").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher.exec_memory_status().unwrap();
+
+        assert!(output.contains("Memory status: ok"));
+        assert!(output.contains("Rows: 1"));
+        assert!(output.contains("FTS consistent: yes"));
     }
 }
