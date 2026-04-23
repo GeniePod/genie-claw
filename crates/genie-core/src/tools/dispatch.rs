@@ -76,6 +76,7 @@ impl ToolDispatcher {
                 || std::env::var("GENIEPOD_WEB_SEARCH_BASE_URL")
                     .map(|value| !value.trim().is_empty())
                     .unwrap_or(false),
+            "allow_remote_base_url": self.web_search.allow_remote_base_url,
             "timeout_secs": self.web_search.timeout_secs,
             "max_results": self.web_search.max_results,
             "cache_enabled": self.web_search.cache_enabled,

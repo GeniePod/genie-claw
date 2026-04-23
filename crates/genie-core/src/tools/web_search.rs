@@ -140,6 +140,11 @@ async fn search_searxng(
             "SearXNG web search requires web_search.base_url or GENIEPOD_WEB_SEARCH_BASE_URL"
         )
     })?;
+    if !config.allow_remote_base_url && !is_local_base_url(&base_url) {
+        anyhow::bail!(
+            "SearXNG web search base URL must be local unless web_search.allow_remote_base_url is true"
+        );
+    }
     let search_url = searxng_search_url(&base_url);
 
     let body = client
@@ -268,6 +273,16 @@ fn searxng_search_url(base_url: &str) -> String {
     } else {
         format!("{base}/search")
     }
+}
+
+fn is_local_base_url(base_url: &str) -> bool {
+    let lower = base_url.trim().to_lowercase();
+    lower.starts_with("http://127.")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("http://[::1]")
+        || lower.starts_with("https://127.")
+        || lower.starts_with("https://localhost")
+        || lower.starts_with("https://[::1]")
 }
 
 pub(crate) fn format_results(query: &str, body: &str, limit: usize) -> Result<String> {
@@ -538,6 +553,14 @@ mod tests {
             searxng_search_url("http://127.0.0.1:8888/search"),
             "http://127.0.0.1:8888/search"
         );
+    }
+
+    #[test]
+    fn local_base_url_detection_allows_loopback() {
+        assert!(is_local_base_url("http://127.0.0.1:8888"));
+        assert!(is_local_base_url("http://localhost:8888"));
+        assert!(is_local_base_url("http://[::1]:8888"));
+        assert!(!is_local_base_url("https://searx.example.com"));
     }
 
     #[test]

@@ -255,6 +255,10 @@ pub struct WebSearchConfig {
     #[serde(default)]
     pub base_url: String,
 
+    /// Allow SearXNG base_url to point to a non-localhost service.
+    #[serde(default)]
+    pub allow_remote_base_url: bool,
+
     /// Request timeout in seconds.
     #[serde(default = "defaults::web_search_timeout_secs")]
     pub timeout_secs: u64,
@@ -475,6 +479,7 @@ impl Default for WebSearchConfig {
             enabled: defaults::web_search_enabled(),
             provider: WebSearchProvider::default(),
             base_url: String::new(),
+            allow_remote_base_url: false,
             timeout_secs: defaults::web_search_timeout_secs(),
             max_results: defaults::web_search_max_results(),
             cache_enabled: defaults::web_search_cache_enabled(),
@@ -585,6 +590,7 @@ mod tests {
 enabled = true
 provider = "searxng"
 base_url = "http://127.0.0.1:8888"
+allow_remote_base_url = true
 timeout_secs = 2
 max_results = 5
 cache_enabled = false
@@ -597,6 +603,7 @@ cache_max_entries = 12
         assert!(config.enabled);
         assert_eq!(config.provider, WebSearchProvider::Searxng);
         assert_eq!(config.base_url, "http://127.0.0.1:8888");
+        assert!(config.allow_remote_base_url);
         assert_eq!(config.timeout_secs, 2);
         assert_eq!(config.max_results, 5);
         assert!(!config.cache_enabled);

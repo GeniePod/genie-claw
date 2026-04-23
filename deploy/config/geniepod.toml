@@ -62,6 +62,7 @@ alert_webhook_url = ""            # Optional local notifier endpoint.
 enabled = true
 provider = "duckduckgo"          # "duckduckgo" or "searxng"
 base_url = ""                    # Example for SearXNG: "http://127.0.0.1:8888"
+allow_remote_base_url = false    # Keep SearXNG local unless explicitly changed.
 timeout_secs = 8
 max_results = 3
 cache_enabled = true

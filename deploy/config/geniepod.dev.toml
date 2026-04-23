@@ -24,6 +24,7 @@ max_history_turns = 20
 enabled = true
 provider = "duckduckgo"
 base_url = ""
+allow_remote_base_url = false
 timeout_secs = 8
 max_results = 3
 cache_enabled = true

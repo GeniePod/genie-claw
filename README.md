@@ -153,6 +153,7 @@ For a more private or controllable setup, point it at a local SearXNG instance:
 enabled = true
 provider = "searxng"
 base_url = "http://127.0.0.1:8888"
+allow_remote_base_url = false
 timeout_secs = 8
 max_results = 3
 cache_enabled = true
