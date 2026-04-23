@@ -60,6 +60,13 @@ pub async fn search_with_options(
         return Ok("Web search is disabled in GeniePod config.".to_string());
     }
 
+    if should_block_private_query(query) {
+        return Ok(
+            "I will not send private secrets, tokens, passwords, or local credentials to web search."
+                .to_string(),
+        );
+    }
+
     let limit = requested_limit
         .min(config.max_results.max(1))
         .clamp(1, MAX_RESULTS);
@@ -185,6 +192,34 @@ fn normalize_cache_query(query: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+fn should_block_private_query(query: &str) -> bool {
+    let normalized = normalize_cache_query(query);
+    contains_any(
+        &normalized,
+        &[
+            "my password",
+            "our password",
+            "wifi password",
+            "wi fi password",
+            "my api key",
+            "our api key",
+            "my token",
+            "our token",
+            "home assistant token",
+            "telegram bot token",
+            "private key",
+            "secret key",
+            "recovery code",
+            "one time code",
+            "2fa code",
+        ],
+    )
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
 }
 
 fn cache_lookup(key: &CacheKey, ttl_secs: u64) -> Option<String> {
@@ -522,6 +557,16 @@ mod tests {
 
         assert_eq!(cache_lookup(&key, 60).as_deref(), Some("cached output"));
         assert!(cache_lookup(&key, 0).is_some());
+    }
+
+    #[test]
+    fn private_queries_are_blocked() {
+        assert!(should_block_private_query("search my password"));
+        assert!(should_block_private_query("Home Assistant token"));
+        assert!(should_block_private_query("wifi password for my router"));
+        assert!(!should_block_private_query(
+            "how to rotate an api key safely"
+        ));
     }
 
     #[test]

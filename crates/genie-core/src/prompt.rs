@@ -143,6 +143,7 @@ Available tools:
 - For math, always use the calculate tool.
 - For weather, always use the get_weather tool.
 {web_search_rule}
+- Never send private secrets, passwords, tokens, API keys, local credentials, or one-time codes to web_search.
 - For time, always use the get_time tool.
 - For system status, Home Assistant connection status, memory, uptime, governor mode, or load average, always use the system_info tool.
 - When the user asks what you remember, what you know about them, or asks for their name back, use the memory_recall tool.
@@ -246,6 +247,7 @@ You: {{"tool": "get_weather", "arguments": {{"location": "Tokyo"}}}}
 {home_note}
 Risky home actions such as locks, garage doors, cameras, alarms, purchases, or non-voice-safe scripts require local confirmation and may be blocked by policy.
 {web_search_note}
+Never send private secrets, passwords, tokens, API keys, local credentials, or one-time codes to web_search.
 If the user asks what you remember, what you know about them, or asks for their name back, use memory_recall.
 If the user asks about memory database health, memory index health, or memory diagnostics, use memory_status.
 Only use memory_store when the user explicitly asks you to remember or save something.
