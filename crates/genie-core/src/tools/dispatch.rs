@@ -1,5 +1,5 @@
 use anyhow::Result;
-use genie_common::config::WebSearchConfig;
+use genie_common::config::{WebSearchConfig, WebSearchProvider};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -63,6 +63,22 @@ impl ToolDispatcher {
 
     pub fn has_web_search(&self) -> bool {
         self.web_search.enabled
+    }
+
+    pub fn web_search_status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.web_search.enabled,
+            "provider": match self.web_search.provider {
+                WebSearchProvider::Duckduckgo => "duckduckgo",
+                WebSearchProvider::Searxng => "searxng",
+            },
+            "base_url_configured": !self.web_search.base_url.trim().is_empty()
+                || std::env::var("GENIEPOD_WEB_SEARCH_BASE_URL")
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false),
+            "timeout_secs": self.web_search.timeout_secs,
+            "max_results": self.web_search.max_results,
+        })
     }
 
     /// Set public web search provider configuration.

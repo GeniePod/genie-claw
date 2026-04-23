@@ -159,6 +159,14 @@ max_results = 3
 
 Set `enabled = false` to remove the tool from the model prompt and quick router.
 
+Direct local API test:
+
+```bash
+curl -s http://127.0.0.1:3000/api/web-search \
+  -H "Content-Type: application/json" \
+  -d '{"query":"ESP32-C6 Thread support","limit":3}'
+```
+
 ## Documentation
 
 - [GETTING_STARTED.md](GETTING_STARTED.md) for local dev, Docker, and Jetson bring-up

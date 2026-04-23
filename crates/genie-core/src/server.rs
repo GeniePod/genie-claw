@@ -22,6 +22,7 @@ use crate::tools::ToolDispatcher;
 ///   GET  /api/conversations     — list all conversations
 ///   GET  /api/chat/export?id=X  — export conversation as JSON
 ///   GET  /api/tools             — list available tools
+///   POST /api/web-search        — direct web search tool execution
 ///   GET  /api/health            — health check
 ///   GET  /api/connectivity      — connectivity coprocessor status
 ///   POST /v1/chat/completions   — OpenAI-compatible (for local apps and adapters)
@@ -182,7 +183,10 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
         ("POST", "/api/chat/clear") => handle_clear(conversations, current_conv_id).await,
         ("GET", "/api/conversations") => handle_list_conversations(conversations),
         ("GET", "/api/tools") => handle_list_tools(tools),
-        ("GET", "/api/health") => handle_health(llm, connectivity, memory, conversations).await,
+        ("POST", "/api/web-search") => handle_web_search(body.as_deref(), tools).await,
+        ("GET", "/api/health") => {
+            handle_health(llm, tools, connectivity, memory, conversations).await
+        }
         ("GET", "/api/connectivity") => handle_connectivity(connectivity).await,
         ("POST", "/v1/chat/completions") => {
             handle_openai_chat(
@@ -797,6 +801,7 @@ async fn handle_clear(
 /// GET /api/health — rich system status.
 async fn handle_health(
     llm: &LlmClient,
+    tools: &ToolDispatcher,
     connectivity: &dyn ConnectivityController,
     memory: &Memory,
     conversations: &ConversationStore,
@@ -816,6 +821,7 @@ async fn handle_health(
         "conversations": conv_count,
         "mem_available_mb": mem_avail,
         "connectivity": connectivity_health,
+        "web_search": tools.web_search_status(),
         "version": env!("CARGO_PKG_VERSION"),
     });
 
@@ -870,6 +876,73 @@ fn handle_list_tools(tools: &ToolDispatcher) -> (u16, &'static str, String) {
     let defs = tools.tool_defs();
     let json = serde_json::to_string(&defs).unwrap_or_else(|_| "[]".into());
     (200, "application/json", json)
+}
+
+/// POST /api/web-search
+async fn handle_web_search(
+    body: Option<&str>,
+    tools: &ToolDispatcher,
+) -> (u16, &'static str, String) {
+    if !tools.has_web_search() {
+        return (
+            503,
+            "application/json",
+            r#"{"error":"web search disabled"}"#.into(),
+        );
+    }
+
+    let Some(body) = body else {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"missing body"}"#.into(),
+        );
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                format!(r#"{{"error":"invalid JSON: {}"}}"#, e),
+            );
+        }
+    };
+
+    let query = parsed
+        .get("query")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if query.trim().is_empty() {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"missing query"}"#.into(),
+        );
+    }
+
+    let limit = parsed
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(3)
+        .clamp(1, 5);
+    let call = crate::tools::ToolCall {
+        name: "web_search".into(),
+        arguments: serde_json::json!({
+            "query": query,
+            "limit": limit,
+        }),
+    };
+    let result = tools.execute(&call).await;
+    let status = if result.success { 200 } else { 502 };
+    let body = serde_json::json!({
+        "tool": result.tool,
+        "success": result.success,
+        "response": result.output,
+    });
+
+    (status, "application/json", body.to_string())
 }
 
 /// POST /v1/chat/completions — OpenAI-compatible endpoint.
@@ -1162,9 +1235,11 @@ fn status_text(code: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectivityState, StreamMode, detect_stream_mode, overall_health_status,
-        should_summarize_tool_result,
+        ConnectivityState, StreamMode, detect_stream_mode, handle_web_search,
+        overall_health_status, should_summarize_tool_result,
     };
+    use crate::tools::ToolDispatcher;
+    use genie_common::config::WebSearchConfig;
 
     #[test]
     fn system_info_tool_preserves_raw_output() {
@@ -1222,5 +1297,26 @@ mod tests {
             overall_health_status(true, ConnectivityState::Offline),
             "degraded"
         );
+    }
+
+    #[tokio::test]
+    async fn web_search_endpoint_rejects_empty_query() {
+        let tools = ToolDispatcher::new(None);
+        let (status, _, body) = handle_web_search(Some(r#"{"query":""}"#), &tools).await;
+
+        assert_eq!(status, 400);
+        assert!(body.contains("missing query"));
+    }
+
+    #[tokio::test]
+    async fn web_search_endpoint_respects_disabled_config() {
+        let mut config = WebSearchConfig::default();
+        config.enabled = false;
+        let tools = ToolDispatcher::new(None).with_web_search_config(config);
+        let (status, _, body) =
+            handle_web_search(Some(r#"{"query":"ESP32-C6 Thread"}"#), &tools).await;
+
+        assert_eq!(status, 503);
+        assert!(body.contains("web search disabled"));
     }
 }

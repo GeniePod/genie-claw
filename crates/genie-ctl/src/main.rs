@@ -379,6 +379,21 @@ async fn cmd_status() -> Result<()> {
                     .unwrap_or("unknown");
                 println!("Radio:     {}", state);
             }
+            if let Some(web_search) = data.get("web_search") {
+                let enabled = web_search
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let provider = web_search
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                println!(
+                    "WebSearch: {} ({})",
+                    if enabled { "enabled" } else { "disabled" },
+                    provider
+                );
+            }
         }
         Err(_) => println!("Core:      offline"),
     }
@@ -430,7 +445,21 @@ async fn cmd_search(query: &str) -> Result<()> {
         anyhow::bail!("Usage: genie-ctl search <query>");
     }
 
-    cmd_chat(&format!("search the web for {query}")).await
+    let body = serde_json::json!({"query": query}).to_string();
+    let response = http_post(CORE_URL, "/api/web-search", &body).await?;
+    let data: serde_json::Value = serde_json::from_str(&response)?;
+
+    if let Some(resp) = data.get("response").and_then(|v| v.as_str()) {
+        let tool = data
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .unwrap_or("web_search");
+        println!("[{}] {}", tool, resp);
+    } else if let Some(err) = data.get("error").and_then(|v| v.as_str()) {
+        eprintln!("Error: {}", err);
+    }
+
+    Ok(())
 }
 
 async fn cmd_history() -> Result<()> {
