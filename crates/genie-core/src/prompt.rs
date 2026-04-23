@@ -124,6 +124,7 @@ Available tools:
 - Never make up information. If unsure, say so.
 {home_rule}
 {hello_world_rule}
+- Risky home actions such as locks, garage doors, cameras, alarms, purchases, or non-voice-safe scripts require local confirmation and may be blocked by policy.
 - For math, always use the calculate tool.
 - For weather, always use the get_weather tool.
 - For time, always use the get_time tool.
@@ -211,6 +212,7 @@ You: {{"tool": "get_weather", "arguments": {{"location": "Tokyo"}}}}
 
 {hello_world_note}\
 {home_note}
+Risky home actions such as locks, garage doors, cameras, alarms, purchases, or non-voice-safe scripts require local confirmation and may be blocked by policy.
 If the user asks what you remember, what you know about them, or asks for their name back, use memory_recall.
 If the user asks about memory database health, memory index health, or memory diagnostics, use memory_status.
 Only use memory_store when the user explicitly asks you to remember or save something.

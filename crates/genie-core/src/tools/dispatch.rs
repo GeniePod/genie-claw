@@ -77,7 +77,7 @@ impl ToolDispatcher {
         if self.has_home_automation() {
             defs.push(ToolDef {
                 name: "home_control".into(),
-                description: "Control Home Assistant devices, scenes, and voice-safe routines. Use for lights, switches, climate, covers, locks, and scene activation.".into(),
+                description: "Control Home Assistant devices, scenes, and voice-safe routines. Use for lights, switches, climate, safe covers, and scene activation. Risky actions like locks, garage doors, cameras, and alarms require local confirmation and may be blocked.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {

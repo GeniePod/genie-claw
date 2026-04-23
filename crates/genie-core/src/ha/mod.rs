@@ -3,9 +3,11 @@ use std::sync::Arc;
 use genie_common::config::Config;
 
 mod client;
+mod policy;
 mod provider;
 
 pub use client::{Entity, HaClient};
+pub use policy::{ActionPolicyDecision, ActionRisk, assess_home_action};
 pub use provider::{
     ActionResult, AreaRef, DeviceRef, HomeAction, HomeActionKind, HomeAssistantProvider,
     HomeAutomationProvider, HomeGraph, HomeState, HomeTarget, HomeTargetKind, IntegrationHealth,
