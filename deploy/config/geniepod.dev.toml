@@ -26,6 +26,9 @@ provider = "duckduckgo"
 base_url = ""
 timeout_secs = 8
 max_results = 3
+cache_enabled = true
+cache_ttl_secs = 900
+cache_max_entries = 64
 
 [governor]
 poll_interval_ms = 5000

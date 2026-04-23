@@ -927,11 +927,17 @@ async fn handle_web_search(
         .and_then(|value| value.as_u64())
         .unwrap_or(3)
         .clamp(1, 5);
+    let fresh = parsed
+        .get("fresh")
+        .or_else(|| parsed.get("cache_bypass"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let call = crate::tools::ToolCall {
         name: "web_search".into(),
         arguments: serde_json::json!({
             "query": query,
             "limit": limit,
+            "fresh": fresh,
         }),
     };
     let result = tools.execute(&call).await;

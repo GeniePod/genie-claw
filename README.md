@@ -155,6 +155,9 @@ provider = "searxng"
 base_url = "http://127.0.0.1:8888"
 timeout_secs = 8
 max_results = 3
+cache_enabled = true
+cache_ttl_secs = 900
+cache_max_entries = 64
 ```
 
 Set `enabled = false` to remove the tool from the model prompt and quick router.
@@ -164,7 +167,7 @@ Direct local API test:
 ```bash
 curl -s http://127.0.0.1:3000/api/web-search \
   -H "Content-Type: application/json" \
-  -d '{"query":"ESP32-C6 Thread support","limit":3}'
+  -d '{"query":"ESP32-C6 Thread support","limit":3,"fresh":false}'
 ```
 
 ## Documentation

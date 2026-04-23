@@ -1,10 +1,15 @@
 use anyhow::Result;
 use genie_common::config::{WebSearchConfig, WebSearchProvider};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use std::time::Instant;
 
 const DUCKDUCKGO_INSTANT_ANSWER_URL: &str = "https://api.duckduckgo.com/";
 const MAX_RESULTS: usize = 5;
+
+static SEARCH_CACHE: OnceLock<Mutex<SearchCache>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SearchItem {
@@ -13,10 +18,38 @@ struct SearchItem {
     url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    provider: WebSearchProvider,
+    base_url: String,
+    query: String,
+    limit: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    output: String,
+    stored_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct SearchCache {
+    entries: HashMap<CacheKey, CacheEntry>,
+}
+
 pub async fn search_with_config(
     query: &str,
     requested_limit: usize,
     config: &WebSearchConfig,
+) -> Result<String> {
+    search_with_options(query, requested_limit, config, false).await
+}
+
+pub async fn search_with_options(
+    query: &str,
+    requested_limit: usize,
+    config: &WebSearchConfig,
+    fresh: bool,
 ) -> Result<String> {
     let query = query.trim();
     if query.is_empty() {
@@ -30,16 +63,30 @@ pub async fn search_with_config(
     let limit = requested_limit
         .min(config.max_results.max(1))
         .clamp(1, MAX_RESULTS);
+    let cache_key = cache_key(query, limit, config);
+    if config.cache_enabled
+        && !fresh
+        && let Some(output) = cache_lookup(&cache_key, config.cache_ttl_secs)
+    {
+        return Ok(output);
+    }
+
     let timeout_secs = config.timeout_secs.max(1);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .user_agent("GeniePod/1.0 local web search")
         .build()?;
 
-    match config.provider {
+    let output = match config.provider {
         WebSearchProvider::Duckduckgo => search_duckduckgo(&client, query, limit).await,
         WebSearchProvider::Searxng => search_searxng(&client, query, limit, config).await,
+    }?;
+
+    if config.cache_enabled {
+        cache_store(cache_key, output.clone(), config.cache_max_entries);
     }
+
+    Ok(output)
 }
 
 pub async fn search(query: &str, limit: usize) -> Result<String> {
@@ -108,6 +155,65 @@ fn searxng_base_url(config: &WebSearchConfig) -> Option<String> {
     } else {
         Some(base.to_string())
     }
+}
+
+fn cache_key(query: &str, limit: usize, config: &WebSearchConfig) -> CacheKey {
+    CacheKey {
+        provider: config.provider,
+        base_url: match config.provider {
+            WebSearchProvider::Duckduckgo => String::new(),
+            WebSearchProvider::Searxng => searxng_base_url(config).unwrap_or_default(),
+        },
+        query: normalize_cache_query(query),
+        limit,
+    }
+}
+
+fn normalize_cache_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn cache_lookup(key: &CacheKey, ttl_secs: u64) -> Option<String> {
+    let ttl = Duration::from_secs(ttl_secs.max(1));
+    let cache = SEARCH_CACHE.get_or_init(|| Mutex::new(SearchCache::default()));
+    let mut cache = cache.lock().ok()?;
+    let entry = cache.entries.get(key)?;
+    if entry.stored_at.elapsed() > ttl {
+        cache.entries.remove(key);
+        return None;
+    }
+    Some(entry.output.clone())
+}
+
+fn cache_store(key: CacheKey, output: String, max_entries: usize) {
+    let max_entries = max_entries.max(1);
+    let cache = SEARCH_CACHE.get_or_init(|| Mutex::new(SearchCache::default()));
+    let Ok(mut cache) = cache.lock() else {
+        return;
+    };
+
+    if cache.entries.len() >= max_entries
+        && !cache.entries.contains_key(&key)
+        && let Some(oldest_key) = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.stored_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.entries.remove(&oldest_key);
+    }
+
+    cache.entries.insert(
+        key,
+        CacheEntry {
+            output,
+            stored_at: Instant::now(),
+        },
+    );
 }
 
 fn searxng_search_url(base_url: &str) -> String {
@@ -387,6 +493,25 @@ mod tests {
             searxng_search_url("http://127.0.0.1:8888/search"),
             "http://127.0.0.1:8888/search"
         );
+    }
+
+    #[test]
+    fn cache_query_normalization_is_stable() {
+        assert_eq!(
+            normalize_cache_query("  ESP32-C6   Thread Support "),
+            "esp32-c6 thread support"
+        );
+    }
+
+    #[test]
+    fn cache_lookup_respects_ttl() {
+        let mut config = WebSearchConfig::default();
+        config.cache_ttl_secs = 60;
+        let key = cache_key("Matter news", 3, &config);
+        cache_store(key.clone(), "cached output".into(), 8);
+
+        assert_eq!(cache_lookup(&key, 60).as_deref(), Some("cached output"));
+        assert!(cache_lookup(&key, 0).is_some());
     }
 
     #[test]

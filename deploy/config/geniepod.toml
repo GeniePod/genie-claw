@@ -64,6 +64,9 @@ provider = "duckduckgo"          # "duckduckgo" or "searxng"
 base_url = ""                    # Example for SearXNG: "http://127.0.0.1:8888"
 timeout_secs = 8
 max_results = 3
+cache_enabled = true
+cache_ttl_secs = 900
+cache_max_entries = 64
 
 # Uncomment to enable an ESP32-C6 UART Thread/Matter sidecar for GenieClaw-local diagnostics or control:
 # [connectivity]

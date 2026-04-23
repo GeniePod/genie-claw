@@ -262,9 +262,21 @@ pub struct WebSearchConfig {
     /// Upper bound for returned results.
     #[serde(default = "defaults::web_search_max_results")]
     pub max_results: usize,
+
+    /// Cache successful search responses in-process to reduce repeated network calls.
+    #[serde(default = "defaults::web_search_cache_enabled")]
+    pub cache_enabled: bool,
+
+    /// How long cached search responses remain fresh.
+    #[serde(default = "defaults::web_search_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+
+    /// Maximum number of cached search responses kept in memory.
+    #[serde(default = "defaults::web_search_cache_max_entries")]
+    pub cache_max_entries: usize,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WebSearchProvider {
     #[default]
@@ -465,6 +477,9 @@ impl Default for WebSearchConfig {
             base_url: String::new(),
             timeout_secs: defaults::web_search_timeout_secs(),
             max_results: defaults::web_search_max_results(),
+            cache_enabled: defaults::web_search_cache_enabled(),
+            cache_ttl_secs: defaults::web_search_cache_ttl_secs(),
+            cache_max_entries: defaults::web_search_cache_max_entries(),
         }
     }
 }
@@ -559,6 +574,8 @@ mod tests {
         assert!(config.web_search.enabled);
         assert_eq!(config.web_search.provider, WebSearchProvider::Duckduckgo);
         assert_eq!(config.web_search.max_results, 3);
+        assert!(config.web_search.cache_enabled);
+        assert_eq!(config.web_search.cache_ttl_secs, 900);
     }
 
     #[test]
@@ -570,6 +587,9 @@ provider = "searxng"
 base_url = "http://127.0.0.1:8888"
 timeout_secs = 2
 max_results = 5
+cache_enabled = false
+cache_ttl_secs = 60
+cache_max_entries = 12
 "#,
         )
         .unwrap();
@@ -579,6 +599,9 @@ max_results = 5
         assert_eq!(config.base_url, "http://127.0.0.1:8888");
         assert_eq!(config.timeout_secs, 2);
         assert_eq!(config.max_results, 5);
+        assert!(!config.cache_enabled);
+        assert_eq!(config.cache_ttl_secs, 60);
+        assert_eq!(config.cache_max_entries, 12);
     }
 
     #[test]
@@ -713,6 +736,15 @@ mod defaults {
     }
     pub fn web_search_max_results() -> usize {
         3
+    }
+    pub fn web_search_cache_enabled() -> bool {
+        true
+    }
+    pub fn web_search_cache_ttl_secs() -> u64 {
+        900
+    }
+    pub fn web_search_cache_max_entries() -> usize {
+        64
     }
     pub fn connectivity_device() -> String {
         "esp32c6".into()

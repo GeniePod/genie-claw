@@ -4,7 +4,8 @@
 //!   genie-ctl status          Show system status (governor mode, memory, services)
 //!   genie-ctl mode <MODE>     Change governor mode (day, night_a, night_b, media)
 //!   genie-ctl chat <MESSAGE>  Send a chat message and print the response
-//!   genie-ctl search <QUERY>   Search the web through genie-core
+//!   genie-ctl search [--fresh] <QUERY>
+//!                              Search the web through genie-core
 //!   genie-ctl history         Show conversation history
 //!   genie-ctl tools           List available tools
 //!   genie-ctl skill ...       Manage loadable skill modules
@@ -59,11 +60,11 @@ async fn main() -> Result<()> {
         }
         "search" | "web-search" => {
             if args.len() < 3 {
-                eprintln!("Usage: genie-ctl search <query>");
+                eprintln!("Usage: genie-ctl search [--fresh] <query>");
                 std::process::exit(1);
             }
-            let query = args[2..].join(" ");
-            cmd_search(&query).await?;
+            let (fresh, query) = parse_search_args(&args[2..]);
+            cmd_search(&query, fresh).await?;
         }
         "history" => cmd_history().await?,
         "tools" => cmd_tools().await?,
@@ -103,7 +104,8 @@ COMMANDS:
     status              System status (governor mode, memory, uptime)
     mode <MODE>         Change mode (day, night_a, night_b, media)
     chat <MESSAGE>      Send a chat message
-    search <QUERY>      Search the web through genie-core
+    search [--fresh] <QUERY>
+                        Search the web through genie-core
     history             Show conversation history
     tools               List available tools
     connectivity        Inspect ESP32-C6 Thread/Matter sidecar status
@@ -439,13 +441,26 @@ async fn cmd_chat(message: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_search(query: &str) -> Result<()> {
+fn parse_search_args(args: &[String]) -> (bool, String) {
+    let fresh = args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--fresh" | "--no-cache"));
+    let query = args
+        .iter()
+        .filter(|arg| !matches!(arg.as_str(), "--fresh" | "--no-cache"))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (fresh, query)
+}
+
+async fn cmd_search(query: &str, fresh: bool) -> Result<()> {
     let query = query.trim();
     if query.is_empty() {
-        anyhow::bail!("Usage: genie-ctl search <query>");
+        anyhow::bail!("Usage: genie-ctl search [--fresh] <query>");
     }
 
-    let body = serde_json::json!({"query": query}).to_string();
+    let body = serde_json::json!({"query": query, "fresh": fresh}).to_string();
     let response = http_post(CORE_URL, "/api/web-search", &body).await?;
     let data: serde_json::Value = serde_json::from_str(&response)?;
 
@@ -976,6 +991,32 @@ mod tests {
         let version = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty());
         assert!(version.contains('.')); // Semver: x.y.z
+    }
+
+    #[test]
+    fn parse_search_args_supports_fresh_flag() {
+        let args = vec![
+            "--fresh".to_string(),
+            "ESP32-C6".to_string(),
+            "Thread".to_string(),
+        ];
+        let (fresh, query) = parse_search_args(&args);
+
+        assert!(fresh);
+        assert_eq!(query, "ESP32-C6 Thread");
+    }
+
+    #[test]
+    fn parse_search_args_supports_no_cache_alias() {
+        let args = vec![
+            "Matter".to_string(),
+            "--no-cache".to_string(),
+            "news".to_string(),
+        ];
+        let (fresh, query) = parse_search_args(&args);
+
+        assert!(fresh);
+        assert_eq!(query, "Matter news");
     }
 
     #[test]

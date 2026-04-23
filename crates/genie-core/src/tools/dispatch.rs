@@ -78,6 +78,9 @@ impl ToolDispatcher {
                     .unwrap_or(false),
             "timeout_secs": self.web_search.timeout_secs,
             "max_results": self.web_search.max_results,
+            "cache_enabled": self.web_search.cache_enabled,
+            "cache_ttl_secs": self.web_search.cache_ttl_secs,
+            "cache_max_entries": self.web_search.cache_max_entries,
         })
     }
 
@@ -171,7 +174,8 @@ impl ToolDispatcher {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "Search query"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 5, "description": "Maximum number of results to return"}
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 5, "description": "Maximum number of results to return"},
+                        "fresh": {"type": "boolean", "description": "Bypass cached results and fetch fresh results"}
                     },
                     "required": ["query"]
                 }),
@@ -684,8 +688,13 @@ async fn exec_web_search(args: &serde_json::Value, config: &WebSearchConfig) -> 
         .and_then(|v| v.as_u64())
         .unwrap_or(3)
         .clamp(1, 5) as usize;
+    let fresh = args
+        .get("fresh")
+        .or_else(|| args.get("cache_bypass"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    super::web_search::search_with_config(query, limit, config).await
+    super::web_search::search_with_options(query, limit, config, fresh).await
 }
 
 fn get_current_time() -> String {
