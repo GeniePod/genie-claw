@@ -344,6 +344,14 @@ impl HomeAssistantProvider {
             return Some(target);
         }
 
+        let domain_match = infer_domain(&query_lower);
+        if area_match.is_none()
+            && let Some(domain) = domain_match
+            && let Some(target) = Self::resolve_domain_target(graph, query, &domain)
+        {
+            return Some(target);
+        }
+
         if action_hint.is_none()
             && let Some((area_name, area_score)) = area_match
             && let Some(target) =
@@ -353,6 +361,31 @@ impl HomeAssistantProvider {
         }
 
         Self::resolve_named_entity(graph, query, action_hint)
+    }
+
+    fn resolve_domain_target(graph: &HomeGraph, query: &str, domain: &str) -> Option<HomeTarget> {
+        let entity_ids: Vec<String> = graph
+            .entities
+            .iter()
+            .filter(|entity| entity.domain == domain)
+            .map(|entity| entity.entity_id.clone())
+            .collect();
+
+        if entity_ids.is_empty() {
+            return None;
+        }
+
+        let display_name = format!("All {}", domain_plural_label(domain));
+        Some(HomeTarget {
+            kind: HomeTargetKind::Group,
+            query: query.to_string(),
+            display_name,
+            entity_ids,
+            domain: Some(domain.to_string()),
+            area: None,
+            confidence: 0.72,
+            voice_safe: domain != "lock",
+        })
     }
 
     fn resolve_group_target(
@@ -1053,6 +1086,17 @@ fn domain_label(domain: &str, count: usize) -> &'static str {
     }
 }
 
+fn domain_plural_label(domain: &str) -> &'static str {
+    match domain {
+        "light" => "lights",
+        "switch" => "switches",
+        "cover" => "covers",
+        "lock" => "locks",
+        "climate" => "thermostats",
+        _ => "devices",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,6 +1174,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(target.kind, HomeTargetKind::Group);
+        assert_eq!(target.domain.as_deref(), Some("light"));
+        assert_eq!(target.entity_ids, vec!["light.living_room_lamp"]);
+    }
+
+    #[test]
+    fn resolve_domain_target_for_whole_home_status() {
+        let graph = sample_graph();
+        let target =
+            HomeAssistantProvider::resolve_target_in_graph(&graph, "lights", None).unwrap();
+
+        assert_eq!(target.kind, HomeTargetKind::Group);
+        assert_eq!(target.display_name, "All lights");
         assert_eq!(target.domain.as_deref(), Some("light"));
         assert_eq!(target.entity_ids, vec!["light.living_room_lamp"]);
     }
