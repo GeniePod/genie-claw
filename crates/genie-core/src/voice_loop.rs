@@ -280,6 +280,21 @@ async fn run_with_wakeword(
                             // (we already have the text).
                             let _ = conversations.append(conv_id, "user", &text, None);
 
+                            if handle_quick_tool_for_voice(
+                                tools,
+                                conversations,
+                                conv_id,
+                                &text,
+                                voice_cfg,
+                                audio_device,
+                                response_language.as_deref(),
+                            )
+                            .await
+                            .is_some()
+                            {
+                                continue;
+                            }
+
                             let memory_context = inject::build_memory_context(memory, &text);
                             let full_prompt = format!(
                                 "{}\n\nRelevant household context:\n{}",
@@ -473,6 +488,47 @@ fn tts_engine_for_language(
     )
 }
 
+async fn handle_quick_tool_for_voice(
+    tools: &ToolDispatcher,
+    conversations: &ConversationStore,
+    conv_id: &str,
+    text: &str,
+    voice_cfg: &VoiceConfig,
+    audio_device: &str,
+    response_language: Option<&str>,
+) -> Option<String> {
+    let call = crate::tools::quick::route(text)?;
+    let tool_result = tools.execute(&call).await;
+    let response = if tool_result.success {
+        tool_result.output.clone()
+    } else {
+        format!("{} failed: {}", tool_result.tool, tool_result.output)
+    };
+    let response = crate::security::sandbox::sanitize_output(&response);
+    let tool_json = serde_json::json!({
+        "tool": call.name,
+        "arguments": call.arguments,
+    })
+    .to_string();
+
+    let _ = conversations.append(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+    let _ = conversations.append(
+        conv_id,
+        "system",
+        &format!("Tool: {}", tool_result.output),
+        None,
+    );
+    let _ = conversations.append(conv_id, "assistant", &response, None);
+
+    let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
+    let voice_text = format::for_voice(&response);
+    if !voice_text.is_empty() {
+        let _ = tts_engine.speak(&voice_text).await;
+    }
+
+    Some(response)
+}
+
 /// Play a short confirmation tone when wake word is detected.
 /// Gives the user immediate feedback that the device heard them.
 async fn play_wake_tone(audio_device: &str) {
@@ -589,6 +645,32 @@ async fn voice_cycle(
         text, transcript.duration_ms
     );
     let _ = conversations.append(conv_id, "user", &text, None);
+
+    if let Some(final_response) = handle_quick_tool_for_voice(
+        tools,
+        conversations,
+        conv_id,
+        &text,
+        voice_cfg,
+        audio_device,
+        response_language.as_deref(),
+    )
+    .await
+    {
+        eprintln!(
+            "[voice] GeniePod: {} (quick tool)",
+            format::for_voice(&final_response)
+        );
+        let stored = extract::extract_and_store(memory, &text);
+        if stored > 0 {
+            eprintln!(
+                "[voice] (remembered {} fact{})",
+                stored,
+                if stored == 1 { "" } else { "s" }
+            );
+        }
+        return true;
+    }
 
     // Step 3: Build LLM context with per-query memory injection.
     let memory_context = inject::build_memory_context(memory, &text);
