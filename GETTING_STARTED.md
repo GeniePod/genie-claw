@@ -87,7 +87,7 @@ INFO genie-core HTTP server listening, addr=127.0.0.1:3000
 cargo run --release --bin genie-ctl -- chat "what time is it"
 cargo run --release --bin genie-ctl -- chat "what is the weather in Denver"
 cargo run --release --bin genie-ctl -- chat "set a timer for 5 minutes"
-cargo run --release --bin genie-ctl -- search "ESP32-C6 Thread support"
+cargo run --release --bin genie-ctl -- search --limit 3 "ESP32-C6 Thread support"
 cargo run --release --bin genie-ctl -- tools
 cargo run --release --bin genie-ctl -- health
 ```

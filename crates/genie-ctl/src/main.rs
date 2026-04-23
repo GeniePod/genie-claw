@@ -4,7 +4,7 @@
 //!   genie-ctl status          Show system status (governor mode, memory, services)
 //!   genie-ctl mode <MODE>     Change governor mode (day, night_a, night_b, media)
 //!   genie-ctl chat <MESSAGE>  Send a chat message and print the response
-//!   genie-ctl search [--fresh] <QUERY>
+//!   genie-ctl search [--fresh] [--limit N] <QUERY>
 //!                              Search the web through genie-core
 //!   genie-ctl history         Show conversation history
 //!   genie-ctl tools           List available tools
@@ -60,11 +60,11 @@ async fn main() -> Result<()> {
         }
         "search" | "web-search" => {
             if args.len() < 3 {
-                eprintln!("Usage: genie-ctl search [--fresh] <query>");
+                eprintln!("Usage: genie-ctl search [--fresh] [--limit N] <query>");
                 std::process::exit(1);
             }
-            let (fresh, query) = parse_search_args(&args[2..]);
-            cmd_search(&query, fresh).await?;
+            let search_args = parse_search_args(&args[2..])?;
+            cmd_search(&search_args.query, search_args.fresh, search_args.limit).await?;
         }
         "history" => cmd_history().await?,
         "tools" => cmd_tools().await?,
@@ -104,7 +104,7 @@ COMMANDS:
     status              System status (governor mode, memory, uptime)
     mode <MODE>         Change mode (day, night_a, night_b, media)
     chat <MESSAGE>      Send a chat message
-    search [--fresh] <QUERY>
+    search [--fresh] [--limit N] <QUERY>
                         Search the web through genie-core
     history             Show conversation history
     tools               List available tools
@@ -441,26 +441,68 @@ async fn cmd_chat(message: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_search_args(args: &[String]) -> (bool, String) {
-    let fresh = args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--fresh" | "--no-cache"));
-    let query = args
-        .iter()
-        .filter(|arg| !matches!(arg.as_str(), "--fresh" | "--no-cache"))
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
-    (fresh, query)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchArgs {
+    fresh: bool,
+    limit: u64,
+    query: String,
 }
 
-async fn cmd_search(query: &str, fresh: bool) -> Result<()> {
-    let query = query.trim();
-    if query.is_empty() {
-        anyhow::bail!("Usage: genie-ctl search [--fresh] <query>");
+fn parse_search_args(args: &[String]) -> Result<SearchArgs> {
+    let mut fresh = false;
+    let mut limit = 3;
+    let mut query_parts = Vec::new();
+    let mut idx = 0;
+
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--fresh" | "--no-cache" => {
+                fresh = true;
+                idx += 1;
+            }
+            "--limit" | "-n" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--limit requires a value");
+                };
+                limit = parse_search_limit(value)?;
+                idx += 2;
+            }
+            _ if arg.starts_with("--limit=") => {
+                limit = parse_search_limit(arg.trim_start_matches("--limit="))?;
+                idx += 1;
+            }
+            _ => {
+                query_parts.push(arg.clone());
+                idx += 1;
+            }
+        }
     }
 
-    let body = serde_json::json!({"query": query, "fresh": fresh}).to_string();
+    Ok(SearchArgs {
+        fresh,
+        limit,
+        query: query_parts.join(" "),
+    })
+}
+
+fn parse_search_limit(value: &str) -> Result<u64> {
+    let limit = value
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("invalid --limit value: {}", value))?;
+    if !(1..=5).contains(&limit) {
+        anyhow::bail!("--limit must be between 1 and 5");
+    }
+    Ok(limit)
+}
+
+async fn cmd_search(query: &str, fresh: bool, limit: u64) -> Result<()> {
+    let query = query.trim();
+    if query.is_empty() {
+        anyhow::bail!("Usage: genie-ctl search [--fresh] [--limit N] <query>");
+    }
+
+    let body = serde_json::json!({"query": query, "fresh": fresh, "limit": limit}).to_string();
     let response = http_post(CORE_URL, "/api/web-search", &body).await?;
     let data: serde_json::Value = serde_json::from_str(&response)?;
 
@@ -1000,10 +1042,11 @@ mod tests {
             "ESP32-C6".to_string(),
             "Thread".to_string(),
         ];
-        let (fresh, query) = parse_search_args(&args);
+        let parsed = parse_search_args(&args).unwrap();
 
-        assert!(fresh);
-        assert_eq!(query, "ESP32-C6 Thread");
+        assert!(parsed.fresh);
+        assert_eq!(parsed.limit, 3);
+        assert_eq!(parsed.query, "ESP32-C6 Thread");
     }
 
     #[test]
@@ -1013,10 +1056,40 @@ mod tests {
             "--no-cache".to_string(),
             "news".to_string(),
         ];
-        let (fresh, query) = parse_search_args(&args);
+        let parsed = parse_search_args(&args).unwrap();
 
-        assert!(fresh);
-        assert_eq!(query, "Matter news");
+        assert!(parsed.fresh);
+        assert_eq!(parsed.query, "Matter news");
+    }
+
+    #[test]
+    fn parse_search_args_supports_limit_flag() {
+        let args = vec![
+            "--limit".to_string(),
+            "5".to_string(),
+            "Home".to_string(),
+            "Assistant".to_string(),
+        ];
+        let parsed = parse_search_args(&args).unwrap();
+
+        assert_eq!(parsed.limit, 5);
+        assert_eq!(parsed.query, "Home Assistant");
+    }
+
+    #[test]
+    fn parse_search_args_supports_limit_equals() {
+        let args = vec!["--limit=2".to_string(), "Matter".to_string()];
+        let parsed = parse_search_args(&args).unwrap();
+
+        assert_eq!(parsed.limit, 2);
+        assert_eq!(parsed.query, "Matter");
+    }
+
+    #[test]
+    fn parse_search_args_rejects_invalid_limit() {
+        let args = vec!["--limit".to_string(), "9".to_string(), "Matter".to_string()];
+
+        assert!(parse_search_args(&args).is_err());
     }
 
     #[test]
