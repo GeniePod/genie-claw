@@ -34,6 +34,13 @@ pub fn route(text: &str) -> Option<ToolCall> {
         ));
     }
 
+    if let Some(expression) = calculation_request(&normalized) {
+        return Some(tool(
+            "calculate",
+            serde_json::json!({ "expression": expression }),
+        ));
+    }
+
     if let Some(entity) = home_status_target(&normalized) {
         return Some(tool("home_status", serde_json::json!({ "entity": entity })));
     }
@@ -237,6 +244,63 @@ fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
     }
 }
 
+fn calculation_request(text: &str) -> Option<String> {
+    percentage_expression(text).or_else(|| arithmetic_expression(text))
+}
+
+fn percentage_expression(text: &str) -> Option<String> {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let percent_idx = tokens
+        .iter()
+        .position(|token| matches!(*token, "percent" | "percentage" | "%"))?;
+    let percent = parse_decimal_token(tokens.get(percent_idx.wrapping_sub(1))?)?;
+
+    let of_idx = tokens.iter().position(|token| *token == "of")?;
+    let base = parse_decimal_token(tokens.get(of_idx + 1)?)?;
+
+    Some(format!("{} * {} / 100", base, percent))
+}
+
+fn arithmetic_expression(text: &str) -> Option<String> {
+    let expression = text
+        .strip_prefix("calculate ")
+        .or_else(|| text.strip_prefix("what is "))
+        .or_else(|| text.strip_prefix("whats "))
+        .or_else(|| text.strip_prefix("what's "))
+        .unwrap_or(text)
+        .replace(" plus ", " + ")
+        .replace(" minus ", " - ")
+        .replace(" times ", " * ")
+        .replace(" multiplied by ", " * ")
+        .replace(" divided by ", " / ")
+        .replace(" over ", " / ");
+
+    if !expression.chars().any(|c| c.is_ascii_digit())
+        || !expression
+            .chars()
+            .any(|c| matches!(c, '+' | '-' | '*' | '/' | '(' | ')'))
+    {
+        return None;
+    }
+
+    if !expression
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, ' ' | '.' | '+' | '-' | '*' | '/' | '(' | ')'))
+    {
+        return None;
+    }
+
+    Some(expression.trim().to_string())
+}
+
+fn parse_decimal_token(token: &str) -> Option<f64> {
+    token
+        .trim_end_matches('%')
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
 fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
     for (idx, token) in tokens.iter().enumerate() {
         let Some(amount) = parse_number(token) else {
@@ -432,6 +496,25 @@ mod tests {
         assert_eq!(call.name, "get_weather");
         assert_eq!(call.arguments["location"], "new york");
         assert_eq!(call.arguments["forecast"], true);
+    }
+
+    #[test]
+    fn routes_simple_arithmetic() {
+        let call = route("what is 12 plus 30").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "12 + 30");
+    }
+
+    #[test]
+    fn routes_percentage_math() {
+        let call = route("what is 15 percent of 200").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "200 * 15 / 100");
+    }
+
+    #[test]
+    fn does_not_route_non_math_numbers() {
+        assert!(route("what happened in 2024").is_none());
     }
 
     #[test]
