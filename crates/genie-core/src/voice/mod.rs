@@ -292,12 +292,34 @@ struct ToolCallJson {
 }
 
 fn format_memories(memory: &Memory) -> String {
-    match memory.recent(5) {
-        Ok(entries) if !entries.is_empty() => entries
-            .iter()
-            .map(|e| format!("- [{}] {}", e.kind, e.content))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => "(no household context yet)".into(),
+    crate::memory::inject::build_memory_context(memory, "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_memory() -> Memory {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-voice-memory-test-{}-{}.db",
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_file(&path);
+        Memory::open(&path).unwrap()
+    }
+
+    #[test]
+    fn voice_memory_context_filters_person_memory() {
+        let mem = temp_memory();
+        mem.store("person_preference", "Maya likes oat milk")
+            .unwrap();
+
+        let context = format_memories(&mem);
+        assert_eq!(context, "(no household context yet)");
     }
 }

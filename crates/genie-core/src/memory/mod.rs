@@ -491,14 +491,25 @@ impl Memory {
         self.conn
             .execute("UPDATE memories SET promoted = 1 WHERE id = ?1", [id])?;
         if let Some(entry) = self.get_by_id(id)? {
-            self.append_root_memory(&entry.kind, &entry.content)?;
+            let shared_safe = policy::assess_memory_read(
+                entry.metadata,
+                policy::MemoryReadContext::shared_room_voice(),
+            )
+            .allowed;
+            if shared_safe {
+                self.append_root_memory(&entry.kind, &entry.content)?;
+            }
             self.record_canonical_event(MemoryEvent {
                 ts_ms: now_ms(),
                 action: "promote",
                 id: Some(id),
                 kind: Some(entry.kind),
                 content: Some(entry.content),
-                detail: None,
+                detail: Some(if shared_safe {
+                    "added to MEMORY.md".into()
+                } else {
+                    "promotion retained in DB only; skipped MEMORY.md due to policy".into()
+                }),
             })?;
         }
         Ok(())
@@ -1361,6 +1372,19 @@ mod tests {
         let root = mem.canonical_dir.join("MEMORY.md");
         let text = std::fs::read_to_string(root).unwrap();
         assert!(text.contains("User's favorite color is green"));
+    }
+
+    #[test]
+    fn promotion_does_not_write_person_memory_to_root_file() {
+        let mem = temp_memory();
+        let id = mem
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        mem.mark_promoted(id).unwrap();
+
+        let root = mem.canonical_dir.join("MEMORY.md");
+        let text = std::fs::read_to_string(root).unwrap_or_default();
+        assert!(!text.contains("Maya likes oat milk"));
     }
 
     #[test]

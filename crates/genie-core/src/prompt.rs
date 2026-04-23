@@ -290,12 +290,9 @@ Assume replies may be heard in a shared room. Do not volunteer secrets or highly
 }
 
 fn format_memories(memory: &Memory) -> String {
-    match memory.recent(5) {
-        Ok(entries) if !entries.is_empty() => {
-            let items: Vec<String> = entries.iter().map(|e| format!("- {}", e.content)).collect();
-            format!("Relevant household context:\n{}", items.join("\n"))
-        }
-        _ => String::new(),
+    match crate::memory::inject::build_memory_context(memory, "") {
+        context if context == "(no household context yet)" => String::new(),
+        context => format!("Relevant household context:\n{context}"),
     }
 }
 
@@ -500,5 +497,24 @@ mod tests {
         assert!(prompt.contains("ONLY a JSON object"));
         assert!(prompt.contains("Do NOT wrap the JSON in markdown code blocks"));
         assert!(!prompt.contains("EXAMPLES:"));
+    }
+
+    #[test]
+    fn prompt_memory_section_filters_person_scoped_memory() {
+        let builder = PromptBuilder::new(ModelFamily::Phi);
+        let tools = vec![crate::tools::dispatch::ToolDef {
+            name: "get_time".into(),
+            description: "Get current time".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let mem_path = std::env::temp_dir().join("prompt-test-policy-filter.db");
+        let _ = std::fs::remove_file(&mem_path);
+        let memory = Memory::open(&mem_path).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+
+        let prompt = builder.build(&tools, &memory);
+        assert!(!prompt.contains("Maya likes oat milk"));
     }
 }

@@ -153,6 +153,8 @@ Current practical behavior:
 - high-risk secrets are blocked
 - query-time memory injection reads the persisted policy metadata before adding memory to prompts
 - memory recall also respects persisted policy metadata, with shared-room voice as the conservative default
+- static prompt and voice bootstrap context now use the same shared-room-safe memory filtering
+- promotion to `memory/MEMORY.md` is limited to memories that are safe for shared household disclosure
 
 ## Profile Ingest
 
