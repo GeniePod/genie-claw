@@ -143,6 +143,16 @@ pub fn extract_and_store(memory: &Memory, user_text: &str) -> usize {
             Err(_) => continue,
         }
 
+        let policy = super::policy::assess_memory_write(&fact.category, &fact.content);
+        if !policy.allowed {
+            tracing::debug!(
+                category = %fact.category,
+                reason = policy.reason,
+                "skipping auto-captured memory by policy"
+            );
+            continue;
+        }
+
         if let Ok(outcome) = memory.store_resolved(&fact.category, &fact.content) {
             if !outcome.duplicate {
                 tracing::debug!(
@@ -423,5 +433,20 @@ mod tests {
         // "I'm a bit tired" should NOT extract "bit tired" as occupation
         let facts = extract_facts("I'm a bit tired");
         assert!(facts.iter().all(|f| f.category != "identity"));
+    }
+
+    #[test]
+    fn auto_store_rejects_password_memory() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-extract-policy-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let memory = Memory::open(&path).unwrap();
+
+        let stored = extract_and_store(&memory, "Remember that my password is swordfish");
+
+        assert_eq!(stored, 0);
+        assert!(memory.search("password", 5).unwrap().is_empty());
     }
 }

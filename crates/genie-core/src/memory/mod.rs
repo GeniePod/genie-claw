@@ -1,6 +1,7 @@
 pub mod decay;
 pub mod extract;
 pub mod inject;
+pub mod policy;
 pub mod recall;
 
 use anyhow::Result;

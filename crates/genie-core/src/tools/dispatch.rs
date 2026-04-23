@@ -198,7 +198,7 @@ impl ToolDispatcher {
 
         defs.push(ToolDef {
             name: "memory_store".into(),
-            description: "Explicitly store a fact about the user. Use when the user says 'remember that...' or asks you to save something.".into(),
+            description: "Explicitly store a safe household fact or preference. Use when the user says 'remember that...' or asks you to save something. Do not store passwords, one-time codes, payment details, keys, tokens, or private secrets.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -392,11 +392,25 @@ impl ToolDispatcher {
         }
 
         let mut stored = Vec::new();
+        let mut rejected = Vec::new();
         let mut replaced = 0;
         for (category, content) in memories {
+            let policy = crate::memory::policy::assess_memory_write(&category, &content);
+            if !policy.allowed {
+                rejected.push(policy.reason);
+                continue;
+            }
             let outcome = mem.store_resolved(&category, &content)?;
             replaced += outcome.replaced;
             stored.push(content);
+        }
+
+        if stored.is_empty() {
+            return Ok(rejected
+                .first()
+                .copied()
+                .unwrap_or("I could not store that memory.")
+                .to_string());
         }
 
         if stored.len() == 1 {
@@ -414,7 +428,11 @@ impl ToolDispatcher {
             } else {
                 "I'll remember these details"
             };
-            Ok(format!("{prefix}:\n- {}", stored.join("\n- ")))
+            let mut response = format!("{prefix}:\n- {}", stored.join("\n- "));
+            if let Some(reason) = rejected.first() {
+                response.push_str(&format!("\nSkipped one memory: {reason}"));
+            }
+            Ok(response)
         }
     }
 
@@ -918,6 +936,30 @@ mod tests {
         let results = mem.get_by_kind("identity", 5).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Alice"));
+    }
+
+    #[test]
+    fn memory_store_rejects_high_risk_secret() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-store-secret-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "remember that my password is swordfish",
+                "category": "fact"
+            }))
+            .unwrap();
+
+        assert!(result.contains("should not store passwords"));
+
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert!(mem.search("password", 5).unwrap().is_empty());
     }
 
     #[test]

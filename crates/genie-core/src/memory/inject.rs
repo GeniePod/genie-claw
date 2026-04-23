@@ -3,7 +3,7 @@
 //! Instead of static "recent 5 memories" at startup, this module
 //! searches for query-relevant memories and identity facts per turn.
 
-use super::Memory;
+use super::{Memory, policy};
 
 /// Build the memory section to append to the system prompt for a given query.
 ///
@@ -25,7 +25,9 @@ pub fn build_memory_context(memory: &Memory, user_query: &str) -> String {
     // Always inject identity memories.
     if let Ok(identities) = memory.get_by_kind("identity", 5) {
         for entry in identities {
-            if seen_ids.insert(entry.id) {
+            if seen_ids.insert(entry.id)
+                && policy::may_inject_into_shared_prompt(&entry.kind, &entry.content)
+            {
                 entries.push(format!("[{}] {}", entry.kind, entry.content));
             }
         }
@@ -34,7 +36,9 @@ pub fn build_memory_context(memory: &Memory, user_query: &str) -> String {
     // Always inject relationship memories.
     if let Ok(relationships) = memory.get_by_kind("relationship", 3) {
         for entry in relationships {
-            if seen_ids.insert(entry.id) {
+            if seen_ids.insert(entry.id)
+                && policy::may_inject_into_shared_prompt(&entry.kind, &entry.content)
+            {
                 entries.push(format!("[{}] {}", entry.kind, entry.content));
             }
         }
@@ -44,7 +48,9 @@ pub fn build_memory_context(memory: &Memory, user_query: &str) -> String {
     if !user_query.trim().is_empty() {
         if let Ok(relevant) = memory.search(user_query, 5) {
             for entry in relevant {
-                if seen_ids.insert(entry.id) {
+                if seen_ids.insert(entry.id)
+                    && policy::may_inject_into_shared_prompt(&entry.kind, &entry.content)
+                {
                     entries.push(format!("[{}] {}", entry.kind, entry.content));
                 }
             }
@@ -58,7 +64,9 @@ pub fn build_memory_context(memory: &Memory, user_query: &str) -> String {
                 if entries.len() >= 8 {
                     break;
                 }
-                if seen_ids.insert(entry.id) {
+                if seen_ids.insert(entry.id)
+                    && policy::may_inject_into_shared_prompt(&entry.kind, &entry.content)
+                {
                     entries.push(format!("[{}] {}", entry.kind, entry.content));
                 }
             }
@@ -135,5 +143,15 @@ mod tests {
         let ctx = build_memory_context(&mem, "Jared");
         let count = ctx.matches("Jared").count();
         assert_eq!(count, 1, "should not duplicate: {}", ctx);
+    }
+
+    #[test]
+    fn inject_skips_restricted_memory() {
+        let mem = temp_memory();
+        mem.store("fact", "User's password is swordfish").unwrap();
+
+        let ctx = build_memory_context(&mem, "password");
+
+        assert_eq!(ctx, "(no household context yet)");
     }
 }
