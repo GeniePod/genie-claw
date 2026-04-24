@@ -1,5 +1,5 @@
 use anyhow::Result;
-use genie_common::config::{WebSearchConfig, WebSearchProvider};
+use genie_common::config::{ActuationSafetyConfig, WebSearchConfig, WebSearchProvider};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -48,6 +48,7 @@ pub struct ToolDispatcher {
     memory: Option<Arc<std::sync::Mutex<crate::memory::Memory>>>,
     skills: Option<Arc<std::sync::Mutex<SkillLoader>>>,
     web_search: WebSearchConfig,
+    actuation_safety: ActuationSafetyConfig,
     pub(crate) timers: timer::TimerManager,
 }
 
@@ -58,6 +59,7 @@ impl ToolDispatcher {
             memory: None,
             skills: None,
             web_search: WebSearchConfig::default(),
+            actuation_safety: ActuationSafetyConfig::default(),
             timers: timer::TimerManager::new(),
         }
     }
@@ -103,6 +105,11 @@ impl ToolDispatcher {
     /// Set public web search provider configuration.
     pub fn with_web_search_config(mut self, config: WebSearchConfig) -> Self {
         self.web_search = config;
+        self
+    }
+
+    pub fn with_actuation_safety_config(mut self, config: ActuationSafetyConfig) -> Self {
+        self.actuation_safety = config;
         self
     }
 
@@ -334,7 +341,14 @@ impl ToolDispatcher {
             .unwrap_or("toggle");
         let value = args.get("value").and_then(|v| v.as_f64());
 
-        home::control(ha.as_ref(), entity_name, action, value).await
+        home::control(
+            ha.as_ref(),
+            entity_name,
+            action,
+            value,
+            &self.actuation_safety,
+        )
+        .await
     }
 
     async fn exec_home_status(&self, args: &serde_json::Value) -> Result<String> {

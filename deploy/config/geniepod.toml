@@ -39,6 +39,14 @@ wakeword_script = "/opt/geniepod/bin/genie-wake-listen.py"   # Wake word listene
 # local_profile_dir = "/opt/geniepod/data/speakers"
 # local_min_score = 0.82
 
+# Final actuation safety gate for physical home-control execution:
+# [core.actuation_safety]
+# enabled = true
+# min_target_confidence = 0.78
+# min_sensitive_confidence = 0.90
+# deny_multi_target_sensitive = true
+# require_available_state = true
+
 [governor]
 poll_interval_ms = 5000
 night_start_hour = 23

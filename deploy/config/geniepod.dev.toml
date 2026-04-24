@@ -28,6 +28,13 @@ max_history_turns = 20
 # local_profile_dir = "./data/speakers"
 # local_min_score = 0.82
 
+# [core.actuation_safety]
+# enabled = true
+# min_target_confidence = 0.78
+# min_sensitive_confidence = 0.90
+# deny_multi_target_sensitive = true
+# require_available_state = true
+
 [web_search]
 enabled = true
 provider = "duckduckgo"

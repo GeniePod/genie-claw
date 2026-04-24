@@ -119,6 +119,10 @@ pub struct CoreConfig {
     /// Optional speaker identity provider for voice memory context.
     #[serde(default)]
     pub speaker_identity: SpeakerIdentityConfig,
+
+    /// Final actuation safety gate for home-control execution.
+    #[serde(default)]
+    pub actuation_safety: ActuationSafetyConfig,
 }
 
 impl Default for CoreConfig {
@@ -145,6 +149,37 @@ impl Default for CoreConfig {
             llm_model_path: defaults::llm_model_path(),
             wakeword_script: defaults::wakeword_script(),
             speaker_identity: SpeakerIdentityConfig::default(),
+            actuation_safety: ActuationSafetyConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ActuationSafetyConfig {
+    #[serde(default = "defaults::actuation_safety_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "defaults::actuation_min_target_confidence")]
+    pub min_target_confidence: f32,
+
+    #[serde(default = "defaults::actuation_min_sensitive_confidence")]
+    pub min_sensitive_confidence: f32,
+
+    #[serde(default = "defaults::actuation_deny_multi_target_sensitive")]
+    pub deny_multi_target_sensitive: bool,
+
+    #[serde(default = "defaults::actuation_require_available_state")]
+    pub require_available_state: bool,
+}
+
+impl Default for ActuationSafetyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: defaults::actuation_safety_enabled(),
+            min_target_confidence: defaults::actuation_min_target_confidence(),
+            min_sensitive_confidence: defaults::actuation_min_sensitive_confidence(),
+            deny_multi_target_sensitive: defaults::actuation_deny_multi_target_sensitive(),
+            require_available_state: defaults::actuation_require_available_state(),
         }
     }
 }
@@ -722,6 +757,38 @@ local_min_score = 0.91
     }
 
     #[test]
+    fn actuation_safety_defaults_to_enabled_fail_closed_settings() {
+        let config = test_config();
+        assert!(config.core.actuation_safety.enabled);
+        assert!((config.core.actuation_safety.min_target_confidence - 0.78).abs() < f32::EPSILON);
+        assert!(
+            (config.core.actuation_safety.min_sensitive_confidence - 0.90).abs() < f32::EPSILON
+        );
+        assert!(config.core.actuation_safety.deny_multi_target_sensitive);
+        assert!(config.core.actuation_safety.require_available_state);
+    }
+
+    #[test]
+    fn actuation_safety_config_parses() {
+        let config: ActuationSafetyConfig = toml::from_str(
+            r#"
+enabled = true
+min_target_confidence = 0.81
+min_sensitive_confidence = 0.95
+deny_multi_target_sensitive = false
+require_available_state = false
+"#,
+        )
+        .unwrap();
+
+        assert!(config.enabled);
+        assert!((config.min_target_confidence - 0.81).abs() < f32::EPSILON);
+        assert!((config.min_sensitive_confidence - 0.95).abs() < f32::EPSILON);
+        assert!(!config.deny_multi_target_sensitive);
+        assert!(!config.require_available_state);
+    }
+
+    #[test]
     fn connectivity_is_disabled_by_default() {
         let config = test_config();
         assert!(!config.connectivity_enabled());
@@ -847,6 +914,21 @@ mod defaults {
     }
     pub fn speaker_identity_min_score() -> f32 {
         0.82
+    }
+    pub fn actuation_safety_enabled() -> bool {
+        true
+    }
+    pub fn actuation_min_target_confidence() -> f32 {
+        0.78
+    }
+    pub fn actuation_min_sensitive_confidence() -> f32 {
+        0.90
+    }
+    pub fn actuation_deny_multi_target_sensitive() -> bool {
+        true
+    }
+    pub fn actuation_require_available_state() -> bool {
+        true
     }
     pub fn telegram_api_base() -> String {
         "https://api.telegram.org".into()

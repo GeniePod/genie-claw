@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
 
     let tool_dispatcher = tools::ToolDispatcher::new(ha)
         .with_web_search_config(config.web_search.clone())
+        .with_actuation_safety_config(config.core.actuation_safety.clone())
         .with_memory(Arc::clone(&mem_arc))
         .with_skill_loader(skill_loader);
 

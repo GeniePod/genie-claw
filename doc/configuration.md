@@ -53,6 +53,7 @@ Runtime load path:
 | `llm_model_path` | Model path used by voice mode time-sharing logic |
 | `wakeword_script` | Wake-word listener helper path |
 | `speaker_identity.*` | Optional voice speaker-identity provider settings |
+| `actuation_safety.*` | Final home-actuation safety gate settings |
 
 ### `[core.speaker_identity]`
 
@@ -72,6 +73,22 @@ Behavior notes:
 - `local_biometric` is the optional local-recognizer boundary. It is scaffolded now so a real on-device recognizer can be dropped in later without changing config or voice-loop wiring.
 - Today, only `fixed` returns an identity immediately. `local_biometric` is a placeholder boundary and currently falls back to unknown identity until the recognizer implementation lands.
 - This only affects memory read context in voice mode today; it does not yet add completed biometric recognition by itself.
+
+### `[core.actuation_safety]`
+
+| Key | Purpose |
+| --- | --- |
+| `enabled` | Turn the final actuation safety gate on or off |
+| `min_target_confidence` | Minimum target-match confidence for ordinary actions |
+| `min_sensitive_confidence` | Minimum target-match confidence for medium/high-risk actions |
+| `deny_multi_target_sensitive` | Block medium/high-risk actions that fan out to multiple entities |
+| `require_available_state` | Require a successful current-state check before executing non-scene/script actions |
+
+Behavior notes:
+
+- This gate runs after target resolution and before the actual Home Assistant service call.
+- It is separate from prompt rules and separate from the first local policy check.
+- Default behavior is fail-closed for ambiguous or degraded physical actions.
 
 ## `[governor]`
 

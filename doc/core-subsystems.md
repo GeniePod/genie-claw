@@ -108,7 +108,8 @@ Responsibilities:
 
 - keep Home Assistant behind a provider interface
 - resolve household-facing device/entity language to HA targets
-- enforce action safety policies
+- enforce first-pass action safety policies
+- enforce a final runtime actuation safety gate before physical execution
 - separate "home control available" from "home control required for core usefulness"
 
 This repo treats Home Assistant as optional integration, not as the product's

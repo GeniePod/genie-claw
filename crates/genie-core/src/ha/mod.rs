@@ -7,7 +7,10 @@ mod policy;
 mod provider;
 
 pub use client::{Entity, HaClient};
-pub use policy::{ActionPolicyDecision, ActionRisk, assess_home_action};
+pub use policy::{
+    ActionPolicyDecision, ActionRisk, RuntimeSafetyDecision, assess_home_action,
+    assess_runtime_home_action,
+};
 pub use provider::{
     ActionResult, AreaRef, DeviceRef, HomeAction, HomeActionKind, HomeAssistantProvider,
     HomeAutomationProvider, HomeGraph, HomeState, HomeTarget, HomeTargetKind, IntegrationHealth,
