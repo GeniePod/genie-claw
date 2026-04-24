@@ -1,4 +1,4 @@
-use super::dispatch::{ToolCall, ToolDispatcher, ToolResult};
+use super::dispatch::{ToolCall, ToolDispatcher, ToolExecutionContext, ToolResult};
 
 /// Parse a tool call from LLM output and execute it.
 ///
@@ -8,6 +8,14 @@ use super::dispatch::{ToolCall, ToolDispatcher, ToolResult};
 /// 3. Embedded in text: `I'll check that. {"tool": "get_weather", "arguments": {"location": "Denver"}}`
 /// 4. With extra fields: `{"tool": "set_timer", "arguments": {"seconds": 300}, "reasoning": "..."}`
 pub async fn try_tool_call(response: &str, tools: &ToolDispatcher) -> Option<ToolResult> {
+    try_tool_call_with_context(response, tools, ToolExecutionContext::default()).await
+}
+
+pub async fn try_tool_call_with_context(
+    response: &str,
+    tools: &ToolDispatcher,
+    exec_ctx: ToolExecutionContext,
+) -> Option<ToolResult> {
     let json_str = extract_json(response)?;
     let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
     let call = parse_tool_call_value(value, tools)?;
@@ -16,7 +24,7 @@ pub async fn try_tool_call(response: &str, tools: &ToolDispatcher) -> Option<Too
         return None;
     }
 
-    Some(tools.execute(&call).await)
+    Some(tools.execute_with_context(&call, exec_ctx).await)
 }
 
 fn parse_tool_call_value(value: serde_json::Value, tools: &ToolDispatcher) -> Option<ToolCall> {

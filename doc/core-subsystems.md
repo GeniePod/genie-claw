@@ -181,6 +181,7 @@ Responsibilities:
 - audio recording and wake-word integration
 - STT client/CLI execution
 - conservative voice intent gating for shared-room wake flows
+- speaker-identity context plumbing into memory read paths
 - language detection and language-specific TTS model selection
 - output formatting for speech
 - streaming spoken responses
@@ -193,6 +194,7 @@ Notable modules:
 - `language.rs`
 - `intent.rs`
 - `format.rs`
+- `identity.rs`
 - `streaming.rs`
 - `noise.rs`
 - `dsp.rs`

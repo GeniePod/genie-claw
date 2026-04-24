@@ -18,6 +18,7 @@ use crate::memory::{extract, inject};
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
 use crate::tools::ToolDispatcher;
+use crate::voice::identity::{self, SpeakerIdentity};
 use crate::voice::intent::{self, VoiceIntentDecision};
 use crate::voice::{aec, format, streaming, stt, tts};
 
@@ -270,6 +271,8 @@ async fn run_with_wakeword(
                             .language
                             .clone()
                             .or_else(|| crate::voice::language::detect_language_from_text(&text));
+                        let speaker = SpeakerIdentity::default();
+                        let read_context = identity::build_memory_read_context(&text, &speaker);
 
                         if !text.is_empty() {
                             if let VoiceIntentDecision::Reject(reason) =
@@ -296,6 +299,7 @@ async fn run_with_wakeword(
                                 conversations,
                                 conv_id,
                                 &text,
+                                read_context,
                                 voice_cfg,
                                 audio_device,
                                 response_language.as_deref(),
@@ -306,7 +310,11 @@ async fn run_with_wakeword(
                                 continue;
                             }
 
-                            let memory_context = inject::build_memory_context(memory, &text);
+                            let memory_context = inject::build_memory_context_with_read_context(
+                                memory,
+                                &text,
+                                read_context,
+                            );
                             let full_prompt = format!(
                                 "{}\n\nRelevant household context:\n{}",
                                 system_prompt, memory_context
@@ -504,6 +512,7 @@ async fn handle_quick_tool_for_voice(
     conversations: &ConversationStore,
     conv_id: &str,
     text: &str,
+    read_context: crate::memory::policy::MemoryReadContext,
     voice_cfg: &VoiceConfig,
     audio_device: &str,
     response_language: Option<&str>,
@@ -562,7 +571,14 @@ async fn handle_quick_tool_for_voice(
         return Some(response);
     }
 
-    let tool_result = tools.execute(&call).await;
+    let tool_result = tools
+        .execute_with_context(
+            &call,
+            crate::tools::ToolExecutionContext {
+                memory_read_context: Some(read_context),
+            },
+        )
+        .await;
     let response = if tool_result.success {
         tool_result.output.clone()
     } else {
@@ -657,6 +673,7 @@ async fn voice_cycle(
     model_family: ModelFamily,
     conv_id: &str,
 ) -> bool {
+    let speaker = SpeakerIdentity::default();
     // Step 1: Record (fixed duration — reliable).
     eprintln!(
         "[voice] Recording {} seconds — speak now!",
@@ -710,6 +727,7 @@ async fn voice_cycle(
         .language
         .clone()
         .or_else(|| crate::voice::language::detect_language_from_text(&text));
+    let read_context = identity::build_memory_read_context(&text, &speaker);
 
     eprintln!(
         "[voice] You said: \"{}\" (STT: {} ms)",
@@ -722,6 +740,7 @@ async fn voice_cycle(
         conversations,
         conv_id,
         &text,
+        read_context,
         voice_cfg,
         audio_device,
         response_language.as_deref(),
@@ -744,7 +763,8 @@ async fn voice_cycle(
     }
 
     // Step 3: Build LLM context with per-query memory injection.
-    let memory_context = inject::build_memory_context(memory, &text);
+    let memory_context =
+        inject::build_memory_context_with_read_context(memory, &text, read_context);
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -796,7 +816,14 @@ async fn voice_cycle(
 
     // Tool dispatch — if LLM output is a tool call, execute and speak result.
     let (final_response, _tool_name) = if let Some(tool_result) =
-        crate::tools::try_tool_call(&response, tools).await
+        crate::tools::try_tool_call_with_context(
+            &response,
+            tools,
+            crate::tools::ToolExecutionContext {
+                memory_read_context: Some(read_context),
+            },
+        )
+        .await
     {
         eprintln!(
             "[voice] Tool: {} → {}",

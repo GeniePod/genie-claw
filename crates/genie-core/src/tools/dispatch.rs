@@ -27,6 +27,11 @@ pub struct ToolResult {
     pub output: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ToolExecutionContext {
+    pub memory_read_context: Option<crate::memory::policy::MemoryReadContext>,
+}
+
 /// LLM-generated tool call (parsed from model output).
 /// Accepts both `{"tool": "..."}` and `{"name": "..."}` formats.
 #[derive(Debug, Deserialize)]
@@ -277,6 +282,15 @@ impl ToolDispatcher {
 
     /// Execute a tool call from the LLM.
     pub async fn execute(&self, call: &ToolCall) -> ToolResult {
+        self.execute_with_context(call, ToolExecutionContext::default())
+            .await
+    }
+
+    pub async fn execute_with_context(
+        &self,
+        call: &ToolCall,
+        exec_ctx: ToolExecutionContext,
+    ) -> ToolResult {
         let result = match call.name.as_str() {
             "home_control" => self.exec_home_control(&call.arguments).await,
             "home_status" => self.exec_home_status(&call.arguments).await,
@@ -287,7 +301,7 @@ impl ToolDispatcher {
             "system_info" => super::system::system_info(self.ha.as_deref()).await,
             "calculate" => exec_calculate(&call.arguments),
             "play_media" => self.exec_play_media(&call.arguments).await,
-            "memory_recall" => self.exec_memory_recall(&call.arguments),
+            "memory_recall" => self.exec_memory_recall(&call.arguments, exec_ctx),
             "memory_status" => self.exec_memory_status(),
             "memory_forget" => self.exec_memory_forget(&call.arguments),
             "memory_store" => self.exec_memory_store(&call.arguments),
@@ -343,7 +357,11 @@ impl ToolDispatcher {
         Ok(format!("Timer set for {} seconds: {}", seconds, label))
     }
 
-    fn exec_memory_recall(&self, args: &serde_json::Value) -> Result<String> {
+    fn exec_memory_recall(
+        &self,
+        args: &serde_json::Value,
+        exec_ctx: ToolExecutionContext,
+    ) -> Result<String> {
         let mem = self
             .memory
             .as_ref()
@@ -352,7 +370,9 @@ impl ToolDispatcher {
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
         let query = memory_query(args);
-        let read_context = memory_read_context(args);
+        let read_context = exec_ctx
+            .memory_read_context
+            .unwrap_or_else(|| memory_read_context(args));
 
         let results = crate::memory::recall::recall_with_context(&mem, query, 10, read_context)?;
         if results.is_empty() {
@@ -1110,7 +1130,10 @@ mod tests {
             ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
         let output = dispatcher
-            .exec_memory_recall(&serde_json::json!({"query": "did you remember my name"}))
+            .exec_memory_recall(
+                &serde_json::json!({"query": "did you remember my name"}),
+                ToolExecutionContext::default(),
+            )
             .unwrap();
 
         assert_eq!(output, "Your name is Jared");
@@ -1131,7 +1154,10 @@ mod tests {
             ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
         let output = dispatcher
-            .exec_memory_recall(&serde_json::json!({"query": "oat milk"}))
+            .exec_memory_recall(
+                &serde_json::json!({"query": "oat milk"}),
+                ToolExecutionContext::default(),
+            )
             .unwrap();
 
         assert_eq!(output, "I don't remember anything about oat milk yet.");
@@ -1152,19 +1178,66 @@ mod tests {
             ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
         let output = dispatcher
-            .exec_memory_recall(&serde_json::json!({
-                "query": "oat milk",
-                "identity_confidence": "high"
-            }))
+            .exec_memory_recall(
+                &serde_json::json!({
+                    "query": "oat milk",
+                    "identity_confidence": "high"
+                }),
+                ToolExecutionContext::default(),
+            )
             .unwrap();
 
         assert_eq!(output, "I remember: Maya likes oat milk");
     }
 
+    #[tokio::test]
+    async fn execute_with_context_allows_person_memory_recall() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-exec-ctx-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let call = ToolCall {
+            name: "memory_recall".into(),
+            arguments: serde_json::json!({"query": "oat milk"}),
+        };
+        let output = dispatcher
+            .execute_with_context(
+                &call,
+                ToolExecutionContext {
+                    memory_read_context: Some(crate::memory::policy::MemoryReadContext {
+                        identity_confidence: crate::memory::policy::IdentityConfidence::High,
+                        explicit_named_person: false,
+                        explicit_private_intent: false,
+                        shared_space_voice: true,
+                    }),
+                },
+            )
+            .await;
+
+        assert!(output.success);
+        assert_eq!(output.output, "I remember: Maya likes oat milk");
+    }
+
     #[test]
     fn memory_status_reports_health() {
-        let db = std::env::temp_dir().join(format!("memory-status-test-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&db);
+        static MEMORY_STATUS_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "memory-status-test-{}-{}",
+            std::process::id(),
+            MEMORY_STATUS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("memory.db");
         let memory = crate::memory::Memory::open(&db).unwrap();
         memory.store("fact", "GenieClaw has local memory").unwrap();
         let dispatcher =

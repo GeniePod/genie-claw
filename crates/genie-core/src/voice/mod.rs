@@ -1,6 +1,7 @@
 pub mod aec;
 pub mod dsp;
 pub mod format;
+pub mod identity;
 pub mod intent;
 pub mod language;
 pub mod noise;
