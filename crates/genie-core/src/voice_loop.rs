@@ -18,7 +18,7 @@ use crate::memory::{extract, inject};
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
 use crate::tools::ToolDispatcher;
-use crate::voice::identity::{self, SpeakerIdentity};
+use crate::voice::identity::{self, SpeakerIdentityProvider};
 use crate::voice::intent::{self, VoiceIntentDecision};
 use crate::voice::{aec, format, streaming, stt, tts};
 
@@ -40,6 +40,8 @@ pub struct VoiceConfig {
     pub voice_continuous: bool,
     /// Recording duration for follow-up (shorter than initial).
     pub voice_continuous_secs: u32,
+    /// Speaker identity provider for voice memory context.
+    pub speaker_identity: SpeakerIdentityProvider,
 }
 
 /// Run the voice interaction loop.
@@ -271,7 +273,13 @@ async fn run_with_wakeword(
                             .language
                             .clone()
                             .or_else(|| crate::voice::language::detect_language_from_text(&text));
-                        let speaker = SpeakerIdentity::default();
+                        let speaker = voice_cfg.speaker_identity.identify(
+                            &identity::SpeakerIdentityRequest {
+                                wav_path: Some(&followup_path),
+                                transcript: &text,
+                                detected_language: response_language.as_deref(),
+                            },
+                        );
                         let read_context = identity::build_memory_read_context(&text, &speaker);
 
                         if !text.is_empty() {
@@ -486,6 +494,7 @@ fn clone_voice_config(cfg: &VoiceConfig) -> VoiceConfig {
         wakeword_script: cfg.wakeword_script.clone(),
         voice_continuous: cfg.voice_continuous,
         voice_continuous_secs: cfg.voice_continuous_secs,
+        speaker_identity: cfg.speaker_identity.clone(),
     }
 }
 
@@ -673,7 +682,6 @@ async fn voice_cycle(
     model_family: ModelFamily,
     conv_id: &str,
 ) -> bool {
-    let speaker = SpeakerIdentity::default();
     // Step 1: Record (fixed duration — reliable).
     eprintln!(
         "[voice] Recording {} seconds — speak now!",
@@ -727,6 +735,13 @@ async fn voice_cycle(
         .language
         .clone()
         .or_else(|| crate::voice::language::detect_language_from_text(&text));
+    let speaker = voice_cfg
+        .speaker_identity
+        .identify(&identity::SpeakerIdentityRequest {
+            wav_path: Some(&wav_path),
+            transcript: &text,
+            detected_language: response_language.as_deref(),
+        });
     let read_context = identity::build_memory_read_context(&text, &speaker);
 
     eprintln!(

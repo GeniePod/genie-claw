@@ -141,6 +141,9 @@ async fn main() -> Result<()> {
             wakeword_script: config.core.wakeword_script.to_string_lossy().to_string(),
             voice_continuous: config.core.voice_continuous,
             voice_continuous_secs: config.core.voice_continuous_secs,
+            speaker_identity: genie_core::voice::identity::SpeakerIdentityProvider::from_config(
+                &config.core.speaker_identity,
+            ),
         };
         genie_core::voice_loop::run(
             voice_cfg,

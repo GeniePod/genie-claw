@@ -115,6 +115,10 @@ pub struct CoreConfig {
     /// Path to the wake word listener script (empty = push-to-talk mode).
     #[serde(default = "defaults::wakeword_script")]
     pub wakeword_script: PathBuf,
+
+    /// Optional speaker identity provider for voice memory context.
+    #[serde(default)]
+    pub speaker_identity: SpeakerIdentityConfig,
 }
 
 impl Default for CoreConfig {
@@ -140,8 +144,47 @@ impl Default for CoreConfig {
             voice_continuous_secs: defaults::voice_continuous_secs(),
             llm_model_path: defaults::llm_model_path(),
             wakeword_script: defaults::wakeword_script(),
+            speaker_identity: SpeakerIdentityConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpeakerIdentityConfig {
+    /// Enable speaker identity enrichment for voice flows.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Identity provider implementation.
+    #[serde(default)]
+    pub provider: SpeakerIdentityProvider,
+
+    /// Fixed speaker label for single-user or test deployments.
+    #[serde(default)]
+    pub fixed_name: String,
+
+    /// Confidence to report for the fixed provider.
+    #[serde(default = "defaults::speaker_identity_confidence")]
+    pub fixed_confidence: String,
+}
+
+impl Default for SpeakerIdentityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: SpeakerIdentityProvider::None,
+            fixed_name: String::new(),
+            fixed_confidence: defaults::speaker_identity_confidence(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerIdentityProvider {
+    #[default]
+    None,
+    Fixed,
 }
 
 #[derive(Debug, Deserialize)]
@@ -612,6 +655,36 @@ cache_max_entries = 12
     }
 
     #[test]
+    fn speaker_identity_defaults_to_disabled_none() {
+        let config = test_config();
+        assert!(!config.core.speaker_identity.enabled);
+        assert_eq!(
+            config.core.speaker_identity.provider,
+            SpeakerIdentityProvider::None
+        );
+        assert!(config.core.speaker_identity.fixed_name.is_empty());
+        assert_eq!(config.core.speaker_identity.fixed_confidence, "high");
+    }
+
+    #[test]
+    fn speaker_identity_config_parses_fixed_provider() {
+        let config: SpeakerIdentityConfig = toml::from_str(
+            r#"
+enabled = true
+provider = "fixed"
+fixed_name = "Jared"
+fixed_confidence = "medium"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.enabled);
+        assert_eq!(config.provider, SpeakerIdentityProvider::Fixed);
+        assert_eq!(config.fixed_name, "Jared");
+        assert_eq!(config.fixed_confidence, "medium");
+    }
+
+    #[test]
     fn connectivity_is_disabled_by_default() {
         let config = test_config();
         assert!(!config.connectivity_enabled());
@@ -728,6 +801,9 @@ mod defaults {
     }
     pub fn wakeword_script() -> PathBuf {
         PathBuf::from("/opt/geniepod/bin/genie-wake-listen.py")
+    }
+    pub fn speaker_identity_confidence() -> String {
+        "high".into()
     }
     pub fn telegram_api_base() -> String {
         "https://api.telegram.org".into()

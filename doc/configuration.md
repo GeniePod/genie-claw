@@ -52,6 +52,22 @@ Runtime load path:
 | `voice_continuous_secs` | Shorter recording length in continuous mode |
 | `llm_model_path` | Model path used by voice mode time-sharing logic |
 | `wakeword_script` | Wake-word listener helper path |
+| `speaker_identity.*` | Optional voice speaker-identity provider settings |
+
+### `[core.speaker_identity]`
+
+| Key | Purpose |
+| --- | --- |
+| `enabled` | Turn speaker-identity enrichment on for voice flows |
+| `provider` | `none` or `fixed` |
+| `fixed_name` | Speaker label used by the `fixed` provider |
+| `fixed_confidence` | `low`, `medium`, or `high` confidence reported by the `fixed` provider |
+
+Behavior notes:
+
+- `none` is the default and behaves like anonymous shared-room voice.
+- `fixed` is mainly for single-user boxes, testing, and plumbing validation.
+- This only affects memory read context in voice mode today; it does not add biometric speaker recognition by itself.
 
 ## `[governor]`
 

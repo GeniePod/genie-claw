@@ -30,6 +30,13 @@ wakeword_script = "/opt/geniepod/bin/genie-wake-listen.py"   # Wake word listene
 # de = "/opt/geniepod/voices/de_DE-thorsten-medium.onnx"
 # zh = "/opt/geniepod/voices/zh_CN-huayan-medium.onnx"
 
+# Optional speaker-identity provider for voice memory context:
+# [core.speaker_identity]
+# enabled = true
+# provider = "fixed"             # "none" or "fixed"
+# fixed_name = "Jared"
+# fixed_confidence = "high"      # "low", "medium", or "high"
+
 [governor]
 poll_interval_ms = 5000
 night_start_hour = 23

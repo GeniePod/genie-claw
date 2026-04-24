@@ -1,4 +1,7 @@
 use crate::memory::policy::{IdentityConfidence, MemoryReadContext};
+use genie_common::config::{
+    SpeakerIdentityConfig, SpeakerIdentityProvider as SpeakerIdentityProviderKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeakerIdentity {
@@ -11,6 +14,50 @@ impl Default for SpeakerIdentity {
         Self {
             name: None,
             confidence: IdentityConfidence::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpeakerIdentityRequest<'a> {
+    pub wav_path: Option<&'a str>,
+    pub transcript: &'a str,
+    pub detected_language: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum SpeakerIdentityProvider {
+    #[default]
+    None,
+    Fixed(SpeakerIdentity),
+}
+
+impl SpeakerIdentityProvider {
+    pub fn from_config(config: &SpeakerIdentityConfig) -> Self {
+        if !config.enabled {
+            return Self::None;
+        }
+
+        match config.provider {
+            SpeakerIdentityProviderKind::None => Self::None,
+            SpeakerIdentityProviderKind::Fixed => {
+                let name = config.fixed_name.trim();
+                if name.is_empty() {
+                    Self::None
+                } else {
+                    Self::Fixed(SpeakerIdentity {
+                        name: Some(name.to_string()),
+                        confidence: identity_confidence_from_str(&config.fixed_confidence),
+                    })
+                }
+            }
+        }
+    }
+
+    pub fn identify(&self, _request: &SpeakerIdentityRequest<'_>) -> SpeakerIdentity {
+        match self {
+            Self::None => SpeakerIdentity::default(),
+            Self::Fixed(identity) => identity.clone(),
         }
     }
 }
@@ -75,6 +122,15 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
+fn identity_confidence_from_str(value: &str) -> IdentityConfidence {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "high" => IdentityConfidence::High,
+        "medium" => IdentityConfidence::Medium,
+        "low" => IdentityConfidence::Low,
+        _ => IdentityConfidence::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +163,22 @@ mod tests {
             &SpeakerIdentity::default(),
         );
         assert!(ctx.explicit_private_intent);
+    }
+
+    #[test]
+    fn fixed_provider_returns_configured_identity() {
+        let provider = SpeakerIdentityProvider::from_config(&SpeakerIdentityConfig {
+            enabled: true,
+            provider: SpeakerIdentityProviderKind::Fixed,
+            fixed_name: "Jared".into(),
+            fixed_confidence: "high".into(),
+        });
+        let identity = provider.identify(&SpeakerIdentityRequest {
+            wav_path: None,
+            transcript: "what do you remember about me",
+            detected_language: Some("en"),
+        });
+        assert_eq!(identity.name.as_deref(), Some("Jared"));
+        assert_eq!(identity.confidence, IdentityConfidence::High);
     }
 }

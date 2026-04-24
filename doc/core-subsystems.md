@@ -181,7 +181,7 @@ Responsibilities:
 - audio recording and wake-word integration
 - STT client/CLI execution
 - conservative voice intent gating for shared-room wake flows
-- speaker-identity context plumbing into memory read paths
+- speaker-identity provider boundary plus memory-context plumbing into voice read paths
 - language detection and language-specific TTS model selection
 - output formatting for speech
 - streaming spoken responses

@@ -20,6 +20,12 @@ max_history_turns = 20
 # de = "./models/piper-de.onnx"
 # zh = "./models/piper-zh.onnx"
 
+# [core.speaker_identity]
+# enabled = true
+# provider = "fixed"
+# fixed_name = "Dev User"
+# fixed_confidence = "high"
+
 [web_search]
 enabled = true
 provider = "duckduckgo"
