@@ -2,6 +2,7 @@ use crate::memory::policy::{IdentityConfidence, MemoryReadContext};
 use genie_common::config::{
     SpeakerIdentityConfig, SpeakerIdentityProvider as SpeakerIdentityProviderKind,
 };
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeakerIdentity {
@@ -25,11 +26,18 @@ pub struct SpeakerIdentityRequest<'a> {
     pub detected_language: Option<&'a str>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LocalBiometricRecognizer {
+    pub profile_dir: PathBuf,
+    pub min_score: f32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum SpeakerIdentityProvider {
     #[default]
     None,
     Fixed(SpeakerIdentity),
+    LocalBiometric(LocalBiometricRecognizer),
 }
 
 impl SpeakerIdentityProvider {
@@ -51,14 +59,33 @@ impl SpeakerIdentityProvider {
                     })
                 }
             }
+            SpeakerIdentityProviderKind::LocalBiometric => {
+                Self::LocalBiometric(LocalBiometricRecognizer {
+                    profile_dir: config.local_profile_dir.clone(),
+                    min_score: config.local_min_score,
+                })
+            }
         }
     }
 
-    pub fn identify(&self, _request: &SpeakerIdentityRequest<'_>) -> SpeakerIdentity {
+    pub fn identify(&self, request: &SpeakerIdentityRequest<'_>) -> SpeakerIdentity {
         match self {
             Self::None => SpeakerIdentity::default(),
             Self::Fixed(identity) => identity.clone(),
+            Self::LocalBiometric(recognizer) => recognizer.identify(request),
         }
+    }
+}
+
+impl LocalBiometricRecognizer {
+    pub fn identify(&self, request: &SpeakerIdentityRequest<'_>) -> SpeakerIdentity {
+        let _ = (&self.profile_dir, self.min_score, request.wav_path);
+        // Placeholder boundary for a future fully local biometric recognizer.
+        // When implemented, this should:
+        // 1. extract a local speaker embedding from the wav
+        // 2. compare against enrolled local profiles
+        // 3. return a named speaker only when the score clears min_score
+        SpeakerIdentity::default()
     }
 }
 
@@ -172,6 +199,8 @@ mod tests {
             provider: SpeakerIdentityProviderKind::Fixed,
             fixed_name: "Jared".into(),
             fixed_confidence: "high".into(),
+            local_profile_dir: PathBuf::from("/opt/geniepod/data/speakers"),
+            local_min_score: 0.82,
         });
         let identity = provider.identify(&SpeakerIdentityRequest {
             wav_path: None,
@@ -180,5 +209,28 @@ mod tests {
         });
         assert_eq!(identity.name.as_deref(), Some("Jared"));
         assert_eq!(identity.confidence, IdentityConfidence::High);
+    }
+
+    #[test]
+    fn local_biometric_provider_builds_with_future_runtime_boundary() {
+        let provider = SpeakerIdentityProvider::from_config(&SpeakerIdentityConfig {
+            enabled: true,
+            provider: SpeakerIdentityProviderKind::LocalBiometric,
+            fixed_name: String::new(),
+            fixed_confidence: "high".into(),
+            local_profile_dir: PathBuf::from("/opt/geniepod/data/speakers"),
+            local_min_score: 0.88,
+        });
+
+        match provider {
+            SpeakerIdentityProvider::LocalBiometric(recognizer) => {
+                assert_eq!(
+                    recognizer.profile_dir,
+                    PathBuf::from("/opt/geniepod/data/speakers")
+                );
+                assert!((recognizer.min_score - 0.88).abs() < f32::EPSILON);
+            }
+            _ => panic!("expected local biometric provider"),
+        }
     }
 }

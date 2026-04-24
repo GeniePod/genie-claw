@@ -33,9 +33,11 @@ wakeword_script = "/opt/geniepod/bin/genie-wake-listen.py"   # Wake word listene
 # Optional speaker-identity provider for voice memory context:
 # [core.speaker_identity]
 # enabled = true
-# provider = "fixed"             # "none" or "fixed"
+# provider = "fixed"             # "none", "fixed", or "local_biometric"
 # fixed_name = "Jared"
 # fixed_confidence = "high"      # "low", "medium", or "high"
+# local_profile_dir = "/opt/geniepod/data/speakers"
+# local_min_score = 0.82
 
 [governor]
 poll_interval_ms = 5000

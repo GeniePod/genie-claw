@@ -25,6 +25,8 @@ max_history_turns = 20
 # provider = "fixed"
 # fixed_name = "Dev User"
 # fixed_confidence = "high"
+# local_profile_dir = "./data/speakers"
+# local_min_score = 0.82
 
 [web_search]
 enabled = true

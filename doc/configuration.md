@@ -59,15 +59,19 @@ Runtime load path:
 | Key | Purpose |
 | --- | --- |
 | `enabled` | Turn speaker-identity enrichment on for voice flows |
-| `provider` | `none` or `fixed` |
+| `provider` | `none`, `fixed`, or `local_biometric` |
 | `fixed_name` | Speaker label used by the `fixed` provider |
 | `fixed_confidence` | `low`, `medium`, or `high` confidence reported by the `fixed` provider |
+| `local_profile_dir` | Local enrolled speaker profile directory for the biometric provider |
+| `local_min_score` | Minimum score required to accept a biometric match |
 
 Behavior notes:
 
 - `none` is the default and behaves like anonymous shared-room voice.
 - `fixed` is mainly for single-user boxes, testing, and plumbing validation.
-- This only affects memory read context in voice mode today; it does not add biometric speaker recognition by itself.
+- `local_biometric` is the optional local-recognizer boundary. It is scaffolded now so a real on-device recognizer can be dropped in later without changing config or voice-loop wiring.
+- Today, only `fixed` returns an identity immediately. `local_biometric` is a placeholder boundary and currently falls back to unknown identity until the recognizer implementation lands.
+- This only affects memory read context in voice mode today; it does not yet add completed biometric recognition by itself.
 
 ## `[governor]`
 

@@ -166,6 +166,14 @@ pub struct SpeakerIdentityConfig {
     /// Confidence to report for the fixed provider.
     #[serde(default = "defaults::speaker_identity_confidence")]
     pub fixed_confidence: String,
+
+    /// Local speaker profile directory for biometric recognition.
+    #[serde(default = "defaults::speaker_identity_profile_dir")]
+    pub local_profile_dir: PathBuf,
+
+    /// Minimum score for accepting a local biometric match.
+    #[serde(default = "defaults::speaker_identity_min_score")]
+    pub local_min_score: f32,
 }
 
 impl Default for SpeakerIdentityConfig {
@@ -175,6 +183,8 @@ impl Default for SpeakerIdentityConfig {
             provider: SpeakerIdentityProvider::None,
             fixed_name: String::new(),
             fixed_confidence: defaults::speaker_identity_confidence(),
+            local_profile_dir: defaults::speaker_identity_profile_dir(),
+            local_min_score: defaults::speaker_identity_min_score(),
         }
     }
 }
@@ -185,6 +195,7 @@ pub enum SpeakerIdentityProvider {
     #[default]
     None,
     Fixed,
+    LocalBiometric,
 }
 
 #[derive(Debug, Deserialize)]
@@ -664,6 +675,11 @@ cache_max_entries = 12
         );
         assert!(config.core.speaker_identity.fixed_name.is_empty());
         assert_eq!(config.core.speaker_identity.fixed_confidence, "high");
+        assert_eq!(
+            config.core.speaker_identity.local_profile_dir,
+            defaults::speaker_identity_profile_dir()
+        );
+        assert_eq!(config.core.speaker_identity.local_min_score, 0.82);
     }
 
     #[test]
@@ -682,6 +698,27 @@ fixed_confidence = "medium"
         assert_eq!(config.provider, SpeakerIdentityProvider::Fixed);
         assert_eq!(config.fixed_name, "Jared");
         assert_eq!(config.fixed_confidence, "medium");
+    }
+
+    #[test]
+    fn speaker_identity_config_parses_local_biometric_provider() {
+        let config: SpeakerIdentityConfig = toml::from_str(
+            r#"
+enabled = true
+provider = "local_biometric"
+local_profile_dir = "/opt/geniepod/data/speakers"
+local_min_score = 0.91
+"#,
+        )
+        .unwrap();
+
+        assert!(config.enabled);
+        assert_eq!(config.provider, SpeakerIdentityProvider::LocalBiometric);
+        assert_eq!(
+            config.local_profile_dir,
+            PathBuf::from("/opt/geniepod/data/speakers")
+        );
+        assert!((config.local_min_score - 0.91).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -804,6 +841,12 @@ mod defaults {
     }
     pub fn speaker_identity_confidence() -> String {
         "high".into()
+    }
+    pub fn speaker_identity_profile_dir() -> PathBuf {
+        PathBuf::from("/opt/geniepod/data/speakers")
+    }
+    pub fn speaker_identity_min_score() -> f32 {
+        0.82
     }
     pub fn telegram_api_base() -> String {
         "https://api.telegram.org".into()
