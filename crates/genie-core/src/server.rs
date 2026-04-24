@@ -29,6 +29,10 @@ use crate::tools::{RequestOrigin, ToolExecutionContext};
 ///   GET  /api/connectivity      — connectivity coprocessor status
 ///   GET  /api/actuation/pending — pending high-risk confirmations
 ///   POST /api/actuation/confirm — execute a pending confirmed action
+///   GET  /api/memories          — list saved memories for the dashboard
+///   POST /api/memories/update   — update a saved memory
+///   POST /api/memories/delete   — delete a saved memory
+///   POST /api/memories/reorder  — persist dashboard memory ordering
 ///   POST /v1/chat/completions   — OpenAI-compatible (for local apps and adapters)
 ///
 /// The local web UI and any first-party adapters connect here.
@@ -211,6 +215,10 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
         ("POST", "/api/actuation/confirm") => {
             handle_actuation_confirm(body.as_deref(), tools).await
         }
+        ("GET", "/api/memories") => handle_memories_list(memory),
+        ("POST", "/api/memories/update") => handle_memories_update(body.as_deref(), memory),
+        ("POST", "/api/memories/delete") => handle_memories_delete(body.as_deref(), memory),
+        ("POST", "/api/memories/reorder") => handle_memories_reorder(body.as_deref(), memory),
         ("POST", "/v1/chat/completions") => {
             handle_openai_chat(
                 body.as_deref(),
@@ -266,6 +274,23 @@ struct StreamState {
     mode: StreamMode,
     pending: String,
     emitted_text: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MemoryUpdateRequest {
+    id: i64,
+    content: String,
+    kind: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MemoryDeleteRequest {
+    id: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MemoryReorderRequest {
+    ids: Vec<i64>,
 }
 
 async fn handle_chat_stream(
@@ -964,6 +989,133 @@ fn handle_actuation_pending(tools: &ToolDispatcher) -> (u16, &'static str, Strin
             .map(|path| path.to_string_lossy().to_string()),
     });
     (200, "application/json", body.to_string())
+}
+
+fn handle_memories_list(memory: &Memory) -> (u16, &'static str, String) {
+    match memory.list_managed(500) {
+        Ok(entries) => (
+            200,
+            "application/json",
+            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => (
+            500,
+            "application/json",
+            serde_json::json!({ "error": e.to_string() }).to_string(),
+        ),
+    }
+}
+
+fn handle_memories_update(body: Option<&str>, memory: &Memory) -> (u16, &'static str, String) {
+    let Some(body) = body else {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"missing body"}"#.into(),
+        );
+    };
+
+    let req: MemoryUpdateRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                serde_json::json!({ "error": format!("invalid JSON: {e}") }).to_string(),
+            );
+        }
+    };
+
+    match memory.update_managed(req.id, &req.content, req.kind.as_deref()) {
+        Ok(true) => (
+            200,
+            "application/json",
+            serde_json::json!({ "ok": true }).to_string(),
+        ),
+        Ok(false) => (
+            404,
+            "application/json",
+            serde_json::json!({ "ok": false, "error": "memory not found" }).to_string(),
+        ),
+        Err(e) => (
+            400,
+            "application/json",
+            serde_json::json!({ "ok": false, "error": e.to_string() }).to_string(),
+        ),
+    }
+}
+
+fn handle_memories_delete(body: Option<&str>, memory: &Memory) -> (u16, &'static str, String) {
+    let Some(body) = body else {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"missing body"}"#.into(),
+        );
+    };
+
+    let req: MemoryDeleteRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                serde_json::json!({ "error": format!("invalid JSON: {e}") }).to_string(),
+            );
+        }
+    };
+
+    match memory.delete_by_id(req.id) {
+        Ok(true) => (
+            200,
+            "application/json",
+            serde_json::json!({ "ok": true }).to_string(),
+        ),
+        Ok(false) => (
+            404,
+            "application/json",
+            serde_json::json!({ "ok": false, "error": "memory not found" }).to_string(),
+        ),
+        Err(e) => (
+            500,
+            "application/json",
+            serde_json::json!({ "ok": false, "error": e.to_string() }).to_string(),
+        ),
+    }
+}
+
+fn handle_memories_reorder(body: Option<&str>, memory: &Memory) -> (u16, &'static str, String) {
+    let Some(body) = body else {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"missing body"}"#.into(),
+        );
+    };
+
+    let req: MemoryReorderRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                serde_json::json!({ "error": format!("invalid JSON: {e}") }).to_string(),
+            );
+        }
+    };
+
+    match memory.reorder_managed(&req.ids) {
+        Ok(()) => (
+            200,
+            "application/json",
+            serde_json::json!({ "ok": true }).to_string(),
+        ),
+        Err(e) => (
+            500,
+            "application/json",
+            serde_json::json!({ "ok": false, "error": e.to_string() }).to_string(),
+        ),
+    }
 }
 
 async fn handle_actuation_confirm(

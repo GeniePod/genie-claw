@@ -72,6 +72,21 @@ pub struct MemoryEntry {
     pub metadata: policy::MemoryPolicyMetadata,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManagedMemoryEntry {
+    pub id: i64,
+    pub kind: String,
+    pub content: String,
+    pub created_ms: i64,
+    pub accessed_ms: i64,
+    pub recall_count: i64,
+    pub promoted: bool,
+    pub scope: String,
+    pub sensitivity: String,
+    pub spoken_policy: String,
+    pub display_order: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MemoryEvent {
     ts_ms: u64,
@@ -124,7 +139,8 @@ impl Memory {
                 evergreen     INTEGER NOT NULL DEFAULT 0,
                 scope         TEXT NOT NULL DEFAULT 'household',
                 sensitivity   TEXT NOT NULL DEFAULT 'normal',
-                spoken_policy TEXT NOT NULL DEFAULT 'allow'
+                spoken_policy TEXT NOT NULL DEFAULT 'allow',
+                display_order INTEGER NOT NULL DEFAULT 2147483647
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -181,11 +197,19 @@ impl Memory {
             "ALTER TABLE memories ADD COLUMN spoken_policy TEXT NOT NULL DEFAULT 'allow'",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE memories ADD COLUMN display_order INTEGER NOT NULL DEFAULT 2147483647",
+            [],
+        );
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_kind_accessed ON memories(kind, accessed_ms DESC)", []);
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_promotion ON memories(promoted, recall_count, max_score)", []);
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_prune ON memories(evergreen, promoted, accessed_ms)", []);
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memories_scope_sensitivity ON memories(scope, sensitivity, spoken_policy)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_display_order ON memories(display_order, accessed_ms DESC, id DESC)",
             [],
         );
 
@@ -457,6 +481,23 @@ impl Memory {
         Ok(entries)
     }
 
+    pub fn list_managed(&self, limit: usize) -> Result<Vec<ManagedMemoryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, content, created_ms, accessed_ms, recall_count, promoted,
+                    scope, sensitivity, spoken_policy, display_order
+             FROM memories
+             ORDER BY display_order ASC, accessed_ms DESC, id DESC
+             LIMIT ?1",
+        )?;
+
+        let entries = stmt
+            .query_map([limit.max(1)], read_managed_entry)?
+            .filter_map(|row| row.ok())
+            .collect();
+
+        Ok(entries)
+    }
+
     /// Get promotion candidates — memories recalled frequently from diverse queries.
     pub fn promotion_candidates(
         &self,
@@ -496,9 +537,7 @@ impl Memory {
                 policy::MemoryReadContext::shared_room_voice(),
             )
             .allowed;
-            if shared_safe {
-                self.append_root_memory(&entry.kind, &entry.content)?;
-            }
+            self.rebuild_root_memory_file()?;
             self.record_canonical_event(MemoryEvent {
                 ts_ms: now_ms(),
                 action: "promote",
@@ -581,6 +620,9 @@ impl Memory {
         if deleted > 0
             && let Some(entry) = existing
         {
+            if entry.promoted {
+                self.rebuild_root_memory_file()?;
+            }
             self.record_canonical_event(MemoryEvent {
                 ts_ms: now_ms(),
                 action: "delete",
@@ -596,6 +638,90 @@ impl Memory {
             )?;
         }
         Ok(deleted > 0)
+    }
+
+    pub fn update_managed(&self, id: i64, content: &str, kind: Option<&str>) -> Result<bool> {
+        let Some(existing) = self.get_by_id(id)? else {
+            return Ok(false);
+        };
+
+        let content = normalize_memory_content(content);
+        if content.is_empty() {
+            anyhow::bail!("memory content cannot be empty");
+        }
+
+        let next_kind = match kind {
+            Some(kind) if kind.trim().is_empty() => {
+                anyhow::bail!("memory kind cannot be empty");
+            }
+            Some(kind) => kind.trim().to_string(),
+            None => existing.kind.clone(),
+        };
+
+        let metadata = policy::infer_metadata(&next_kind, &content);
+        let changed = existing.kind != next_kind
+            || existing.content != content
+            || existing.metadata != metadata;
+
+        if !changed {
+            return Ok(true);
+        }
+
+        let updated = self.conn.execute(
+            "UPDATE memories
+             SET kind = ?1, content = ?2, scope = ?3, sensitivity = ?4, spoken_policy = ?5
+             WHERE id = ?6",
+            rusqlite::params![
+                next_kind,
+                content,
+                metadata.scope.as_str(),
+                metadata.sensitivity.as_str(),
+                metadata.spoken_policy.as_str(),
+                id
+            ],
+        )?;
+
+        if updated > 0 {
+            if existing.promoted {
+                self.rebuild_root_memory_file()?;
+            }
+            let detail = format!("from [{}] {}", existing.kind, existing.content);
+            self.record_canonical_event(MemoryEvent {
+                ts_ms: now_ms(),
+                action: "update",
+                id: Some(id),
+                kind: Some(next_kind.clone()),
+                content: Some(content.clone()),
+                detail: Some(detail),
+            })?;
+            self.append_daily_note(now_ms(), "updated", &format!("[{}] {}", next_kind, content))?;
+        }
+
+        Ok(updated > 0)
+    }
+
+    pub fn reorder_managed(&self, ids: &[i64]) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let update_result = (|| -> Result<()> {
+            for (idx, id) in ids.iter().enumerate() {
+                self.conn.execute(
+                    "UPDATE memories SET display_order = ?1 WHERE id = ?2",
+                    rusqlite::params![idx as i64, id],
+                )?;
+            }
+            Ok(())
+        })();
+
+        match update_result {
+            Ok(()) => self.conn.execute_batch("COMMIT")?,
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(err);
+            }
+        }
+
+        self.rebuild_root_memory_file()?;
+        Ok(())
     }
 
     /// Search and delete matching memories. Returns count deleted.
@@ -827,25 +953,49 @@ impl Memory {
         Ok(())
     }
 
-    fn append_root_memory(&self, kind: &str, content: &str) -> Result<()> {
+    fn rebuild_root_memory_file(&self) -> Result<()> {
         let file = self.canonical_dir.join("MEMORY.md");
-        let mut existing = std::fs::read_to_string(&file).unwrap_or_default();
-        if existing.is_empty() {
-            existing.push_str("# GenieClaw Durable Memory\n\n");
-        }
-        let line = format!("- [{}] {}\n", kind, content);
-        if existing.contains(&line) {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, content, scope, sensitivity, spoken_policy
+             FROM memories
+             WHERE promoted = 1
+             ORDER BY display_order ASC, accessed_ms DESC, id ASC",
+        )?;
+        let lines = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    policy::MemoryPolicyMetadata {
+                        scope: policy::MemoryScope::from_str(&row.get::<_, String>(2)?),
+                        sensitivity: policy::MemorySensitivity::from_str(&row.get::<_, String>(3)?),
+                        spoken_policy: policy::SpokenMemoryPolicy::from_str(
+                            &row.get::<_, String>(4)?,
+                        ),
+                    },
+                ))
+            })?
+            .filter_map(|row| row.ok())
+            .filter_map(|(kind, content, metadata)| {
+                let allowed = policy::assess_memory_read(
+                    metadata,
+                    policy::MemoryReadContext::shared_room_voice(),
+                )
+                .allowed;
+                allowed.then(|| format!("- [{}] {}\n", kind, content))
+            })
+            .collect::<Vec<_>>();
+
+        if lines.is_empty() {
+            let _ = std::fs::remove_file(&file);
             return Ok(());
         }
-        use std::io::Write;
-        let mut handle = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(file)?;
-        if !existing.ends_with('\n') {
-            writeln!(handle)?;
+
+        let mut text = String::from("# GenieClaw Durable Memory\n\n");
+        for line in lines {
+            text.push_str(&line);
         }
-        write!(handle, "{line}")?;
+        std::fs::write(file, text)?;
         Ok(())
     }
 }
@@ -872,6 +1022,22 @@ fn read_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
             sensitivity: policy::MemorySensitivity::from_str(&row.get::<_, String>(9)?),
             spoken_policy: policy::SpokenMemoryPolicy::from_str(&row.get::<_, String>(10)?),
         },
+    })
+}
+
+fn read_managed_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedMemoryEntry> {
+    Ok(ManagedMemoryEntry {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        content: row.get(2)?,
+        created_ms: row.get(3)?,
+        accessed_ms: row.get(4)?,
+        recall_count: row.get(5).unwrap_or(0),
+        promoted: row.get::<_, i64>(6).unwrap_or(0) != 0,
+        scope: row.get::<_, String>(7)?,
+        sensitivity: row.get::<_, String>(8)?,
+        spoken_policy: row.get::<_, String>(9)?,
+        display_order: row.get::<_, i64>(10).unwrap_or(i64::MAX),
     })
 }
 
@@ -1400,5 +1566,54 @@ mod tests {
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"action\":\"delete\""));
         assert!(event_text.contains("temporary fact"));
+    }
+
+    #[test]
+    fn update_managed_refreshes_promoted_root_file() {
+        let mem = temp_memory();
+        let id = mem
+            .store("preference", "User's favorite color is green")
+            .unwrap();
+        mem.mark_promoted(id).unwrap();
+        mem.update_managed(id, "User's favorite color is blue", None)
+            .unwrap();
+
+        let root = mem.canonical_dir.join("MEMORY.md");
+        let text = std::fs::read_to_string(root).unwrap();
+        assert!(!text.contains("green"));
+        assert!(text.contains("blue"));
+    }
+
+    #[test]
+    fn delete_promoted_memory_refreshes_root_file() {
+        let mem = temp_memory();
+        let first = mem.store("fact", "alpha durable fact").unwrap();
+        let second = mem.store("fact", "beta durable fact").unwrap();
+        mem.mark_promoted(first).unwrap();
+        mem.mark_promoted(second).unwrap();
+
+        assert!(mem.delete_by_id(first).unwrap());
+
+        let root = mem.canonical_dir.join("MEMORY.md");
+        let text = std::fs::read_to_string(root).unwrap();
+        assert!(!text.contains("alpha durable fact"));
+        assert!(text.contains("beta durable fact"));
+    }
+
+    #[test]
+    fn reorder_managed_rebuilds_promoted_root_order() {
+        let mem = temp_memory();
+        let first = mem.store("fact", "first durable fact").unwrap();
+        let second = mem.store("fact", "second durable fact").unwrap();
+        mem.mark_promoted(first).unwrap();
+        mem.mark_promoted(second).unwrap();
+
+        mem.reorder_managed(&[second, first]).unwrap();
+
+        let root = mem.canonical_dir.join("MEMORY.md");
+        let text = std::fs::read_to_string(root).unwrap();
+        let first_pos = text.find("first durable fact").unwrap();
+        let second_pos = text.find("second durable fact").unwrap();
+        assert!(second_pos < first_pos);
     }
 }

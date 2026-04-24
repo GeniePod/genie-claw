@@ -124,6 +124,7 @@ fn status_text(code: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        502 => "Bad Gateway",
         500 => "Internal Server Error",
         _ => "Unknown",
     }

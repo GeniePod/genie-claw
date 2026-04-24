@@ -1,7 +1,5 @@
 use genie_common::config::Config;
 use genie_common::tegrastats;
-use rusqlite::params;
-use serde::{Deserialize, Serialize};
 
 use crate::http::Response;
 
@@ -211,44 +209,17 @@ pub fn serve_dashboard_js() -> Response {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct DashboardMemoryEntry {
-    id: i64,
-    kind: String,
-    content: String,
-    created_ms: i64,
-    accessed_ms: i64,
-    recall_count: i64,
-    promoted: bool,
-    scope: String,
-    sensitivity: String,
-    spoken_policy: String,
-    display_order: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct MemoryUpdateRequest {
-    id: i64,
-    content: String,
-    kind: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MemoryDeleteRequest {
-    id: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct MemoryReorderRequest {
-    ids: Vec<i64>,
+struct CoreProxyResponse {
+    status: u16,
+    body: String,
 }
 
 pub async fn get_actuation_pending(_config: &Config) -> Response {
     match proxy_core_json("GET", "/api/actuation/pending", None).await {
-        Ok(body) => Response {
-            status: 200,
+        Ok(proxy) => Response {
+            status: proxy.status,
             content_type: "application/json",
-            body,
+            body: proxy.body,
         },
         Err(e) => Response {
             status: 502,
@@ -304,10 +275,10 @@ pub async fn post_actuation_confirm(_config: &Config, body: Option<&str>) -> Res
     };
 
     match proxy_core_json("POST", "/api/actuation/confirm", Some(body)).await {
-        Ok(payload) => Response {
-            status: 200,
+        Ok(proxy) => Response {
+            status: proxy.status,
             content_type: "application/json",
-            body: payload,
+            body: proxy.body,
         },
         Err(e) => Response {
             status: 502,
@@ -317,63 +288,22 @@ pub async fn post_actuation_confirm(_config: &Config, body: Option<&str>) -> Res
     }
 }
 
-pub async fn get_memories(config: &Config) -> Response {
-    let db_path = config.data_dir.join("memory.db");
-    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-        ensure_memory_dashboard_schema(&conn).map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, kind, content, created_ms, accessed_ms, recall_count, promoted,
-                        scope, sensitivity, spoken_policy, display_order
-                 FROM memories
-                 ORDER BY display_order ASC, accessed_ms DESC, id DESC
-                 LIMIT 500",
-            )
-            .map_err(|e| e.to_string())?;
-        let entries = stmt
-            .query_map([], |row| {
-                Ok(DashboardMemoryEntry {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    content: row.get(2)?,
-                    created_ms: row.get(3)?,
-                    accessed_ms: row.get(4)?,
-                    recall_count: row.get(5)?,
-                    promoted: row.get::<_, i64>(6)? != 0,
-                    scope: row.get(7)?,
-                    sensitivity: row.get(8)?,
-                    spoken_policy: row.get(9)?,
-                    display_order: row.get(10)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .filter_map(|row| row.ok())
-            .collect::<Vec<_>>();
-        serde_json::to_string(&entries).map_err(|e| e.to_string())
-    })
-    .await;
-
-    match result {
-        Ok(Ok(body)) => Response {
-            status: 200,
+pub async fn get_memories(_config: &Config) -> Response {
+    match proxy_core_json("GET", "/api/memories", None).await {
+        Ok(proxy) => Response {
+            status: proxy.status,
             content_type: "application/json",
-            body,
-        },
-        Ok(Err(e)) => Response {
-            status: 500,
-            content_type: "application/json",
-            body: serde_json::json!({ "error": e }).to_string(),
+            body: proxy.body,
         },
         Err(e) => Response {
-            status: 500,
+            status: 502,
             content_type: "application/json",
-            body: serde_json::json!({ "error": e.to_string() }).to_string(),
+            body: serde_json::json!({ "error": e }).to_string(),
         },
     }
 }
 
-pub async fn post_memory_update(config: &Config, body: Option<&str>) -> Response {
+pub async fn post_memory_update(_config: &Config, body: Option<&str>) -> Response {
     let Some(body) = body else {
         return Response {
             status: 400,
@@ -381,7 +311,7 @@ pub async fn post_memory_update(config: &Config, body: Option<&str>) -> Response
             body: r#"{"error":"missing body"}"#.into(),
         };
     };
-    let req: MemoryUpdateRequest = match serde_json::from_str(body) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(req) => req,
         Err(e) => {
             return Response {
@@ -391,50 +321,22 @@ pub async fn post_memory_update(config: &Config, body: Option<&str>) -> Response
             };
         }
     };
-
-    let db_path = config.data_dir.join("memory.db");
-    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-        ensure_memory_dashboard_schema(&conn).map_err(|e| e.to_string())?;
-        let updated = if let Some(kind) = req.kind {
-            conn.execute(
-                "UPDATE memories SET content = ?1, kind = ?2 WHERE id = ?3",
-                params![req.content.trim(), kind.trim(), req.id],
-            )
-            .map_err(|e| e.to_string())?
-        } else {
-            conn.execute(
-                "UPDATE memories SET content = ?1 WHERE id = ?2",
-                params![req.content.trim(), req.id],
-            )
-            .map_err(|e| e.to_string())?
-        };
-        serde_json::json!({ "ok": updated > 0 })
-            .to_string()
-            .pipe(Ok)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(body)) => Response {
-            status: 200,
+    let payload = serde_json::to_string(&parsed).unwrap_or_else(|_| body.to_string());
+    match proxy_core_json("POST", "/api/memories/update", Some(&payload)).await {
+        Ok(proxy) => Response {
+            status: proxy.status,
             content_type: "application/json",
-            body,
-        },
-        Ok(Err(e)) => Response {
-            status: 500,
-            content_type: "application/json",
-            body: serde_json::json!({ "error": e }).to_string(),
+            body: proxy.body,
         },
         Err(e) => Response {
-            status: 500,
+            status: 502,
             content_type: "application/json",
-            body: serde_json::json!({ "error": e.to_string() }).to_string(),
+            body: serde_json::json!({ "error": e }).to_string(),
         },
     }
 }
 
-pub async fn post_memory_delete(config: &Config, body: Option<&str>) -> Response {
+pub async fn post_memory_delete(_config: &Config, body: Option<&str>) -> Response {
     let Some(body) = body else {
         return Response {
             status: 400,
@@ -442,7 +344,7 @@ pub async fn post_memory_delete(config: &Config, body: Option<&str>) -> Response
             body: r#"{"error":"missing body"}"#.into(),
         };
     };
-    let req: MemoryDeleteRequest = match serde_json::from_str(body) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(req) => req,
         Err(e) => {
             return Response {
@@ -452,39 +354,22 @@ pub async fn post_memory_delete(config: &Config, body: Option<&str>) -> Response
             };
         }
     };
-
-    let db_path = config.data_dir.join("memory.db");
-    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-        let deleted = conn
-            .execute("DELETE FROM memories WHERE id = ?1", params![req.id])
-            .map_err(|e| e.to_string())?;
-        serde_json::json!({ "ok": deleted > 0 })
-            .to_string()
-            .pipe(Ok)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(body)) => Response {
-            status: 200,
+    let payload = serde_json::to_string(&parsed).unwrap_or_else(|_| body.to_string());
+    match proxy_core_json("POST", "/api/memories/delete", Some(&payload)).await {
+        Ok(proxy) => Response {
+            status: proxy.status,
             content_type: "application/json",
-            body,
-        },
-        Ok(Err(e)) => Response {
-            status: 500,
-            content_type: "application/json",
-            body: serde_json::json!({ "error": e }).to_string(),
+            body: proxy.body,
         },
         Err(e) => Response {
-            status: 500,
+            status: 502,
             content_type: "application/json",
-            body: serde_json::json!({ "error": e.to_string() }).to_string(),
+            body: serde_json::json!({ "error": e }).to_string(),
         },
     }
 }
 
-pub async fn post_memory_reorder(config: &Config, body: Option<&str>) -> Response {
+pub async fn post_memory_reorder(_config: &Config, body: Option<&str>) -> Response {
     let Some(body) = body else {
         return Response {
             status: 400,
@@ -492,7 +377,7 @@ pub async fn post_memory_reorder(config: &Config, body: Option<&str>) -> Respons
             body: r#"{"error":"missing body"}"#.into(),
         };
     };
-    let req: MemoryReorderRequest = match serde_json::from_str(body) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(req) => req,
         Err(e) => {
             return Response {
@@ -502,56 +387,26 @@ pub async fn post_memory_reorder(config: &Config, body: Option<&str>) -> Respons
             };
         }
     };
-
-    let db_path = config.data_dir.join("memory.db");
-    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let mut conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-        ensure_memory_dashboard_schema(&conn).map_err(|e| e.to_string())?;
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        for (idx, id) in req.ids.iter().enumerate() {
-            tx.execute(
-                "UPDATE memories SET display_order = ?1 WHERE id = ?2",
-                params![idx as i64, id],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        serde_json::json!({ "ok": true }).to_string().pipe(Ok)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(body)) => Response {
-            status: 200,
+    let payload = serde_json::to_string(&parsed).unwrap_or_else(|_| body.to_string());
+    match proxy_core_json("POST", "/api/memories/reorder", Some(&payload)).await {
+        Ok(proxy) => Response {
+            status: proxy.status,
             content_type: "application/json",
-            body,
-        },
-        Ok(Err(e)) => Response {
-            status: 500,
-            content_type: "application/json",
-            body: serde_json::json!({ "error": e }).to_string(),
+            body: proxy.body,
         },
         Err(e) => Response {
-            status: 500,
+            status: 502,
             content_type: "application/json",
-            body: serde_json::json!({ "error": e.to_string() }).to_string(),
+            body: serde_json::json!({ "error": e }).to_string(),
         },
     }
 }
 
-fn ensure_memory_dashboard_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    let _ = conn.execute(
-        "ALTER TABLE memories ADD COLUMN display_order INTEGER NOT NULL DEFAULT 2147483647",
-        [],
-    );
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_memories_display_order ON memories(display_order, accessed_ms DESC)",
-        [],
-    );
-    Ok(())
-}
-
-async fn proxy_core_json(method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
+async fn proxy_core_json(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<CoreProxyResponse, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -574,16 +429,17 @@ async fn proxy_core_json(method: &str, path: &str, body: Option<&str>) -> Result
         .await
         .map_err(|e| e.to_string())?;
     let raw = String::from_utf8_lossy(&raw);
-    let (_, body) = raw
+    let (head, body) = raw
         .split_once("\r\n\r\n")
         .ok_or_else(|| "invalid core response".to_string())?;
-    Ok(body.to_string())
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| "invalid core status".to_string())?;
+    Ok(CoreProxyResponse {
+        status,
+        body: body.to_string(),
+    })
 }
-
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
-    }
-}
-
-impl<T> Pipe for T {}
