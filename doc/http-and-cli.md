@@ -273,7 +273,21 @@ Implemented in `crates/genie-ctl/src/main.rs`.
 | `genie-ctl conversations` | List stored conversations |
 | `genie-ctl update-check` | OTA check |
 | `genie-ctl diag` | Diagnostics summary |
+| `genie-ctl support-bundle [PATH]` | Write a JSON diagnostics bundle |
 | `genie-ctl version` | Version output |
+
+### `genie-ctl support-bundle`
+
+Writes a local JSON support bundle. If no path is provided, the output goes to:
+
+```text
+/tmp/geniepod-support-<timestamp>.json
+```
+
+The bundle includes service reachability, governor status, core health, runtime
+contract, connectivity status, actuation state, selected system files, binary
+inventory, model inventory, recent runtime contracts, and recent actuation audit
+events. It records config presence but does not copy config contents.
 
 ### Skill Subcommands
 

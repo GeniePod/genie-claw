@@ -12,6 +12,8 @@
 //!   genie-ctl health          Check service health
 //!   genie-ctl connectivity    Inspect the ESP32-C6 connectivity sidecar
 //!   genie-ctl conversations   List all conversations
+//!   genie-ctl support-bundle [PATH]
+//!                              Write a local diagnostics support bundle
 //!   genie-ctl version         Show version info
 
 use anyhow::Result;
@@ -80,6 +82,13 @@ async fn main() -> Result<()> {
         "conversations" | "convos" => cmd_conversations().await?,
         "update-check" | "update" => cmd_update_check().await?,
         "diag" | "diagnostics" => cmd_diag().await?,
+        "support-bundle" | "bundle" => {
+            let output_path = args
+                .get(2)
+                .map(PathBuf::from)
+                .unwrap_or_else(default_support_bundle_path);
+            cmd_support_bundle(&output_path).await?;
+        }
         "version" | "--version" | "-v" => cmd_version(),
         "help" | "--help" | "-h" => print_usage(),
         other => {
@@ -114,6 +123,7 @@ COMMANDS:
     conversations       List all conversations
     update-check        Check for OTA updates
     diag                Full system diagnostics report
+    support-bundle [P]  Write JSON diagnostics bundle to path P
     version             Show version info
     help                Show this help",
         env!("CARGO_PKG_VERSION")
@@ -896,6 +906,213 @@ async fn cmd_diag() -> Result<()> {
     Ok(())
 }
 
+async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
+    let services = [
+        ("genie-core", CORE_URL, "/api/health"),
+        ("llama.cpp", "127.0.0.1:8080", "/health"),
+        ("genie-api", "127.0.0.1:3080", "/api/status"),
+        ("Home Assistant", "127.0.0.1:8123", "/api/"),
+    ];
+
+    let mut service_status = Vec::new();
+    for (name, addr, path) in &services {
+        service_status.push(serde_json::json!({
+            "service": name,
+            "addr": addr,
+            "path": path,
+            "reachable": http_get(addr, path).await.is_ok(),
+        }));
+    }
+
+    let bundle = serde_json::json!({
+        "schema_version": 1,
+        "created_ms": unix_time_ms(),
+        "tool": {
+            "name": "genie-ctl",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "services": service_status,
+        "governor": governor_cmd(r#"{"cmd":"status"}"#).await,
+        "core": {
+            "health": http_json_value(CORE_URL, "/api/health").await,
+            "runtime_contract": http_json_value(CORE_URL, "/api/runtime/contract").await,
+            "connectivity": http_json_value(CORE_URL, "/api/connectivity").await,
+        },
+        "actuation": {
+            "pending": http_json_value(CORE_URL, "/api/actuation/pending").await,
+            "actions": http_json_value(CORE_URL, "/api/actuation/actions").await,
+            "audit": http_json_value("127.0.0.1:3080", "/api/actuation/audit").await,
+        },
+        "system": {
+            "meminfo": read_file_lines("/proc/meminfo", 8),
+            "loadavg": read_file_string("/proc/loadavg"),
+            "uptime": read_file_string("/proc/uptime"),
+            "disk_opt_geniepod": disk_summary("/opt/geniepod").await,
+        },
+        "files": {
+            "config_presence": config_presence(),
+            "binaries": binary_inventory(),
+            "models": model_inventory(),
+            "runtime_contract_log_tail": tail_jsonl_file(Path::new("/opt/geniepod/data/runtime/contracts.jsonl"), 5),
+            "actuation_audit_log_tail": tail_jsonl_file(Path::new("/opt/geniepod/data/safety/actuation-audit.jsonl"), 20),
+        },
+    });
+
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(output_path, serde_json::to_string_pretty(&bundle)?)?;
+    println!("support bundle written: {}", output_path.display());
+    Ok(())
+}
+
+fn default_support_bundle_path() -> PathBuf {
+    PathBuf::from(format!("/tmp/geniepod-support-{}.json", unix_time_ms()))
+}
+
+fn unix_time_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+async fn http_json_value(addr: &str, path: &str) -> serde_json::Value {
+    match http_get(addr, path).await {
+        Ok(body) => serde_json::from_str(&body).unwrap_or_else(|e| {
+            serde_json::json!({
+                "error": format!("invalid JSON: {e}"),
+                "raw": body,
+            })
+        }),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    }
+}
+
+fn read_file_string(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+}
+
+fn read_file_lines(path: &str, limit: usize) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| {
+            text.lines()
+                .take(limit)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+async fn disk_summary(path: &str) -> serde_json::Value {
+    match tokio::process::Command::new("df")
+        .args(["-h", path])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            let output = String::from_utf8_lossy(&out.stdout);
+            let columns = output
+                .lines()
+                .nth(1)
+                .map(|line| line.split_whitespace().collect::<Vec<_>>())
+                .unwrap_or_default();
+            serde_json::json!({
+                "path": path,
+                "summary": columns,
+            })
+        }
+        Ok(out) => serde_json::json!({
+            "path": path,
+            "error": String::from_utf8_lossy(&out.stderr).trim(),
+        }),
+        Err(e) => serde_json::json!({
+            "path": path,
+            "error": e.to_string(),
+        }),
+    }
+}
+
+fn config_presence() -> Vec<serde_json::Value> {
+    [
+        "/etc/geniepod/geniepod.toml",
+        "/etc/geniepod/mosquitto.conf",
+        "/etc/systemd/system/genie-core.service",
+        "/etc/systemd/system/genie-llm.service",
+    ]
+    .into_iter()
+    .map(|path| {
+        serde_json::json!({
+            "path": path,
+            "present": Path::new(path).exists(),
+        })
+    })
+    .collect()
+}
+
+fn binary_inventory() -> Vec<serde_json::Value> {
+    [
+        "genie-core",
+        "genie-ctl",
+        "genie-governor",
+        "genie-health",
+        "genie-api",
+        "llama-server",
+    ]
+    .into_iter()
+    .map(|name| {
+        let path = PathBuf::from("/opt/geniepod/bin").join(name);
+        let size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
+        serde_json::json!({
+            "name": name,
+            "path": path,
+            "present": path.exists(),
+            "size_bytes": size_bytes,
+        })
+    })
+    .collect()
+}
+
+fn model_inventory() -> Vec<serde_json::Value> {
+    let model_dir = Path::new("/opt/geniepod/models");
+    let Ok(entries) = std::fs::read_dir(model_dir) else {
+        return Vec::new();
+    };
+
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            let size_bytes = entry.metadata().ok().map(|meta| meta.len());
+            serde_json::json!({
+                "name": entry.file_name().to_string_lossy(),
+                "path": path,
+                "size_bytes": size_bytes,
+            })
+        })
+        .collect()
+}
+
+fn tail_jsonl_file(path: &Path, limit: usize) -> Vec<serde_json::Value> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    let mut items = text
+        .lines()
+        .rev()
+        .take(limit)
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    items.reverse();
+    items
+}
+
 // ── HTTP helpers ───────────────────────────────────────────────
 
 async fn http_get(addr: &str, path: &str) -> Result<String> {
@@ -1098,6 +1315,32 @@ mod tests {
         let args = vec!["--limit".to_string(), "9".to_string(), "Matter".to_string()];
 
         assert!(parse_search_args(&args).is_err());
+    }
+
+    #[test]
+    fn support_bundle_default_path_is_json_under_tmp() {
+        let path = default_support_bundle_path();
+        assert!(path.starts_with("/tmp"));
+        assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("json"));
+    }
+
+    #[test]
+    fn tail_jsonl_file_returns_recent_valid_events_in_original_order() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-tail-jsonl-test-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            concat!("{\"n\":1}\n", "not json\n", "{\"n\":2}\n", "{\"n\":3}\n"),
+        )
+        .unwrap();
+
+        let items = tail_jsonl_file(&path, 2);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["n"], 2);
+        assert_eq!(items[1]["n"], 3);
     }
 
     #[test]

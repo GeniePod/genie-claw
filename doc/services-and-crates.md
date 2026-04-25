@@ -105,6 +105,7 @@ Primary responsibilities:
 
 - operator-facing CLI for chat, web search, connectivity, skills, and diagnostics
 - simple interface over `genie-core` HTTP and governor socket surfaces
+- write local JSON support bundles for field debugging and incident reports
 
 Key file:
 

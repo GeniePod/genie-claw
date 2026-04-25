@@ -92,6 +92,7 @@ curl -s http://127.0.0.1:3000/api/health
 curl -s http://127.0.0.1:3000/api/tools
 genie-ctl status
 genie-ctl diag
+genie-ctl support-bundle
 ```
 
 ## Runtime Data And State

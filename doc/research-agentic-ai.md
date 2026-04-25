@@ -85,10 +85,10 @@ Current implementation:
 - compact contract summary in `/api/health`
 - boot contract JSONL log at `<data_dir>/runtime/contracts.jsonl`
 - dashboard runtime contract card
+- `genie-ctl support-bundle` includes the active contract and recent contract log tail
 
 Next work:
 
-- include contract hash in support bundles and health reports
 - alert when a field unit contract hash changes outside an update window
 
 ### 4. Security And Permission Boundaries Are Core Features
