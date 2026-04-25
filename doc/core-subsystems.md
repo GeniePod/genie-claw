@@ -114,6 +114,7 @@ Responsibilities:
 - enforce a final runtime actuation safety gate before physical execution
 - keep a recent action ledger for explanations and bounded undo
 - expose action history to tools, HTTP, and the dashboard
+- hydrate recent action history from the append-only actuation audit log on startup
 - separate "home control available" from "home control required for core usefulness"
 
 This repo treats Home Assistant as optional integration, not as the product's

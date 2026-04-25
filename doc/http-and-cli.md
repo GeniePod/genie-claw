@@ -143,6 +143,10 @@ Current response shape:
 
 ### `GET /api/actuation/actions`
 
+Returns the short recent action ledger used for explanations and bounded undo.
+The ledger is restored from the append-only actuation audit log when
+`genie-core` starts.
+
 Current response shape:
 
 ```json

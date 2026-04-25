@@ -128,6 +128,8 @@ impl ToolDispatcher {
 
     pub fn with_actuation_audit_path(mut self, path: PathBuf) -> Self {
         self.audit_logger = AuditLogger::new(path);
+        let recent = self.audit_logger.read_recent_executed_actions(32);
+        self.action_ledger.hydrate(recent);
         self
     }
 
@@ -407,7 +409,7 @@ impl ToolDispatcher {
         .await
         {
             Ok(home::ControlOutcome::Executed(output, confidence)) => {
-                if let Some(original_id) = undo_of {
+                let recorded = if let Some(original_id) = undo_of {
                     self.action_ledger.record_undo(
                         original_id,
                         entity_name,
@@ -416,7 +418,7 @@ impl ToolDispatcher {
                         exec_ctx.request_origin,
                         &output,
                         confidence,
-                    );
+                    )
                 } else {
                     self.action_ledger.record(
                         entity_name,
@@ -425,8 +427,8 @@ impl ToolDispatcher {
                         exec_ctx.request_origin,
                         &output,
                         confidence,
-                    );
-                }
+                    )
+                };
                 self.audit_logger.append(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::Executed,
@@ -437,6 +439,8 @@ impl ToolDispatcher {
                     reason: "home action executed".into(),
                     token: None,
                     confidence,
+                    action_id: Some(recorded.id),
+                    undo_of: recorded.undo_of,
                 });
                 Ok(output)
             }
@@ -458,6 +462,8 @@ impl ToolDispatcher {
                     reason: reason.clone(),
                     token: Some(pending.token.clone()),
                     confidence: None,
+                    action_id: None,
+                    undo_of: None,
                 });
                 Ok(format!(
                     "Confirmation required before I can do that: {}. Pending token: {}. Confirm from the local dashboard or POST /api/actuation/confirm.",
@@ -483,6 +489,8 @@ impl ToolDispatcher {
                     reason: error.clone(),
                     token: None,
                     confidence: None,
+                    action_id: None,
+                    undo_of: None,
                 });
                 Err(anyhow::anyhow!(error))
             }
@@ -1403,6 +1411,48 @@ mod tests {
             .await;
         assert!(!second_undo.success);
         assert!(second_undo.output.contains("No recent reversible"));
+    }
+
+    #[tokio::test]
+    async fn action_history_hydrates_from_audit_log() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-dispatch-audit-test-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
+            executed: Arc::new(std::sync::Mutex::new(Vec::new())),
+        })))
+        .with_actuation_audit_path(path.clone());
+        assert!(
+            dispatcher
+                .execute(&ToolCall {
+                    name: "home_control".into(),
+                    arguments: serde_json::json!({
+                        "entity": "kitchen light",
+                        "action": "turn_on"
+                    }),
+                })
+                .await
+                .success
+        );
+
+        let restarted = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
+            executed: Arc::new(std::sync::Mutex::new(Vec::new())),
+        })))
+        .with_actuation_audit_path(path.clone());
+        let history = restarted
+            .execute(&ToolCall {
+                name: "action_history".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await;
+
+        assert!(history.success);
+        assert!(history.output.contains("turn_on kitchen light"));
+        assert!(history.output.contains("undo: turn_off"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
