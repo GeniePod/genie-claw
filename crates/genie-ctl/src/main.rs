@@ -17,7 +17,10 @@
 //!   genie-ctl version         Show version info
 
 use anyhow::Result;
-use genie_core::skills::{SkillLoader, skills_dir as runtime_skills_dir};
+use genie_core::skills::{
+    SkillLoader, SkillManifestAudit, find_manifest_sidecar, manifest_sidecar_candidates,
+    skills_dir as runtime_skills_dir,
+};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -32,6 +35,7 @@ struct InstalledSkillInfo {
     version: String,
     description: String,
     path: PathBuf,
+    manifest: SkillManifestAudit,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -200,6 +204,30 @@ fn cmd_skill_list() -> Result<()> {
             .unwrap_or_else(|| skill.path.display().to_string());
         println!("  {} v{} ({})", skill.name, skill.version, file_name);
         println!("    {}", skill.description);
+        println!("    manifest: {}", skill.manifest.status);
+        if !skill.manifest.permissions.is_empty() {
+            println!("    permissions: {}", skill.manifest.permissions.join(", "));
+        }
+        if !skill.manifest.capabilities.is_empty() {
+            println!(
+                "    capabilities: {}",
+                skill.manifest.capabilities.join(", ")
+            );
+        }
+        if !skill.manifest.reviewed_by.is_empty() || skill.manifest.signed {
+            let reviewer = if skill.manifest.reviewed_by.is_empty() {
+                "unreviewed"
+            } else {
+                &skill.manifest.reviewed_by
+            };
+            println!(
+                "    reviewed: {}; signed: {}",
+                reviewer, skill.manifest.signed
+            );
+        }
+        if !skill.manifest.error.is_empty() {
+            println!("    manifest note: {}", skill.manifest.error);
+        }
     }
 
     Ok(())
@@ -245,6 +273,7 @@ fn load_installed_skills(skills_dir: &Path) -> Result<Vec<InstalledSkillInfo>> {
             version: skill.version.clone(),
             description: skill.description.clone(),
             path: skill.path.clone(),
+            manifest: skill.manifest.clone(),
         })
         .collect::<Vec<_>>();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -273,6 +302,7 @@ fn validate_skill_file(path: &Path) -> Result<InstalledSkillInfo> {
         version: skill.version.clone(),
         description: skill.description.clone(),
         path: skill.path.clone(),
+        manifest: skill.manifest.clone(),
     })
 }
 
@@ -304,20 +334,37 @@ fn install_skill(
     skills_dir: &Path,
     dest_name: Option<&str>,
 ) -> Result<(InstalledSkillInfo, u64)> {
-    let skill = validate_skill_file(source)?;
+    let _source_skill = validate_skill_file(source)?;
     std::fs::create_dir_all(skills_dir)?;
 
     let file_name = normalize_skill_filename(source, dest_name)?;
     let dest_path = skills_dir.join(file_name);
     let bytes_copied = std::fs::copy(source, &dest_path)?;
+    let _ = copy_skill_manifest_sidecar(source, &dest_path)?;
 
-    Ok((
-        InstalledSkillInfo {
-            path: dest_path,
-            ..skill
-        },
-        bytes_copied,
-    ))
+    let installed = validate_skill_file(&dest_path)?;
+
+    Ok((installed, bytes_copied))
+}
+
+fn copy_skill_manifest_sidecar(source: &Path, dest_path: &Path) -> Result<Option<PathBuf>> {
+    let Some(source_manifest) = find_manifest_sidecar(source) else {
+        return Ok(None);
+    };
+
+    let dest_manifest = dest_path.with_extension("skill.json");
+    std::fs::copy(&source_manifest, &dest_manifest)?;
+    Ok(Some(dest_manifest))
+}
+
+fn remove_skill_and_sidecars(skill_path: &Path) -> Result<()> {
+    std::fs::remove_file(skill_path)?;
+    for sidecar in manifest_sidecar_candidates(skill_path) {
+        if sidecar.exists() {
+            std::fs::remove_file(sidecar)?;
+        }
+    }
+    Ok(())
 }
 
 fn remove_skill(target: &str, skills_dir: &Path) -> Result<PathBuf> {
@@ -329,7 +376,7 @@ fn remove_skill(target: &str, skills_dir: &Path) -> Result<PathBuf> {
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy() == target)
     }) {
-        std::fs::remove_file(&skill.path)?;
+        remove_skill_and_sidecars(&skill.path)?;
         return Ok(skill.path.clone());
     }
 
@@ -344,7 +391,7 @@ fn remove_skill(target: &str, skills_dir: &Path) -> Result<PathBuf> {
 
     for candidate in direct_candidates {
         if candidate.exists() {
-            std::fs::remove_file(&candidate)?;
+            remove_skill_and_sidecars(&candidate)?;
             return Ok(candidate);
         }
     }
@@ -1364,6 +1411,46 @@ mod tests {
         assert_eq!(installed_skills.len(), 1);
         assert_eq!(installed_skills[0].name, "hello_world");
         assert!(installed_skills[0].description.contains("greeting"));
+        assert_eq!(installed_skills[0].manifest.status, "missing");
+    }
+
+    #[test]
+    fn install_copies_and_remove_deletes_skill_manifest() {
+        let source_dir = temp_skills_dir();
+        let skills_dir = temp_skills_dir();
+        let sample_skill = sample_skill_path();
+        let source_path = source_dir.join(sample_skill.file_name().unwrap());
+        std::fs::copy(sample_skill, &source_path).unwrap();
+        std::fs::write(
+            source_path.with_extension("skill.json"),
+            r#"{
+                "name": "hello_world",
+                "version": "0.1.0",
+                "description": "Sample hello skill",
+                "permissions": ["speech.output"],
+                "capabilities": ["demo.greeting"],
+                "reviewed_by": "test",
+                "signature": "test-signature"
+            }"#,
+        )
+        .unwrap();
+
+        let (installed, _) = install_skill(&source_path, &skills_dir, Some("hello")).unwrap();
+        assert_eq!(installed.manifest.status, "ok");
+
+        let dest_manifest = skills_dir.join("hello.skill.json");
+        assert!(dest_manifest.exists());
+
+        let installed_skills = load_installed_skills(&skills_dir).unwrap();
+        assert_eq!(
+            installed_skills[0].manifest.permissions,
+            vec!["speech.output"]
+        );
+        assert!(installed_skills[0].manifest.signed);
+
+        let removed = remove_skill("hello_world", &skills_dir).unwrap();
+        assert_eq!(removed.file_name().unwrap().to_string_lossy(), "hello.so");
+        assert!(!dest_manifest.exists());
     }
 
     #[test]

@@ -126,6 +126,32 @@ sudo cp target/release/libgeniepod_skill_myskill.so /opt/geniepod/skills/myskill
 sudo systemctl restart genie-core
 ```
 
+### Optional: Add a sidecar manifest
+
+For auditability, place a manifest next to the shared library. For `myskill.so`,
+the preferred filename is `myskill.skill.json`.
+
+```json
+{
+  "name": "my_tool",
+  "version": "0.1.0",
+  "description": "Describe what the skill does for operators.",
+  "permissions": ["network.http"],
+  "capabilities": ["example.lookup"],
+  "reviewed_by": "local-operator",
+  "signature": ""
+}
+```
+
+Current runtime behavior:
+
+- Missing manifests do not block loading.
+- Invalid or mismatched manifests are reported in diagnostics.
+- `genie-ctl skill install` copies a detected sidecar manifest.
+- `genie-ctl skill list` shows manifest status, permissions, capabilities, review, and signing presence.
+
+Future signed-skill policy can turn this metadata into an enforcement boundary.
+
 ### Step 6: Test
 
 ```

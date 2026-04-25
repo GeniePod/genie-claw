@@ -117,11 +117,27 @@ impl ToolDispatcher {
     }
 
     pub fn runtime_policy_status(&self) -> serde_json::Value {
-        let loaded_skills = self
+        let (loaded_skills, skill_manifests) = self
             .skills
             .as_ref()
-            .and_then(|skills| skills.lock().ok().map(|loader| loader.loaded().len()))
-            .unwrap_or(0);
+            .and_then(|skills| {
+                skills.lock().ok().map(|loader| {
+                    let loaded = loader
+                        .loaded()
+                        .iter()
+                        .map(|skill| {
+                            serde_json::json!({
+                                "name": &skill.name,
+                                "version": &skill.version,
+                                "path": skill.path.display().to_string(),
+                                "manifest": &skill.manifest,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    (loader.loaded().len(), loaded)
+                })
+            })
+            .unwrap_or_else(|| (0, Vec::new()));
 
         serde_json::json!({
             "home_automation": {
@@ -159,6 +175,7 @@ impl ToolDispatcher {
             "skills": {
                 "loader_attached": self.skills.is_some(),
                 "loaded_count": loaded_skills,
+                "loaded": skill_manifests,
             },
         })
     }

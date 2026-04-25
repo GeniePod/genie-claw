@@ -302,6 +302,11 @@ events. It records config presence but does not copy config contents.
 | `genie-ctl skill remove <SKILL_NAME|FILE_NAME>` | Remove a skill |
 | `genie-ctl skill dir` | Print runtime skill directory |
 
+`genie-ctl skill list` also reports optional sidecar manifest status. A skill
+`hello.so` may include `hello.skill.json`; the CLI shows manifest status,
+requested permissions, capabilities, review identity, and whether signature
+material is present. This is audit visibility only in the current release.
+
 ## Current Built-In Tool Families
 
 The exact tool list depends on config and loaded skills, but the built-in

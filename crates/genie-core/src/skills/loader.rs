@@ -9,6 +9,124 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use genie_skill_sdk::{ABI_VERSION, SkillVTable};
 use libloading::{Library, Symbol};
+use serde::{Deserialize, Serialize};
+
+/// Optional sidecar metadata for a native skill.
+///
+/// A skill named `hello.so` can declare metadata in `hello.skill.json`.
+/// The loader treats this as audit metadata today, not as a signature check.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SkillManifest {
+    /// Expected tool name exposed by the vtable.
+    pub name: String,
+    /// Expected semantic version exposed by the vtable.
+    pub version: String,
+    /// Human-readable manifest description.
+    pub description: String,
+    /// Permission labels requested by the skill, e.g. `network.http`.
+    pub permissions: Vec<String>,
+    /// Capability labels exposed for operators, e.g. `music.playback`.
+    pub capabilities: Vec<String>,
+    /// Reviewer identity or process name.
+    pub reviewed_by: String,
+    /// Signature material or signature reference. Presence only is reported.
+    pub signature: String,
+}
+
+/// Audit view of the manifest state for a loaded skill.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SkillManifestAudit {
+    pub status: String,
+    pub path: Option<PathBuf>,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub permissions: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub reviewed_by: String,
+    pub signed: bool,
+    pub error: String,
+}
+
+impl SkillManifestAudit {
+    fn missing() -> Self {
+        Self {
+            status: "missing".into(),
+            path: None,
+            name: String::new(),
+            version: String::new(),
+            description: String::new(),
+            permissions: Vec::new(),
+            capabilities: Vec::new(),
+            reviewed_by: String::new(),
+            signed: false,
+            error: "no sidecar manifest found".into(),
+        }
+    }
+
+    fn invalid(path: PathBuf, error: String) -> Self {
+        Self {
+            status: "invalid".into(),
+            path: Some(path),
+            name: String::new(),
+            version: String::new(),
+            description: String::new(),
+            permissions: Vec::new(),
+            capabilities: Vec::new(),
+            reviewed_by: String::new(),
+            signed: false,
+            error,
+        }
+    }
+
+    fn from_manifest(
+        path: PathBuf,
+        manifest: SkillManifest,
+        loaded_name: &str,
+        loaded_version: &str,
+    ) -> Self {
+        let mut problems = Vec::new();
+
+        if manifest.name.trim().is_empty() {
+            problems.push("manifest name is empty".to_string());
+        } else if manifest.name != loaded_name {
+            problems.push(format!(
+                "manifest name '{}' does not match loaded skill '{}'",
+                manifest.name, loaded_name
+            ));
+        }
+
+        if manifest.version.trim().is_empty() {
+            problems.push("manifest version is empty".to_string());
+        } else if manifest.version != loaded_version {
+            problems.push(format!(
+                "manifest version '{}' does not match loaded skill '{}'",
+                manifest.version, loaded_version
+            ));
+        }
+
+        let status = if problems.is_empty() {
+            "ok"
+        } else {
+            "mismatch"
+        };
+        let signed = !manifest.signature.trim().is_empty();
+
+        Self {
+            status: status.into(),
+            path: Some(path),
+            name: manifest.name,
+            version: manifest.version,
+            description: manifest.description,
+            permissions: manifest.permissions,
+            capabilities: manifest.capabilities,
+            reviewed_by: manifest.reviewed_by,
+            signed,
+            error: problems.join("; "),
+        }
+    }
+}
 
 /// A loaded skill module — holds the .so library handle and vtable reference.
 pub struct LoadedSkill {
@@ -22,6 +140,8 @@ pub struct LoadedSkill {
     pub parameters_json: String,
     /// Path to the .so file.
     pub path: PathBuf,
+    /// Optional sidecar manifest audit metadata.
+    pub manifest: SkillManifestAudit,
     /// Number of faults (panics/errors). Auto-unloaded after 3.
     pub fault_count: u32,
     /// The vtable pointer (valid for lifetime of `_lib`).
@@ -102,6 +222,43 @@ unsafe fn read_c_str(ptr: *const c_char) -> String {
         String::new()
     } else {
         unsafe { CStr::from_ptr(ptr) }.to_string_lossy().to_string()
+    }
+}
+
+/// Return supported sidecar manifest candidates for a skill shared library.
+pub fn manifest_sidecar_candidates(skill_path: &Path) -> Vec<PathBuf> {
+    vec![
+        skill_path.with_extension("skill.json"),
+        skill_path.with_extension("manifest.json"),
+        skill_path.with_extension("json"),
+    ]
+}
+
+/// Find the first sidecar manifest that exists for a skill shared library.
+pub fn find_manifest_sidecar(skill_path: &Path) -> Option<PathBuf> {
+    manifest_sidecar_candidates(skill_path)
+        .into_iter()
+        .find(|path| path.exists())
+}
+
+fn read_manifest_audit(
+    skill_path: &Path,
+    loaded_name: &str,
+    loaded_version: &str,
+) -> SkillManifestAudit {
+    let Some(path) = find_manifest_sidecar(skill_path) else {
+        return SkillManifestAudit::missing();
+    };
+
+    match std::fs::read_to_string(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|content| {
+            serde_json::from_str::<SkillManifest>(&content).map_err(|e| e.to_string())
+        }) {
+        Ok(manifest) => {
+            SkillManifestAudit::from_manifest(path, manifest, loaded_name, loaded_version)
+        }
+        Err(error) => SkillManifestAudit::invalid(path, error),
     }
 }
 
@@ -211,12 +368,23 @@ impl SkillLoader {
             anyhow::bail!("skill '{}' already loaded", name);
         }
 
+        let manifest = read_manifest_audit(path, &name, &version);
+        if manifest.status != "ok" {
+            tracing::warn!(
+                skill = %name,
+                status = %manifest.status,
+                error = %manifest.error,
+                "skill manifest is not verified"
+            );
+        }
+
         let skill = LoadedSkill {
             name: name.clone(),
             description,
             version,
             parameters_json,
             path: path.to_path_buf(),
+            manifest,
             fault_count: 0,
             vtable: vtable_ptr,
             _lib: lib,
@@ -365,10 +533,50 @@ mod tests {
         assert_eq!(loader.count(), 1);
 
         let skill = loader.get_mut("hello_world").unwrap();
+        assert_eq!(skill.manifest.status, "missing");
         let (success, output) = skill.execute_parsed(r#"{"name":"Jared"}"#);
         assert!(success);
         assert!(output.contains("Jared"));
         assert!(output.contains("loadable skill module"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loader_reads_skill_manifest_sidecar() {
+        let skill_path = sample_skill_path();
+        let dir = std::env::temp_dir().join(format!(
+            "geniepod-skills-test-manifest-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let installed_path = dir.join("hello.so");
+        std::fs::copy(skill_path, &installed_path).unwrap();
+        std::fs::write(
+            dir.join("hello.skill.json"),
+            r#"{
+                "name": "hello_world",
+                "version": "0.1.0",
+                "description": "Sample hello skill",
+                "permissions": ["speech.output"],
+                "capabilities": ["demo.greeting"],
+                "reviewed_by": "test",
+                "signature": "test-signature"
+            }"#,
+        )
+        .unwrap();
+
+        let mut loader = SkillLoader::new(&dir);
+        let name = loader.load_skill(&installed_path).unwrap();
+        assert_eq!(name, "hello_world");
+
+        let skill = loader.loaded().first().unwrap();
+        assert_eq!(skill.manifest.status, "ok");
+        assert_eq!(skill.manifest.permissions, vec!["speech.output"]);
+        assert_eq!(skill.manifest.capabilities, vec!["demo.greeting"]);
+        assert!(skill.manifest.signed);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

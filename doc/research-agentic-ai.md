@@ -53,6 +53,7 @@ Current implementation:
 - model-visible tool definitions
 - deterministic quick router for common daily requests
 - native skill loader baseline
+- sidecar skill manifest audit metadata in runtime policy status and `genie-ctl skill list`
 - actuation safety gate, confirmations, audit log, and bounded undo
 
 Next work:

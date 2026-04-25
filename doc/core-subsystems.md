@@ -267,8 +267,15 @@ Responsibilities:
 
 - discover `.so` files from the runtime skills directory
 - validate and load skill entrypoints
+- discover optional sidecar manifests such as `hello.skill.json`
+- expose manifest status, permissions, capabilities, review, and signing presence for audit
 - expose loaded skills as model-callable tools
 - execute native code through a narrow ABI
+
+Manifest status is currently visibility-only. Missing, invalid, or mismatched
+manifests are reported through runtime policy status and `genie-ctl skill list`,
+but they do not yet block loading. Hard enforcement belongs in the signed skill
+platform work once permissions and signatures are fully specified.
 
 For author guidance, see [../skills/SKILL-DEVELOPER-GUIDE.md](../skills/SKILL-DEVELOPER-GUIDE.md).
 
