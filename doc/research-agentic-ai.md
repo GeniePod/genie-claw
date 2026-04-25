@@ -33,8 +33,7 @@ Current implementation:
 Next work:
 
 - explicit channel/session registry
-- per-channel permissions and rate limits
-- more visible routing diagnostics
+- dashboard-visible channel/session routing diagnostics
 
 ### 2. Tools, Skills, Hooks, And Protocols Are The Product Surface
 
@@ -60,8 +59,8 @@ Current implementation:
 
 Next work:
 
-- signed skill manifests
-- per-skill permissions
+- cryptographically verified signed skill manifests
+- true per-skill runtime permission enforcement and sandboxing
 - production default decision for when `[core.skill_policy].require_manifest` should become true
 - hook points for safe pre/post action checks
 - compatibility tests for the tool surface
@@ -121,9 +120,7 @@ Current implementation:
 
 Next work:
 
-- per-tool capability policy
-- per-channel permission policy
-- stronger skill sandboxing
+- stronger native skill sandboxing
 - RAG/document-ingest prompt-injection screening before vector memory rollout
 
 ### 5. Multi-Agent Patterns Are Useful Only Behind Strong Isolation
