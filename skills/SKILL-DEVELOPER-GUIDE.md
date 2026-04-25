@@ -1,6 +1,6 @@
 # GeniePod Skill Developer Guide
 
-**Version:** 1.0 | **SDK:** genie-skill-sdk 1.0.0-alpha.3
+**Version:** 1.0 | **SDK:** genie-skill-sdk 1.0.0-alpha.4
 **Target:** GeniePod Home / aarch64 Jetson-class hardware | **Language:** Rust
 
 ---

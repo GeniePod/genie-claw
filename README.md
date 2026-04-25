@@ -2,6 +2,8 @@
 
 GenieClaw is the agent layer of the **Genie** home AI ecosystem.
 
+Current alpha: **1.0.0-alpha.4**.
+
 This repository is built first for Jetson, especially Jetson Orin Nano 8 GB (67 TOPS).
 Its job is to turn a Jetson-based box into a private, always-on local AI for
 the home and other shared spaces: local voice, local memory, local control,
@@ -37,7 +39,8 @@ If you want a short definition:
 
 ## Ecosystem Position
 
-The intended Genie stack has five layers:
+The intended Genie stack has five product layers. Layer three has two runtime
+components:
 
 - custom Jetson hardware
 - `genie-os`: custom L4T image, drivers, OTA, and service supervision
@@ -68,10 +71,22 @@ Home control now has an explicit safety model:
 
 - first-pass local action policy
 - final runtime actuation gate before Home Assistant service execution
+- configurable request-origin allowlist for physical actuation
+- configurable per-origin physical-action rate limits
 - pending confirmation tokens for high-risk actions
 - recent action ledger for "what did you do?" and bounded undo
 - dashboard/API visibility for pending, executed, and audited home actions
 - append-only actuation audit logging under the data directory
+
+Alpha 4 also adds the runtime control-plane surfaces needed for safer local
+agent operation:
+
+- runtime contract fingerprints for prompt, tools, policy, and hydrated state
+- optional contract drift detection after a known-good boot
+- privacy-preserving tool audit logs
+- origin-aware tool allow/deny policy
+- native skill manifest audit metadata and configurable skill-load policy
+- local support bundles for field diagnostics
 
 ## What It Is Not
 
@@ -208,6 +223,7 @@ The direct endpoint returns both a rendered `response` string and structured
 ## Documentation
 
 - [doc/README.md](doc/README.md) for the current documentation entry point and repo-wide map
+- [CHANGELOG.md](CHANGELOG.md) for alpha release notes
 - [GETTING_STARTED.md](GETTING_STARTED.md) for local dev, Docker, and Jetson bring-up
 - [ARCHITECTURE.md](ARCHITECTURE.md) for the Genie ecosystem and repo-boundary architecture
 - [CODEBASE.md](CODEBASE.md) for the file-by-file code map

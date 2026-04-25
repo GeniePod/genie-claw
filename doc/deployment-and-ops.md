@@ -95,6 +95,26 @@ genie-ctl diag
 genie-ctl support-bundle
 ```
 
+## Alpha 4 Release Checklist
+
+For a `1.0.0-alpha.4` deployment, validate the control-plane hardening surfaces
+after binaries and config are installed:
+
+```bash
+genie-ctl version
+curl -s http://127.0.0.1:3000/api/runtime/contract
+curl -s http://127.0.0.1:3000/api/health
+genie-ctl skill list
+genie-ctl support-bundle
+```
+
+Operator decisions before enabling stricter policy:
+
+- Pin `[core].expected_runtime_contract_hash` only after a known-good boot.
+- Enable `[core.skill_policy].require_manifest` only after installed skills have valid sidecar manifests.
+- Use `[core.tool_policy]` allowlists/denylists per channel when a surface should be less capable than local dashboard/API.
+- Keep `unknown` out of physical actuation origins unless there is a controlled reason to allow it.
+
 ## Runtime Data And State
 
 Default production data location:

@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "genie-api"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 dependencies = [
  "anyhow",
  "genie-common",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "genie-common"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 dependencies = [
  "anyhow",
  "serde",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "genie-core"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "genie-ctl"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 dependencies = [
  "anyhow",
  "genie-common",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "genie-governor"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 dependencies = [
  "anyhow",
  "genie-common",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "genie-health"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 dependencies = [
  "anyhow",
  "genie-common",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "genie-skill-sdk"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 dependencies = [
  "serde_json",
 ]
