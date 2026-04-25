@@ -84,12 +84,18 @@ Behavior notes:
 | `min_sensitive_confidence` | Minimum target-match confidence for medium/high-risk actions |
 | `deny_multi_target_sensitive` | Block medium/high-risk actions that fan out to multiple entities |
 | `require_available_state` | Require a successful current-state check before executing non-scene/script actions |
+| `allowed_origins` | Request origins allowed to execute physical actuation |
+| `max_actions_per_minute` | Default per-origin actuation rate limit |
+| `max_actions_per_minute_by_origin` | Optional per-origin rate-limit overrides |
 
 Behavior notes:
 
 - This gate runs after target resolution and before the actual Home Assistant service call.
 - It is separate from prompt rules and separate from the first local policy check.
 - Default behavior is fail-closed for ambiguous or degraded physical actions.
+- `unknown` is not in the default `allowed_origins`; direct tool execution without a channel context cannot actuate the home.
+- Valid origin keys are `voice`, `dashboard`, `api`, `telegram`, `repl`, and `confirmation`.
+- Rate limits apply before physical execution and are tracked per origin over a 60-second window.
 
 ### Runtime Contract Pinning
 

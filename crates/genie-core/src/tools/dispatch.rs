@@ -1,8 +1,9 @@
 use anyhow::Result;
 use genie_common::config::{ActuationSafetyConfig, WebSearchConfig, WebSearchProvider};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::actuation::{
     ActionLedger, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager, PendingConfirmation,
@@ -12,6 +13,8 @@ use super::home;
 use super::timer;
 use crate::ha::HomeAutomationProvider;
 use crate::skills::SkillLoader;
+
+const ACTUATION_RATE_WINDOW_MS: u64 = 60_000;
 
 /// Tool definition for LLM function calling.
 ///
@@ -58,8 +61,14 @@ pub struct ToolDispatcher {
     actuation_safety: ActuationSafetyConfig,
     confirmations: Arc<ConfirmationManager>,
     action_ledger: Arc<ActionLedger>,
+    actuation_rate_limiter: Arc<ActuationRateLimiter>,
     audit_logger: AuditLogger,
     pub(crate) timers: timer::TimerManager,
+}
+
+#[derive(Debug, Default)]
+struct ActuationRateLimiter {
+    attempts: Mutex<HashMap<RequestOrigin, VecDeque<u64>>>,
 }
 
 impl ToolDispatcher {
@@ -72,6 +81,7 @@ impl ToolDispatcher {
             actuation_safety: ActuationSafetyConfig::default(),
             confirmations: Arc::new(ConfirmationManager::default()),
             action_ledger: Arc::new(ActionLedger::default()),
+            actuation_rate_limiter: Arc::new(ActuationRateLimiter::default()),
             audit_logger: AuditLogger::disabled(),
             timers: timer::TimerManager::new(),
         }
@@ -123,6 +133,9 @@ impl ToolDispatcher {
                 "min_sensitive_confidence": self.actuation_safety.min_sensitive_confidence,
                 "deny_multi_target_sensitive": self.actuation_safety.deny_multi_target_sensitive,
                 "require_available_state": self.actuation_safety.require_available_state,
+                "allowed_origins": &self.actuation_safety.allowed_origins,
+                "max_actions_per_minute": self.actuation_safety.max_actions_per_minute,
+                "max_actions_per_minute_by_origin": &self.actuation_safety.max_actions_per_minute_by_origin,
                 "audit_enabled": self.actuation_audit_path().is_some(),
             },
             "web_search": {
@@ -441,6 +454,46 @@ impl ToolDispatcher {
             .and_then(|v| v.as_str())
             .unwrap_or("toggle");
         let value = args.get("value").and_then(|v| v.as_f64());
+        if !actuation_origin_allowed(&self.actuation_safety, exec_ctx.request_origin) {
+            let reason = format!(
+                "actuation from '{}' is not allowed by channel policy",
+                exec_ctx.request_origin.as_policy_key()
+            );
+            self.audit_logger.append(AuditEvent {
+                ts_ms: now_ms(),
+                status: AuditStatus::BlockedPolicy,
+                origin: exec_ctx.request_origin,
+                entity: entity_name.to_string(),
+                action: action.to_string(),
+                value,
+                reason: reason.clone(),
+                token: None,
+                confidence: None,
+                action_id: None,
+                undo_of: None,
+            });
+            anyhow::bail!("Home action blocked by channel policy: {}", reason);
+        }
+        if let Err(err) = self
+            .actuation_rate_limiter
+            .check_and_record(&self.actuation_safety, exec_ctx.request_origin)
+        {
+            let reason = err.to_string();
+            self.audit_logger.append(AuditEvent {
+                ts_ms: now_ms(),
+                status: AuditStatus::BlockedRuntime,
+                origin: exec_ctx.request_origin,
+                entity: entity_name.to_string(),
+                action: action.to_string(),
+                value,
+                reason: reason.clone(),
+                token: None,
+                confidence: None,
+                action_id: None,
+                undo_of: None,
+            });
+            anyhow::bail!("Home action blocked by rate limit: {}", reason);
+        }
         match home::control(
             ha.as_ref(),
             entity_name,
@@ -902,6 +955,55 @@ impl ToolDispatcher {
             }
         }
     }
+}
+
+fn actuation_origin_allowed(config: &ActuationSafetyConfig, origin: RequestOrigin) -> bool {
+    config
+        .allowed_origins
+        .iter()
+        .any(|allowed| allowed.trim().eq_ignore_ascii_case(origin.as_policy_key()))
+}
+
+impl ActuationRateLimiter {
+    fn check_and_record(
+        &self,
+        config: &ActuationSafetyConfig,
+        origin: RequestOrigin,
+    ) -> Result<()> {
+        let limit = actuation_rate_limit(config, origin);
+        if limit == 0 {
+            anyhow::bail!(
+                "actuation from '{}' is rate-limited to zero actions per minute",
+                origin.as_policy_key()
+            );
+        }
+
+        let now = now_ms();
+        let cutoff = now.saturating_sub(ACTUATION_RATE_WINDOW_MS);
+        let mut attempts = self.attempts.lock().expect("actuation rate limiter lock");
+        let bucket = attempts.entry(origin).or_default();
+        while bucket.front().copied().is_some_and(|ts| ts < cutoff) {
+            bucket.pop_front();
+        }
+        if bucket.len() >= limit {
+            anyhow::bail!(
+                "actuation from '{}' exceeded {} action(s) per minute",
+                origin.as_policy_key(),
+                limit
+            );
+        }
+        bucket.push_back(now);
+        Ok(())
+    }
+}
+
+fn actuation_rate_limit(config: &ActuationSafetyConfig, origin: RequestOrigin) -> usize {
+    config
+        .max_actions_per_minute_by_origin
+        .iter()
+        .find(|(key, _)| key.trim().eq_ignore_ascii_case(origin.as_policy_key()))
+        .map(|(_, limit)| *limit)
+        .unwrap_or(config.max_actions_per_minute)
 }
 
 fn memory_query(args: &serde_json::Value) -> &str {
@@ -1418,6 +1520,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn home_control_blocks_unknown_origin_by_default() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
+            executed: executed.clone(),
+        })));
+
+        let result = dispatcher
+            .execute(&ToolCall {
+                name: "home_control".into(),
+                arguments: serde_json::json!({
+                    "entity": "kitchen light",
+                    "action": "turn_on"
+                }),
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("channel policy"));
+        assert!(executed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn home_control_respects_configured_allowed_origins() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let safety = ActuationSafetyConfig {
+            allowed_origins: vec!["dashboard".into(), "confirmation".into()],
+            ..ActuationSafetyConfig::default()
+        };
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
+            executed: executed.clone(),
+        })))
+        .with_actuation_safety_config(safety);
+
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: serde_json::json!({
+                        "entity": "kitchen light",
+                        "action": "turn_on"
+                    }),
+                },
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Telegram,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("telegram"));
+        assert!(executed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn home_control_rate_limits_by_origin() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut safety = ActuationSafetyConfig::default();
+        safety
+            .max_actions_per_minute_by_origin
+            .insert("dashboard".into(), 1);
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
+            executed: executed.clone(),
+        })))
+        .with_actuation_safety_config(safety);
+        let call = ToolCall {
+            name: "home_control".into(),
+            arguments: serde_json::json!({
+                "entity": "kitchen light",
+                "action": "turn_on"
+            }),
+        };
+        let ctx = ToolExecutionContext {
+            request_origin: RequestOrigin::Dashboard,
+            ..ToolExecutionContext::default()
+        };
+
+        let first = dispatcher.execute_with_context(&call, ctx).await;
+        let second = dispatcher.execute_with_context(&call, ctx).await;
+
+        assert!(first.success);
+        assert!(!second.success);
+        assert!(second.output.contains("rate limit"));
+        assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::TurnOn]);
+    }
+
+    #[tokio::test]
     async fn home_undo_reverses_last_reversible_action() {
         let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
@@ -1431,13 +1620,30 @@ mod tests {
                 "action": "turn_on"
             }),
         };
-        assert!(dispatcher.execute(&control).await.success);
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &control,
+                    ToolExecutionContext {
+                        request_origin: RequestOrigin::Dashboard,
+                        ..ToolExecutionContext::default()
+                    },
+                )
+                .await
+                .success
+        );
 
         let undo = dispatcher
-            .execute(&ToolCall {
-                name: "home_undo".into(),
-                arguments: serde_json::json!({}),
-            })
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_undo".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Dashboard,
+                    ..ToolExecutionContext::default()
+                },
+            )
             .await;
 
         assert!(undo.success);
@@ -1448,10 +1654,16 @@ mod tests {
         );
 
         let second_undo = dispatcher
-            .execute(&ToolCall {
-                name: "home_undo".into(),
-                arguments: serde_json::json!({}),
-            })
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_undo".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Dashboard,
+                    ..ToolExecutionContext::default()
+                },
+            )
             .await;
         assert!(!second_undo.success);
         assert!(second_undo.output.contains("No recent reversible"));
@@ -1471,13 +1683,19 @@ mod tests {
         .with_actuation_audit_path(path.clone());
         assert!(
             dispatcher
-                .execute(&ToolCall {
-                    name: "home_control".into(),
-                    arguments: serde_json::json!({
-                        "entity": "kitchen light",
-                        "action": "turn_on"
-                    }),
-                })
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "turn_on"
+                        }),
+                    },
+                    ToolExecutionContext {
+                        request_origin: RequestOrigin::Dashboard,
+                        ..ToolExecutionContext::default()
+                    },
+                )
                 .await
                 .success
         );

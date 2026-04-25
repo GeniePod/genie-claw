@@ -111,6 +111,8 @@ Current implementation:
 - environment sanitization for tools
 - memory write/read policy
 - actuation confirmation and runtime safety gate
+- actuation channel allowlist by request origin
+- per-origin physical actuation rate limits
 - web-search sensitive-query blocking
 
 Next work:

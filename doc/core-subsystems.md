@@ -112,6 +112,8 @@ Responsibilities:
 - resolve household-facing device/entity language to HA targets
 - enforce first-pass action safety policies
 - enforce a final runtime actuation safety gate before physical execution
+- enforce a configurable channel allowlist before physical execution
+- enforce per-origin physical actuation rate limits
 - keep a recent action ledger for explanations and bounded undo
 - expose action history to tools, HTTP, and the dashboard
 - hydrate recent action history from the append-only actuation audit log on startup

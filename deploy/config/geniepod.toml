@@ -47,6 +47,9 @@ wakeword_script = "/opt/geniepod/bin/genie-wake-listen.py"   # Wake word listene
 # min_sensitive_confidence = 0.90
 # deny_multi_target_sensitive = true
 # require_available_state = true
+# allowed_origins = ["voice", "dashboard", "api", "telegram", "repl", "confirmation"]
+# max_actions_per_minute = 12
+# max_actions_per_minute_by_origin = { telegram = 3, voice = 8 }
 
 [governor]
 poll_interval_ms = 5000

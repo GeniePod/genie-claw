@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ACTION_HISTORY_LIMIT: usize = 32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOrigin {
     #[default]
@@ -31,6 +31,18 @@ impl RequestOrigin {
             "repl" => Self::Repl,
             "confirmation" => Self::Confirmation,
             _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_policy_key(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Voice => "voice",
+            Self::Dashboard => "dashboard",
+            Self::Api => "api",
+            Self::Telegram => "telegram",
+            Self::Repl => "repl",
+            Self::Confirmation => "confirmation",
         }
     }
 }

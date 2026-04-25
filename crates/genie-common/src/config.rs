@@ -175,6 +175,15 @@ pub struct ActuationSafetyConfig {
 
     #[serde(default = "defaults::actuation_require_available_state")]
     pub require_available_state: bool,
+
+    #[serde(default = "defaults::actuation_allowed_origins")]
+    pub allowed_origins: Vec<String>,
+
+    #[serde(default = "defaults::actuation_max_actions_per_minute")]
+    pub max_actions_per_minute: usize,
+
+    #[serde(default)]
+    pub max_actions_per_minute_by_origin: HashMap<String, usize>,
 }
 
 impl Default for ActuationSafetyConfig {
@@ -185,6 +194,9 @@ impl Default for ActuationSafetyConfig {
             min_sensitive_confidence: defaults::actuation_min_sensitive_confidence(),
             deny_multi_target_sensitive: defaults::actuation_deny_multi_target_sensitive(),
             require_available_state: defaults::actuation_require_available_state(),
+            allowed_origins: defaults::actuation_allowed_origins(),
+            max_actions_per_minute: defaults::actuation_max_actions_per_minute(),
+            max_actions_per_minute_by_origin: HashMap::new(),
         }
     }
 }
@@ -771,6 +783,21 @@ local_min_score = 0.91
         );
         assert!(config.core.actuation_safety.deny_multi_target_sensitive);
         assert!(config.core.actuation_safety.require_available_state);
+        assert!(
+            config
+                .core
+                .actuation_safety
+                .allowed_origins
+                .contains(&"voice".to_string())
+        );
+        assert!(
+            !config
+                .core
+                .actuation_safety
+                .allowed_origins
+                .contains(&"unknown".to_string())
+        );
+        assert_eq!(config.core.actuation_safety.max_actions_per_minute, 12);
     }
 
     #[test]
@@ -782,6 +809,9 @@ min_target_confidence = 0.81
 min_sensitive_confidence = 0.95
 deny_multi_target_sensitive = false
 require_available_state = false
+allowed_origins = ["dashboard", "confirmation"]
+max_actions_per_minute = 4
+max_actions_per_minute_by_origin = { telegram = 1, voice = 2 }
 "#,
         )
         .unwrap();
@@ -791,6 +821,10 @@ require_available_state = false
         assert!((config.min_sensitive_confidence - 0.95).abs() < f32::EPSILON);
         assert!(!config.deny_multi_target_sensitive);
         assert!(!config.require_available_state);
+        assert_eq!(config.allowed_origins, vec!["dashboard", "confirmation"]);
+        assert_eq!(config.max_actions_per_minute, 4);
+        assert_eq!(config.max_actions_per_minute_by_origin["telegram"], 1);
+        assert_eq!(config.max_actions_per_minute_by_origin["voice"], 2);
     }
 
     #[test]
@@ -946,6 +980,22 @@ mod defaults {
     }
     pub fn actuation_require_available_state() -> bool {
         true
+    }
+    pub fn actuation_allowed_origins() -> Vec<String> {
+        [
+            "voice",
+            "dashboard",
+            "api",
+            "telegram",
+            "repl",
+            "confirmation",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+    pub fn actuation_max_actions_per_minute() -> usize {
+        12
     }
     pub fn telegram_api_base() -> String {
         "https://api.telegram.org".into()
