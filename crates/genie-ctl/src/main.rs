@@ -788,6 +788,14 @@ async fn cmd_diag() -> Result<()> {
         if let Some(v) = data.get("conversations").and_then(|v| v.as_u64()) {
             println!("  Conversations: {}", v);
         }
+        if let Some(contract) = data.get("runtime_contract") {
+            if let Some(v) = contract.get("contract_hash").and_then(|v| v.as_str()) {
+                println!("  Runtime Hash:  {}", v);
+            }
+            if let Some(v) = contract.get("tool_count").and_then(|v| v.as_u64()) {
+                println!("  Runtime Tools: {}", v);
+            }
+        }
     }
 
     // System info.

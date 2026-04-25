@@ -25,6 +25,7 @@ Default bind:
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/tools` | List built-in and loaded tool definitions |
+| `GET` | `/api/runtime/contract` | Deterministic runtime contract: prompt/tool/policy/hydration hashes |
 | `GET` | `/api/web-search` | Web search config/cache status |
 | `POST` | `/api/web-search` | Execute direct web search |
 | `GET` | `/api/actuation/pending` | List pending high-risk confirmations and audit-log path |
@@ -83,7 +84,43 @@ Current top-level fields:
 - `mem_available_mb`
 - `connectivity`
 - `web_search`
+- `runtime_contract`
 - `version`
+
+`runtime_contract` is a compact summary with the active contract hash, prompt
+hash, tool schema hash, policy hash, hydration hash, model family, and tool
+count. Use `GET /api/runtime/contract` for the full payload.
+
+### `GET /api/runtime/contract`
+
+Operational fingerprint for deterministic startup and incident response.
+
+Current top-level fields:
+
+- `schema_version`
+- `package`
+- `version`
+- `model_family`
+- `max_history_turns`
+- `prompt_hash`
+- `tool_schema_hash`
+- `policy_hash`
+- `hydration_hash`
+- `contract_hash`
+- `tool_names`
+- `policy`
+- `hydration`
+
+Use this endpoint to verify that a deployed box booted with the expected
+prompt, tool surface, policy settings, and hydrated local state.
+
+At daemon startup, `genie-core` also appends the full contract to:
+
+```text
+<data_dir>/runtime/contracts.jsonl
+```
+
+This file is intended for support bundles and incident reconstruction.
 
 ### `POST /api/web-search`
 
@@ -205,6 +242,7 @@ Served by `crates/genie-api/src/routes.rs`.
 | `GET` | `/api/status` | Governor mode, memory, uptime-oriented status |
 | `GET` | `/api/tegrastats` | Recent tegrastats history from `governor.db` |
 | `GET` | `/api/services` | Latest health state per service from `health.db` |
+| `GET` | `/api/runtime/contract` | Runtime contract proxied from `genie-core` |
 | `GET` | `/api/actuation/pending` | Pending confirmations from `genie-core` |
 | `GET` | `/api/actuation/actions` | Recent executed actions from `genie-core` |
 | `GET` | `/api/actuation/audit` | Recent actuation audit events |

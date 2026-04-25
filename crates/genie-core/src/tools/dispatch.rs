@@ -106,6 +106,50 @@ impl ToolDispatcher {
         })
     }
 
+    pub fn runtime_policy_status(&self) -> serde_json::Value {
+        let loaded_skills = self
+            .skills
+            .as_ref()
+            .and_then(|skills| skills.lock().ok().map(|loader| loader.loaded().len()))
+            .unwrap_or(0);
+
+        serde_json::json!({
+            "home_automation": {
+                "available": self.has_home_automation(),
+            },
+            "actuation_safety": {
+                "enabled": self.actuation_safety.enabled,
+                "min_target_confidence": self.actuation_safety.min_target_confidence,
+                "min_sensitive_confidence": self.actuation_safety.min_sensitive_confidence,
+                "deny_multi_target_sensitive": self.actuation_safety.deny_multi_target_sensitive,
+                "require_available_state": self.actuation_safety.require_available_state,
+                "audit_enabled": self.actuation_audit_path().is_some(),
+            },
+            "web_search": {
+                "enabled": self.web_search.enabled,
+                "provider": match self.web_search.provider {
+                    WebSearchProvider::Duckduckgo => "duckduckgo",
+                    WebSearchProvider::Searxng => "searxng",
+                },
+                "base_url_configured": !self.web_search.base_url.trim().is_empty()
+                    || std::env::var("GENIEPOD_WEB_SEARCH_BASE_URL")
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false),
+                "allow_remote_base_url": self.web_search.allow_remote_base_url,
+                "timeout_secs": self.web_search.timeout_secs,
+                "max_results": self.web_search.max_results,
+                "cache_enabled": self.web_search.cache_enabled,
+                "cache_ttl_secs": self.web_search.cache_ttl_secs,
+                "cache_max_entries": self.web_search.cache_max_entries,
+            },
+            "memory_read_default": "shared_room_voice",
+            "skills": {
+                "loader_attached": self.skills.is_some(),
+                "loaded_count": loaded_skills,
+            },
+        })
+    }
+
     pub(crate) async fn web_search_response(
         &self,
         query: &str,

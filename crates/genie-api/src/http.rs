@@ -72,6 +72,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: &Config) -> Re
         ("GET", "/api/status") => routes::get_status(config).await,
         ("GET", "/api/tegrastats") => routes::get_tegrastats(config).await,
         ("GET", "/api/services") => routes::get_services(config).await,
+        ("GET", "/api/runtime/contract") => routes::get_runtime_contract(config).await,
         ("GET", "/api/actuation/pending") => routes::get_actuation_pending(config).await,
         ("GET", "/api/actuation/actions") => routes::get_actuation_actions(config).await,
         ("GET", "/api/actuation/audit") => routes::get_actuation_audit(config).await,

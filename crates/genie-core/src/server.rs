@@ -4,7 +4,7 @@ use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::Mutex;
 
-use crate::connectivity::{ConnectivityController, ConnectivityState};
+use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, Message};
 use crate::memory::Memory;
@@ -23,6 +23,7 @@ use crate::tools::{RequestOrigin, ToolExecutionContext};
 ///   GET  /api/conversations     — list all conversations
 ///   GET  /api/chat/export?id=X  — export conversation as JSON
 ///   GET  /api/tools             — list available tools
+///   GET  /api/runtime/contract  — deterministic prompt/tool/policy/hydration contract
 ///   POST /api/web-search        — direct web search tool execution
 ///   GET  /api/web-search        — web search provider and cache status
 ///   GET  /api/health            — health check
@@ -206,10 +207,32 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
         ("POST", "/api/chat/clear") => handle_clear(conversations, current_conv_id).await,
         ("GET", "/api/conversations") => handle_list_conversations(conversations),
         ("GET", "/api/tools") => handle_list_tools(tools),
+        ("GET", "/api/runtime/contract") => {
+            handle_runtime_contract(
+                tools,
+                connectivity,
+                memory,
+                conversations,
+                system_prompt,
+                max_history,
+                model_family,
+            )
+            .await
+        }
         ("GET", "/api/web-search") => handle_web_search_status(tools),
         ("POST", "/api/web-search") => handle_web_search(body.as_deref(), tools).await,
         ("GET", "/api/health") => {
-            handle_health(llm, tools, connectivity, memory, conversations).await
+            handle_health(
+                llm,
+                tools,
+                connectivity,
+                memory,
+                conversations,
+                system_prompt,
+                max_history,
+                model_family,
+            )
+            .await
         }
         ("GET", "/api/connectivity") => handle_connectivity(connectivity).await,
         ("GET", "/api/actuation/pending") => handle_actuation_pending(tools),
@@ -904,12 +927,25 @@ async fn handle_health(
     connectivity: &dyn ConnectivityController,
     memory: &Memory,
     conversations: &ConversationStore,
+    system_prompt: &str,
+    max_history: usize,
+    model_family: ModelFamily,
 ) -> (u16, &'static str, String) {
     let llm_ok = llm.health().await;
     let connectivity_health = connectivity.health().await;
     let mem_count = memory.count().unwrap_or(0);
     let conv_count = conversations.list().map(|l| l.len()).unwrap_or(0);
     let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
+    let runtime_contract = build_runtime_contract_snapshot(
+        tools,
+        memory,
+        conversations,
+        system_prompt,
+        max_history,
+        model_family,
+        &connectivity_health,
+    )
+    .summary();
 
     let status = overall_health_status(llm_ok, connectivity_health.state);
 
@@ -921,6 +957,7 @@ async fn handle_health(
         "mem_available_mb": mem_avail,
         "connectivity": connectivity_health,
         "web_search": tools.web_search_status(),
+        "runtime_contract": runtime_contract,
         "version": env!("CARGO_PKG_VERSION"),
     });
 
@@ -975,6 +1012,71 @@ fn handle_list_tools(tools: &ToolDispatcher) -> (u16, &'static str, String) {
     let defs = tools.tool_defs();
     let json = serde_json::to_string(&defs).unwrap_or_else(|_| "[]".into());
     (200, "application/json", json)
+}
+
+async fn handle_runtime_contract(
+    tools: &ToolDispatcher,
+    connectivity: &dyn ConnectivityController,
+    memory: &Memory,
+    conversations: &ConversationStore,
+    system_prompt: &str,
+    max_history: usize,
+    model_family: ModelFamily,
+) -> (u16, &'static str, String) {
+    let connectivity_health = connectivity.health().await;
+    let contract = build_runtime_contract_snapshot(
+        tools,
+        memory,
+        conversations,
+        system_prompt,
+        max_history,
+        model_family,
+        &connectivity_health,
+    );
+    let body = serde_json::to_string(&contract).unwrap_or_else(|e| {
+        serde_json::json!({ "error": format!("runtime contract serialization failed: {e}") })
+            .to_string()
+    });
+    (200, "application/json", body)
+}
+
+pub fn build_runtime_contract_snapshot(
+    tools: &ToolDispatcher,
+    memory: &Memory,
+    conversations: &ConversationStore,
+    system_prompt: &str,
+    max_history: usize,
+    model_family: ModelFamily,
+    connectivity_health: &ConnectivityHealth,
+) -> crate::runtime_contract::RuntimeContract {
+    let tool_defs = tools.tool_defs();
+    let hydration = serde_json::json!({
+        "memory": {
+            "count": memory.count().unwrap_or(0),
+            "promoted_count": memory.promoted_count().unwrap_or(0),
+        },
+        "conversations": {
+            "count": conversations.list().map(|items| items.len()).unwrap_or(0),
+        },
+        "actuation": {
+            "recent_action_count": tools.recent_home_actions().len(),
+            "pending_confirmation_count": tools.pending_confirmations().len(),
+        },
+        "connectivity": {
+            "state": connectivity_health.state,
+            "transport": connectivity_health.transport.clone(),
+            "device": connectivity_health.device.clone(),
+        },
+    });
+
+    crate::runtime_contract::build_runtime_contract(
+        system_prompt,
+        model_family,
+        max_history,
+        &tool_defs,
+        tools.runtime_policy_status(),
+        hydration,
+    )
 }
 
 /// GET /api/web-search
@@ -1584,10 +1686,15 @@ fn status_text(code: u16) -> &'static str {
 mod tests {
     use super::{
         ConnectivityState, StreamMode, detect_stream_mode, handle_actuation_actions,
-        handle_web_search, handle_web_search_status, overall_health_status,
-        should_summarize_tool_result,
+        handle_runtime_contract, handle_web_search, handle_web_search_status,
+        overall_health_status, should_summarize_tool_result,
     };
+    use crate::connectivity::NullConnectivityController;
+    use crate::conversation::ConversationStore;
+    use crate::memory::Memory;
+    use crate::prompt::ModelFamily;
     use crate::tools::ToolDispatcher;
+    use genie_common::config::ConnectivityConfig;
     use genie_common::config::WebSearchConfig;
 
     #[test]
@@ -1704,6 +1811,51 @@ mod tests {
 
         assert_eq!(status, 200);
         assert_eq!(body, r#"{"actions":[]}"#);
+    }
+
+    #[tokio::test]
+    async fn runtime_contract_endpoint_reports_fingerprints() {
+        let temp = std::env::temp_dir();
+        let memory_path = temp.join("genie-runtime-contract-memory.db");
+        let conversations_path = temp.join("genie-runtime-contract-conversations.db");
+        let _ = std::fs::remove_file(&memory_path);
+        let _ = std::fs::remove_file(&conversations_path);
+
+        let tools = ToolDispatcher::new(None);
+        let connectivity = NullConnectivityController::from_config(&ConnectivityConfig::default());
+        let memory = Memory::open(&memory_path).unwrap();
+        let conversations = ConversationStore::open(&conversations_path).unwrap();
+        conversations.create().unwrap();
+
+        let (status, _, body) = handle_runtime_contract(
+            &tools,
+            &connectivity,
+            &memory,
+            &conversations,
+            "system prompt",
+            12,
+            ModelFamily::Phi,
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["model_family"], "Phi");
+        assert_eq!(parsed["max_history_turns"], 12);
+        assert!(parsed["prompt_hash"].as_str().unwrap().len() >= 16);
+        assert!(parsed["tool_schema_hash"].as_str().unwrap().len() >= 16);
+        assert!(parsed["policy_hash"].as_str().unwrap().len() >= 16);
+        assert!(parsed["hydration_hash"].as_str().unwrap().len() >= 16);
+        assert!(parsed["contract_hash"].as_str().unwrap().len() >= 16);
+        assert!(
+            parsed["tool_names"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::Value::String("get_time".to_string()))
+        );
+        assert_eq!(parsed["hydration"]["conversations"]["count"], 1);
+        assert_eq!(parsed["hydration"]["connectivity"]["state"], "disabled");
     }
 
     #[test]

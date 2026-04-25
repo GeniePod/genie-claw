@@ -158,6 +158,27 @@ async function pollServices() {
   }).join('');
 }
 
+async function pollRuntimeContract() {
+  const data = await fetchJson('/api/runtime/contract');
+  if (!data || data.error) {
+    setText('contract-hash', '--');
+    setText('contract-model', '--');
+    setText('contract-tools', '--');
+    setText('contract-prompt', '--');
+    setText('contract-detail', data?.error ? `Runtime contract unavailable: ${data.error}` : 'Runtime contract unavailable.');
+    return;
+  }
+
+  setText('contract-hash', data.contract_hash || '--');
+  setText('contract-model', data.model_family || '--');
+  setText('contract-tools', data.tool_count ?? '--');
+  setText('contract-prompt', data.prompt_hash || '--');
+  setText(
+    'contract-detail',
+    `policy ${data.policy_hash || '--'} · hydration ${data.hydration_hash || '--'} · history ${data.max_history_turns ?? '--'} turns`
+  );
+}
+
 async function postJson(url, payload) {
   const r = await fetch(url, {
     method: 'POST',
@@ -342,6 +363,7 @@ document.addEventListener('DOMContentLoaded', () => {
   pollStatus();
   pollTegrastats();
   pollServices();
+  pollRuntimeContract();
   pollActuation();
   loadMemories();
 
@@ -349,6 +371,7 @@ document.addEventListener('DOMContentLoaded', () => {
   setInterval(pollStatus, POLL_MS);
   setInterval(pollTegrastats, POLL_MS);
   setInterval(pollServices, POLL_MS * 2); // Services change slowly.
+  setInterval(pollRuntimeContract, POLL_MS * 4); // Runtime contract should rarely change.
   setInterval(pollActuation, POLL_MS * 2);
 
   document.getElementById('refresh-actuation')?.addEventListener('click', pollActuation);

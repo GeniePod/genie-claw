@@ -51,6 +51,7 @@ pub mod profile;
 pub mod prompt;
 pub mod reasoning;
 pub mod repl;
+pub mod runtime_contract;
 pub mod security;
 pub mod server;
 pub mod skills;

@@ -116,6 +116,33 @@ async fn main() -> Result<()> {
     let conv_list = conversations.list()?;
     tracing::info!(conversations = conv_list.len(), "conversation store loaded");
 
+    let boot_contract = genie_core::server::build_runtime_contract_snapshot(
+        &tool_dispatcher,
+        &mem,
+        &conversations,
+        &system_prompt,
+        config.core.max_history_turns,
+        model_family,
+        &connectivity_health,
+    );
+    let contract_hash = boot_contract.contract_hash.clone();
+    let contract_log_path = config.data_dir.join("runtime/contracts.jsonl");
+    match genie_core::runtime_contract::append_runtime_contract_log(
+        &contract_log_path,
+        &boot_contract,
+    ) {
+        Ok(()) => tracing::info!(
+            contract_hash = %contract_hash,
+            path = %contract_log_path.display(),
+            "runtime contract logged"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            path = %contract_log_path.display(),
+            "failed to log runtime contract"
+        ),
+    }
+
     // Check for voice mode: --voice flag or GENIEPOD_VOICE=1 or config voice_enabled.
     let voice_mode = std::env::args().any(|a| a == "--voice")
         || std::env::var("GENIEPOD_VOICE").unwrap_or_default() == "1"

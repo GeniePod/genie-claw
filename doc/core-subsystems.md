@@ -227,6 +227,31 @@ Responsibilities:
 This subsystem is intentionally spread across multiple small files because the
 guardrails target different failure modes.
 
+## Runtime Contract
+
+Source:
+
+- `crates/genie-core/src/runtime_contract.rs`
+- `crates/genie-core/src/server.rs`
+
+Responsibilities:
+
+- expose prompt, tool schema, policy, and hydration fingerprints
+- provide a deterministic startup contract for operations and incident response
+- make tool/policy drift visible without inspecting logs
+- append boot contracts to `<data_dir>/runtime/contracts.jsonl`
+- expose a compact contract summary through `/api/health`
+- support persistent local-agent patterns where boot state must be reproducible
+
+Current HTTP surface:
+
+- `GET /api/runtime/contract`
+- `GET /api/health` includes `runtime_contract`
+
+The contract hash is an operational fingerprint, not a security signature.
+It should be used to compare deployments, debug field issues, and confirm that
+the expected prompt/tool/policy bundle is active.
+
 ## Skills
 
 Source:
