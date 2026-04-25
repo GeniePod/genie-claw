@@ -290,8 +290,9 @@ Writes a local JSON support bundle. If no path is provided, the output goes to:
 
 The bundle includes service reachability, governor status, core health, runtime
 contract, connectivity status, actuation state, selected system files, binary
-inventory, model inventory, recent runtime contracts, and recent actuation audit
-events. It records config presence but does not copy config contents.
+inventory, model inventory, recent runtime contracts, recent tool audit events,
+and recent actuation audit events. It records config presence but does not copy
+config contents.
 
 ### Skill Subcommands
 

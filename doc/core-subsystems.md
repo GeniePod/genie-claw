@@ -70,6 +70,11 @@ Responsibilities:
 - parse tool JSON produced by the model
 - execute built-in tools
 - expose fast deterministic routing for repeated daily-use requests
+- append privacy-preserving tool audit events to `<data_dir>/runtime/tool-audit.jsonl`
+
+The tool audit log records tool name, request origin, success, duration,
+argument keys, and output length. It intentionally does not record argument
+values or tool outputs.
 
 Current notable tool modules:
 

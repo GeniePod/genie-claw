@@ -1006,6 +1006,7 @@ async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
             "binaries": binary_inventory(),
             "models": model_inventory(),
             "runtime_contract_log_tail": tail_jsonl_file(Path::new("/opt/geniepod/data/runtime/contracts.jsonl"), 5),
+            "tool_audit_log_tail": tail_jsonl_file(Path::new("/opt/geniepod/data/runtime/tool-audit.jsonl"), 20),
             "actuation_audit_log_tail": tail_jsonl_file(Path::new("/opt/geniepod/data/safety/actuation-audit.jsonl"), 20),
         },
     });

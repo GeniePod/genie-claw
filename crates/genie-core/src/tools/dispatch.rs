@@ -2,8 +2,11 @@ use anyhow::Result;
 use genie_common::config::{ActuationSafetyConfig, WebSearchConfig, WebSearchProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use super::actuation::{
     ActionLedger, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager, PendingConfirmation,
@@ -63,12 +66,60 @@ pub struct ToolDispatcher {
     action_ledger: Arc<ActionLedger>,
     actuation_rate_limiter: Arc<ActuationRateLimiter>,
     audit_logger: AuditLogger,
+    tool_audit_logger: ToolAuditLogger,
     pub(crate) timers: timer::TimerManager,
 }
 
 #[derive(Debug, Default)]
 struct ActuationRateLimiter {
     attempts: Mutex<HashMap<RequestOrigin, VecDeque<u64>>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolAuditEvent {
+    ts_ms: u64,
+    tool: String,
+    origin: RequestOrigin,
+    success: bool,
+    duration_ms: u64,
+    argument_keys: Vec<String>,
+    output_chars: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolAuditLogger {
+    path: Option<PathBuf>,
+    lock: Arc<Mutex<()>>,
+}
+
+impl ToolAuditLogger {
+    fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: Some(path.into()),
+            lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn append(&self, event: ToolAuditEvent) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let _guard = self.lock.lock().expect("tool audit logger lock");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+            return;
+        };
+        let Ok(line) = serde_json::to_string(&event) else {
+            return;
+        };
+        let _ = writeln!(file, "{line}");
+    }
+
+    fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
 }
 
 impl ToolDispatcher {
@@ -83,6 +134,7 @@ impl ToolDispatcher {
             action_ledger: Arc::new(ActionLedger::default()),
             actuation_rate_limiter: Arc::new(ActuationRateLimiter::default()),
             audit_logger: AuditLogger::disabled(),
+            tool_audit_logger: ToolAuditLogger::default(),
             timers: timer::TimerManager::new(),
         }
     }
@@ -172,6 +224,10 @@ impl ToolDispatcher {
                 "cache_max_entries": self.web_search.cache_max_entries,
             },
             "memory_read_default": "shared_room_voice",
+            "tool_audit": {
+                "enabled": self.tool_audit_logger.path().is_some(),
+                "path": self.tool_audit_logger.path().map(|path| path.display().to_string()),
+            },
             "skills": {
                 "loader_attached": self.skills.is_some(),
                 "loaded_count": loaded_skills,
@@ -204,6 +260,11 @@ impl ToolDispatcher {
         self.audit_logger = AuditLogger::new(path);
         let recent = self.audit_logger.read_recent_executed_actions(32);
         self.action_ledger.hydrate(recent);
+        self
+    }
+
+    pub fn with_tool_audit_path(mut self, path: PathBuf) -> Self {
+        self.tool_audit_logger = ToolAuditLogger::new(path);
         self
     }
 
@@ -414,6 +475,7 @@ impl ToolDispatcher {
         call: &ToolCall,
         exec_ctx: ToolExecutionContext,
     ) -> ToolResult {
+        let started = Instant::now();
         let result = match call.name.as_str() {
             "home_control" => self.exec_home_control(&call.arguments, exec_ctx).await,
             "home_status" => self.exec_home_status(&call.arguments).await,
@@ -433,7 +495,7 @@ impl ToolDispatcher {
             other => self.exec_skill(other, &call.arguments),
         };
 
-        match result {
+        let tool_result = match result {
             Ok(output) => ToolResult {
                 tool: call.name.clone(),
                 success: true,
@@ -444,7 +506,19 @@ impl ToolDispatcher {
                 success: false,
                 output: e.to_string(),
             },
-        }
+        };
+
+        self.tool_audit_logger.append(ToolAuditEvent {
+            ts_ms: now_ms(),
+            tool: call.name.clone(),
+            origin: exec_ctx.request_origin,
+            success: tool_result.success,
+            duration_ms: started.elapsed().as_millis() as u64,
+            argument_keys: tool_argument_keys(&call.arguments),
+            output_chars: tool_result.output.chars().count(),
+        });
+
+        tool_result
     }
 
     async fn exec_home_control(
@@ -1127,6 +1201,15 @@ fn runtime_skill_description(skill: &crate::skills::LoadedSkill) -> String {
     }
 }
 
+fn tool_argument_keys(args: &serde_json::Value) -> Vec<String> {
+    let Some(object) = args.as_object() else {
+        return Vec::new();
+    };
+    let mut keys = object.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
 fn exec_calculate(args: &serde_json::Value) -> Result<String> {
     let expr = args
         .get("expression")
@@ -1484,6 +1567,41 @@ mod tests {
         let result = dispatcher.execute(&call).await;
         assert!(result.success);
         assert!(!result.output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_audit_records_origin_and_argument_keys_without_values() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-tool-audit-test-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let dispatcher = ToolDispatcher::new(None).with_tool_audit_path(path.clone());
+
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "calculate".into(),
+                    arguments: serde_json::json!({"expression": "secret-token-value"}),
+                },
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Api,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+
+        assert!(!result.success);
+        let line = std::fs::read_to_string(&path).unwrap();
+        let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(event["tool"], "calculate");
+        assert_eq!(event["origin"], "api");
+        assert_eq!(event["success"], false);
+        assert_eq!(event["argument_keys"], serde_json::json!(["expression"]));
+        assert!(event["duration_ms"].as_u64().is_some());
+        assert!(!line.contains("secret-token-value"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
