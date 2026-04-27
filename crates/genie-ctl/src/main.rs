@@ -990,6 +990,7 @@ async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
             "runtime_contract": http_json_value(CORE_URL, "/api/runtime/contract").await,
             "connectivity": http_json_value(CORE_URL, "/api/connectivity").await,
         },
+        "security": http_json_value("127.0.0.1:3080", "/api/security").await,
         "actuation": {
             "pending": http_json_value(CORE_URL, "/api/actuation/pending").await,
             "actions": http_json_value(CORE_URL, "/api/actuation/actions").await,

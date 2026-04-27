@@ -182,6 +182,32 @@ async function pollRuntimeContract() {
   );
 }
 
+async function pollSecurity() {
+  const data = await fetchJson('/api/security');
+  if (!data || data.error) {
+    setText('security-trust', '--');
+    setText('security-config', '--');
+    setText('security-memory', '--');
+    setText('security-risk-count', '--');
+    setText('security-detail', data?.error ? `Security posture unavailable: ${data.error}` : 'Security posture unavailable.');
+    return;
+  }
+
+  const riskFlags = Array.isArray(data.risk_flags) ? data.risk_flags : [];
+  const rawConfig = data.raw_config_exposed ? 'exposed' : 'hidden';
+  const sharedMemory = data.shared_memory?.mode || 'unknown';
+  const chatAccess = data.control_surfaces?.telegram_allowlist_enabled ? 'telegram allowlist' : 'local first';
+  const details = riskFlags.length
+    ? `flags ${riskFlags.join(', ')}`
+    : `clean summary · ${chatAccess} · config ${data.raw_config_policy || 'local only'}`;
+
+  setText('security-trust', data.trust_model || '--');
+  setText('security-config', rawConfig);
+  setText('security-memory', sharedMemory);
+  setText('security-risk-count', riskFlags.length);
+  setText('security-detail', details);
+}
+
 async function postJson(url, payload) {
   const r = await fetch(url, {
     method: 'POST',
@@ -211,9 +237,10 @@ async function pollActuation() {
   const pendingEl = document.getElementById('pending-list');
   const actionsEl = document.getElementById('action-list');
   const auditEl = document.getElementById('audit-list');
-  const auditPathEl = document.getElementById('actuation-audit-path');
-  if (auditPathEl) {
-    auditPathEl.textContent = 'Audit log: ' + (pendingData?.audit_log_path || '--');
+  const auditStateEl = document.getElementById('actuation-audit-state');
+  if (auditStateEl) {
+    const auditEnabled = pendingData?.audit_log?.enabled;
+    auditStateEl.textContent = auditEnabled ? 'Audit log: local private file' : 'Audit log: disabled';
   }
 
   if (pendingEl) {
@@ -367,6 +394,7 @@ document.addEventListener('DOMContentLoaded', () => {
   pollTegrastats();
   pollServices();
   pollRuntimeContract();
+  pollSecurity();
   pollActuation();
   loadMemories();
 
@@ -375,6 +403,7 @@ document.addEventListener('DOMContentLoaded', () => {
   setInterval(pollTegrastats, POLL_MS);
   setInterval(pollServices, POLL_MS * 2); // Services change slowly.
   setInterval(pollRuntimeContract, POLL_MS * 4); // Runtime contract should rarely change.
+  setInterval(pollSecurity, POLL_MS * 4); // Security posture should rarely change.
   setInterval(pollActuation, POLL_MS * 2);
 
   document.getElementById('refresh-actuation')?.addEventListener('click', pollActuation);

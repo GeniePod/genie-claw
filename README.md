@@ -32,6 +32,7 @@ This repo is the Rust agent runtime for a very specific product shape:
 - transitional `llama.cpp` support while `genie-ai-runtime` is not yet split out
 - a privacy-first and security-first system
 - a memory-footprint-conscious runtime built for constrained edge hardware
+- a household trust model that exposes redacted posture, not raw config files
 
 If you want a short definition:
 
@@ -84,6 +85,7 @@ agent operation:
 - runtime contract fingerprints for prompt, tools, policy, and hydrated state
 - optional contract drift detection after a known-good boot
 - privacy-preserving tool audit logs
+- redacted `/api/security` posture for dashboard/support use instead of raw TOML exposure
 - origin-aware tool allow/deny policy
 - native skill manifest audit metadata and configurable skill-load policy
 - local support bundles for field diagnostics

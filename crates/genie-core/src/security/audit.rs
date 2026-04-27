@@ -181,16 +181,46 @@ fn check_dir_permissions(path: &Path, label: &str, findings: &mut Vec<AuditFindi
                     remediation: format!("chmod 700 {}", path.display()),
                 });
             }
+
+            if bits & 0o004 != 0 {
+                findings.push(AuditFinding {
+                    id: format!("fs.{}.world_readable", label),
+                    severity: Severity::Critical,
+                    message: format!(
+                        "{} is world-readable (mode {:o}) — may expose shared memory, conversations, or audit data",
+                        path.display(),
+                        bits
+                    ),
+                    remediation: format!("chmod 700 {}", path.display()),
+                });
+            }
+
+            if bits & 0o040 != 0 {
+                findings.push(AuditFinding {
+                    id: format!("fs.{}.group_readable", label),
+                    severity: Severity::Warning,
+                    message: format!(
+                        "{} is group-readable (mode {:o}) — keep household memory under one trusted OS boundary",
+                        path.display(),
+                        bits
+                    ),
+                    remediation: format!("chmod 700 {}", path.display()),
+                });
+            }
         }
     }
 }
 
 fn check_config_secrets(path: &Path, findings: &mut Vec<AuditFinding>) {
     if let Ok(content) = std::fs::read_to_string(path) {
-        // Check for non-empty ha_token in plain text.
         for line in content.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("ha_token") && trimmed.contains('=') {
+            let key = trimmed.split('=').next().unwrap_or("").trim();
+            if matches!(
+                key,
+                "ha_token" | "bot_token" | "api_key" | "secret" | "password"
+            ) && trimmed.contains('=')
+            {
                 let value = trimmed
                     .split('=')
                     .nth(1)
@@ -199,11 +229,12 @@ fn check_config_secrets(path: &Path, findings: &mut Vec<AuditFinding>) {
                     .trim_matches('"');
                 if !value.is_empty() {
                     findings.push(AuditFinding {
-                        id: "config.plaintext_secret".into(),
+                        id: format!("config.plaintext_secret.{}", key),
                         severity: Severity::Warning,
-                        message: "ha_token stored in plain text in config file".into(),
-                        remediation: "Use HA_TOKEN env var instead, or ensure config is chmod 600"
-                            .into(),
+                        message: format!("{} stored in plain text in config file", key),
+                        remediation:
+                            "Prefer environment variables for secrets and keep config chmod 600"
+                                .into(),
                     });
                 }
             }
@@ -268,9 +299,34 @@ mod tests {
         fs::write(&path, "ha_token = \"eyJ0b2tlbi1zZWNyZXQi\"\n").unwrap();
 
         let findings = run_audit(&path, &std::env::temp_dir());
-        assert!(findings.iter().any(|f| f.id == "config.plaintext_secret"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.id == "config.plaintext_secret.ha_token")
+        );
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_world_readable_data_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join("geniepod-audit-data-dir");
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut findings = Vec::new();
+        check_dir_permissions(&path, "data_dir", &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.id == "fs.data_dir.world_readable")
+        );
+
+        let _ = fs::remove_dir_all(&path);
     }
 
     #[test]

@@ -21,6 +21,7 @@ Where current code is transitional, the docs call that out explicitly.
 - [services-and-crates.md](services-and-crates.md): every crate, binary, and systemd service
 - [configuration.md](configuration.md): config sections, fields, and environment overrides
 - [http-and-cli.md](http-and-cli.md): `genie-core` HTTP API, `genie-api` dashboard API, and `genie-ctl`
+- [household-security.md](household-security.md): family/shared-memory trust model and redacted config policy
 - [core-subsystems.md](core-subsystems.md): LLM, prompt, tools, memory, voice, Telegram, security, and skills
 - [deployment-and-ops.md](deployment-and-ops.md): local dev, Docker, Jetson deploy, systemd, and operations
 - [repo-map.md](repo-map.md): top-level files, directories, and module map

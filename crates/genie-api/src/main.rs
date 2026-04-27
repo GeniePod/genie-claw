@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 ///   GET  /api/status      — current mode, memory, uptime
 ///   GET  /api/tegrastats  — recent tegrastats history (JSON array)
 ///   GET  /api/services    — service health status
+///   GET  /api/security    — redacted household security posture
 ///   POST /api/mode        — change operating mode
 ///   GET  /                — dashboard HTML
 ///   GET  /dashboard.js    — dashboard JavaScript

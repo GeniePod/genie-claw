@@ -571,6 +571,95 @@ impl Config {
     pub fn connectivity_enabled(&self) -> bool {
         self.connectivity.enabled && self.connectivity.transport != ConnectivityTransport::None
     }
+
+    /// Redacted posture for dashboards and support tools.
+    ///
+    /// This intentionally reports capability and risk state instead of raw TOML,
+    /// file paths, endpoint URLs, tokens, or speaker labels.
+    pub fn household_security_summary(&self) -> serde_json::Value {
+        let mut risk_flags = Vec::new();
+
+        if !matches!(
+            self.core.bind_host.as_str(),
+            "127.0.0.1" | "localhost" | "::1"
+        ) {
+            risk_flags.push("core_api_not_localhost");
+        }
+        if self.telegram.enabled && self.telegram.allow_all_chats {
+            risk_flags.push("telegram_accepts_any_chat");
+        }
+        if self.telegram.enabled
+            && !self.telegram.allow_all_chats
+            && self.telegram.allowed_chat_ids.is_empty()
+        {
+            risk_flags.push("telegram_enabled_without_chat_allowlist");
+        }
+        if self.web_search.enabled
+            && self.web_search.provider == WebSearchProvider::Searxng
+            && self.web_search.allow_remote_base_url
+        {
+            risk_flags.push("web_search_remote_base_url_allowed");
+        }
+        if !self.core.tool_policy.enabled {
+            risk_flags.push("tool_policy_disabled");
+        }
+        if !self.core.actuation_safety.enabled {
+            risk_flags.push("actuation_safety_disabled");
+        }
+        if !self.core.ha_token.trim().is_empty() {
+            risk_flags.push("homeassistant_token_in_config_file");
+        }
+        if self.telegram.enabled && !self.telegram.bot_token.trim().is_empty() {
+            risk_flags.push("telegram_token_in_config_file");
+        }
+        if !self.core.skill_policy.require_manifest {
+            risk_flags.push("skill_manifest_not_required");
+        }
+        if !self.core.skill_policy.require_signature {
+            risk_flags.push("skill_signature_not_required");
+        }
+
+        serde_json::json!({
+            "trust_model": "single_household_operator_boundary",
+            "raw_config_exposed": false,
+            "raw_config_policy": "local_operator_file_only",
+            "shared_memory": {
+                "mode": "household_shared_by_default",
+                "dashboard_manager_enabled": true,
+                "shared_room_safe_prompt_filtering": true,
+                "speaker_identity_enabled": self.core.speaker_identity.enabled,
+                "speaker_identity_provider": match self.core.speaker_identity.provider {
+                    SpeakerIdentityProvider::None => "none",
+                    SpeakerIdentityProvider::Fixed => "fixed",
+                    SpeakerIdentityProvider::LocalBiometric => "local_biometric",
+                },
+                "speaker_label_exposed": false
+            },
+            "control_surfaces": {
+                "core_api_local_only": matches!(self.core.bind_host.as_str(), "127.0.0.1" | "localhost" | "::1"),
+                "dashboard_local_only": true,
+                "telegram_enabled": self.telegram.enabled,
+                "telegram_allowlist_enabled": self.telegram.enabled && !self.telegram.allow_all_chats && !self.telegram.allowed_chat_ids.is_empty(),
+                "homeassistant_bridge_configured": self.services.homeassistant.is_some(),
+                "connectivity_coprocessor_enabled": self.connectivity_enabled()
+            },
+            "policy": {
+                "tool_policy_enabled": self.core.tool_policy.enabled,
+                "actuation_safety_enabled": self.core.actuation_safety.enabled,
+                "sensitive_multi_target_denied": self.core.actuation_safety.deny_multi_target_sensitive,
+                "available_state_required": self.core.actuation_safety.require_available_state,
+                "skill_manifest_required": self.core.skill_policy.require_manifest,
+                "skill_signature_required": self.core.skill_policy.require_signature
+            },
+            "secret_presence": {
+                "homeassistant_token_configured": self.homeassistant_token().is_some(),
+                "homeassistant_token_source": if self.core.ha_token.trim().is_empty() { "environment_or_absent" } else { "config_file" },
+                "telegram_token_configured": self.telegram_bot_token().is_some(),
+                "telegram_token_source": if self.telegram.bot_token.trim().is_empty() { "environment_or_absent" } else { "config_file" }
+            },
+            "risk_flags": risk_flags
+        })
+    }
 }
 
 impl Default for GovernorConfig {
@@ -988,6 +1077,33 @@ expected_runtime_contract_hash = "abc123"
 
         config.connectivity.transport = ConnectivityTransport::Esp32c6Uart;
         assert!(config.connectivity_enabled());
+    }
+
+    #[test]
+    fn household_security_summary_redacts_raw_config() {
+        let mut config = test_config();
+        config.telegram.enabled = true;
+        config.telegram.bot_token = "telegram-secret".into();
+        config.telegram.allow_all_chats = true;
+        config.core.ha_token = "ha-secret".into();
+
+        let summary = config.household_security_summary();
+
+        assert_eq!(summary["raw_config_exposed"], false);
+        assert_eq!(summary["shared_memory"]["speaker_label_exposed"], false);
+        assert_eq!(
+            summary["secret_presence"]["homeassistant_token_configured"],
+            true
+        );
+        assert_eq!(
+            summary["secret_presence"]["telegram_token_configured"],
+            true
+        );
+        let text = summary.to_string();
+        assert!(!text.contains("telegram-secret"));
+        assert!(!text.contains("ha-secret"));
+        assert!(text.contains("telegram_accepts_any_chat"));
+        assert!(text.contains("homeassistant_token_in_config_file"));
     }
 
     #[test]

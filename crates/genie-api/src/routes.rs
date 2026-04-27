@@ -142,6 +142,15 @@ pub async fn get_services(config: &Config) -> Response {
     }
 }
 
+/// GET /api/security — redacted household security posture.
+pub async fn get_security(config: &Config) -> Response {
+    Response {
+        status: 200,
+        content_type: "application/json",
+        body: config.household_security_summary().to_string(),
+    }
+}
+
 /// POST /api/mode — send mode change command to governor.
 pub async fn post_mode(body: Option<&str>) -> Response {
     let Some(body) = body else {

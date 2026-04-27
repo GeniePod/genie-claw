@@ -1147,9 +1147,10 @@ fn handle_web_search_status(tools: &ToolDispatcher) -> (u16, &'static str, Strin
 fn handle_actuation_pending(tools: &ToolDispatcher) -> (u16, &'static str, String) {
     let body = serde_json::json!({
         "pending": tools.pending_confirmations(),
-        "audit_log_path": tools
-            .actuation_audit_path()
-            .map(|path| path.to_string_lossy().to_string()),
+        "audit_log": {
+            "enabled": tools.actuation_audit_path().is_some(),
+            "storage": "local_private_file"
+        },
     });
     (200, "application/json", body.to_string())
 }

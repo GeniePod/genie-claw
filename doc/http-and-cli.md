@@ -36,7 +36,7 @@ Requests without the header are treated as `api`, not `dashboard`.
 | `GET` | `/api/runtime/contract` | Deterministic runtime contract: prompt/tool/policy/hydration hashes |
 | `GET` | `/api/web-search` | Web search config/cache status |
 | `POST` | `/api/web-search` | Execute direct web search |
-| `GET` | `/api/actuation/pending` | List pending high-risk confirmations and audit-log path |
+| `GET` | `/api/actuation/pending` | List pending high-risk confirmations and redacted audit state |
 | `GET` | `/api/actuation/actions` | List recent executed home actions for dashboard/inspection |
 | `POST` | `/api/actuation/confirm` | Confirm and execute one pending action token |
 | `GET` | `/api/health` | Rich runtime health |
@@ -186,7 +186,10 @@ Current response shape:
       "expires_ms": 1777000600000
     }
   ],
-  "audit_log_path": "/opt/geniepod/data/safety/actuation-audit.jsonl"
+  "audit_log": {
+    "enabled": true,
+    "storage": "local_private_file"
+  }
 }
 ```
 
@@ -254,6 +257,7 @@ Served by `crates/genie-api/src/routes.rs`.
 | `GET` | `/api/status` | Governor mode, memory, uptime-oriented status |
 | `GET` | `/api/tegrastats` | Recent tegrastats history from `governor.db` |
 | `GET` | `/api/services` | Latest health state per service from `health.db` |
+| `GET` | `/api/security` | Redacted household security posture without raw config exposure |
 | `GET` | `/api/runtime/contract` | Runtime contract proxied from `genie-core` |
 | `GET` | `/api/actuation/pending` | Pending confirmations from `genie-core` |
 | `GET` | `/api/actuation/actions` | Recent executed actions from `genie-core` |
@@ -297,10 +301,10 @@ Writes a local JSON support bundle. If no path is provided, the output goes to:
 ```
 
 The bundle includes service reachability, governor status, core health, runtime
-contract, connectivity status, actuation state, selected system files, binary
-inventory, model inventory, recent runtime contracts, recent tool audit events,
-and recent actuation audit events. It records config presence but does not copy
-config contents.
+contract, connectivity status, redacted household security posture, actuation
+state, selected system files, binary inventory, model inventory, recent runtime
+contracts, recent tool audit events, and recent actuation audit events. It
+records config presence but does not copy config contents.
 
 ### Skill Subcommands
 

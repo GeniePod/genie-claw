@@ -185,9 +185,30 @@ canvas { width: 100% !important; height: 180px !important; }
   </div>
 
   <div class="card">
+    <h2>Household Security</h2>
+    <div class="stat">
+      <span class="label">Trust Boundary</span>
+      <span><span class="value" id="security-trust" style="font-size:.9rem">--</span></span>
+    </div>
+    <div class="stat">
+      <span class="label">Raw Config</span>
+      <span><span class="value" id="security-config" style="font-size:.9rem">--</span></span>
+    </div>
+    <div class="stat">
+      <span class="label">Shared Memory</span>
+      <span><span class="value" id="security-memory" style="font-size:.9rem">--</span></span>
+    </div>
+    <div class="stat">
+      <span class="label">Risk Flags</span>
+      <span><span class="value" id="security-risk-count">--</span></span>
+    </div>
+    <div class="small" id="security-detail">Security posture not loaded yet.</div>
+  </div>
+
+  <div class="card">
     <h2>Actuation Safety</h2>
     <div class="panel-toolbar">
-      <span class="small" id="actuation-audit-path">Audit log: --</span>
+      <span class="small" id="actuation-audit-state">Audit log: --</span>
       <button class="btn btn-quiet" id="refresh-actuation" type="button">Refresh</button>
     </div>
     <div class="stack">
