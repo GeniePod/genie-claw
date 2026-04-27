@@ -40,7 +40,7 @@ wakeword_script = "/opt/geniepod/bin/genie-wake-listen.py"   # Wake word listene
 # fixed_confidence = "high"      # "low", "medium", or "high"
 # local_profile_dir = "/opt/geniepod/data/speakers"
 # local_min_score = 0.82
-# Enroll with: genie-ctl speaker enroll Jared /path/to/jared.wav
+# Enroll with: genie-ctl speaker enroll-live Jared
 
 # Runtime load policy for native skills. Defaults are audit-only so existing
 # local skills keep loading; enable these after manifests/signatures are ready.

@@ -76,6 +76,7 @@ Behavior notes:
 - `fixed` is mainly for single-user boxes, testing, and plumbing validation.
 - `local_biometric` uses local WAV-derived speaker profiles from `local_profile_dir`.
 - Enroll a profile with `genie-ctl speaker enroll <NAME> <WAV>`.
+- On device, use `genie-ctl speaker enroll-live <NAME>` to record and enroll through ALSA in one step.
 - Test matching with `genie-ctl speaker identify <WAV>`.
 - This affects memory read context in voice mode today. A recognized speaker can unlock person-scoped memory recall when the match clears `local_min_score`.
 - The current recognizer is useful for household routing, not adversarial authentication. Do not treat it as a door-lock or payment authorization factor.

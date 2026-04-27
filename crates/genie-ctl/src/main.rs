@@ -24,9 +24,10 @@ use genie_core::skills::{
     skills_dir as runtime_skills_dir,
 };
 use genie_core::voice::identity::{
-    enroll_speaker_file, identify_speaker_file, list_speaker_profiles,
+    enroll_speaker_file, identify_speaker_file, list_speaker_profiles, remove_speaker_profile,
 };
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const CORE_URL: &str = "127.0.0.1:3000";
@@ -154,12 +155,18 @@ fn print_speaker_usage() {
 USAGE:
     genie-ctl speaker list [--profile-dir DIR]
     genie-ctl speaker enroll <NAME> <WAV> [--profile-dir DIR]
+    genie-ctl speaker enroll-live <NAME> [--device DEV] [--sample-rate N] [--duration SECS] [--profile-dir DIR]
+    genie-ctl speaker record <OUT.wav> [--device DEV] [--sample-rate N] [--duration SECS]
     genie-ctl speaker identify <WAV> [--profile-dir DIR] [--min-score N]
+    genie-ctl speaker remove <NAME> [--profile-dir DIR]
 
 SUBCOMMANDS:
     list                List enrolled local speaker profiles
     enroll              Enroll a local speaker profile from a short WAV sample
+    enroll-live         Record a local sample, then enroll it
+    record              Record a WAV sample using arecord
     identify            Match a WAV sample against enrolled local profiles
+    remove              Delete an enrolled local speaker profile
 
 NOTES:
     Speaker identification is local and optional. It helps route household
@@ -205,6 +212,26 @@ fn cmd_speaker(args: &[String]) -> Result<()> {
             let opts = parse_speaker_options(&args[3..])?;
             cmd_speaker_enroll(name, wav, &opts.profile_dir)
         }
+        "enroll-live" | "enroll-record" => {
+            if args.len() < 2 {
+                anyhow::bail!(
+                    "Usage: genie-ctl speaker enroll-live <NAME> [--device DEV] [--sample-rate N] [--duration SECS] [--profile-dir DIR]"
+                );
+            }
+            let name = &args[1];
+            let opts = parse_speaker_options(&args[2..])?;
+            cmd_speaker_enroll_live(name, &opts)
+        }
+        "record" => {
+            if args.len() < 2 {
+                anyhow::bail!(
+                    "Usage: genie-ctl speaker record <OUT.wav> [--device DEV] [--sample-rate N] [--duration SECS]"
+                );
+            }
+            let output = Path::new(&args[1]);
+            let opts = parse_speaker_options(&args[2..])?;
+            cmd_speaker_record(output, &opts)
+        }
         "identify" | "id" => {
             if args.len() < 2 {
                 anyhow::bail!(
@@ -214,6 +241,13 @@ fn cmd_speaker(args: &[String]) -> Result<()> {
             let wav = Path::new(&args[1]);
             let opts = parse_speaker_options(&args[2..])?;
             cmd_speaker_identify(wav, &opts.profile_dir, opts.min_score)
+        }
+        "remove" | "rm" | "delete" => {
+            if args.len() < 2 {
+                anyhow::bail!("Usage: genie-ctl speaker remove <NAME> [--profile-dir DIR]");
+            }
+            let opts = parse_speaker_options(&args[2..])?;
+            cmd_speaker_remove(&args[1], &opts.profile_dir)
         }
         other => {
             anyhow::bail!("Unknown speaker subcommand: {}", other);
@@ -225,11 +259,18 @@ fn cmd_speaker(args: &[String]) -> Result<()> {
 struct SpeakerCliOptions {
     profile_dir: PathBuf,
     min_score: f32,
+    device: String,
+    sample_rate: u32,
+    duration_secs: u32,
 }
 
 fn parse_speaker_options(args: &[String]) -> Result<SpeakerCliOptions> {
-    let mut profile_dir = default_speaker_profile_dir();
-    let mut min_score = 0.82f32;
+    let defaults = default_speaker_options();
+    let mut profile_dir = defaults.profile_dir;
+    let mut min_score = defaults.min_score;
+    let mut device = defaults.device;
+    let mut sample_rate = defaults.sample_rate;
+    let mut duration_secs = defaults.duration_secs;
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -247,6 +288,27 @@ fn parse_speaker_options(args: &[String]) -> Result<SpeakerCliOptions> {
                 min_score = value.parse::<f32>()?;
                 i += 2;
             }
+            "--device" => {
+                let Some(value) = args.get(i + 1) else {
+                    anyhow::bail!("--device requires an ALSA device, e.g. plughw:2,0");
+                };
+                device = value.to_string();
+                i += 2;
+            }
+            "--sample-rate" => {
+                let Some(value) = args.get(i + 1) else {
+                    anyhow::bail!("--sample-rate requires a number");
+                };
+                sample_rate = value.parse::<u32>()?;
+                i += 2;
+            }
+            "--duration" | "--secs" => {
+                let Some(value) = args.get(i + 1) else {
+                    anyhow::bail!("--duration requires a number of seconds");
+                };
+                duration_secs = value.parse::<u32>()?;
+                i += 2;
+            }
             other => anyhow::bail!("unknown speaker option: {}", other),
         }
     }
@@ -254,13 +316,32 @@ fn parse_speaker_options(args: &[String]) -> Result<SpeakerCliOptions> {
     Ok(SpeakerCliOptions {
         profile_dir,
         min_score,
+        device,
+        sample_rate,
+        duration_secs,
     })
 }
 
-fn default_speaker_profile_dir() -> PathBuf {
+fn default_speaker_options() -> SpeakerCliOptions {
     Config::load()
-        .map(|config| config.core.speaker_identity.local_profile_dir)
-        .unwrap_or_else(|_| PathBuf::from("/opt/geniepod/data/speakers"))
+        .map(|config| SpeakerCliOptions {
+            profile_dir: config.core.speaker_identity.local_profile_dir,
+            device: if config.core.audio_device.is_empty() || config.core.audio_device == "auto" {
+                "default".into()
+            } else {
+                config.core.audio_device
+            },
+            sample_rate: config.core.audio_sample_rate,
+            duration_secs: config.core.voice_record_secs.max(3),
+            min_score: config.core.speaker_identity.local_min_score,
+        })
+        .unwrap_or_else(|_| SpeakerCliOptions {
+            profile_dir: PathBuf::from("/opt/geniepod/data/speakers"),
+            device: "default".into(),
+            sample_rate: 48_000,
+            duration_secs: 5,
+            min_score: 0.82,
+        })
 }
 
 fn cmd_speaker_list(profile_dir: &Path) -> Result<()> {
@@ -298,6 +379,34 @@ fn cmd_speaker_enroll(name: &str, wav: &Path, profile_dir: &Path) -> Result<()> 
     Ok(())
 }
 
+fn cmd_speaker_enroll_live(name: &str, opts: &SpeakerCliOptions) -> Result<()> {
+    let wav_path = std::env::temp_dir().join(format!(
+        "geniepod-speaker-enroll-{}-{}.wav",
+        std::process::id(),
+        unix_time_ms()
+    ));
+    println!(
+        "Recording {} seconds for '{}' on {}...",
+        opts.duration_secs, name, opts.device
+    );
+    record_speaker_wav(&wav_path, opts)?;
+    let result = cmd_speaker_enroll(name, &wav_path, &opts.profile_dir);
+    let _ = std::fs::remove_file(&wav_path);
+    result
+}
+
+fn cmd_speaker_record(output: &Path, opts: &SpeakerCliOptions) -> Result<()> {
+    println!(
+        "Recording {} seconds on {} -> {}",
+        opts.duration_secs,
+        opts.device,
+        output.display()
+    );
+    record_speaker_wav(output, opts)?;
+    println!("Recorded {}", output.display());
+    Ok(())
+}
+
 fn cmd_speaker_identify(wav: &Path, profile_dir: &Path, min_score: f32) -> Result<()> {
     match identify_speaker_file(profile_dir, wav, min_score)? {
         Some(result) => {
@@ -315,6 +424,53 @@ fn cmd_speaker_identify(wav: &Path, profile_dir: &Path, min_score: f32) -> Resul
                 profile_dir.display()
             );
         }
+    }
+    Ok(())
+}
+
+fn cmd_speaker_remove(name: &str, profile_dir: &Path) -> Result<()> {
+    let removed = remove_speaker_profile(profile_dir, name)?;
+    println!("Removed speaker profile {}", removed.display());
+    Ok(())
+}
+
+fn record_speaker_wav(output: &Path, opts: &SpeakerCliOptions) -> Result<()> {
+    if opts.duration_secs == 0 {
+        anyhow::bail!("recording duration must be greater than zero");
+    }
+    if opts.sample_rate == 0 {
+        anyhow::bail!("sample rate must be greater than zero");
+    }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let status = Command::new("arecord")
+        .args([
+            "-D",
+            &opts.device,
+            "-f",
+            "S16_LE",
+            "-r",
+            &opts.sample_rate.to_string(),
+            "-c",
+            "1",
+            "-d",
+            &opts.duration_secs.to_string(),
+            output
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("output path is not valid UTF-8"))?,
+        ])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("arecord failed with status {}", status);
+    }
+
+    let metadata = std::fs::metadata(output)?;
+    if metadata.len() <= 44 {
+        anyhow::bail!("recording produced empty audio; check microphone device");
     }
     Ok(())
 }
@@ -1548,6 +1704,37 @@ mod tests {
         let args = vec!["--limit".to_string(), "9".to_string(), "Matter".to_string()];
 
         assert!(parse_search_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_speaker_options_supports_recording_flags() {
+        let args = vec![
+            "--profile-dir".to_string(),
+            "/tmp/speakers".to_string(),
+            "--min-score".to_string(),
+            "0.91".to_string(),
+            "--device".to_string(),
+            "plughw:2,0".to_string(),
+            "--sample-rate".to_string(),
+            "16000".to_string(),
+            "--duration".to_string(),
+            "7".to_string(),
+        ];
+
+        let parsed = parse_speaker_options(&args).unwrap();
+
+        assert_eq!(parsed.profile_dir, PathBuf::from("/tmp/speakers"));
+        assert!((parsed.min_score - 0.91).abs() < f32::EPSILON);
+        assert_eq!(parsed.device, "plughw:2,0");
+        assert_eq!(parsed.sample_rate, 16_000);
+        assert_eq!(parsed.duration_secs, 7);
+    }
+
+    #[test]
+    fn parse_speaker_options_rejects_unknown_flag() {
+        let args = vec!["--bad".to_string()];
+
+        assert!(parse_speaker_options(&args).is_err());
     }
 
     #[test]

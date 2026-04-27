@@ -173,6 +173,7 @@ pub fn enroll_speaker_file(
 
     let profile_dir = profile_dir.as_ref();
     std::fs::create_dir_all(profile_dir)?;
+    secure_profile_dir(profile_dir)?;
     let path = profile_path(profile_dir, name);
     let bytes = serde_json::to_vec_pretty(&profile)?;
     std::fs::write(path, bytes)?;
@@ -209,6 +210,23 @@ pub fn list_speaker_profiles(profile_dir: impl AsRef<Path>) -> anyhow::Result<Ve
     }
     profiles.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(profiles)
+}
+
+pub fn remove_speaker_profile(
+    profile_dir: impl AsRef<Path>,
+    name: &str,
+) -> anyhow::Result<PathBuf> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("speaker name is required");
+    }
+
+    let path = profile_path(profile_dir.as_ref(), name);
+    if !path.exists() {
+        anyhow::bail!("speaker profile not found: {}", path.display());
+    }
+    std::fs::remove_file(&path)?;
+    Ok(path)
 }
 
 fn identify_fingerprint(
@@ -262,6 +280,19 @@ fn is_profile_file(path: &Path) -> bool {
 
 fn profile_path(profile_dir: &Path, name: &str) -> PathBuf {
     profile_dir.join(format!("{}.speaker.json", sanitize_profile_name(name)))
+}
+
+#[cfg(unix)]
+fn secure_profile_dir(profile_dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(profile_dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_profile_dir(_profile_dir: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn sanitize_profile_name(name: &str) -> String {
@@ -703,6 +734,12 @@ mod tests {
         let profile = enroll_speaker_file(&dir, "Jared", &jared_train).unwrap();
         assert_eq!(profile.name, "Jared");
         assert_eq!(list_speaker_profiles(&dir).unwrap().len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
 
         let matched = identify_speaker_file(&dir, &jared_test, 0.82)
             .unwrap()
@@ -712,6 +749,10 @@ mod tests {
 
         let rejected = identify_speaker_file(&dir, &maya_test, 0.82).unwrap();
         assert!(rejected.is_none());
+
+        let removed = remove_speaker_profile(&dir, "Jared").unwrap();
+        assert!(removed.ends_with("jared.speaker.json"));
+        assert!(list_speaker_profiles(&dir).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

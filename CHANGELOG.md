@@ -14,6 +14,8 @@
   the local biometric recognizer boundary viable for the next alpha.
 - Local speaker identification now supports offline WAV-derived profile
   enrollment and matching through `genie-ctl speaker`.
+- Speaker profile management now supports live microphone enrollment, WAV
+  recording, and profile removal from `genie-ctl`.
 
 ## 1.0.0-alpha.4 - 2026-04-25
 

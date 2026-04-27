@@ -29,7 +29,7 @@ expected_runtime_contract_hash = ""  # Optional: pin after a known-good boot.
 # fixed_confidence = "high"
 # local_profile_dir = "./data/speakers"
 # local_min_score = 0.82
-# Enroll with: genie-ctl speaker enroll "Dev User" ./samples/dev-user.wav --profile-dir ./data/speakers
+# Enroll with: genie-ctl speaker enroll-live "Dev User" --profile-dir ./data/speakers
 
 # [core.skill_policy]
 # require_manifest = false

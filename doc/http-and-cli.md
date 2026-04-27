@@ -327,7 +327,10 @@ material is present. This is audit visibility only in the current release.
 | --- | --- |
 | `genie-ctl speaker list [--profile-dir DIR]` | List enrolled local speaker profiles |
 | `genie-ctl speaker enroll <NAME> <WAV> [--profile-dir DIR]` | Enroll a WAV sample as a local speaker profile |
+| `genie-ctl speaker enroll-live <NAME> [--device DEV] [--sample-rate N] [--duration SECS] [--profile-dir DIR]` | Record and enroll a speaker profile in one step |
+| `genie-ctl speaker record <OUT.wav> [--device DEV] [--sample-rate N] [--duration SECS]` | Record a reusable enrollment/test WAV |
 | `genie-ctl speaker identify <WAV> [--profile-dir DIR] [--min-score N]` | Match a WAV sample against enrolled profiles |
+| `genie-ctl speaker remove <NAME> [--profile-dir DIR]` | Delete an enrolled speaker profile |
 
 Speaker profiles store compact local acoustic fingerprints, not raw audio. They
 are used for household memory routing in voice mode and are not a hostile-user
