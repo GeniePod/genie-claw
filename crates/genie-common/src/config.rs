@@ -133,6 +133,16 @@ pub struct CoreConfig {
     #[serde(default = "defaults::deep_filter_atten_lim_db")]
     pub deep_filter_atten_lim_db: f32,
 
+    /// Half-duplex gate (issue #15): milliseconds to wait after Piper's `aplay`
+    /// subprocess exits before allowing the next mic capture. Lets the ALSA
+    /// hardware buffer drain and the speaker/room reverb decay below the
+    /// whisper-server no-speech threshold. Without this, the next cycle's
+    /// recording contains the assistant's own TTS bleed and whisper
+    /// transcribes the assistant's voice instead of the user's. Set to 0
+    /// on installs with full physical isolation (headphones / headset).
+    #[serde(default = "defaults::post_tts_silence_ms")]
+    pub post_tts_silence_ms: u64,
+
     /// Enable voice mode (mic → STT → LLM → TTS → speaker loop).
     #[serde(default)]
     pub voice_enabled: bool,
@@ -197,6 +207,7 @@ impl Default for CoreConfig {
             audio_denoiser: defaults::audio_denoiser(),
             deep_filter_path: defaults::deep_filter_path(),
             deep_filter_atten_lim_db: defaults::deep_filter_atten_lim_db(),
+            post_tts_silence_ms: defaults::post_tts_silence_ms(),
             voice_enabled: false,
             voice_record_secs: defaults::voice_record_secs(),
             voice_continuous: true,
@@ -1239,6 +1250,13 @@ mod defaults {
     }
     pub fn deep_filter_path() -> PathBuf {
         PathBuf::from("/opt/geniepod/bin/deep-filter")
+    }
+    pub fn post_tts_silence_ms() -> u64 {
+        // 1500 ms: empirical default that lets ALSA's hardware playback buffer
+        // drain on Tegra HDA and the speaker/room decay fall below the
+        // whisper-server no-speech threshold. Set lower on headphone-only
+        // installs, higher on rooms with long reverberation.
+        1500
     }
     pub fn deep_filter_atten_lim_db() -> f32 {
         100.0

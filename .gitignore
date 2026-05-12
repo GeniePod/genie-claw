@@ -1,3 +1,7 @@
 /target/
 /ROADMAP.md
 /VISION.md
+
+# macOS metadata
+.DS_Store
+**/.DS_Store

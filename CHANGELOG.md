@@ -4,6 +4,22 @@
 
 ### Added
 
+- Half-duplex post-TTS gate to suppress speaker→mic acoustic echo (issue #15).
+  `TtsEngine::speak()` now sleeps `post_tts_silence_ms` milliseconds after
+  `aplay` exits. The ALSA hardware playback buffer continues draining for
+  some time after `aplay` returns, and the room itself takes time to decay
+  below the whisper-server no-speech threshold. Without the gate, the next
+  cycle's mic capture picked up the assistant's own TTS and whisper happily
+  transcribed it as the next user utterance — confirmed in the #14 chase
+  on Jetson + LyraT + speakers in a shared room. Default 1500 ms; settable
+  via `[core].post_tts_silence_ms` in `geniepod.toml`. Headphone / headset
+  installs can drop it to 0.
+- `aec::process_aec` now discards stale echo references — any TTS reference
+  older than `TTS_duration + MAX_ECHO_TAIL_MS` (1.5 s) is dropped before
+  NLMS runs. Push-to-talk recordings that happen after the room reverb has
+  decayed should not be processed against an aged TTS reference; the
+  previous behavior would convolve fresh user speech with old TTS PCM and
+  introduce phantom artifacts.
 - DeepFilterNet capture-side denoiser as the alpha.7 default (issue #12).
   `record_audio` now branches on a new `audio_denoiser` config knob with
   three backends: `"deepfilternet"` (neural; new default), `"sox"` (the

@@ -21,6 +21,12 @@ pub struct TtsEngine {
     pub sample_rate: u32,
     /// ALSA device for playback (e.g. "plughw:0,0").
     audio_device: String,
+    /// Half-duplex post-TTS silence (issue #15): milliseconds to sleep after
+    /// `aplay` exits before returning from speak(). Gives the ALSA hardware
+    /// playback buffer time to drain and the room reverb time to decay below
+    /// the whisper-server no-speech threshold, so the next mic capture does
+    /// not pick up the assistant's own TTS.
+    post_silence_ms: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -41,6 +47,7 @@ impl TtsEngine {
             child: None,
             sample_rate: 22050,
             audio_device: String::new(),
+            post_silence_ms: 0,
         }
     }
 
@@ -53,6 +60,7 @@ impl TtsEngine {
             child: None,
             sample_rate: 22050,
             audio_device: String::new(),
+            post_silence_ms: 0,
         }
     }
 
@@ -74,7 +82,14 @@ impl TtsEngine {
             child: None,
             sample_rate: 22050,
             audio_device: audio_device.to_string(),
+            post_silence_ms: 0,
         }
+    }
+
+    /// Set the half-duplex post-TTS silence (ms) — see issue #15.
+    pub fn with_post_silence_ms(mut self, ms: u64) -> Self {
+        self.post_silence_ms = ms;
+        self
     }
 
     pub fn for_model(&self, model_path: &str) -> Self {
@@ -85,6 +100,7 @@ impl TtsEngine {
             child: None,
             sample_rate: self.sample_rate,
             audio_device: self.audio_device.clone(),
+            post_silence_ms: self.post_silence_ms,
         }
     }
 
@@ -192,6 +208,20 @@ impl TtsEngine {
         let aplay_output = aplay.wait().await?;
         if !aplay_output.success() {
             tracing::warn!("aplay exited with error");
+        }
+
+        // Half-duplex gate (issue #15): once aplay has exited, the ALSA
+        // hardware buffer may still be flushing the tail of the TTS PCM, and
+        // the room itself takes time to decay below the whisper-server
+        // no-speech threshold. Without this sleep, the next mic capture
+        // contains the assistant's own voice and whisper happily transcribes
+        // it as the next "user" utterance.
+        if self.post_silence_ms > 0 {
+            tracing::debug!(
+                post_silence_ms = self.post_silence_ms,
+                "half-duplex gate: sleeping for room decay"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(self.post_silence_ms)).await;
         }
 
         Ok(())

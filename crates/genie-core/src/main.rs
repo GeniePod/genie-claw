@@ -193,6 +193,7 @@ async fn main() -> Result<()> {
             audio_denoiser: config.core.audio_denoiser.clone(),
             deep_filter_path: config.core.deep_filter_path.to_string_lossy().to_string(),
             deep_filter_atten_lim_db: config.core.deep_filter_atten_lim_db,
+            post_tts_silence_ms: config.core.post_tts_silence_ms,
             record_secs: config.core.voice_record_secs,
             llm_model_path: config.core.llm_model_path.to_string_lossy().to_string(),
             wakeword_script: config.core.wakeword_script.to_string_lossy().to_string(),

@@ -29,6 +29,11 @@ struct EchoReference {
     play_start_ms: u64,
 }
 
+/// Maximum room/acoustic tail after TTS playback where the reference is still
+/// meaningful for echo cancellation. Push-to-talk recordings that happen after
+/// this window should not be processed against old TTS audio.
+const MAX_ECHO_TAIL_MS: u64 = 1_500;
+
 /// Store TTS output as echo reference for future AEC processing.
 ///
 /// Called by TTS speak() after Piper generates PCM, before sending to aplay.
@@ -149,8 +154,43 @@ pub fn cancel_echo(mic_samples: &mut [f32], mic_sample_rate: u32) {
 /// Reads the WAV, applies echo cancellation, writes back.
 /// Called from noise processing pipeline after recording.
 pub async fn process_aec(wav_path: &str, sample_rate: u32) {
-    // Check if we have an echo reference.
-    let has_ref = ECHO_REF.lock().map(|g| g.is_some()).unwrap_or(false);
+    // Check if we have a fresh echo reference. The current voice loop records
+    // after TTS playback, not during it. Applying an old TTS reference to the
+    // next push-to-talk capture corrupts real speech, so stale references are
+    // discarded before NLMS runs.
+    let has_ref = ECHO_REF
+        .lock()
+        .map(|mut guard| {
+            let Some(reference) = guard.as_ref() else {
+                return false;
+            };
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let ref_duration_ms = if reference.sample_rate == 0 {
+                0
+            } else {
+                (reference.samples.len() as u64 * 1_000) / reference.sample_rate as u64
+            };
+            let age_ms = now_ms.saturating_sub(reference.play_start_ms);
+            let fresh_window_ms = ref_duration_ms.saturating_add(MAX_ECHO_TAIL_MS);
+
+            if age_ms > fresh_window_ms {
+                tracing::debug!(
+                    age_ms,
+                    ref_duration_ms,
+                    fresh_window_ms,
+                    "skipping stale echo reference"
+                );
+                *guard = None;
+                false
+            } else {
+                true
+            }
+        })
+        .unwrap_or(false);
 
     if !has_ref {
         return; // No echo reference — TTS wasn't playing during recording.
@@ -296,6 +336,63 @@ mod tests {
 
         let has_ref = ECHO_REF.lock().unwrap().is_some();
         assert!(!has_ref, "Reference should be cleared");
+    }
+
+    #[tokio::test]
+    async fn process_aec_skips_stale_reference() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        let sample_rate = 16000;
+        let pcm = vec![0u8; 3200];
+        let path = format!("/tmp/geniepod-aec-stale-test-{}.wav", std::process::id());
+        let wav = test_wav(&pcm, sample_rate);
+        tokio::fs::write(&path, &wav).await.unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        *ECHO_REF.lock().unwrap() = Some(EchoReference {
+            samples: vec![1000.0; 1600],
+            sample_rate,
+            play_start_ms: now_ms - 60_000,
+        });
+
+        process_aec(&path, sample_rate).await;
+
+        let after = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(after, wav, "stale AEC reference should not modify WAV");
+        assert!(
+            ECHO_REF.lock().unwrap().is_none(),
+            "stale reference should be cleared"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    fn test_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+        let channels = 1u16;
+        let bits_per_sample = 16u16;
+        let data_size = pcm.len() as u32;
+        let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
+        let block_align = channels * bits_per_sample / 8;
+
+        let mut wav = Vec::with_capacity(44 + pcm.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        wav.extend_from_slice(pcm);
+        wav
     }
 
     fn rms(samples: &[f32]) -> f32 {

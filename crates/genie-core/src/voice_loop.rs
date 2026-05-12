@@ -47,6 +47,10 @@ pub struct VoiceConfig {
     pub deep_filter_path: String,
     /// DeepFilterNet `--atten-lim` in dB. 100.0 = full denoising.
     pub deep_filter_atten_lim_db: f32,
+    /// Half-duplex gate: wait this long after aplay exits before recording.
+    /// See issue #15 — prevents the previous TTS from being captured as the
+    /// next utterance.
+    pub post_tts_silence_ms: u64,
     pub record_secs: u32,
     pub llm_model_path: String,
     pub wakeword_script: String,
@@ -622,6 +626,7 @@ fn clone_voice_config(cfg: &VoiceConfig) -> VoiceConfig {
         audio_denoiser: cfg.audio_denoiser.clone(),
         deep_filter_path: cfg.deep_filter_path.clone(),
         deep_filter_atten_lim_db: cfg.deep_filter_atten_lim_db,
+        post_tts_silence_ms: cfg.post_tts_silence_ms,
         record_secs: cfg.record_secs,
         llm_model_path: cfg.llm_model_path.clone(),
         wakeword_script: cfg.wakeword_script.clone(),
@@ -651,6 +656,7 @@ fn tts_engine_for_language(
         &voice_cfg.audio_output_device,
         voice_cfg.piper_pipe_mode,
     )
+    .with_post_silence_ms(voice_cfg.post_tts_silence_ms)
 }
 
 async fn handle_quick_tool_for_voice(
