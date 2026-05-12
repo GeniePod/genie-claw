@@ -4,6 +4,17 @@
 
 ### Added
 
+- First-voice-reply latency banner (issue #19). On the first completed voice
+  cycle of a `genie-core` run, the loop prints a one-shot summary block with
+  three numbers:
+    - `speech end -> STT done`
+    - `STT done -> first audio`
+    - `total (first reply)`
+  Lets an operator see at a glance whether the warmup services
+  (`genie-llm-warmup.service`, `genie-whisper-warmup.service`) actually
+  pre-loaded the iGPU. Subsequent cycles keep the existing one-liner.
+  TTFA is captured by stamping the moment the first PCM byte hits
+  `aplay`'s stdin, exposed via `tts::first_audio_at()`.
 - `genie-whisper-warmup.service` (issue #17) — oneshot systemd unit ordered
   `After=genie-whisper.service` that polls the whisper-server port and POSTs
   one second of synthesized silence to `/inference`. Forces the ggml-small

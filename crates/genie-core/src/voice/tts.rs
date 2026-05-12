@@ -1,6 +1,37 @@
 use anyhow::Result;
+use std::sync::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
+
+/// Time-to-first-audio (TTFA) tracker for the latency banner (issue #19).
+///
+/// The voice loop resets this to `None` before each cycle's TTS phase via
+/// `reset_first_audio_marker`. The first invocation of `TtsEngine::speak()`
+/// in that phase stamps the current `Instant` here, immediately before
+/// writing the first PCM byte to `aplay`'s stdin. The voice loop reads it
+/// back with `first_audio_at()` to compute "STT done -> first audio".
+static FIRST_AUDIO_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Reset the first-audio timestamp tracker. Call before the TTS phase of
+/// a voice cycle whose TTFA you want to measure.
+pub fn reset_first_audio_marker() {
+    if let Ok(mut g) = FIRST_AUDIO_AT.lock() {
+        *g = None;
+    }
+}
+
+/// Read the first-audio timestamp captured since the last reset, if any.
+pub fn first_audio_at() -> Option<std::time::Instant> {
+    FIRST_AUDIO_AT.lock().ok().and_then(|g| *g)
+}
+
+fn mark_first_audio() {
+    if let Ok(mut g) = FIRST_AUDIO_AT.lock() {
+        if g.is_none() {
+            *g = Some(std::time::Instant::now());
+        }
+    }
+}
 
 /// Piper TTS subprocess manager.
 ///
@@ -202,6 +233,10 @@ impl TtsEngine {
 
         if let Some(mut stdin) = aplay.stdin.take() {
             use tokio::io::AsyncWriteExt;
+            // TTFA marker for issue #19 latency banner: stamp the moment the
+            // first PCM byte is about to be written to aplay. ALSA's hardware
+            // buffer will turn this into audible audio within a few ms.
+            mark_first_audio();
             stdin.write_all(&pcm).await?;
         }
 

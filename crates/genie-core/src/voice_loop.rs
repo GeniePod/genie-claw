@@ -8,8 +8,14 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+
+/// Whether the first-voice-reply latency banner (issue #19) has been printed
+/// this process. Set true after the first successful voice cycle so subsequent
+/// cycles only emit the normal one-liner.
+static FIRST_REPLY_BANNER_PRINTED: AtomicBool = AtomicBool::new(false);
 
 use crate::conversation::ConversationStore;
 use crate::llm::LlmClient;
@@ -856,6 +862,13 @@ async fn voice_cycle(
             return true;
         }
     };
+    // T0 for the latency banner (#19): the user has finished speaking.
+    let t_record_done = std::time::Instant::now();
+
+    // Reset the TTFA tracker before any speak() runs this cycle so the
+    // banner reads back this cycle's first-audio instant, not a stale one
+    // from the previous response.
+    tts::reset_first_audio_marker();
 
     // Step 2: Light noise processing only.
     // Full noise processing (gate, spectral suppression) disabled for now —
@@ -905,6 +918,9 @@ async fn voice_cycle(
         });
     let read_context = identity::build_memory_read_context(&text, &speaker);
     let _ = tokio::fs::remove_file(&wav_path).await;
+
+    // T1 for the latency banner (#19): STT response is in.
+    let t_stt_done = std::time::Instant::now();
 
     eprintln!(
         "[voice] You said: \"{}\" (STT: {} ms)",
@@ -1072,6 +1088,29 @@ async fn voice_cycle(
         format::for_voice(&final_response),
         llm_tts_ms
     );
+
+    // First-voice-reply latency banner (#19). Print once per process so an
+    // operator can see at a glance whether the LLM/whisper warmup services
+    // pre-loaded the iGPU (target: a few hundred ms STT, low-second total)
+    // vs the cold path (60-90 s STT, multi-minute total). Subsequent cycles
+    // keep only the existing one-liner.
+    if !FIRST_REPLY_BANNER_PRINTED.swap(true, Ordering::SeqCst) {
+        let stt_ms = (t_stt_done - t_record_done).as_millis();
+        let ttfa = tts::first_audio_at();
+        let ttfa_ms = ttfa.map(|t| (t - t_stt_done).as_millis());
+        let total_ms = ttfa.map(|t| (t - t_record_done).as_millis());
+        let fmt_ms = |v: Option<u128>| match v {
+            Some(ms) => format!("{} ms", ms),
+            None => "n/a (no audio played)".into(),
+        };
+        eprintln!();
+        eprintln!("=== first voice reply latency ===");
+        eprintln!("  speech end -> STT done:      {} ms", stt_ms);
+        eprintln!("  STT done   -> first audio:   {}", fmt_ms(ttfa_ms));
+        eprintln!("  total (first reply):         {}", fmt_ms(total_ms));
+        eprintln!("=================================");
+        eprintln!();
+    }
 
     // Auto-capture facts from user's speech (runs after TTS, non-blocking).
     let stored = extract::extract_and_store(memory, &text);
