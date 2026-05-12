@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Added
+
+- DeepFilterNet capture-side denoiser as the alpha.7 default (issue #12).
+  `record_audio` now branches on a new `audio_denoiser` config knob with
+  three backends: `"deepfilternet"` (neural; new default), `"sox"` (the
+  alpha.6 baseline of spectral subtraction + compand), and `"none"`
+  (bandpass + compand + normalize). The DFN chain runs as
+  `sox(channels 1, highpass 100, lowpass 7000) → deep-filter --atten-lim N
+  → sox(gain -n -3)`: bandpass first so DFN's STFT doesn't spend capacity
+  on rumble/hiss bands whisper can't use, then DFN denoise (handles
+  non-stationary noise — fans, typing, background voices — without
+  needing a captured noise profile), then peak-normalize. Compand is
+  intentionally dropped from the DFN chain because DFN's implicit gating
+  preserves quiet phonemes better than a hard `-65 dBFS` compand gate.
+  Any subprocess failure (binary missing, DFN crash, intermediate file
+  empty) falls back to the sox chain at runtime, so a host without the
+  binary still records cleanly via the alpha.6 path. New config fields
+  `audio_denoiser`, `deep_filter_path`, `deep_filter_atten_lim_db`.
+- `setup-jetson.sh` now installs the prebuilt
+  `deep-filter-0.5.6-aarch64-unknown-linux-gnu` binary (~39 MB, MIT/Apache
+  dual-licensed, DFN3 model statically linked via tract) into
+  `/opt/geniepod/bin/deep-filter` when `audio_denoiser = "deepfilternet"`.
+  The download is best-effort — failures leave the runtime fallback path
+  in place rather than aborting setup. Skipped when the operator has
+  pinned `audio_denoiser` to `"sox"` or `"none"`.
+
 ### Changed
 
 - `voice_loop` now runs `stt::flush_mic_buffer` BEFORE printing the

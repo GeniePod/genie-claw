@@ -251,6 +251,45 @@ if [ "$VOICE_MISSING" -eq 1 ]; then
     echo "  Until installed, keep voice_enabled = false in $CONFIG_DIR/geniepod.toml."
 fi
 
+# 5f. Install DeepFilterNet `deep-filter` binary (alpha.7, issue #12).
+# Used by record_audio when audio_denoiser = "deepfilternet". The binary is
+# self-contained — DFN3 model is statically linked via tract. License: MIT/
+# Apache-2.0 dual (the project explicitly clarifies AGPL compatibility).
+# Falls back to sox-chain at runtime if this step is skipped, so the install
+# is non-fatal.
+echo "[5f/6] Checking DeepFilterNet binary..."
+AUDIO_DENOISER="$(read_toml_string audio_denoiser)"
+AUDIO_DENOISER="${AUDIO_DENOISER:-deepfilternet}"
+DEEP_FILTER_BIN="$(read_toml_string deep_filter_path)"
+DEEP_FILTER_BIN="${DEEP_FILTER_BIN:-$GENIEPOD_DIR/bin/deep-filter}"
+DEEP_FILTER_VER="0.5.6"
+DEEP_FILTER_URL="https://github.com/Rikorose/DeepFilterNet/releases/download/v${DEEP_FILTER_VER}/deep-filter-${DEEP_FILTER_VER}-aarch64-unknown-linux-gnu"
+
+if [ "$AUDIO_DENOISER" != "deepfilternet" ]; then
+    echo "  SKIP: audio_denoiser=\"$AUDIO_DENOISER\" — deep-filter not required"
+elif [ -x "$DEEP_FILTER_BIN" ]; then
+    echo "  OK: deep-filter ($(du -h "$DEEP_FILTER_BIN" | cut -f1)) at $DEEP_FILTER_BIN"
+else
+    echo "  Downloading deep-filter v${DEEP_FILTER_VER} (~39 MB)..."
+    TMP_DOWNLOAD="$(mktemp /tmp/deep-filter.XXXXXX)"
+    if wget -q --show-progress -O "$TMP_DOWNLOAD" "$DEEP_FILTER_URL"; then
+        # The release asset is a Linux ELF executable; reject anything else.
+        if file "$TMP_DOWNLOAD" 2>/dev/null | grep -q "ELF.*aarch64"; then
+            sudo install -m 0755 "$TMP_DOWNLOAD" "$DEEP_FILTER_BIN"
+            rm -f "$TMP_DOWNLOAD"
+            echo "  OK: installed $DEEP_FILTER_BIN ($(du -h "$DEEP_FILTER_BIN" | cut -f1))"
+        else
+            rm -f "$TMP_DOWNLOAD"
+            echo "  WARN: downloaded file is not an aarch64 ELF — leaving deep-filter unset"
+            echo "        Capture pipeline will fall back to sox chain at runtime."
+        fi
+    else
+        rm -f "$TMP_DOWNLOAD"
+        echo "  WARN: could not download deep-filter from $DEEP_FILTER_URL"
+        echo "        Capture pipeline will fall back to sox chain at runtime."
+    fi
+fi
+
 # 6. Enable systemd services.
 echo "[6/6] Enabling systemd services..."
 sudo systemctl daemon-reload

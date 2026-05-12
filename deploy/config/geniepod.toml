@@ -57,6 +57,25 @@ audio_sample_rate = 24000         # Match the AHUB's I2S2 Sample Rate (24 kHz on
                                   # (a 3-second `arecord -r 16000 -d 3` finished in
                                   # ~1 s wall-clock). whisper-server resamples to
                                   # 16 kHz internally so STT is unaffected.
+audio_denoiser = "deepfilternet"  # Capture-side noise reduction backend. Options:
+                                  #   "deepfilternet" — neural denoiser (alpha.7, issue #12).
+                                  #                     Handles non-stationary noise
+                                  #                     (fan cycling, typing, background
+                                  #                     voices) without a noise profile.
+                                  #                     Run setup-jetson.sh to fetch the
+                                  #                     binary into deep_filter_path.
+                                  #   "sox"           — alpha.6 baseline; spectral
+                                  #                     subtraction against a profile
+                                  #                     captured in setup-jetson.sh,
+                                  #                     plus compand quiet-speech lift.
+                                  #   "none"          — bandpass + compand + normalize only.
+                                  # Falls back to "sox" then "none" at runtime if the
+                                  # configured backend's binary is missing.
+deep_filter_path = "/opt/geniepod/bin/deep-filter"
+deep_filter_atten_lim_db = 100.0  # DeepFilterNet attenuation limit (--atten-lim). 100.0 =
+                                  # full denoising (upstream default). Lower values mix
+                                  # the noisy signal back in — drop to ~30 if DFN
+                                  # over-suppresses quiet phonemes.
 voice_enabled = true              # Voice mode on by default in alpha.5 (push-to-talk).
                                   # Set false on hosts without whisper/piper installed.
 voice_record_secs = 3             # Seconds to record per voice interaction. Most

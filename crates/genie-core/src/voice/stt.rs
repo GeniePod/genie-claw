@@ -438,10 +438,56 @@ pub async fn flush_mic_buffer(device: &str, sample_rate: u32) {
     let _ = tokio::fs::remove_file(&flush_path).await;
 }
 
+/// Capture preprocessing backend.
+///
+/// Variants in increasing strength / latency:
+/// - `None`        — bandpass + peak-normalize only (debug / no-denoise A/B)
+/// - `Sox`         — sox `noisered` spectral subtraction against a per-host
+///                   noise profile (alpha.6 baseline, see PR #11)
+/// - `DeepFilterNet` — neural denoiser via the `deep-filter` subprocess
+///                   (alpha.7, see issue #12). Handles non-stationary noise
+///                   without a noise profile.
+#[derive(Debug, Clone)]
+pub enum Denoiser {
+    None,
+    Sox {
+        noise_profile_path: String,
+    },
+    DeepFilterNet {
+        binary_path: String,
+        atten_lim_db: f32,
+    },
+}
+
+impl Denoiser {
+    /// Build from VoiceConfig strings. Unknown values default to `None`.
+    pub fn from_config(
+        kind: &str,
+        deep_filter_path: &str,
+        deep_filter_atten_lim_db: f32,
+    ) -> Self {
+        match kind {
+            "deepfilternet" | "deep_filter" | "dfn" => Denoiser::DeepFilterNet {
+                binary_path: deep_filter_path.to_string(),
+                atten_lim_db: deep_filter_atten_lim_db,
+            },
+            "sox" => Denoiser::Sox {
+                noise_profile_path: "/opt/geniepod/data/mic-noise.prof".to_string(),
+            },
+            _ => Denoiser::None,
+        }
+    }
+}
+
 /// Record audio with fixed duration.
 ///
 /// Returns the path to the recorded WAV file.
-pub async fn record_audio(device: &str, sample_rate: u32, duration_secs: u32) -> Result<String> {
+pub async fn record_audio(
+    device: &str,
+    sample_rate: u32,
+    duration_secs: u32,
+    denoiser: Denoiser,
+) -> Result<String> {
     // NOTE: callers are expected to call `flush_mic_buffer` themselves BEFORE
     // printing any "speak now" prompt to the user. Doing the flush here would
     // cause the throwaway 1 s arecord to run *after* the user sees the
@@ -503,83 +549,105 @@ pub async fn record_audio(device: &str, sample_rate: u32, duration_secs: u32) ->
         "recording complete"
     );
 
-    // Preprocess captured audio for STT.
+    // Preprocess captured audio for STT. The chain branches on the configured
+    // denoiser; common stages are bandpass (highpass 100 + lowpass 7000) and
+    // final peak-normalize (gain -n -3). Bandpass kills DC/rumble and ADC hiss
+    // above the speech band so whisper sees clean speech-only audio.
     //
-    //   channels 1     — downmix stereo (captured by `arecord -c 2` above)
-    //                    to mono. sox's `channels 1` averages all input
-    //                    channels — for a stereo LyraT capture this is the
-    //                    passive broadside delay-and-sum beamformer pointed
-    //                    at the speaker.
-    //   highpass 100   — kill DC + sub-bass rumble (kept above the lowest
-    //                    male fundamentals around 80 Hz).
-    //   lowpass  7000  — kill ADC hiss and electronic noise above the
-    //                    speech band (kept above sibilance to preserve
-    //                    /s/, /f/, /sh/ phonemes for whisper).
-    //   compand …      — dynamic-range expand-the-quiet-bits. Before this,
-    //                    `gain -n -3` had to amplify both the loudest speech
-    //                    peak and any quiet speech segments by the same
-    //                    linear scalar — so when a user mumbled half their
-    //                    command, the loud parts ate the gain budget and
-    //                    the mumbled half stayed underwater (whisper would
-    //                    hear ambiguous low-level audio and fall back to
-    //                    assistant-stock hallucinations). The compand
-    //                    transfer function lifts input -25 dBFS to output
-    //                    -12 dBFS (~13 dB of expansion on quiet speech),
-    //                    keeps loud speech at -5 dBFS so it doesn't clip,
-    //                    and pins the floor at -50 dBFS so noise is NOT
-    //                    amplified into the speech band.
-    //   gain -n -3     — final peak-normalize the cleaned + compressed
-    //                    signal to -3 dBFS so whisper sees nominal
-    //                    speech-level audio.
+    //   sox `channels 1` downmixes stereo (captured by `arecord -c 2` above)
+    //                   to mono. On the LyraT this is a broadside
+    //                   delay-and-sum beamformer pointed at the speaker.
     //
-    //   Compand args breakdown:
-    //     attack=0.02 release=0.20  — 20 ms attack / 200 ms release matches
-    //                                  speech syllable timing
-    //     -50,-50                   — noise floor stays at -50 dBFS
-    //     -25,-12                   — input -25 dBFS -> output -12 dBFS
-    //                                  (+13 dB on quiet speech)
-    //     -5,-5                     — loud speech (-5 dBFS) stays at -5
-    //     -2                        — slight makeup offset
-    let normalized_path = format!("/tmp/geniepod-rec-{}-norm.wav", std::process::id());
-    match Command::new("sox")
-        .args([
-            wav_path.as_str(),
-            normalized_path.as_str(),
-            "channels",
-            "1",
-            "highpass",
-            "100",
-            "lowpass",
-            "7000",
-            "compand",
-            "0.02,0.20",
-            "-50,-50,-25,-12,-5,-5",
-            "-2",
-            "gain",
-            "-n",
-            "-3",
-        ])
-        .output()
-        .await
-    {
+    // Variant-specific stages:
+    //   - DeepFilterNet: neural denoise (handles non-stationary noise without
+    //                    a noise profile). Sox compand is skipped — DFN's
+    //                    internal gating preserves quiet phonemes better than
+    //                    a hard compand gate.
+    //   - Sox:           spectral subtraction with a per-host noise profile
+    //                    captured by setup-jetson.sh, plus a compand gate +
+    //                    quiet-speech lift (alpha.6 baseline).
+    //   - None:          bandpass + compand + normalize only (alpha.6 fallback
+    //                    when no noise profile is available).
+    let normalized_path = preprocess_capture(&wav_path, &denoiser).await?;
+    let _ = tokio::fs::copy(&normalized_path, "/tmp/geniepod-last-rec.wav").await;
+    if normalized_path != wav_path {
+        let _ = tokio::fs::remove_file(&wav_path).await;
+    }
+    Ok(normalized_path)
+}
+
+/// Run the configured denoise + normalize chain over a captured WAV. Returns
+/// the path of the cleaned WAV (or the raw recording on best-effort fallback
+/// when the configured backend's binary or noise profile is unavailable).
+async fn preprocess_capture(wav_path: &str, denoiser: &Denoiser) -> Result<String> {
+    let pid = std::process::id();
+    let normalized_path = format!("/tmp/geniepod-rec-{}-norm.wav", pid);
+
+    match denoiser {
+        Denoiser::DeepFilterNet {
+            binary_path,
+            atten_lim_db,
+        } => {
+            run_deepfilternet_chain(wav_path, &normalized_path, binary_path, *atten_lim_db).await
+        }
+        Denoiser::Sox { noise_profile_path } => {
+            run_sox_chain(wav_path, &normalized_path, Some(noise_profile_path.as_str())).await
+        }
+        Denoiser::None => run_sox_chain(wav_path, &normalized_path, None).await,
+    }
+}
+
+/// alpha.6 sox-only chain: downmix → bandpass → (optional noisered) → compand
+/// gate+lift → peak-normalize. Falls back to the raw WAV on sox failure.
+async fn run_sox_chain(
+    wav_path: &str,
+    normalized_path: &str,
+    noise_profile: Option<&str>,
+) -> Result<String> {
+    let have_noise_profile = match noise_profile {
+        Some(p) => tokio::fs::metadata(p).await.is_ok(),
+        None => false,
+    };
+
+    let mut sox_cmd = Command::new("sox");
+    sox_cmd
+        .arg(wav_path)
+        .arg(normalized_path)
+        .args(["channels", "1"])
+        .args(["highpass", "100"])
+        .args(["lowpass", "7000"]);
+    if have_noise_profile {
+        // 0.21 amount — conservative, picked so the subtraction is audibly
+        // helpful on the ES8388 ADC noise floor without producing the
+        // swirling "musical noise" artifact that aggressive spectral
+        // subtraction is famous for.
+        sox_cmd.args(["noisered", noise_profile.unwrap(), "0.21"]);
+    }
+    // compand: 20 ms attack / 200 ms release, floor at -50 dBFS, +13 dB lift on
+    // quiet speech (-25 -> -12), loud speech (-5) held to avoid clip, -2 dB
+    // makeup offset.
+    sox_cmd.args([
+        "compand",
+        "0.02,0.20",
+        "-50,-50,-25,-12,-5,-5",
+        "-2",
+    ]);
+    sox_cmd.args(["gain", "-n", "-3"]);
+
+    match sox_cmd.output().await {
         Ok(out)
             if out.status.success()
-                && tokio::fs::metadata(&normalized_path)
+                && tokio::fs::metadata(normalized_path)
                     .await
                     .map(|m| m.len() > 44)
                     .unwrap_or(false) =>
         {
-            // Keep a fixed-path copy of the last capture so an operator can
-            // `aplay /tmp/geniepod-last-rec.wav` to verify what was actually
-            // recorded after a suspicious transcript. Best-effort — failures
-            // here are non-fatal.
-            let _ = tokio::fs::copy(&normalized_path, "/tmp/geniepod-last-rec.wav").await;
-            let _ = tokio::fs::remove_file(&wav_path).await;
             tracing::info!(
                 path = %normalized_path,
-                "preprocessed audio (highpass 100 Hz, lowpass 7 kHz, compand quiet-speech lift, peak-normalize -3 dBFS)"
+                noisered = have_noise_profile,
+                "preprocessed audio with sox chain (bandpass, noisered if profile, compand, peak-normalize -3 dBFS)"
             );
-            Ok(normalized_path)
+            Ok(normalized_path.to_string())
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -588,13 +656,141 @@ pub async fn record_audio(device: &str, sample_rate: u32, duration_secs: u32) ->
                 "sox normalization failed (status {:?}); using raw recording",
                 out.status.code()
             );
-            Ok(wav_path)
+            Ok(wav_path.to_string())
         }
         Err(e) => {
             tracing::warn!(error = %e, "sox not available; using raw recording (install sox for better STT accuracy on quiet captures)");
-            Ok(wav_path)
+            Ok(wav_path.to_string())
         }
     }
+}
+
+/// alpha.7 DeepFilterNet chain:
+///   sox(channels 1, highpass 100, lowpass 7000) → mono_path
+///   deep-filter mono_path -o tmp_dir → tmp_dir/<basename>
+///   sox(gain -n -3) → normalized_path
+///
+/// DFN takes mono input and writes to an output directory preserving the
+/// input filename. We feed it the already-bandpassed mono WAV (so its
+/// internal STFT doesn't waste capacity on rumble/hiss bands whisper can't
+/// use anyway) and apply only peak-normalize on the way out — DFN's
+/// implicit gate preserves quiet phonemes better than a hard sox compand.
+///
+/// Falls back to the sox-only chain (no noise profile) if the deep-filter
+/// binary is missing or any subprocess step fails.
+async fn run_deepfilternet_chain(
+    wav_path: &str,
+    normalized_path: &str,
+    binary_path: &str,
+    atten_lim_db: f32,
+) -> Result<String> {
+    if tokio::fs::metadata(binary_path).await.is_err() {
+        tracing::warn!(
+            binary = binary_path,
+            "deep-filter binary missing; falling back to sox chain. Run setup-jetson.sh to install."
+        );
+        return run_sox_chain(wav_path, normalized_path, None).await;
+    }
+
+    let pid = std::process::id();
+    let mono_path = format!("/tmp/geniepod-rec-{}-mono.wav", pid);
+    let dfn_dir = format!("/tmp/geniepod-rec-{}-dfn", pid);
+    let mono_basename = std::path::Path::new(&mono_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("mono.wav");
+    let dfn_out = format!("{}/{}", dfn_dir, mono_basename);
+
+    let _ = tokio::fs::remove_dir_all(&dfn_dir).await;
+    if let Err(e) = tokio::fs::create_dir_all(&dfn_dir).await {
+        tracing::warn!(error = %e, "could not create DFN tmp dir; falling back to sox chain");
+        return run_sox_chain(wav_path, normalized_path, None).await;
+    }
+
+    // Stage 1: stereo → mono + bandpass.
+    let stage1 = Command::new("sox")
+        .arg(wav_path)
+        .arg(&mono_path)
+        .args(["channels", "1"])
+        .args(["highpass", "100"])
+        .args(["lowpass", "7000"])
+        .output()
+        .await;
+    let stage1_ok = matches!(stage1, Ok(ref o) if o.status.success())
+        && tokio::fs::metadata(&mono_path)
+            .await
+            .map(|m| m.len() > 44)
+            .unwrap_or(false);
+    if !stage1_ok {
+        if let Ok(o) = stage1 {
+            tracing::warn!(
+                stderr = String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or(""),
+                "sox stage 1 (downmix+bandpass) failed; falling back to sox chain"
+            );
+        }
+        let _ = tokio::fs::remove_dir_all(&dfn_dir).await;
+        return run_sox_chain(wav_path, normalized_path, None).await;
+    }
+
+    // Stage 2: deep-filter <mono.wav> -o <dfn_dir> --atten-lim <db>.
+    let dfn_start = std::time::Instant::now();
+    let dfn_res = Command::new(binary_path)
+        .arg(&mono_path)
+        .args(["-o", &dfn_dir])
+        .args(["--atten-lim", &format!("{}", atten_lim_db)])
+        .output()
+        .await;
+    let dfn_ok = matches!(dfn_res, Ok(ref o) if o.status.success())
+        && tokio::fs::metadata(&dfn_out)
+            .await
+            .map(|m| m.len() > 44)
+            .unwrap_or(false);
+    if !dfn_ok {
+        if let Ok(o) = dfn_res {
+            tracing::warn!(
+                stderr = String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or(""),
+                "deep-filter run failed; falling back to sox chain"
+            );
+        } else if let Err(ref e) = dfn_res {
+            tracing::warn!(error = %e, "could not spawn deep-filter; falling back to sox chain");
+        }
+        let _ = tokio::fs::remove_file(&mono_path).await;
+        let _ = tokio::fs::remove_dir_all(&dfn_dir).await;
+        return run_sox_chain(wav_path, normalized_path, None).await;
+    }
+    let dfn_ms = dfn_start.elapsed().as_millis();
+
+    // Stage 3: peak-normalize cleaned audio.
+    let stage3 = Command::new("sox")
+        .arg(&dfn_out)
+        .arg(normalized_path)
+        .args(["gain", "-n", "-3"])
+        .output()
+        .await;
+    let stage3_ok = matches!(stage3, Ok(ref o) if o.status.success())
+        && tokio::fs::metadata(normalized_path)
+            .await
+            .map(|m| m.len() > 44)
+            .unwrap_or(false);
+    let _ = tokio::fs::remove_file(&mono_path).await;
+    let _ = tokio::fs::remove_dir_all(&dfn_dir).await;
+    if !stage3_ok {
+        if let Ok(o) = stage3 {
+            tracing::warn!(
+                stderr = String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or(""),
+                "sox stage 3 (peak-normalize) failed; falling back to sox chain"
+            );
+        }
+        return run_sox_chain(wav_path, normalized_path, None).await;
+    }
+
+    tracing::info!(
+        path = %normalized_path,
+        dfn_ms = dfn_ms as u64,
+        atten_lim_db = atten_lim_db as f64,
+        "preprocessed audio with DeepFilterNet chain (bandpass, deep-filter denoise, peak-normalize -3 dBFS)"
+    );
+    Ok(normalized_path.to_string())
 }
 
 /// Write raw PCM data as a WAV file.

@@ -41,6 +41,12 @@ pub struct VoiceConfig {
     /// LyraT/I2S input + USB headphone output).
     pub audio_output_device: String,
     pub sample_rate: u32,
+    /// Capture denoiser: "deepfilternet", "sox", or "none". See issue #12.
+    pub audio_denoiser: String,
+    /// Path to the deep-filter binary (used when audio_denoiser == "deepfilternet").
+    pub deep_filter_path: String,
+    /// DeepFilterNet `--atten-lim` in dB. 100.0 = full denoising.
+    pub deep_filter_atten_lim_db: f32,
     pub record_secs: u32,
     pub llm_model_path: String,
     pub wakeword_script: String,
@@ -312,6 +318,11 @@ async fn run_with_wakeword(
                     audio_device,
                     voice_cfg.sample_rate,
                     voice_cfg.voice_continuous_secs,
+                    stt::Denoiser::from_config(
+                        &voice_cfg.audio_denoiser,
+                        &voice_cfg.deep_filter_path,
+                        voice_cfg.deep_filter_atten_lim_db,
+                    ),
                 )
                 .await
                 {
@@ -608,6 +619,9 @@ fn clone_voice_config(cfg: &VoiceConfig) -> VoiceConfig {
         audio_device: cfg.audio_device.clone(),
         audio_output_device: cfg.audio_output_device.clone(),
         sample_rate: cfg.sample_rate,
+        audio_denoiser: cfg.audio_denoiser.clone(),
+        deep_filter_path: cfg.deep_filter_path.clone(),
+        deep_filter_atten_lim_db: cfg.deep_filter_atten_lim_db,
         record_secs: cfg.record_secs,
         llm_model_path: cfg.llm_model_path.clone(),
         wakeword_script: cfg.wakeword_script.clone(),
@@ -818,14 +832,24 @@ async fn voice_cycle(
         "[voice] Recording {} seconds — speak now!",
         voice_cfg.record_secs
     );
-    let wav_path =
-        match stt::record_audio(audio_device, voice_cfg.sample_rate, voice_cfg.record_secs).await {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!("[voice] Recording failed: {}", e);
-                return true;
-            }
-        };
+    let wav_path = match stt::record_audio(
+        audio_device,
+        voice_cfg.sample_rate,
+        voice_cfg.record_secs,
+        stt::Denoiser::from_config(
+            &voice_cfg.audio_denoiser,
+            &voice_cfg.deep_filter_path,
+            voice_cfg.deep_filter_atten_lim_db,
+        ),
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("[voice] Recording failed: {}", e);
+            return true;
+        }
+    };
 
     // Step 2: Light noise processing only.
     // Full noise processing (gate, spectral suppression) disabled for now —

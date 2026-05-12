@@ -113,6 +113,26 @@ pub struct CoreConfig {
     #[serde(default = "defaults::audio_sample_rate")]
     pub audio_sample_rate: u32,
 
+    /// Capture denoiser. Options:
+    ///   "deepfilternet" — DeepFilterNet (neural, handles non-stationary noise)
+    ///   "sox"           — sox `noisered` spectral subtraction (alpha.6 baseline)
+    ///   "none"          — no denoise; only bandpass + peak-normalize
+    /// Falls back to "sox" then "none" at runtime if the configured backend's
+    /// binary or noise profile is missing. See issue #12 for evaluation criteria.
+    #[serde(default = "defaults::audio_denoiser")]
+    pub audio_denoiser: String,
+
+    /// Path to the DeepFilterNet binary (released as `deep-filter-<ver>-aarch64-unknown-linux-gnu`).
+    /// Auto-downloaded by setup-jetson.sh into this location.
+    #[serde(default = "defaults::deep_filter_path")]
+    pub deep_filter_path: PathBuf,
+
+    /// Attenuation limit in dB for DeepFilterNet (`--atten-lim`). 100.0 = full
+    /// denoising (default upstream); lower values mix some of the noisy signal
+    /// back in. Drop to ~30 if DFN over-suppresses quiet phonemes.
+    #[serde(default = "defaults::deep_filter_atten_lim_db")]
+    pub deep_filter_atten_lim_db: f32,
+
     /// Enable voice mode (mic → STT → LLM → TTS → speaker loop).
     #[serde(default)]
     pub voice_enabled: bool,
@@ -174,6 +194,9 @@ impl Default for CoreConfig {
             audio_device: defaults::audio_device(),
             audio_output_device: defaults::audio_output_device(),
             audio_sample_rate: defaults::audio_sample_rate(),
+            audio_denoiser: defaults::audio_denoiser(),
+            deep_filter_path: defaults::deep_filter_path(),
+            deep_filter_atten_lim_db: defaults::deep_filter_atten_lim_db(),
             voice_enabled: false,
             voice_record_secs: defaults::voice_record_secs(),
             voice_continuous: true,
@@ -1207,6 +1230,18 @@ mod defaults {
     }
     pub fn audio_device() -> String {
         "auto".into()
+    }
+    pub fn audio_denoiser() -> String {
+        // alpha.7 default: try the neural denoiser first. Runtime falls back to
+        // sox then none if the binary is absent, so this is safe even on hosts
+        // that have not run the alpha.7 setup-jetson.sh yet.
+        "deepfilternet".into()
+    }
+    pub fn deep_filter_path() -> PathBuf {
+        PathBuf::from("/opt/geniepod/bin/deep-filter")
+    }
+    pub fn deep_filter_atten_lim_db() -> f32 {
+        100.0
     }
     pub fn audio_sample_rate() -> u32 {
         48000
