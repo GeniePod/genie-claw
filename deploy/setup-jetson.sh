@@ -251,6 +251,40 @@ if [ "$VOICE_MISSING" -eq 1 ]; then
     echo "  Until installed, keep voice_enabled = false in $CONFIG_DIR/geniepod.toml."
 fi
 
+# 5f. Capture a mic noise profile for sox `noisered` spectral subtraction.
+# record_audio reads this if present; absent = chain skips noisered (safe
+# fallback to compand-only). Re-run setup-jetson.sh after moving the
+# Jetson or LyraT to a different room to refresh the profile.
+NOISE_PROFILE="$DATA_DIR/mic-noise.prof"
+echo "[5f/6] Mic noise profile for sox noisered..."
+if [ -f "$NOISE_PROFILE" ]; then
+    echo "  OK: $NOISE_PROFILE ($(du -h "$NOISE_PROFILE" | cut -f1)) — re-capture by deleting and re-running setup"
+elif ! command -v sox > /dev/null 2>&1; then
+    echo "  SKIP: sox not installed; cannot generate noise profile"
+elif [ ! -x "$GENIEPOD_DIR/bin/detect-audio-device.sh" ]; then
+    echo "  SKIP: detect-audio-device.sh missing; cannot pick capture device"
+else
+    CAPTURE_DEV="$($GENIEPOD_DIR/bin/detect-audio-device.sh 2>/dev/null)"
+    if [ -z "$CAPTURE_DEV" ]; then
+        echo "  SKIP: no capture device detected"
+    else
+        echo "  Capturing 3 seconds of ambient noise from $CAPTURE_DEV"
+        echo "  >>> STAY SILENT — no speech, no typing, no chair-creaking <<<"
+        sleep 2
+        SILENCE_WAV="/tmp/genie-noise-sample-$$.wav"
+        if arecord -D "$CAPTURE_DEV" -c 2 -r 24000 -f S16_LE -d 3 "$SILENCE_WAV" 2>/dev/null; then
+            if sox "$SILENCE_WAV" -n channels 1 highpass 100 lowpass 7000 noiseprof "$NOISE_PROFILE" 2>/dev/null; then
+                echo "  OK: noise profile saved to $NOISE_PROFILE"
+            else
+                echo "  WARN: sox noiseprof failed — capture pipeline will skip noisered"
+            fi
+            rm -f "$SILENCE_WAV"
+        else
+            echo "  WARN: arecord failed — capture pipeline will skip noisered"
+        fi
+    fi
+fi
+
 # 6. Enable systemd services.
 echo "[6/6] Enabling systemd services..."
 sudo systemctl daemon-reload
