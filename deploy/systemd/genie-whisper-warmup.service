@@ -1,0 +1,45 @@
+[Unit]
+Description=GeniePod Whisper Warmup (force ggml-small into iGPU before first voice cycle)
+Documentation=https://github.com/GeniePod/genie-claw/issues/17
+After=genie-whisper.service
+Wants=genie-whisper.service
+ConditionPathExists=/opt/geniepod/bin/whisper-server
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Mirrors genie-llm-warmup.service (issue #3, PR #7): wait for the
+# whisper-server TCP port to open, then send one tiny /inference request
+# to force the ggml model load + CUDA kernels into iGPU memory. Without
+# this, the first user-visible voice cycle's STT can take 60-90 s on
+# Orin Nano while the model warms up in-band.
+#
+# The reference audio is 1 second of synthesized silence — whisper-server
+# decodes it (returns empty / "[BLANK_AUDIO]"), which is enough to load
+# weights and warm the kernels.
+#
+# Failures are non-fatal (|| true) so a broken whisper does not block boot.
+ExecStart=/bin/sh -c '\
+    for i in $(seq 1 90); do \
+        if nc -z 127.0.0.1 8178; then break; fi; \
+        sleep 1; \
+    done; \
+    if ! command -v sox > /dev/null 2>&1; then \
+        echo "[genie-whisper-warmup] sox not installed; skipping"; \
+        exit 0; \
+    fi; \
+    WAV=$(mktemp /tmp/whisper-warmup.XXXXXX.wav); \
+    sox -n -r 16000 -c 1 "$WAV" trim 0.0 1.0 2>/dev/null || { rm -f "$WAV"; echo "[genie-whisper-warmup] sox synth failed"; exit 0; }; \
+    curl -sf -X POST http://127.0.0.1:8178/inference \
+        -F "file=@$WAV" \
+        -F "language=en" \
+        -F "temperature=0.0" \
+        -F "response_format=json" > /dev/null || true; \
+    rm -f "$WAV"; \
+    echo "[genie-whisper-warmup] done"'
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=geniepod.target

@@ -306,7 +306,7 @@ fi
 
 # Enable core services. genie-audio runs the I2S/AHUB route setup at boot
 # (no-op if /opt/geniepod/bin/genie-audio-init is missing, see ConditionPathExists).
-for svc in homeassistant genie-audio genie-whisper genie-llm genie-llm-warmup genie-core genie-governor genie-health genie-api genie-mqtt; do
+for svc in homeassistant genie-audio genie-whisper genie-whisper-warmup genie-llm genie-llm-warmup genie-core genie-governor genie-health genie-api genie-mqtt; do
     if sudo systemctl enable "$svc.service" 2>/dev/null; then
         echo "  Enabled: $svc"
     else

@@ -4,6 +4,15 @@
 
 ### Added
 
+- `genie-whisper-warmup.service` (issue #17) — oneshot systemd unit ordered
+  `After=genie-whisper.service` that polls the whisper-server port and POSTs
+  one second of synthesized silence to `/inference`. Forces the ggml-small
+  weights and CUDA kernels into iGPU memory before the first user-visible
+  voice cycle, eliminating the 60-90 s first-STT cold path observed on
+  Orin Nano. Mirrors the existing `genie-llm-warmup.service` design from
+  PR #7. Wired into `setup-jetson.sh`'s enable loop; failures are non-fatal
+  (`|| true`) so a broken whisper does not block boot. Skips cleanly on
+  hosts without `sox` or `whisper-server`.
 - Half-duplex post-TTS gate to suppress speaker→mic acoustic echo (issue #15).
   `TtsEngine::speak()` now sleeps `post_tts_silence_ms` milliseconds after
   `aplay` exits. The ALSA hardware playback buffer continues draining for
