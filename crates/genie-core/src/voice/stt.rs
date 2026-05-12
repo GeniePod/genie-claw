@@ -732,12 +732,15 @@ async fn run_deepfilternet_chain(
         return run_sox_chain(wav_path, normalized_path, None).await;
     }
 
-    // Stage 2: deep-filter <mono.wav> -o <dfn_dir> --atten-lim <db>.
+    // Stage 2: deep-filter <mono.wav> -o <dfn_dir> --atten-lim-db <db>.
+    // (The v0.5.6 prebuilt binary names the flag `--atten-lim-db` / `-a`,
+    // not `--atten-lim` as the current main-branch enhance_wav.rs source
+    // suggests.)
     let dfn_start = std::time::Instant::now();
     let dfn_res = Command::new(binary_path)
         .arg(&mono_path)
         .args(["-o", &dfn_dir])
-        .args(["--atten-lim", &format!("{}", atten_lim_db)])
+        .args(["--atten-lim-db", &format!("{}", atten_lim_db)])
         .output()
         .await;
     let dfn_ok = matches!(dfn_res, Ok(ref o) if o.status.success())
