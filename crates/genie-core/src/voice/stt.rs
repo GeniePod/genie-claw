@@ -1,7 +1,33 @@
 use anyhow::Result;
+use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+
+/// "Speech end" marker for the #19 latency banner: stamped inside
+/// `record_audio` the moment arecord returns, before DFN/sox preprocessing
+/// starts. The voice loop reads it back to compute capture-to-first-audio.
+static AUDIO_CAPTURED_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Reset the audio-captured timestamp tracker. Call before each cycle.
+pub fn reset_audio_captured_marker() {
+    if let Ok(mut g) = AUDIO_CAPTURED_AT.lock() {
+        *g = None;
+    }
+}
+
+/// Read the audio-captured timestamp captured since the last reset.
+pub fn audio_captured_at() -> Option<std::time::Instant> {
+    AUDIO_CAPTURED_AT.lock().ok().and_then(|g| *g)
+}
+
+fn mark_audio_captured() {
+    if let Ok(mut g) = AUDIO_CAPTURED_AT.lock() {
+        if g.is_none() {
+            *g = Some(std::time::Instant::now());
+        }
+    }
+}
 
 /// Whisper STT subprocess manager.
 ///
@@ -548,6 +574,12 @@ pub async fn record_audio(
         size_bytes = metadata.len(),
         "recording complete"
     );
+
+    // Stamp "speech end" for the #19 latency banner: the moment arecord
+    // finished (i.e. the user's 3-second window closed). Everything after
+    // this point — DFN, sox, STT, LLM, TTS — counts against first-reply
+    // latency.
+    mark_audio_captured();
 
     // Preprocess captured audio for STT. The chain branches on the configured
     // denoiser; common stages are bandpass (highpass 100 + lowpass 7000) and

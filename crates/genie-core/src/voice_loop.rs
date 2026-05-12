@@ -844,6 +844,13 @@ async fn voice_cycle(
         "[voice] Recording {} seconds — speak now!",
         voice_cfg.record_secs
     );
+    // Reset latency banner phase markers before this cycle's recording and
+    // TTS pipeline run. The markers are stamped at distinct moments inside
+    // record_audio (after arecord) and TtsEngine::speak() (entry + first
+    // PCM write), letting us decompose first-reply latency into five phases.
+    stt::reset_audio_captured_marker();
+    tts::reset_first_audio_marker();
+
     let wav_path = match stt::record_audio(
         audio_device,
         voice_cfg.sample_rate,
@@ -862,13 +869,10 @@ async fn voice_cycle(
             return true;
         }
     };
-    // T0 for the latency banner (#19): the user has finished speaking.
-    let t_record_done = std::time::Instant::now();
-
-    // Reset the TTFA tracker before any speak() runs this cycle so the
-    // banner reads back this cycle's first-audio instant, not a stale one
-    // from the previous response.
-    tts::reset_first_audio_marker();
+    // T0 for the latency banner (#19): record_audio has returned, so DFN+sox
+    // preprocessing is also done. The arecord-finished instant is captured
+    // earlier inside record_audio via stt::audio_captured_at().
+    let t_preprocess_done = std::time::Instant::now();
 
     // Step 2: Light noise processing only.
     // Full noise processing (gate, spectral suppression) disabled for now —
@@ -1094,20 +1098,39 @@ async fn voice_cycle(
     // pre-loaded the iGPU (target: a few hundred ms STT, low-second total)
     // vs the cold path (60-90 s STT, multi-minute total). Subsequent cycles
     // keep only the existing one-liner.
+    //
+    // The breakdown decomposes "speech end -> first audio" into five phases
+    // so the operator can see exactly where time went — LLM cold-start time
+    // looks identical to slow Piper synth in a single number.
+    //
+    //   capture (DFN+sox) = preprocess_done - audio_captured
+    //   STT               = stt_done        - preprocess_done
+    //   LLM thinking      = first_speak     - stt_done
+    //   TTS first synth   = first_audio     - first_speak
+    //   total             = first_audio     - audio_captured
     if !FIRST_REPLY_BANNER_PRINTED.swap(true, Ordering::SeqCst) {
-        let stt_ms = (t_stt_done - t_record_done).as_millis();
-        let ttfa = tts::first_audio_at();
-        let ttfa_ms = ttfa.map(|t| (t - t_stt_done).as_millis());
-        let total_ms = ttfa.map(|t| (t - t_record_done).as_millis());
-        let fmt_ms = |v: Option<u128>| match v {
+        let audio_captured = stt::audio_captured_at();
+        let first_speak = tts::first_speak_called_at();
+        let first_audio = tts::first_audio_at();
+
+        let fmt = |v: Option<u128>| match v {
             Some(ms) => format!("{} ms", ms),
-            None => "n/a (no audio played)".into(),
+            None => "n/a".into(),
         };
+        let preprocess_ms = audio_captured.map(|t| (t_preprocess_done - t).as_millis());
+        let stt_phase_ms = Some((t_stt_done - t_preprocess_done).as_millis());
+        let llm_ms = first_speak.map(|t| (t - t_stt_done).as_millis());
+        let tts_synth_ms = first_speak.and_then(|fs| first_audio.map(|fa| (fa - fs).as_millis()));
+        let total_ms = audio_captured.and_then(|t0| first_audio.map(|fa| (fa - t0).as_millis()));
+
         eprintln!();
         eprintln!("=== first voice reply latency ===");
-        eprintln!("  speech end -> STT done:      {} ms", stt_ms);
-        eprintln!("  STT done   -> first audio:   {}", fmt_ms(ttfa_ms));
-        eprintln!("  total (first reply):         {}", fmt_ms(total_ms));
+        eprintln!("  preprocess (DFN+sox):      {}", fmt(preprocess_ms));
+        eprintln!("  STT:                       {}", fmt(stt_phase_ms));
+        eprintln!("  LLM until first sentence:  {}", fmt(llm_ms));
+        eprintln!("  TTS first synth:           {}", fmt(tts_synth_ms));
+        eprintln!("  --------------------------------");
+        eprintln!("  speech end -> first audio: {}", fmt(total_ms));
         eprintln!("=================================");
         eprintln!();
     }
