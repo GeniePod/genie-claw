@@ -1,13 +1,50 @@
 # GenieClaw
 
-GenieClaw is the agent layer of the **Genie** home AI ecosystem.
+**A private, always-on AI for your home. Runs entirely on a Jetson Orin Nano.
+Voice in, voice out, controls Home Assistant, no cloud.**
 
-Current alpha: **1.0.0-alpha.4**.
+- 🎙️ Local voice loop — wake word → STT (Whisper) → LLM → TTS (Piper) → action
+- 🧠 Local memory — conversations and household context kept in SQLite on the device
+- 🏠 Home Assistant control behind a safety gate (rate-limited, confirmed, audited)
+- 🔒 Private by default — no audio, no transcripts, no model traffic leaves the box
+- 🦀 Rust runtime, ~8 GB Jetson Orin Nano target, alpha-grade today
 
-This repository is built first for Jetson, especially Jetson Orin Nano 8 GB (67 TOPS).
-Its job is to turn a Jetson-based box into a private, always-on local AI for
-the home and other shared spaces: local voice, local memory, local control,
-and strong local security boundaries.
+<!-- TODO: replace with a real demo capture (voice → LLM → HA action, ≤30 s). -->
+<!-- Recommended: 720p / 30 fps, hosted on YouTube + linked here as a thumbnail. -->
+
+> **Status:** `v1.0.0-alpha.4`. The voice loop, the Home Assistant integration,
+> and the safety/audit surfaces are working end-to-end on Jetson Orin Nano Super
+> 8 GB (see [`CHANGELOG.md`](CHANGELOG.md) for the alpha.5 verified-deploy notes
+> and the alpha.7 verified voice cycle). Setup is currently a 30-60 min Jetson
+> bring-up, not a one-line install — see [`GETTING_STARTED.md`](GETTING_STARTED.md).
+
+## How it works
+
+```
+   you speak                      you hear
+       │                              ▲
+       ▼                              │
+   ┌────────┐   ┌────────┐   ┌──────────────┐   ┌───────┐
+   │ Wake + │ → │ STT    │ → │ GenieClaw    │ → │ TTS   │
+   │ VAD    │   │ Whisper│   │ agent (Rust) │   │ Piper │
+   └────────┘   └────────┘   └──────┬───────┘   └───────┘
+                                    │
+                       memory ◄─────┼─────► local LLM
+                       (SQLite)     │       (llama.cpp today;
+                                    │        genie-ai-runtime
+                                    │        replacing it)
+                                    ▼
+                          Home Assistant
+                          (rate-limited, audited)
+```
+
+GenieClaw owns the **agent layer**: prompts, memory, tool routing, voice
+orchestration, channel adapters. It does **not** own the LLM kernels (see
+[`genie-ai-runtime`](https://github.com/GeniePod/genie-ai-runtime)) or the
+eventual device-control runtime (`genie-home-runtime`, planned). See
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for the full stack.
+
+---
 
 ## Why It Exists
 
