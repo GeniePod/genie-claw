@@ -201,6 +201,27 @@ Each service block has:
 | --- | --- |
 | `url` | Health or base URL |
 | `systemd_unit` | Associated systemd unit name |
+| `backend` | LLM backend selector; only meaningful for `[services.llm]` |
+
+### `[services.llm].backend`
+
+Opt-in selector for the local LLM runtime (issue #27).
+
+| Value | Runtime | Notes |
+| --- | --- | --- |
+| `llama_cpp` (default) | `llama-server` from `llama.cpp` | Legacy path. Preserved for unchanged configs. |
+| `genie_ai_runtime` | `jllm-server` from `genie-ai-runtime` | Jetson-tuned runtime, opt-in until Phase 2 default flip. |
+
+Hyphenated aliases (`"llama-cpp"`, `"genie-ai-runtime"`) are accepted.
+
+When flipping to `genie_ai_runtime`:
+
+- set `systemd_unit = "genie-ai-runtime.service"` on the same block,
+- install `/opt/geniepod/bin/jllm-server`,
+- re-run `setup-jetson.sh` to validate the binary and enable the right unit.
+
+`genie-core` exposes the active backend name in `/api/health` and at startup,
+and `genie-ctl status` reports it.
 
 ## `[telegram]`
 

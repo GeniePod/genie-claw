@@ -26,6 +26,7 @@ The practical reason is simple:
 - `deploy/systemd/genie-governor.service`
 - `deploy/systemd/genie-health.service`
 - `deploy/systemd/genie-llm.service`
+- `deploy/systemd/genie-ai-runtime.service`
 - `deploy/systemd/genie-mqtt.service`
 - `deploy/systemd/genie-audio.service`
 - `deploy/systemd/genie-wakeword.service`

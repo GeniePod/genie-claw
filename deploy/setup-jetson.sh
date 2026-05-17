@@ -92,21 +92,73 @@ else
     fi
 fi
 
-# 5. Check llama.cpp.
-echo "[5/6] Checking llama.cpp..."
-if [ -f "$GENIEPOD_DIR/bin/llama-server" ]; then
-    echo "  OK: llama-server"
-else
-    echo "  NOT FOUND: llama-server"
-    echo ""
-    echo "  Build and install llama.cpp with CUDA:"
-    echo "    git clone https://github.com/ggml-org/llama.cpp.git"
-    echo "    cd llama.cpp"
-    echo "    cmake -B build -DGGML_CUDA=ON"
-    echo "    cmake --build build -j\$(nproc)"
-    echo "    sudo cp build/bin/llama-server $GENIEPOD_DIR/bin/"
-    echo ""
-fi
+# 5. Check the configured LLM backend binary.
+# Issue #27: [services.llm].backend selects llama.cpp (default) or
+# genie-ai-runtime. The setup script validates whichever binary the
+# configured backend needs so opt-in installs do not fall back silently.
+read_services_llm_field() {
+    # Read a key under [services.llm] from geniepod.toml. Strips quotes,
+    # trailing comments, and surrounding whitespace. Tolerates read failure.
+    awk -v key="$1" '
+        /^\[/ { section = substr($0, 2, length($0)-2); next }
+        section == "services.llm" {
+            line = $0
+            if (match(line, "^[[:space:]]*" key "[[:space:]]*=")) {
+                sub(/^[^=]*=[[:space:]]*/, "", line)
+                sub(/[[:space:]]*#.*$/, "", line)
+                gsub(/["'"'"']/, "", line)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+                print line
+                exit
+            }
+        }
+    ' "$CONFIG_DIR/geniepod.toml" 2>/dev/null || true
+}
+
+LLM_BACKEND_RAW="$(read_services_llm_field backend)"
+LLM_BACKEND="$(echo "${LLM_BACKEND_RAW:-llama_cpp}" | tr '-' '_')"
+
+case "$LLM_BACKEND" in
+    llama_cpp)
+        echo "[5/6] Checking llama.cpp backend (configured: llama_cpp)..."
+        if [ -f "$GENIEPOD_DIR/bin/llama-server" ]; then
+            echo "  OK: llama-server"
+        else
+            echo "  NOT FOUND: llama-server"
+            echo ""
+            echo "  Build and install llama.cpp with CUDA:"
+            echo "    git clone https://github.com/ggml-org/llama.cpp.git"
+            echo "    cd llama.cpp"
+            echo "    cmake -B build -DGGML_CUDA=ON"
+            echo "    cmake --build build -j\$(nproc)"
+            echo "    sudo cp build/bin/llama-server $GENIEPOD_DIR/bin/"
+            echo ""
+        fi
+        ;;
+    genie_ai_runtime)
+        echo "[5/6] Checking genie-ai-runtime backend (configured: genie_ai_runtime)..."
+        if [ -f "$GENIEPOD_DIR/bin/jllm-server" ]; then
+            echo "  OK: jllm-server"
+        else
+            echo "  NOT FOUND: jllm-server"
+            echo ""
+            echo "  Build and install genie-ai-runtime (Jetson-tuned LLM runtime):"
+            echo "    git clone https://github.com/GeniePod/genie-ai-runtime.git"
+            echo "    cd genie-ai-runtime"
+            echo "    cmake -B build -DGGML_CUDA=ON"
+            echo "    cmake --build build -j\$(nproc)"
+            echo "    sudo cp build/bin/jllm-server $GENIEPOD_DIR/bin/"
+            echo ""
+            echo "  Or revert to llama.cpp by unsetting backend in"
+            echo "    $CONFIG_DIR/geniepod.toml under [services.llm]."
+            echo ""
+        fi
+        ;;
+    *)
+        echo "[5/6] WARN: unrecognized [services.llm].backend = \"$LLM_BACKEND_RAW\""
+        echo "  Expected llama_cpp or genie_ai_runtime. Skipping backend binary check."
+        ;;
+esac
 
 if command -v docker > /dev/null 2>&1 && docker compose version > /dev/null 2>&1; then
     echo "  OK: docker compose"
@@ -304,9 +356,15 @@ else
     echo "  WARN: geniepod.target unit not found — services will not auto-start"
 fi
 
+# Resolve the configured LLM systemd unit so the genie-ai-runtime opt-in
+# (issue #27) enables the right unit instead of the hardcoded genie-llm.
+LLM_UNIT_CONFIGURED="$(read_services_llm_field systemd_unit)"
+LLM_UNIT_CONFIGURED="${LLM_UNIT_CONFIGURED:-genie-llm.service}"
+LLM_UNIT_NAME="${LLM_UNIT_CONFIGURED%.service}"
+
 # Enable core services. genie-audio runs the I2S/AHUB route setup at boot
 # (no-op if /opt/geniepod/bin/genie-audio-init is missing, see ConditionPathExists).
-for svc in homeassistant genie-audio genie-whisper genie-whisper-warmup genie-llm genie-llm-warmup genie-core genie-governor genie-health genie-api genie-mqtt; do
+for svc in homeassistant genie-audio genie-whisper genie-whisper-warmup "$LLM_UNIT_NAME" genie-llm-warmup genie-core genie-governor genie-health genie-api genie-mqtt; do
     if sudo systemctl enable "$svc.service" 2>/dev/null; then
         echo "  Enabled: $svc"
     else
@@ -324,7 +382,7 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Start services:"
-echo "  sudo systemctl start genie-llm    # LLM server (wait ~10s for model load)"
+echo "  sudo systemctl start $LLM_UNIT_NAME    # LLM server (wait ~10s for model load)"
 echo "  sudo systemctl start genie-core   # Voice AI + chat API on :3000"
 echo "  sudo systemctl start genie-api    # System dashboard on :3080"
 echo "  sudo systemctl start genie-governor"
