@@ -289,6 +289,36 @@ The repo includes:
 - wake-word helper scripts
 - Docker support for local development
 
+### Recommended LLM Pairing
+
+The bundled default is **Phi-4-mini Q4_K_M** on llama.cpp. `setup-jetson.sh`
+auto-downloads it on first run.
+
+For deployments that want stronger reasoning, cleaner JSON tool calls, and
+better multilingual support (matching the per-language Piper voice models),
+the recommended pairing is **Qwen3-4B Q4_K_M** running on
+[`genie-ai-runtime`](https://github.com/GeniePod/genie-ai-runtime) once the
+runtime backend is enabled (`[services.llm].backend = "genie_ai_runtime"`).
+Qwen3-4B's slower per-token decode is exactly what genie-ai-runtime's
+prefill and TTFT improvements address.
+
+Phase 1 is opt-in only — Phi-4-mini remains the default:
+
+```bash
+# On the Jetson, after `make deploy`:
+sudo /opt/geniepod/setup-jetson.sh --model qwen3-4b
+
+# Then edit /etc/geniepod/geniepod.toml:
+#   llm_model_name = "qwen"
+#   llm_model_path = "/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf"
+# And update GENIEPOD_LLM_MODEL in /etc/systemd/system/genie-llm.service,
+# then: sudo systemctl restart genie-llm genie-core
+```
+
+See [issue #44](https://github.com/GeniePod/genie-claw/issues/44) for the
+full rollout plan; flipping the default ships in Phase 2 alongside
+[issue #33](https://github.com/GeniePod/genie-claw/issues/33).
+
 ## Design Principles
 
 - **Privacy and security over broad skills**: trust matters more than a giant extension catalog

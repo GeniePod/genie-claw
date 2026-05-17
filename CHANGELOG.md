@@ -4,6 +4,22 @@
 
 ### Added
 
+- Opt-in Qwen3-4B model download in `setup-jetson.sh` (issue #44, Phase 1).
+  `deploy/setup-jetson.sh --model qwen3-4b` fetches
+  `Qwen3-4B-Q4_K_M.gguf` from `Qwen/Qwen3-4B-GGUF` into
+  `/opt/geniepod/models/`. `--model phi-4-mini` is also accepted as an
+  explicit form of today's default. The flag only changes the download
+  target; it does not rewrite `llm_model_path` in
+  `/etc/geniepod/geniepod.toml`, so existing Phi-4-mini deployments stay
+  on Phi-4-mini until the operator flips the config line by hand. The
+  recommended pairing is Qwen3-4B + `genie-ai-runtime` once both are
+  installed — see the new "Recommended LLM Pairing" section in README.
+  `geniepod.toml` carries commented examples for both
+  `llm_model_name = "qwen"` and the matching `llm_model_path`. Regression
+  tests in `prompt.rs` lock the `Qwen3-4B-Q4_K_M.gguf` filename to
+  `ModelFamily::Qwen` so a future detector refactor cannot silently drop
+  it into the small-model prompt shape. The default flip ships in Phase 2
+  alongside the genie-ai-runtime default flip in issue #33.
 - `.github/workflows/ci.yml` — the fmt + clippy + test daily loop for
   issue #34 (PR #37). Runs `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets --locked -- -D warnings`, and

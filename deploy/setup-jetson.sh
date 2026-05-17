@@ -4,6 +4,15 @@
 #   ssh geniepod@<jetson-ip> 'bash /opt/geniepod/setup-jetson.sh'
 #
 # Flags:
+#   --model phi-4-mini           Explicit form of today's default
+#                                (Phi-4-mini Q4_K_M).
+#   --model qwen3-4b             Download Qwen3-4B Q4_K_M instead
+#                                (issue #44). Recommended pairing with
+#                                genie-ai-runtime once both are installed.
+#                                The flag only changes the download target;
+#                                it does NOT rewrite llm_model_path in
+#                                /etc/geniepod/geniepod.toml — flip that
+#                                line by hand once the new model is on disk.
 #   --runtime genie-ai-runtime   Build + install genie-ai-runtime v1.0.0
 #                                alongside the existing llama.cpp backend.
 #                                Does NOT modify /etc/geniepod/geniepod.toml
@@ -18,11 +27,39 @@ CONFIG_DIR="/etc/geniepod"
 MODEL_DIR="$GENIEPOD_DIR/models"
 DATA_DIR="$GENIEPOD_DIR/data"
 
+# Phi-4-mini Q4_K_M — the current default. Pinned to lmstudio-community's
+# GGUF mirror because that conversion has been verified end-to-end on this
+# repo's Tegra/aarch64 + llama.cpp + flash-attn stack.
+PHI_MODEL_FILENAME="phi-4-mini-instruct-q4_k_m.gguf"
+PHI_MODEL_URL="https://huggingface.co/lmstudio-community/Phi-4-mini-instruct-GGUF/resolve/main/Phi-4-mini-instruct-Q4_K_M.gguf"
+PHI_MODEL_LABEL="Phi-4-mini Q4_K_M (~2.4 GB)"
+
+# Qwen3-4B Q4_K_M — opt-in alternative (issue #44). Sourced from upstream
+# Qwen GGUF release. Stronger reasoning / multilingual / JSON tool-call
+# behavior than Phi-4-mini; per-token decode is slower, which is what
+# genie-ai-runtime is meant to address downstream.
+QWEN3_MODEL_FILENAME="Qwen3-4B-Q4_K_M.gguf"
+QWEN3_MODEL_URL="https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf"
+QWEN3_MODEL_LABEL="Qwen3-4B Q4_K_M (~2.5 GB)"
+
 # ── Argument parsing ────────────────────────────────────────────
+MODEL_CHOICE=""
 RUNTIME_TO_INSTALL=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --model)
+            if [ $# -lt 2 ]; then
+                echo "ERROR: --model requires a value (phi-4-mini | qwen3-4b)" >&2
+                exit 2
+            fi
+            MODEL_CHOICE="$2"
+            shift 2
+            ;;
+        --model=*)
+            MODEL_CHOICE="${1#--model=}"
+            shift
+            ;;
         --runtime)
             shift
             if [ $# -eq 0 ]; then
@@ -37,12 +74,12 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,12p' "$0"
+            sed -n '2,21p' "$0"
             exit 0
             ;;
         *)
             echo "ERROR: unknown argument: $1" >&2
-            echo "Usage: $0 [--runtime genie-ai-runtime]" >&2
+            echo "Usage: $0 [--model phi-4-mini|qwen3-4b] [--runtime genie-ai-runtime]" >&2
             exit 2
             ;;
     esac
@@ -138,6 +175,9 @@ install_genie_ai_runtime() {
     echo "  systemctl status genie-ai-runtime.service"
 }
 
+# --runtime is install-only: do the build/install and exit before the
+# rest of the Jetson setup runs. Validation happens here so an unknown
+# value fails fast, before we resolve any model paths.
 if [ -n "$RUNTIME_TO_INSTALL" ]; then
     case "$RUNTIME_TO_INSTALL" in
         genie-ai-runtime)
@@ -152,7 +192,27 @@ if [ -n "$RUNTIME_TO_INSTALL" ]; then
     esac
 fi
 
+case "$MODEL_CHOICE" in
+    ""|phi-4-mini)
+        MODEL_FLAG_FILENAME="$PHI_MODEL_FILENAME"
+        MODEL_FLAG_URL="$PHI_MODEL_URL"
+        MODEL_FLAG_LABEL="$PHI_MODEL_LABEL"
+        ;;
+    qwen3-4b)
+        MODEL_FLAG_FILENAME="$QWEN3_MODEL_FILENAME"
+        MODEL_FLAG_URL="$QWEN3_MODEL_URL"
+        MODEL_FLAG_LABEL="$QWEN3_MODEL_LABEL"
+        ;;
+    *)
+        echo "ERROR: unknown --model '$MODEL_CHOICE'. Supported: phi-4-mini, qwen3-4b" >&2
+        exit 2
+        ;;
+esac
+
 echo "=== GeniePod Jetson Setup ==="
+if [ -n "$MODEL_CHOICE" ]; then
+    echo "Model selection: --model $MODEL_CHOICE ($MODEL_FLAG_LABEL)"
+fi
 echo ""
 
 # 1. Create directories.
@@ -203,28 +263,45 @@ else
 fi
 
 # 4. Ensure the configured LLM model exists.
+# Selection rules (issue #44):
+#   - Without --model: honor llm_model_path in geniepod.toml if set, else
+#     fall back to the Phi-4-mini default path. Auto-download only when
+#     the resolved path matches the default for the active model choice.
+#   - With --model <name>: download <name>'s canonical artifact to
+#     $MODEL_DIR/<filename>. Does NOT rewrite llm_model_path — operator
+#     flips that line by hand to switch the running LLM.
 echo "[4/6] Checking LLM model..."
-CONFIGURED_MODEL_PATH="$(awk -F'"' '/^llm_model_path = / {print $2; exit}' "$CONFIG_DIR/geniepod.toml" 2>/dev/null || true)"
-DEFAULT_PHI_MODEL="$MODEL_DIR/phi-4-mini-instruct-q4_k_m.gguf"
-GGUF="${CONFIGURED_MODEL_PATH:-$DEFAULT_PHI_MODEL}"
+DEFAULT_MODEL_PATH="$MODEL_DIR/$MODEL_FLAG_FILENAME"
+if [ -n "$MODEL_CHOICE" ]; then
+    GGUF="$DEFAULT_MODEL_PATH"
+else
+    CONFIGURED_MODEL_PATH="$(awk -F'"' '/^llm_model_path = / {print $2; exit}' "$CONFIG_DIR/geniepod.toml" 2>/dev/null || true)"
+    GGUF="${CONFIGURED_MODEL_PATH:-$DEFAULT_MODEL_PATH}"
+fi
 sudo mkdir -p "$(dirname "$GGUF")"
 
 if [ -f "$GGUF" ]; then
     echo "  OK: $(basename "$GGUF") ($(du -h "$GGUF" | cut -f1))"
 else
-    if [ "$GGUF" = "$DEFAULT_PHI_MODEL" ]; then
-        echo "  Downloading Phi-4-mini Q4_K_M (~2.4 GB)..."
-        if wget -q --show-progress -O "$GGUF" \
-            "https://huggingface.co/lmstudio-community/Phi-4-mini-instruct-GGUF/resolve/main/Phi-4-mini-instruct-Q4_K_M.gguf"
-        then
+    if [ "$GGUF" = "$DEFAULT_MODEL_PATH" ]; then
+        echo "  Downloading $MODEL_FLAG_LABEL..."
+        if wget -q --show-progress -O "$GGUF" "$MODEL_FLAG_URL"; then
             echo "  OK: downloaded $(du -h "$GGUF" | cut -f1)"
+            if [ -n "$MODEL_CHOICE" ] && [ "$MODEL_CHOICE" != "phi-4-mini" ]; then
+                echo ""
+                echo "  NOTE: $CONFIG_DIR/geniepod.toml was not modified."
+                echo "        To run with this model, set:"
+                echo "          llm_model_path = \"$GGUF\""
+                echo "          llm_model_name = \"qwen\"   # selects the Qwen prompt template"
+                echo "        then restart genie-llm + genie-core."
+            fi
         else
             rm -f "$GGUF"
-            echo "  FAILED: could not download Phi-4-mini automatically"
+            echo "  FAILED: could not download $MODEL_FLAG_LABEL automatically"
             echo "    Try manually from a dev machine:"
-            echo "      hf download lmstudio-community/Phi-4-mini-instruct-GGUF --include 'Phi-4-mini-instruct-Q4_K_M.gguf' --local-dir ."
-            echo "      scp Phi-4-mini-instruct-Q4_K_M.gguf $(whoami)@$(hostname -I | awk '{print $1}'):/tmp/"
-            echo "      sudo mv /tmp/Phi-4-mini-instruct-Q4_K_M.gguf $GGUF"
+            echo "      wget -O $MODEL_FLAG_FILENAME '$MODEL_FLAG_URL'"
+            echo "      scp $MODEL_FLAG_FILENAME $(whoami)@$(hostname -I | awk '{print $1}'):/tmp/"
+            echo "      sudo mv /tmp/$MODEL_FLAG_FILENAME $GGUF"
             exit 1
         fi
     else

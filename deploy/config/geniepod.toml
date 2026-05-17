@@ -8,6 +8,15 @@ port = 3000
 bind_host = "127.0.0.1"           # Safer default. Use "0.0.0.0" only behind a trusted gateway/firewall.
 ha_token = ""                     # Only needed when Home Assistant service is enabled below. Or set HA_TOKEN env var.
 llm_model_name = "phi"            # For prompt optimization. Options: nemotron-4b, tinyllama, llama, qwen, phi
+                                  # Opt-in Qwen3-4B alternative (issue #44):
+                                  #   1) deploy/setup-jetson.sh --model qwen3-4b
+                                  #   2) flip the two lines below:
+                                  #        llm_model_name = "qwen"
+                                  #        llm_model_path = "/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf"
+                                  #   3) update GENIEPOD_LLM_MODEL in genie-llm.service
+                                  #   4) sudo systemctl restart genie-llm genie-core
+                                  # Recommended pairing: Qwen3-4B + genie-ai-runtime
+                                  # (see ARCHITECTURE.md "Current Transitional Adapters").
 whisper_model = "/opt/geniepod/models/ggml-small.bin"   # alpha.5 default — with the
                                   # long-running whisper-server (genie-whisper.service)
                                   # this model stays resident in iGPU memory, so per-call
@@ -94,6 +103,8 @@ voice_record_secs = 3             # Seconds to record per voice interaction. Mos
 voice_continuous = true           # After response, auto-listen for follow-up without re-wake.
 voice_continuous_secs = 3         # Shorter recording for follow-up conversation.
 llm_model_path = "/opt/geniepod/models/phi-4-mini-instruct-q4_k_m.gguf"  # For GPU time-sharing in voice mode.
+                                  # Qwen3-4B alternative (issue #44, opt-in):
+                                  # llm_model_path = "/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf"
 wakeword_script = ""              # Empty = push-to-talk (alpha.5 default).
                                   # Set to "/opt/geniepod/bin/genie-wake-listen.py" once
                                   # wake-word detection is validated for your install.
