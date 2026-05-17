@@ -287,14 +287,6 @@ else
         echo "  Downloading $MODEL_FLAG_LABEL..."
         if wget -q --show-progress -O "$GGUF" "$MODEL_FLAG_URL"; then
             echo "  OK: downloaded $(du -h "$GGUF" | cut -f1)"
-            if [ -n "$MODEL_CHOICE" ] && [ "$MODEL_CHOICE" != "phi-4-mini" ]; then
-                echo ""
-                echo "  NOTE: $CONFIG_DIR/geniepod.toml was not modified."
-                echo "        To run with this model, set:"
-                echo "          llm_model_path = \"$GGUF\""
-                echo "          llm_model_name = \"qwen\"   # selects the Qwen prompt template"
-                echo "        then restart genie-llm + genie-core."
-            fi
         else
             rm -f "$GGUF"
             echo "  FAILED: could not download $MODEL_FLAG_LABEL automatically"
@@ -308,6 +300,25 @@ else
         echo "  MISSING: configured model $(basename "$GGUF")"
         echo "    Copy the model to: $GGUF"
         exit 1
+    fi
+fi
+
+# Cutover guidance for non-default --model selections (issue #44 review,
+# PR #46). Must run independent of the download branch above so that
+# re-runs against an already-on-disk model still surface the four manual
+# steps the operator needs to take. Suppressed once geniepod.toml's
+# llm_model_path already points at the downloaded model, on the
+# assumption that the operator has completed the cutover.
+if [ -n "$MODEL_CHOICE" ] && [ "$MODEL_CHOICE" != "phi-4-mini" ]; then
+    CUTOVER_CONFIGURED_PATH="$(awk -F'"' '/^llm_model_path = / {print $2; exit}' "$CONFIG_DIR/geniepod.toml" 2>/dev/null || true)"
+    if [ "$GGUF" != "$CUTOVER_CONFIGURED_PATH" ]; then
+        echo ""
+        echo "  NOTE: $CONFIG_DIR/geniepod.toml was not modified."
+        echo "        To run with this model, set:"
+        echo "          llm_model_path = \"$GGUF\""
+        echo "          llm_model_name = \"qwen\"   # selects the Qwen prompt template"
+        echo "        update GENIEPOD_LLM_MODEL in /etc/systemd/system/genie-llm.service,"
+        echo "        then: sudo systemctl restart genie-llm genie-core"
     fi
 fi
 
