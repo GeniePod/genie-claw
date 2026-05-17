@@ -12,6 +12,10 @@ Restart=always
 RestartSec=5
 MemoryMax=32M
 
+# Pin to the system bucket (issue #25) so the dashboard's HTTP loop doesn't
+# steal cycles from whisper (2-3), llama-server (4), or genie-core (5).
+CPUAffinity=0 1
+
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/opt/geniepod/data

@@ -15,6 +15,10 @@ WatchdogSec=30
 MemoryMax=32M
 CPUWeight=50
 
+# Pin to the system bucket (issue #25) — governor only polls memory and writes
+# drop-in configs, keep it off the inference cores (2-5).
+CPUAffinity=0 1
+
 # Security hardening
 ProtectSystem=strict
 ProtectHome=yes
