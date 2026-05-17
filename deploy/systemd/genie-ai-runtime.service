@@ -1,0 +1,31 @@
+[Unit]
+Description=GeniePod AI Runtime (Jetson-tuned LLM, OpenAI-compatible)
+Documentation=https://github.com/GeniePod/genie-ai-runtime
+After=network.target
+ConditionPathExists=/opt/geniepod/bin/jetson-llm-server
+# Conflicts with genie-llm.service: both bind :8080. systemd will refuse
+# to start the second one while the first is running, so a misconfigured
+# [services.llm] block fails loudly instead of silently double-binding.
+Conflicts=genie-llm.service
+
+[Service]
+Type=simple
+# Drop page cache before loading model — Jetson NvMap needs contiguous blocks.
+ExecStartPre=/bin/sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
+# v1.0.0 only accepts `-m <model> -p <port>`. Any llama.cpp-style flags
+# (--n-gpu-layers, --flash-attn, --ctx-size, --threads) are intentionally
+# absent — the runtime hard-codes its own Jetson-tuned defaults.
+ExecStart=/opt/geniepod/bin/jetson-llm-server \
+    -m ${GENIEPOD_LLM_MODEL} \
+    -p 8080
+Environment=GENIEPOD_LLM_MODEL=/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+
+# GPU needs full system access
+ProtectSystem=no
+SupplementaryGroups=video render
+
+[Install]
+WantedBy=geniepod.target

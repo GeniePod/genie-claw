@@ -2,6 +2,14 @@
 # GeniePod — Jetson first-time setup script
 # Run this on the Jetson after make deploy:
 #   ssh geniepod@<jetson-ip> 'bash /opt/geniepod/setup-jetson.sh'
+#
+# Flags:
+#   --runtime genie-ai-runtime   Build + install genie-ai-runtime v1.0.0
+#                                alongside the existing llama.cpp backend.
+#                                Does NOT modify /etc/geniepod/geniepod.toml
+#                                and does NOT stop any running service —
+#                                operator does the cutover by hand per the
+#                                instructions printed at the end. (issue #54)
 
 set -euo pipefail
 
@@ -9,6 +17,140 @@ GENIEPOD_DIR="/opt/geniepod"
 CONFIG_DIR="/etc/geniepod"
 MODEL_DIR="$GENIEPOD_DIR/models"
 DATA_DIR="$GENIEPOD_DIR/data"
+
+# ── Argument parsing ────────────────────────────────────────────
+RUNTIME_TO_INSTALL=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --runtime)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "ERROR: --runtime requires an argument (e.g. genie-ai-runtime)" >&2
+                exit 2
+            fi
+            RUNTIME_TO_INSTALL="$1"
+            shift
+            ;;
+        --runtime=*)
+            RUNTIME_TO_INSTALL="${1#--runtime=}"
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,12p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            echo "Usage: $0 [--runtime genie-ai-runtime]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# ── --runtime mode: install an alternate LLM backend only ───────
+install_genie_ai_runtime() {
+    local build_dir="$GENIEPOD_DIR/src/genie-ai-runtime"
+    local repo_url="https://github.com/GeniePod/genie-ai-runtime.git"
+    local tag="v1.0.0"
+
+    echo "=== GeniePod: install genie-ai-runtime $tag ==="
+    echo ""
+
+    # 1. Verify prerequisites.
+    echo "[1/4] Checking build prerequisites..."
+    for pkg in cmake g++; do
+        if ! command -v "$pkg" > /dev/null 2>&1; then
+            echo "  Installing $pkg via apt..."
+            sudo apt-get update -qq
+            sudo apt-get install -y "$pkg"
+        fi
+        echo "  OK: $pkg ($("$pkg" --version 2>/dev/null | head -1))"
+    done
+    if ! command -v nvcc > /dev/null 2>&1 && [ ! -d /usr/local/cuda/include ]; then
+        echo "  WARN: CUDA toolkit not detected — JetPack normally ships it."
+        echo "        If the build fails on missing cuBLAS / cuda_runtime.h, install:"
+        echo "          sudo apt-get install -y nvidia-cuda-toolkit"
+    fi
+
+    # 2. Clone the pinned release.
+    echo "[2/4] Fetching $repo_url @ $tag ..."
+    sudo mkdir -p "$(dirname "$build_dir")"
+    sudo chown -R "$(whoami):$(whoami)" "$(dirname "$build_dir")"
+    if [ -d "$build_dir/.git" ]; then
+        echo "  Existing checkout found — fetching $tag and resetting."
+        git -C "$build_dir" fetch --tags --depth 1 origin "$tag"
+        git -C "$build_dir" checkout --quiet "tags/$tag"
+        git -C "$build_dir" clean -fdx
+    else
+        rm -rf "$build_dir"
+        git clone --branch "$tag" --depth 1 "$repo_url" "$build_dir"
+    fi
+
+    # 3. Build (10-20 min on Orin Nano).
+    echo "[3/4] Building (Release, $(nproc) jobs — this takes 10-20 min on Orin Nano)..."
+    cd "$build_dir"
+    cmake -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j"$(nproc)"
+
+    # 4. Install binaries. Refuse to overwrite if something looks wrong.
+    echo "[4/4] Installing binaries to $GENIEPOD_DIR/bin/ ..."
+    for bin in jetson-llm-server jetson-llm; do
+        if [ ! -f "build/$bin" ]; then
+            echo "  ERROR: build/$bin not produced — build output unexpected." >&2
+            exit 1
+        fi
+        sudo install -Dm755 "build/$bin" "$GENIEPOD_DIR/bin/$bin"
+        echo "  OK: $bin ($(du -h "$GENIEPOD_DIR/bin/$bin" | cut -f1))"
+    done
+
+    echo ""
+    echo "=== genie-ai-runtime $tag installed ==="
+    echo ""
+    echo "NOTE: jetson-llm-server installed but not yet selected as the LLM backend."
+    echo "      Your existing llama.cpp setup is unchanged."
+    echo ""
+    echo "To run genie-ai-runtime instead of llama.cpp:"
+    echo "  1. Stop the current llama.cpp backend:"
+    echo "       sudo systemctl stop genie-llm"
+    echo "  2. Edit /etc/geniepod/geniepod.toml:"
+    echo "       [services.llm]"
+    echo "       backend      = \"genie_ai_runtime\""
+    echo "       systemd_unit = \"genie-ai-runtime.service\""
+    echo "  3. Start the new backend:"
+    echo "       sudo systemctl daemon-reload"
+    echo "       sudo systemctl enable --now genie-ai-runtime.service"
+    echo "       sudo systemctl enable --now genie-ai-runtime-warmup.service"
+    echo "  4. Restart genie-core to pick up the config change:"
+    echo "       sudo systemctl restart genie-core"
+    echo ""
+    echo "To roll back to llama.cpp:"
+    echo "  1. sudo systemctl stop genie-ai-runtime genie-ai-runtime-warmup"
+    echo "  2. Edit /etc/geniepod/geniepod.toml:"
+    echo "       [services.llm]"
+    echo "       backend      = \"llama_cpp\""
+    echo "       systemd_unit = \"genie-llm.service\""
+    echo "  3. sudo systemctl start genie-llm"
+    echo "  4. sudo systemctl restart genie-core"
+    echo ""
+    echo "Verify:"
+    echo "  genie-ctl status            # should report llm_backend"
+    echo "  systemctl status genie-ai-runtime.service"
+}
+
+if [ -n "$RUNTIME_TO_INSTALL" ]; then
+    case "$RUNTIME_TO_INSTALL" in
+        genie-ai-runtime)
+            install_genie_ai_runtime
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown runtime: $RUNTIME_TO_INSTALL" >&2
+            echo "Supported: genie-ai-runtime" >&2
+            exit 2
+            ;;
+    esac
+fi
 
 echo "=== GeniePod Jetson Setup ==="
 echo ""

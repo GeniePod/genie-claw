@@ -1,12 +1,16 @@
 # genie-core — Build, Test, Cross-Compile, Deploy
 #
 # Usage:
-#   make              Build debug binaries (x86_64)
-#   make test         Run all tests
-#   make release      Build optimized x86_64 binaries
-#   make jetson       Cross-compile release for aarch64 (Jetson)
-#   make deploy       Deploy to Jetson devkit via SSH
-#   make clean        Remove build artifacts
+#   make                       Build debug binaries (x86_64)
+#   make test                  Run all tests
+#   make release               Build optimized x86_64 binaries
+#   make jetson                Cross-compile release for aarch64 (Jetson)
+#   make deploy                Deploy to Jetson devkit via SSH
+#   make jetson-ai-runtime     Build + install genie-ai-runtime v1.0.0 on the
+#                              Jetson alongside llama.cpp (issue #54). Install-
+#                              only — does not flip the backend config or stop
+#                              genie-llm.service.
+#   make clean                 Remove build artifacts
 #
 # Configuration:
 #   JETSON_HOST       SSH target (default: geniepod.local)
@@ -25,7 +29,7 @@ RELEASE_DIR = target/release
 CROSS_DIR = target/$(AARCH64)/release
 INSTALL_DIR = /opt/geniepod
 
-.PHONY: all build test release jetson deploy deploy-config deploy-systemd clean check fmt
+.PHONY: all build test release jetson deploy deploy-config deploy-systemd clean check fmt jetson-ai-runtime
 
 # ── Development ─────────────────────────────────────────────────
 
@@ -120,6 +124,25 @@ deploy-setup:
 		sudo mkdir -p $(INSTALL_DIR)/bin && \
 		sudo cp /tmp/genie-wake-listen.py /tmp/genie-wakeword.py /tmp/detect-audio-device.sh /tmp/genie-restart-all.sh /tmp/genie-audio-init $(INSTALL_DIR)/bin/ && \
 		sudo chmod +x $(INSTALL_DIR)/bin/genie-wake-listen.py $(INSTALL_DIR)/bin/genie-wakeword.py $(INSTALL_DIR)/bin/detect-audio-device.sh $(INSTALL_DIR)/bin/genie-restart-all.sh $(INSTALL_DIR)/bin/genie-audio-init'
+
+# ── Alternate LLM runtime: genie-ai-runtime (issue #54) ─────────
+#
+# Builds genie-ai-runtime v1.0.0 from source on the Jetson and installs the
+# binaries alongside the existing llama.cpp setup. The config switch
+# ([services.llm].backend / .systemd_unit) is intentionally left for the
+# operator to make by hand — this target is install-only, mirroring the
+# `--model qwen3-4b` safety property from PR #46.
+#
+# Prereq: `make deploy` (or at least deploy-systemd + deploy-setup) has run
+# at least once so the new units and the updated setup-jetson.sh are on the
+# target. We re-run those two sub-targets here for a self-contained flow.
+
+jetson-ai-runtime: deploy-systemd deploy-setup
+	@echo ""
+	@echo "=== Building + installing genie-ai-runtime v1.0.0 on $(JETSON_TARGET) ==="
+	@echo "    (this takes 10-20 min on Orin Nano while CMake compiles CUDA)"
+	@echo ""
+	ssh $(JETSON_TARGET) 'bash $(INSTALL_DIR)/setup-jetson.sh --runtime genie-ai-runtime'
 
 # ── Docker (HA + opt-in services) ───────────────────────────────
 

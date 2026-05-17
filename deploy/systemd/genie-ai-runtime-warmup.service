@@ -1,0 +1,30 @@
+[Unit]
+Description=GeniePod AI Runtime Warmup (force Qwen 3 4B into iGPU before first voice cycle)
+Documentation=https://github.com/GeniePod/genie-claw/issues/54
+After=genie-ai-runtime.service
+Wants=genie-ai-runtime.service
+ConditionPathExists=/opt/geniepod/bin/jetson-llm-server
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Poll /health for up to 120 s while jetson-llm-server boots and compiles
+# CUDA kernels on first run, then send one tiny /completion request to force
+# the model load into iGPU memory. Without this, the first user-visible
+# voice cycle either blocks on the cold load or times out with 503 / connect-
+# refused. Failures are non-fatal (|| true) so a broken LLM does not block boot.
+ExecStart=/bin/sh -c '\
+    for i in $(seq 1 120); do \
+        if curl -sf -o /dev/null http://127.0.0.1:8080/health; then break; fi; \
+        sleep 1; \
+    done; \
+    curl -sf -X POST http://127.0.0.1:8080/v1/chat/completions \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"jetson-llm\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" > /dev/null || true; \
+    echo "[genie-ai-runtime-warmup] done"'
+TimeoutStartSec=240
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=geniepod.target
