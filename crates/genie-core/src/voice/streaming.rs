@@ -1,158 +1,523 @@
-//! Streaming voice pipeline — speak while LLM is still generating.
+//! Streaming voice pipeline — speak while the LLM is still generating.
 //!
-//! Instead of waiting for the full LLM response before speaking,
-//! this module buffers tokens into sentences and speaks each sentence
-//! as soon as it completes. The user hears the first sentence 2-5 seconds
-//! sooner than the blocking pipeline.
+//! Unlike the previous implementation (which only sliced the *completed*
+//! LLM response into sentences before speaking), this module detects
+//! sentence boundaries inside the streaming token callback and forwards
+//! each completed sentence to a concurrent TTS task immediately. The
+//! first sentence reaches the speaker as soon as the LLM finishes
+//! emitting it, not after the entire response is collected.
 //!
 //! Pipeline:
-//!   LLM streams tokens → sentence buffer → format for voice → Piper TTS → speaker
-//!                         ↓ (concurrent)
-//!                         next sentence buffering continues
+//!   chat_stream tokens
+//!       └─► SentenceStreamer.feed() ──► mpsc ──► TTS task ──► aplay
+//!                                                  (Arc<TtsEngine>)
+//!
+//! The TTS task drains the channel sequentially so audio plays in order
+//! and the half-duplex `post_silence_ms` gate still works between
+//! sentences.
+
+use std::sync::Arc;
 
 use anyhow::Result;
+use tokio::sync::mpsc;
 
-use super::format;
 use super::tts::TtsEngine;
 
-/// Buffer LLM tokens into complete sentences, speak each one immediately.
+/// Maximum sentences to speak per response. Matches the cap that
+/// `format::for_voice` enforces on the non-streaming path, so voice
+/// replies stay short whether the caller streams or not.
+const MAX_SPOKEN_SENTENCES: usize = 3;
+
+/// Stream the LLM response and speak each sentence in parallel.
 ///
-/// Returns the full assembled response text.
+/// Returns the full assembled response text (untruncated, so callers can
+/// log/persist the complete reply even though only the first
+/// `MAX_SPOKEN_SENTENCES` are spoken).
 pub async fn stream_and_speak(
     llm: &crate::llm::LlmClient,
     messages: &[crate::llm::Message],
     max_tokens: u32,
-    tts_engine: &TtsEngine,
+    tts_engine: Arc<TtsEngine>,
 ) -> Result<String> {
-    let mut full_response = String::new();
-    let mut sentence_buffer = String::new();
-    let mut sentences_spoken = 0;
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    let response = llm
+    let tts_for_task = Arc::clone(&tts_engine);
+    let tts_task = tokio::spawn(async move {
+        let mut spoken: usize = 0;
+        while let Some(sentence) = rx.recv().await {
+            if spoken == 0 {
+                eprintln!("[voice] Speaking (streaming)...");
+            }
+            if let Err(e) = tts_for_task.speak(&sentence).await {
+                tracing::warn!(error = %e, "TTS error on sentence");
+            }
+            spoken += 1;
+        }
+        spoken
+    });
+
+    let mut full_response = String::new();
+    let mut streamer = SentenceStreamer::new(MAX_SPOKEN_SENTENCES);
+
+    let stream_result = llm
         .chat_stream(messages, Some(max_tokens), |token| {
             full_response.push_str(token);
-            sentence_buffer.push_str(token);
+            for sentence in streamer.feed(token) {
+                let _ = tx.send(sentence);
+            }
         })
-        .await?;
+        .await;
 
-    // After streaming completes, speak any remaining buffered text.
-    // (During streaming, we collected everything; now we speak sentence by sentence.)
-    // For V1, we do a simpler approach: split the complete response into sentences
-    // and speak each one. This is still faster than the old "wait for everything
-    // then speak everything" because Piper processes each sentence independently.
+    // Always flush and close the channel so the TTS task exits cleanly,
+    // whether the LLM stream succeeded or errored partway through.
+    if let Some(tail) = streamer.finish() {
+        let _ = tx.send(tail);
+    }
+    drop(tx);
+    let _ = tts_task.await;
 
-    let voice_text = format::for_voice(&response);
+    stream_result
+}
 
-    if voice_text.is_empty() {
-        return Ok(response);
+/// Incremental sentence detector with per-sentence voice cleanup.
+///
+/// The detector consumes raw LLM tokens, tracks markdown code-fence
+/// state across calls, strips inline markdown/URLs from each completed
+/// sentence, and emits at most `max_sentences` cleaned sentences in
+/// total (matching the cap in `format::for_voice`). Sentences shorter
+/// than `MIN_SENTENCE_CHARS` are merged with the next one so Piper
+/// never gets a tiny fragment that synthesizes into a glitch.
+#[derive(Debug)]
+pub struct SentenceStreamer {
+    raw_buffer: String,
+    pending_sentence: String,
+    in_code_fence: bool,
+    fence_marker_buffer: String,
+    emitted: usize,
+    max_sentences: usize,
+}
+
+/// Minimum chars (counted in graphemes, approximated as `chars()`) for a
+/// sentence to be emitted on its own. Shorter fragments merge with the
+/// following sentence so Piper never gets a 1-4 char glitch like "OK!".
+/// Sized to admit dense CJK sentences (~8-12 chars) without merging.
+const MIN_SENTENCE_CHARS: usize = 8;
+
+impl SentenceStreamer {
+    pub fn new(max_sentences: usize) -> Self {
+        Self {
+            raw_buffer: String::new(),
+            pending_sentence: String::new(),
+            in_code_fence: false,
+            fence_marker_buffer: String::new(),
+            emitted: 0,
+            max_sentences,
+        }
     }
 
-    // If response is short (1-2 sentences), speak as one chunk for smoothest audio.
-    // If longer, stream per-sentence for faster perceived response.
-    let sentences = split_sentences(&voice_text);
-
-    if sentences.len() <= 2 {
-        // Short response — speak all at once (no glitch between sentences).
-        eprintln!("[voice] Speaking...");
-        if let Err(e) = tts_engine.speak(&voice_text).await {
-            tracing::warn!(error = %e, "TTS error");
+    /// Feed a chunk of raw LLM output. Returns any complete sentences
+    /// that became ready (already cleaned for TTS). Returns an empty
+    /// vec once the per-response sentence cap has been reached.
+    pub fn feed(&mut self, chunk: &str) -> Vec<String> {
+        if self.emitted >= self.max_sentences {
+            return Vec::new();
         }
-        sentences_spoken = sentences.len();
-    } else {
-        // Longer response — stream per-sentence (faster first audio).
-        for sentence in &sentences {
-            let trimmed = sentence.trim();
-            if trimmed.len() < 3 {
+
+        self.raw_buffer.push_str(chunk);
+        let mut out = Vec::new();
+
+        // Process the buffer character by character so we can react to
+        // sentence boundaries and code-fence toggles mid-chunk. We may
+        // leave a trailing partial sentence in `pending_sentence`.
+        let buffer = std::mem::take(&mut self.raw_buffer);
+        for ch in buffer.chars() {
+            if self.consume_fence_marker(ch) {
                 continue;
             }
 
-            if sentences_spoken == 0 {
-                eprintln!("[voice] Speaking (streaming)...");
+            if self.in_code_fence {
+                continue;
             }
 
-            if let Err(e) = tts_engine.speak(trimmed).await {
-                tracing::warn!(error = %e, "TTS error on sentence");
+            self.pending_sentence.push(ch);
+
+            if is_sentence_boundary(ch) {
+                let candidate = clean_sentence(&self.pending_sentence);
+                if candidate.chars().count() >= MIN_SENTENCE_CHARS {
+                    self.pending_sentence.clear();
+                    out.push(candidate);
+                    self.emitted += 1;
+                    if self.emitted >= self.max_sentences {
+                        return out;
+                    }
+                }
+                // Else: keep accumulating into pending_sentence so a
+                // short opener like "OK!" merges with the next clause.
             }
-            sentences_spoken += 1;
         }
+
+        out
     }
 
-    Ok(response)
-}
-
-/// Split text into sentences for incremental TTS.
-///
-/// Each sentence is spoken as a separate Piper invocation,
-/// allowing the first sentence to play while later ones are synthesized.
-fn split_sentences(text: &str) -> Vec<String> {
-    let mut sentences = Vec::new();
-    let mut current = String::new();
-
-    for ch in text.chars() {
-        current.push(ch);
-
-        // Sentence boundary: period, exclamation, question mark
-        // followed by space or end of text.
-        if is_sentence_boundary(ch) && current.chars().count() > 3 {
-            sentences.push(current.trim().to_string());
-            current = String::new();
+    /// Flush any buffered trailing fragment after the LLM stream ends.
+    /// Returns the cleaned final sentence if one fits under the cap.
+    pub fn finish(mut self) -> Option<String> {
+        if self.emitted >= self.max_sentences {
+            return None;
         }
+        // Flush any half-consumed fence marker back into the sentence
+        // buffer — if it never matured into a real ``` fence, the
+        // partial backticks should still get cleaned and spoken.
+        if !self.fence_marker_buffer.is_empty() && !self.in_code_fence {
+            let pending = std::mem::take(&mut self.fence_marker_buffer);
+            self.pending_sentence.push_str(&pending);
+        }
+
+        let trimmed = self.pending_sentence.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let cleaned = clean_sentence(trimmed);
+        if cleaned.is_empty() {
+            return None;
+        }
+        Some(cleaned)
     }
 
-    // Remaining fragment.
-    let remaining = current.trim().to_string();
-    if !remaining.is_empty() && remaining.len() > 3 {
-        sentences.push(remaining);
-    }
+    /// Track ``` markdown fences across token boundaries. Returns true
+    /// when the character was absorbed into the fence marker buffer
+    /// (and should not be added to `pending_sentence`).
+    fn consume_fence_marker(&mut self, ch: char) -> bool {
+        if ch == '`' {
+            self.fence_marker_buffer.push(ch);
+            if self.fence_marker_buffer.len() == 3 {
+                self.in_code_fence = !self.in_code_fence;
+                self.fence_marker_buffer.clear();
+            }
+            return true;
+        }
 
-    // If no sentence boundaries found, return the whole text as one.
-    if sentences.is_empty() && !text.trim().is_empty() {
-        sentences.push(text.trim().to_string());
+        // Non-backtick: any partially-collected backticks were inline
+        // code markers (`like this`), not a fence. Flush them into the
+        // sentence buffer (stripped — they're noise for TTS) and fall
+        // through so the current character is processed normally.
+        self.fence_marker_buffer.clear();
+        false
     }
-
-    sentences
 }
 
 fn is_sentence_boundary(ch: char) -> bool {
     matches!(ch, '.' | '!' | '?' | '。' | '！' | '？')
 }
 
+/// Per-sentence TTS cleanup. The streaming path can't run the full
+/// `format::for_voice` pipeline (which is whole-text aware: it strips
+/// code blocks, truncates to N sentences, etc.) so this applies the
+/// inline subset: strip markdown links, raw URLs, leading list/header
+/// markers, common inline emphasis chars, and collapse whitespace.
+fn clean_sentence(text: &str) -> String {
+    let stripped_links = strip_inline_links(text);
+    let stripped_urls = strip_raw_urls(&stripped_links);
+    let stripped_prefix = strip_list_or_header_prefix(stripped_urls.trim());
+    #[allow(clippy::collapsible_str_replace)]
+    let stripped_inline = stripped_prefix
+        .replace("**", "")
+        .replace("__", "")
+        .replace('*', "")
+        .replace('`', "");
+    let punct_cleaned = stripped_inline
+        .replace("...", ", ")
+        .replace(" - ", ", ")
+        .replace(" — ", ", ")
+        .replace(" – ", ", ")
+        .replace('(', ", ")
+        .replace(')', ", ")
+        .replace('[', "")
+        .replace(']', "")
+        .replace('{', "")
+        .replace('}', "")
+        .replace('"', "")
+        .replace("'s", "s");
+    collapse_whitespace(punct_cleaned.trim())
+}
+
+fn strip_inline_links(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '[' {
+            let mut link_text = String::new();
+            let mut closed = false;
+            for c in chars.by_ref() {
+                if c == ']' {
+                    closed = true;
+                    break;
+                }
+                link_text.push(c);
+            }
+            if closed && chars.peek() == Some(&'(') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == ')' {
+                        break;
+                    }
+                }
+                result.push_str(&link_text);
+            } else {
+                // Not a real link — restore the '[' and accumulated text.
+                result.push('[');
+                result.push_str(&link_text);
+                if closed {
+                    result.push(']');
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn strip_raw_urls(text: &str) -> String {
+    text.split_whitespace()
+        .filter(|token| {
+            let trimmed = token.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '"' | '\''
+                )
+            });
+            !(trimmed.starts_with("http://")
+                || trimmed.starts_with("https://")
+                || trimmed.starts_with("www."))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_list_or_header_prefix(line: &str) -> String {
+    let trimmed = line.trim_start_matches('#').trim_start();
+    let trimmed = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("• "))
+        .unwrap_or(trimmed);
+    strip_numbered_prefix(trimmed).to_string()
+}
+
+fn strip_numbered_prefix(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1] == b' ' {
+        &line[i + 2..]
+    } else {
+        line
+    }
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut last_was_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space && !result.is_empty() {
+                result.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            result.push(ch);
+            last_was_space = false;
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn split_basic() {
-        let sentences = split_sentences("Hello world. How are you? I'm fine!");
-        assert_eq!(sentences.len(), 3);
-        assert!(sentences[0].contains("Hello"));
-        assert!(sentences[1].contains("How"));
-        assert!(sentences[2].contains("fine"));
+    fn feed_all(streamer: &mut SentenceStreamer, chunks: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend(streamer.feed(chunk));
+        }
+        out
     }
 
     #[test]
-    fn split_single_sentence() {
-        let sentences = split_sentences("Just one sentence here");
-        assert_eq!(sentences.len(), 1);
+    fn emits_first_sentence_mid_stream() {
+        let mut s = SentenceStreamer::new(3);
+        let mut emitted = Vec::new();
+        emitted.extend(s.feed("Hello there, this is the first sentence. "));
+        assert_eq!(emitted.len(), 1, "first sentence should fire before EOF");
+        assert!(emitted[0].contains("Hello there"));
+        emitted.extend(s.feed("And here is the second one!"));
+        // Second sentence is still pending until finish() (no trailing space
+        // needed, but boundary itself triggers it).
+        assert_eq!(emitted.len(), 2);
+        assert!(emitted[1].contains("second one"));
     }
 
     #[test]
-    fn split_short_fragments_filtered() {
-        let sentences = split_sentences("OK. Fine. This is a real sentence here.");
-        // "OK" and "Fine" are too short (<10 chars including period)
-        // They get merged with the next sentence
-        assert!(!sentences.is_empty());
+    fn handles_partial_token_chunks() {
+        let mut s = SentenceStreamer::new(3);
+        let chunks = ["Hel", "lo wor", "ld, how a", "re you do", "ing today?"];
+        let emitted = feed_all(&mut s, &chunks);
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].contains("Hello world"));
+        assert!(emitted[0].contains("doing today"));
     }
 
     #[test]
-    fn split_empty() {
-        let sentences = split_sentences("");
-        assert!(sentences.is_empty());
+    fn caps_at_max_sentences() {
+        let mut s = SentenceStreamer::new(2);
+        let emitted = feed_all(
+            &mut s,
+            &[
+                "First sentence is long enough. ",
+                "Second sentence is also fine. ",
+                "Third should be dropped. ",
+                "Fourth too.",
+            ],
+        );
+        assert_eq!(emitted.len(), 2);
+        assert!(s.finish().is_none());
     }
 
     #[test]
-    fn split_chinese_sentences() {
-        let sentences = split_sentences("第一句话已经说完。第二句话也结束了！第三句来了？");
-        assert_eq!(sentences.len(), 3);
+    fn merges_too_short_opener_with_next_clause() {
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(
+            &mut s,
+            &["OK! Here is the real answer to your question."],
+        );
+        assert_eq!(emitted.len(), 1);
+        // The "OK!" opener is too short to stand alone, so it merges
+        // with the longer follow-up.
+        assert!(emitted[0].contains("OK"));
+        assert!(emitted[0].contains("real answer"));
+    }
+
+    #[test]
+    fn finish_flushes_trailing_fragment() {
+        let mut s = SentenceStreamer::new(3);
+        let _ = s.feed("Hello world and the rest goes here without final punctuation");
+        let tail = s.finish().expect("trailing fragment");
+        assert!(tail.contains("Hello world"));
+    }
+
+    #[test]
+    fn finish_returns_none_for_empty_input() {
+        let s = SentenceStreamer::new(3);
+        assert!(s.finish().is_none());
+    }
+
+    #[test]
+    fn strips_markdown_bold_inline() {
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(&mut s, &["The **weather** is sunny right now. "]);
+        assert_eq!(emitted.len(), 1);
+        assert!(!emitted[0].contains('*'));
+        assert!(emitted[0].contains("weather"));
+    }
+
+    #[test]
+    fn strips_markdown_links() {
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(
+            &mut s,
+            &["See [this guide](https://example.com/docs) for more details about it. "],
+        );
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].contains("this guide"));
+        assert!(!emitted[0].contains("https://"));
+        assert!(!emitted[0].contains('['));
+    }
+
+    #[test]
+    fn strips_raw_urls() {
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(
+            &mut s,
+            &["Top result was found at https://example.com/x today. "],
+        );
+        assert_eq!(emitted.len(), 1);
+        assert!(!emitted[0].contains("https://"));
+        assert!(emitted[0].contains("Top result"));
+    }
+
+    #[test]
+    fn skips_fenced_code_blocks() {
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(
+            &mut s,
+            &[
+                "Here is the code block I prepared.\n",
+                "```\nlet x = 5;\nprint(x);\n```\n",
+                "That is everything you need to know.",
+            ],
+        );
+        // First sentence ends after "prepared." — emitted mid-stream.
+        // Code block is suppressed. Trailing sentence flushed on finish.
+        assert!(emitted.iter().any(|s| s.contains("code block")));
+        assert!(emitted.iter().all(|s| !s.contains("let x")));
+        let tail = s.finish().unwrap_or_default();
+        let combined: String = emitted.join(" ") + " " + &tail;
+        assert!(!combined.contains("let x"));
+        assert!(combined.contains("everything you need"));
+    }
+
+    #[test]
+    fn fence_marker_split_across_chunks() {
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(
+            &mut s,
+            &[
+                "Before block. Here is text. ",
+                "`",
+                "`",
+                "`",
+                "let y = 1;",
+                "`",
+                "`",
+                "`",
+                " After block continues here now.",
+            ],
+        );
+        let tail = s.finish().unwrap_or_default();
+        let combined = emitted.join(" ") + " " + &tail;
+        assert!(combined.contains("Before block") || combined.contains("Here is text"));
+        assert!(!combined.contains("let y"));
+        assert!(combined.contains("After block"));
+    }
+
+    #[test]
+    fn strips_bullet_prefix_at_sentence_start() {
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(&mut s, &["- The first bullet item is right here. "]);
+        assert_eq!(emitted.len(), 1);
+        assert!(!emitted[0].starts_with("- "));
+        assert!(emitted[0].starts_with("The first"));
+    }
+
+    #[test]
+    fn handles_chinese_punctuation() {
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(
+            &mut s,
+            &["这是第一句话已经说完了。这是第二句话也结束了！"],
+        );
+        assert_eq!(emitted.len(), 2);
+    }
+
+    #[test]
+    fn empty_stream_finishes_quietly() {
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(&mut s, &["", "", ""]);
+        assert!(emitted.is_empty());
+        assert!(s.finish().is_none());
     }
 }

@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -414,13 +415,18 @@ async fn run_with_wakeword(
                             messages.extend(history);
 
                             eprintln!("[voice] Thinking...");
-                            let tts_engine = tts_engine_for_language(
+                            let tts_engine = Arc::new(tts_engine_for_language(
                                 voice_cfg,
                                 audio_device,
                                 response_language.as_deref(),
-                            );
-                            match streaming::stream_and_speak(llm, &messages, 256, &tts_engine)
-                                .await
+                            ));
+                            match streaming::stream_and_speak(
+                                llm,
+                                &messages,
+                                256,
+                                Arc::clone(&tts_engine),
+                            )
+                            .await
                             {
                                 Ok(response) => {
                                     let _ =
@@ -989,9 +995,20 @@ async fn voice_cycle(
     // Step 4: LLM → streaming TTS (speak each sentence as it completes).
     eprintln!("[voice] Thinking...");
     let llm_start = std::time::Instant::now();
-    let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language.as_deref());
+    let tts_engine = Arc::new(tts_engine_for_language(
+        voice_cfg,
+        audio_device,
+        response_language.as_deref(),
+    ));
 
-    let response = match streaming::stream_and_speak(llm, &messages, 256, &tts_engine).await {
+    let response = match streaming::stream_and_speak(
+        llm,
+        &messages,
+        256,
+        Arc::clone(&tts_engine),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             // Fallback: try non-streaming if streaming fails.
@@ -1071,7 +1088,13 @@ async fn voice_cycle(
             InteractionKind::ToolSummary,
         );
 
-        let summary = match streaming::stream_and_speak(llm, &summary_msgs, 128, &tts_engine).await
+        let summary = match streaming::stream_and_speak(
+            llm,
+            &summary_msgs,
+            128,
+            Arc::clone(&tts_engine),
+        )
+        .await
         {
             Ok(s) => s,
             Err(_) => {

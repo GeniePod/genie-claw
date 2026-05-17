@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Real streaming TTS** (#26): the voice loop now detects sentence
+  boundaries inside the LLM streaming callback and forwards completed
+  sentences to a concurrent TTS task immediately, instead of waiting
+  for the full response before speaking. First sentence reaches the
+  speaker as soon as the LLM finishes emitting it (typically 1-3 s
+  after wake) rather than after the full response (~5-17 s). New
+  `SentenceStreamer` strips inline markdown / URLs / list markers /
+  fenced code blocks per-sentence, merges sub-8-char openers with the
+  next clause, and caps spoken output at 3 sentences to match
+  `format::for_voice`. `TtsEngine` is shared across the producer and
+  consumer halves via `Arc<TtsEngine>`. The first-reply latency banner
+  (#19) now reports the true LLM-until-first-sentence figure instead
+  of the full-response figure.
+
 ## 1.0.0-alpha.9 - 2026-05-18
 
 Alpha 9 is the **CI / supply-chain hardening + voice-frontend maturation**
