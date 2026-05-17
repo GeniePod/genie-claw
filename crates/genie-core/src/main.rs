@@ -308,6 +308,10 @@ async fn main() -> Result<()> {
                         whisper_cli_path: config.core.whisper_cli_path.clone(),
                         whisper_model: config.core.whisper_model.clone(),
                         stt_language: config.core.stt_language.clone(),
+                        reply_as_voice: config.telegram.voice.reply_as_voice,
+                        max_reply_chars: config.telegram.voice.max_reply_chars,
+                        piper_path: config.core.piper_path.clone(),
+                        piper_model: config.core.piper_model.clone(),
                     },
                 };
 
