@@ -89,10 +89,15 @@ pub async fn stream_and_speak(
 /// never gets a tiny fragment that synthesizes into a glitch.
 #[derive(Debug)]
 pub struct SentenceStreamer {
-    raw_buffer: String,
     pending_sentence: String,
     in_code_fence: bool,
     fence_marker_buffer: String,
+    /// Set after we see an ASCII `.!?` so we can check the next char.
+    /// Whitespace confirms it as a sentence boundary; anything else
+    /// (e.g. the `.` in `example.com` or `3.14`) rejects it. CJK
+    /// punctuation `。！？` never sets this — those emit immediately
+    /// since CJK convention does not put whitespace after punctuation.
+    awaiting_ascii_boundary: bool,
     emitted: usize,
     max_sentences: usize,
 }
@@ -106,10 +111,10 @@ const MIN_SENTENCE_CHARS: usize = 8;
 impl SentenceStreamer {
     pub fn new(max_sentences: usize) -> Self {
         Self {
-            raw_buffer: String::new(),
             pending_sentence: String::new(),
             in_code_fence: false,
             fence_marker_buffer: String::new(),
+            awaiting_ascii_boundary: false,
             emitted: 0,
             max_sentences,
         }
@@ -122,45 +127,73 @@ impl SentenceStreamer {
         if self.emitted >= self.max_sentences {
             return Vec::new();
         }
-
-        self.raw_buffer.push_str(chunk);
         let mut out = Vec::new();
 
-        // Process the buffer character by character so we can react to
-        // sentence boundaries and code-fence toggles mid-chunk. We may
-        // leave a trailing partial sentence in `pending_sentence`.
-        let buffer = std::mem::take(&mut self.raw_buffer);
-        for ch in buffer.chars() {
+        for ch in chunk.chars() {
             if self.consume_fence_marker(ch) {
                 continue;
             }
-
             if self.in_code_fence {
                 continue;
             }
 
+            // If we set the boundary flag last char, this char decides:
+            // whitespace confirms (emit), anything else rejects (URLs,
+            // decimals, abbreviations followed immediately by text).
+            if self.awaiting_ascii_boundary {
+                self.awaiting_ascii_boundary = false;
+                if ch.is_whitespace() {
+                    if let Some(sentence) = self.try_emit() {
+                        out.push(sentence);
+                        if self.emitted >= self.max_sentences {
+                            return out;
+                        }
+                    }
+                    // Push the confirming whitespace so the next
+                    // sentence starts after it; `clean_sentence` later
+                    // collapses leading whitespace.
+                    self.pending_sentence.push(ch);
+                    continue;
+                }
+            }
+
             self.pending_sentence.push(ch);
 
-            if is_sentence_boundary(ch) {
-                let candidate = clean_sentence(&self.pending_sentence);
-                if candidate.chars().count() >= MIN_SENTENCE_CHARS {
-                    self.pending_sentence.clear();
-                    out.push(candidate);
-                    self.emitted += 1;
+            if is_cjk_boundary(ch) {
+                if let Some(sentence) = self.try_emit() {
+                    out.push(sentence);
                     if self.emitted >= self.max_sentences {
                         return out;
                     }
                 }
-                // Else: keep accumulating into pending_sentence so a
-                // short opener like "OK!" merges with the next clause.
+            } else if is_ascii_boundary(ch) {
+                self.awaiting_ascii_boundary = true;
             }
         }
 
         out
     }
 
+    /// Try to emit the current pending sentence. Returns the cleaned
+    /// sentence and clears the buffer iff it meets `MIN_SENTENCE_CHARS`.
+    /// Sub-minimum fragments stay buffered so the next clause merges
+    /// in (e.g. "OK!" + " Here is the real answer.").
+    fn try_emit(&mut self) -> Option<String> {
+        let cleaned = clean_sentence(&self.pending_sentence);
+        if cleaned.chars().count() >= MIN_SENTENCE_CHARS {
+            self.pending_sentence.clear();
+            self.emitted += 1;
+            Some(cleaned)
+        } else {
+            None
+        }
+    }
+
     /// Flush any buffered trailing fragment after the LLM stream ends.
-    /// Returns the cleaned final sentence if one fits under the cap.
+    /// Returns the cleaned final fragment; unlike `try_emit`, no
+    /// minimum-length check applies because EOF can't be merged into
+    /// anything later. Returns `None` only when there is genuinely
+    /// nothing to say or the per-response cap has been reached.
     pub fn finish(mut self) -> Option<String> {
         if self.emitted >= self.max_sentences {
             return None;
@@ -198,16 +231,20 @@ impl SentenceStreamer {
         }
 
         // Non-backtick: any partially-collected backticks were inline
-        // code markers (`like this`), not a fence. Flush them into the
-        // sentence buffer (stripped — they're noise for TTS) and fall
-        // through so the current character is processed normally.
+        // code markers (`like this`), not a fence. Drop them as TTS
+        // noise and fall through so the current character is processed
+        // normally.
         self.fence_marker_buffer.clear();
         false
     }
 }
 
-fn is_sentence_boundary(ch: char) -> bool {
-    matches!(ch, '.' | '!' | '?' | '。' | '！' | '？')
+fn is_ascii_boundary(ch: char) -> bool {
+    matches!(ch, '.' | '!' | '?')
+}
+
+fn is_cjk_boundary(ch: char) -> bool {
+    matches!(ch, '。' | '！' | '？')
 }
 
 /// Per-sentence TTS cleanup. The streaming path can't run the full
@@ -230,13 +267,8 @@ fn clean_sentence(text: &str) -> String {
         .replace(" - ", ", ")
         .replace(" — ", ", ")
         .replace(" – ", ", ")
-        .replace('(', ", ")
-        .replace(')', ", ")
-        .replace('[', "")
-        .replace(']', "")
-        .replace('{', "")
-        .replace('}', "")
-        .replace('"', "")
+        .replace(['(', ')'], ", ")
+        .replace(['[', ']', '{', '}', '"'], "")
         .replace("'s", "s");
     collapse_whitespace(punct_cleaned.trim())
 }
@@ -355,8 +387,11 @@ mod tests {
         assert_eq!(emitted.len(), 1, "first sentence should fire before EOF");
         assert!(emitted[0].contains("Hello there"));
         emitted.extend(s.feed("And here is the second one!"));
-        // Second sentence is still pending until finish() (no trailing space
-        // needed, but boundary itself triggers it).
+        // The trailing '!' has no whitespace after it yet, so finish()
+        // is what flushes the second sentence at EOF.
+        if let Some(tail) = s.finish() {
+            emitted.push(tail);
+        }
         assert_eq!(emitted.len(), 2);
         assert!(emitted[1].contains("second one"));
     }
@@ -365,7 +400,10 @@ mod tests {
     fn handles_partial_token_chunks() {
         let mut s = SentenceStreamer::new(3);
         let chunks = ["Hel", "lo wor", "ld, how a", "re you do", "ing today?"];
-        let emitted = feed_all(&mut s, &chunks);
+        let mut emitted = feed_all(&mut s, &chunks);
+        if let Some(tail) = s.finish() {
+            emitted.push(tail);
+        }
         assert_eq!(emitted.len(), 1);
         assert!(emitted[0].contains("Hello world"));
         assert!(emitted[0].contains("doing today"));
@@ -390,13 +428,14 @@ mod tests {
     #[test]
     fn merges_too_short_opener_with_next_clause() {
         let mut s = SentenceStreamer::new(3);
-        let emitted = feed_all(
-            &mut s,
-            &["OK! Here is the real answer to your question."],
-        );
+        let mut emitted = feed_all(&mut s, &["OK! Here is the real answer to your question."]);
+        // "OK!" alone is below MIN; "...question." sets the ASCII
+        // boundary flag but no trailing whitespace confirms it, so the
+        // merged sentence only flushes at finish() (EOF).
+        if let Some(tail) = s.finish() {
+            emitted.push(tail);
+        }
         assert_eq!(emitted.len(), 1);
-        // The "OK!" opener is too short to stand alone, so it merges
-        // with the longer follow-up.
         assert!(emitted[0].contains("OK"));
         assert!(emitted[0].contains("real answer"));
     }
@@ -506,10 +545,7 @@ mod tests {
     #[test]
     fn handles_chinese_punctuation() {
         let mut s = SentenceStreamer::new(3);
-        let emitted = feed_all(
-            &mut s,
-            &["这是第一句话已经说完了。这是第二句话也结束了！"],
-        );
+        let emitted = feed_all(&mut s, &["这是第一句话已经说完了。这是第二句话也结束了！"]);
         assert_eq!(emitted.len(), 2);
     }
 

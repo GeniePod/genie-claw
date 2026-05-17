@@ -1001,37 +1001,31 @@ async fn voice_cycle(
         response_language.as_deref(),
     ));
 
-    let response = match streaming::stream_and_speak(
-        llm,
-        &messages,
-        256,
-        Arc::clone(&tts_engine),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            // Fallback: try non-streaming if streaming fails.
-            eprintln!(
-                "[voice] Streaming failed for {} backend ({}), trying blocking...",
-                llm.backend_name(),
-                e
-            );
-            match llm.chat(&messages, Some(256)).await {
-                Ok(r) => {
-                    let voice_text = format::for_voice(&r);
-                    if !voice_text.is_empty() {
-                        let _ = tts_engine.speak(&voice_text).await;
+    let response =
+        match streaming::stream_and_speak(llm, &messages, 256, Arc::clone(&tts_engine)).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Fallback: try non-streaming if streaming fails.
+                eprintln!(
+                    "[voice] Streaming failed for {} backend ({}), trying blocking...",
+                    llm.backend_name(),
+                    e
+                );
+                match llm.chat(&messages, Some(256)).await {
+                    Ok(r) => {
+                        let voice_text = format::for_voice(&r);
+                        if !voice_text.is_empty() {
+                            let _ = tts_engine.speak(&voice_text).await;
+                        }
+                        r
                     }
-                    r
-                }
-                Err(e2) => {
-                    eprintln!("[voice] LLM backend error ({}): {}", llm.backend_name(), e2);
-                    return true;
+                    Err(e2) => {
+                        eprintln!("[voice] LLM backend error ({}): {}", llm.backend_name(), e2);
+                        return true;
+                    }
                 }
             }
-        }
-    };
+        };
 
     let llm_tts_ms = llm_start.elapsed().as_millis();
 
@@ -1088,27 +1082,23 @@ async fn voice_cycle(
             InteractionKind::ToolSummary,
         );
 
-        let summary = match streaming::stream_and_speak(
-            llm,
-            &summary_msgs,
-            128,
-            Arc::clone(&tts_engine),
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(_) => {
-                let s = llm
-                    .chat(&summary_msgs, Some(128))
-                    .await
-                    .unwrap_or_else(|_| tool_result.output.clone());
-                let voice_text = format::for_voice(&s);
-                if !voice_text.is_empty() {
-                    let _ = tts_engine.speak(&voice_text).await;
+        let summary =
+            match streaming::stream_and_speak(llm, &summary_msgs, 128, Arc::clone(&tts_engine))
+                .await
+            {
+                Ok(s) => s,
+                Err(_) => {
+                    let s = llm
+                        .chat(&summary_msgs, Some(128))
+                        .await
+                        .unwrap_or_else(|_| tool_result.output.clone());
+                    let voice_text = format::for_voice(&s);
+                    if !voice_text.is_empty() {
+                        let _ = tts_engine.speak(&voice_text).await;
+                    }
+                    s
                 }
-                s
-            }
-        };
+            };
 
         let _ = conversations.append(conv_id, "assistant", &summary, None);
         (summary, Some(tool_result.tool))
