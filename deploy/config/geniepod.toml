@@ -164,6 +164,15 @@ alert_webhook_url = ""            # Optional local notifier endpoint.
 # poll_timeout_secs = 30
 # allowed_chat_ids = [123456789]   # Recommended allowlist for private use.
 # allow_all_chats = false
+#
+# Voice-message ingestion (issue #42). Reuses the configured whisper-server
+# (core.whisper_port > 0) or whisper-cli; needs `ffmpeg` on $PATH for the
+# OGG/Opus → 16 kHz mono WAV transcode.
+# [telegram.voice]
+# enabled = false                  # Off by default — opt-in.
+# max_voice_duration_secs = 60     # Hard limit; longer messages are rejected.
+# delete_temp_audio = true         # Remove /tmp/geniepod-tg-voice-*.{ogg,wav} after handling.
+# ffmpeg_path = "ffmpeg"           # Override if ffmpeg isn't on PATH.
 
 # Public web search tool. Default provider is DuckDuckGo Instant Answer, which needs no API key.
 # For a private/local path, run SearXNG and set provider = "searxng" with base_url.

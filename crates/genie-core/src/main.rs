@@ -272,6 +272,16 @@ async fn main() -> Result<()> {
                     poll_timeout_secs: config.telegram.poll_timeout_secs,
                     allowed_chat_ids: config.telegram.allowed_chat_ids.clone(),
                     allow_all_chats: config.telegram.allow_all_chats,
+                    voice: genie_core::telegram::TelegramVoiceRuntimeConfig {
+                        enabled: config.telegram.voice.enabled,
+                        max_voice_duration_secs: config.telegram.voice.max_voice_duration_secs,
+                        delete_temp_audio: config.telegram.voice.delete_temp_audio,
+                        ffmpeg_path: config.telegram.voice.ffmpeg_path.clone(),
+                        whisper_port: config.core.whisper_port,
+                        whisper_cli_path: config.core.whisper_cli_path.clone(),
+                        whisper_model: config.core.whisper_model.clone(),
+                        stt_language: config.core.stt_language.clone(),
+                    },
                 };
 
                 tracing::info!(

@@ -448,6 +448,43 @@ pub struct TelegramConfig {
     /// Bypass the allowlist and accept messages from any chat.
     #[serde(default)]
     pub allow_all_chats: bool,
+
+    /// Voice-message handling for the Telegram channel (issue #42).
+    #[serde(default)]
+    pub voice: TelegramVoiceConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TelegramVoiceConfig {
+    /// Enable voice-message ingestion. When false, voice messages get a polite
+    /// text reply explaining that voice is not enabled on this deployment.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Hard cap on accepted voice duration. Telegram includes a `duration`
+    /// field; anything longer is rejected before download.
+    #[serde(default = "defaults::telegram_voice_max_duration_secs")]
+    pub max_voice_duration_secs: u32,
+
+    /// Delete the downloaded `.ogg` and transcoded `.wav` after handling.
+    #[serde(default = "defaults::telegram_voice_delete_temp_audio")]
+    pub delete_temp_audio: bool,
+
+    /// Path to the `ffmpeg` binary used to transcode Telegram OGG/Opus to the
+    /// 16 kHz mono WAV that Whisper consumes.
+    #[serde(default = "defaults::telegram_voice_ffmpeg_path")]
+    pub ffmpeg_path: PathBuf,
+}
+
+impl Default for TelegramVoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_voice_duration_secs: defaults::telegram_voice_max_duration_secs(),
+            delete_temp_audio: defaults::telegram_voice_delete_temp_audio(),
+            ffmpeg_path: defaults::telegram_voice_ffmpeg_path(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -811,6 +848,7 @@ impl Default for TelegramConfig {
             poll_timeout_secs: defaults::telegram_poll_timeout_secs(),
             allowed_chat_ids: Vec::new(),
             allow_all_chats: false,
+            voice: TelegramVoiceConfig::default(),
         }
     }
 }
@@ -1426,6 +1464,15 @@ mod defaults {
     }
     pub fn telegram_poll_timeout_secs() -> u64 {
         30
+    }
+    pub fn telegram_voice_max_duration_secs() -> u32 {
+        60
+    }
+    pub fn telegram_voice_delete_temp_audio() -> bool {
+        true
+    }
+    pub fn telegram_voice_ffmpeg_path() -> PathBuf {
+        PathBuf::from("ffmpeg")
     }
     pub fn web_search_enabled() -> bool {
         true

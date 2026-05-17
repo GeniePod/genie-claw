@@ -38,7 +38,7 @@ libloading = "0.8"
 toml = { workspace = true }
 genie-skill-sdk = { path = "../genie-skill-sdk" }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 
 [dev-dependencies]
 toml = { workspace = true }
