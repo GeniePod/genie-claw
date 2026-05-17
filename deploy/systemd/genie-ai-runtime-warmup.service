@@ -1,6 +1,6 @@
 [Unit]
-Description=GeniePod AI Runtime Warmup (force Qwen 3 4B into iGPU before first voice cycle)
-Documentation=https://github.com/GeniePod/genie-claw/issues/54
+Description=GeniePod AI Runtime Warmup (force Qwen3-4B into iGPU before first voice cycle)
+Documentation=https://github.com/GeniePod/genie-claw/issues/52
 After=genie-ai-runtime.service
 Wants=genie-ai-runtime.service
 ConditionPathExists=/opt/geniepod/bin/jetson-llm-server

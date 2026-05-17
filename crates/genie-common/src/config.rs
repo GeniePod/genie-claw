@@ -593,8 +593,7 @@ pub struct Esp32C6UartConfig {
 pub struct ServiceEndpoint {
     pub url: String,
     pub systemd_unit: String,
-    /// LLM backend selector. Only meaningful for `services.llm`; defaults
-    /// preserve the legacy llama.cpp path for existing configs.
+    /// LLM backend selector. Only meaningful for `services.llm`.
     #[serde(default)]
     pub backend: LlmBackendKind,
 }
@@ -603,10 +602,10 @@ pub struct ServiceEndpoint {
 #[serde(rename_all = "snake_case")]
 pub enum LlmBackendKind {
     #[default]
-    #[serde(alias = "llama-cpp")]
-    LlamaCpp,
     #[serde(alias = "genie-ai-runtime")]
     GenieAiRuntime,
+    #[serde(alias = "llama-cpp")]
+    LlamaCpp,
 }
 
 impl Config {
@@ -829,8 +828,8 @@ impl Default for ServicesConfig {
             },
             llm: ServiceEndpoint {
                 url: "http://127.0.0.1:8080/health".into(),
-                systemd_unit: "genie-llm.service".into(),
-                backend: LlmBackendKind::LlamaCpp,
+                systemd_unit: "genie-ai-runtime.service".into(),
+                backend: LlmBackendKind::GenieAiRuntime,
             },
             homeassistant: None,
             nextcloud: None,
@@ -994,16 +993,16 @@ bind_host = "0.0.0.0"
     }
 
     #[test]
-    fn llm_service_backend_defaults_to_llama_cpp() {
+    fn llm_service_backend_defaults_to_genie_ai_runtime() {
         let service: ServiceEndpoint = toml::from_str(
             r#"
 url = "http://127.0.0.1:8080/health"
-systemd_unit = "genie-llm.service"
+systemd_unit = "genie-ai-runtime.service"
 "#,
         )
         .unwrap();
 
-        assert_eq!(service.backend, LlmBackendKind::LlamaCpp);
+        assert_eq!(service.backend, LlmBackendKind::GenieAiRuntime);
     }
 
     #[test]

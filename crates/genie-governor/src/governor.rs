@@ -273,7 +273,7 @@ impl Governor {
     fn llm_service_unit(&self) -> String {
         self.config
             .service_unit_for_alias("llm")
-            .unwrap_or_else(|| "genie-llm.service".into())
+            .unwrap_or_else(|| "genie-ai-runtime.service".into())
     }
 }
 

@@ -78,7 +78,7 @@ The current repo still contains pragmatic adapters used to ship on Jetson now.
 
 | Current adapter | Long-term replacement | Notes |
 | --- | --- | --- |
-| `llama.cpp` OpenAI-compatible client (default) | `genie-ai-runtime` client (opt-in) | Both backends ship behind the `LlmClient` facade; per-deployment selection via `[services.llm].backend` in `geniepod.toml`. Backend identity surfaces in `/api/health`, startup logs, and `genie-ctl status`. |
+| `genie-ai-runtime` OpenAI-compatible client (default on Jetson) | `llama.cpp` client (selectable fallback) | Both backends ship behind the `LlmClient` facade; per-deployment selection via `[services.llm].backend` in `geniepod.toml`. Backend identity surfaces in `/api/health`, startup logs, and `genie-ctl status`. |
 | Home Assistant provider | `genie-home-runtime` MCP/API client | Keep HA-specific behavior behind `ha/` and tools/home boundaries. |
 | Actuation safety in `genie-core` | final safety in `genie-home-runtime` | Keep current safety as an agent-side guard and confirmation layer. |
 | `genie-api` dashboard | application layer | Keep it operational and lightweight; avoid making it the long-term product app. |
@@ -116,8 +116,8 @@ Code in memory, voice, prompt, and channels should not learn Home Assistant inte
 Current Jetson deployment:
 
 ```text
-LLM backend (:8080)         # llama-server by default; genie-ai-runtime if
-                            # [services.llm].backend = "genie_ai_runtime"
+LLM backend (:8080)         # genie-ai-runtime by default on Jetson;
+                            # fallback: [services.llm].backend = "llama_cpp"
         ^
         |
 genie-core (:3000) <---- genie-ctl

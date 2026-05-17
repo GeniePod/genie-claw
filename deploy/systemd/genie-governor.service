@@ -2,7 +2,7 @@
 Description=GeniePod Memory Governor
 Documentation=https://github.com/GeniePod/genie-claw
 After=network.target
-Wants=genie-core.service genie-llm.service
+Wants=genie-core.service
 
 [Service]
 Type=notify
@@ -18,7 +18,7 @@ CPUWeight=50
 # Security hardening
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/geniepod/data /run/geniepod /etc/systemd/system/genie-llm.service.d
+ReadWritePaths=/opt/geniepod/data /run/geniepod /etc/systemd/system/genie-llm.service.d /etc/systemd/system/genie-ai-runtime.service.d
 PrivateTmp=yes
 NoNewPrivileges=yes
 

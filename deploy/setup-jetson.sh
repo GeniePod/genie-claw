@@ -193,15 +193,15 @@ if [ -n "$RUNTIME_TO_INSTALL" ]; then
 fi
 
 case "$MODEL_CHOICE" in
-    ""|phi-4-mini)
-        MODEL_FLAG_FILENAME="$PHI_MODEL_FILENAME"
-        MODEL_FLAG_URL="$PHI_MODEL_URL"
-        MODEL_FLAG_LABEL="$PHI_MODEL_LABEL"
-        ;;
-    qwen3-4b)
+    ""|qwen3-4b)
         MODEL_FLAG_FILENAME="$QWEN3_MODEL_FILENAME"
         MODEL_FLAG_URL="$QWEN3_MODEL_URL"
         MODEL_FLAG_LABEL="$QWEN3_MODEL_LABEL"
+        ;;
+    phi-4-mini)
+        MODEL_FLAG_FILENAME="$PHI_MODEL_FILENAME"
+        MODEL_FLAG_URL="$PHI_MODEL_URL"
+        MODEL_FLAG_LABEL="$PHI_MODEL_LABEL"
         ;;
     *)
         echo "ERROR: unknown --model '$MODEL_CHOICE'. Supported: phi-4-mini, qwen3-4b" >&2
@@ -218,7 +218,7 @@ echo ""
 # 1. Create directories.
 echo "[1/6] Creating directories..."
 sudo mkdir -p "$GENIEPOD_DIR/bin" "$GENIEPOD_DIR/docker" "$MODEL_DIR" "$DATA_DIR" /run/geniepod
-sudo mkdir -p /etc/systemd/system/genie-llm.service.d
+sudo mkdir -p /etc/systemd/system/genie-llm.service.d /etc/systemd/system/genie-ai-runtime.service.d
 sudo chown -R "$(whoami):$(whoami)" "$GENIEPOD_DIR" /run/geniepod
 
 # Clean up stale systemd drop-ins that legacy installs may have left behind.
@@ -226,11 +226,13 @@ sudo chown -R "$(whoami):$(whoami)" "$GENIEPOD_DIR" /run/geniepod
 # and silently mask new flags (--cache-type-k, --ctx-size, etc.) from PR-deployed
 # unit files. The repo unit IS the source of truth; per-host customizations should
 # live in geniepod.toml, not in systemd overrides.
-for drop_in in ctx.conf model.conf; do
-    if [ -f "/etc/systemd/system/genie-llm.service.d/$drop_in" ]; then
-        echo "  Removing stale systemd drop-in: $drop_in"
-        sudo rm -f "/etc/systemd/system/genie-llm.service.d/$drop_in"
-    fi
+for unit in genie-llm.service genie-ai-runtime.service; do
+    for drop_in in ctx.conf model.conf; do
+        if [ -f "/etc/systemd/system/${unit}.d/$drop_in" ]; then
+            echo "  Removing stale systemd drop-in: ${unit}.d/$drop_in"
+            sudo rm -f "/etc/systemd/system/${unit}.d/$drop_in"
+        fi
+    done
 done
 
 # 2. Check binaries.
@@ -309,33 +311,37 @@ fi
 # steps the operator needs to take. Suppressed once geniepod.toml's
 # llm_model_path already points at the downloaded model, on the
 # assumption that the operator has completed the cutover.
-if [ -n "$MODEL_CHOICE" ] && [ "$MODEL_CHOICE" != "phi-4-mini" ]; then
+if [ -n "$MODEL_CHOICE" ] && [ "$MODEL_CHOICE" != "qwen3-4b" ]; then
     CUTOVER_CONFIGURED_PATH="$(awk -F'"' '/^llm_model_path = / {print $2; exit}' "$CONFIG_DIR/geniepod.toml" 2>/dev/null || true)"
     if [ "$GGUF" != "$CUTOVER_CONFIGURED_PATH" ]; then
         echo ""
         echo "  NOTE: $CONFIG_DIR/geniepod.toml was not modified."
         echo "        To run with this model, set:"
         echo "          llm_model_path = \"$GGUF\""
-        echo "          llm_model_name = \"qwen\"   # selects the Qwen prompt template"
-        echo "        update GENIEPOD_LLM_MODEL in /etc/systemd/system/genie-llm.service,"
-        echo "        then: sudo systemctl restart genie-llm genie-core"
+        echo "          llm_model_name = \"phi\"    # selects the Phi prompt template"
+        echo "        update GENIEPOD_LLM_MODEL in the active LLM systemd unit"
+        echo "        (genie-ai-runtime.service for the alpha.9 default, or"
+        echo "        genie-llm.service for the llama.cpp fallback), then:"
+        echo "          sudo systemctl restart <active-llm-unit> genie-core"
     fi
 fi
 
-# 5. Check llama.cpp.
-echo "[5/6] Checking llama.cpp..."
-if [ -f "$GENIEPOD_DIR/bin/llama-server" ]; then
-    echo "  OK: llama-server"
+# 5. Check LLM runtimes.
+echo "[5/6] Checking LLM runtimes..."
+if [ -f "$GENIEPOD_DIR/bin/jetson-llm-server" ]; then
+    echo "  OK: jetson-llm-server"
 else
-    echo "  NOT FOUND: llama-server"
-    echo ""
-    echo "  Build and install llama.cpp with CUDA:"
-    echo "    git clone https://github.com/ggml-org/llama.cpp.git"
-    echo "    cd llama.cpp"
-    echo "    cmake -B build -DGGML_CUDA=ON"
-    echo "    cmake --build build -j\$(nproc)"
-    echo "    sudo cp build/bin/llama-server $GENIEPOD_DIR/bin/"
-    echo ""
+    echo "  NOT FOUND: jetson-llm-server"
+    echo "    Default backend (genie-ai-runtime) requires it. Install via:"
+    echo "      bash $0 --runtime genie-ai-runtime"
+    echo "    Or set [services.llm].backend = \"llama_cpp\" in geniepod.toml"
+    echo "    to use the legacy llama.cpp path instead."
+fi
+
+if [ -f "$GENIEPOD_DIR/bin/llama-server" ]; then
+    echo "  OK: llama-server (legacy fallback backend)"
+else
+    echo "  NOT FOUND: llama-server (optional fallback)"
 fi
 
 if command -v docker > /dev/null 2>&1 && docker compose version > /dev/null 2>&1; then
@@ -536,7 +542,18 @@ fi
 
 # Enable core services. genie-audio runs the I2S/AHUB route setup at boot
 # (no-op if /opt/geniepod/bin/genie-audio-init is missing, see ConditionPathExists).
-for svc in homeassistant genie-audio genie-whisper genie-whisper-warmup genie-llm genie-llm-warmup genie-core genie-governor genie-health genie-api genie-mqtt; do
+LLM_BACKEND="$(awk -F'"' '/^backend = / {print $2; exit}' "$CONFIG_DIR/geniepod.toml" 2>/dev/null || true)"
+if [ -z "$LLM_BACKEND" ]; then
+    LLM_BACKEND="genie_ai_runtime"
+fi
+
+if [ "$LLM_BACKEND" = "llama_cpp" ] || [ "$LLM_BACKEND" = "llama-cpp" ]; then
+    LLM_SERVICES="genie-llm genie-llm-warmup"
+else
+    LLM_SERVICES="genie-ai-runtime genie-ai-runtime-warmup"
+fi
+
+for svc in homeassistant genie-audio genie-whisper genie-whisper-warmup $LLM_SERVICES genie-core genie-governor genie-health genie-api genie-mqtt; do
     if sudo systemctl enable "$svc.service" 2>/dev/null; then
         echo "  Enabled: $svc"
     else
@@ -554,7 +571,11 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Start services:"
-echo "  sudo systemctl start genie-llm    # LLM server (wait ~10s for model load)"
+if [ "$LLM_BACKEND" = "llama_cpp" ] || [ "$LLM_BACKEND" = "llama-cpp" ]; then
+    echo "  sudo systemctl start genie-llm    # LLM server (wait ~10s for model load)"
+else
+    echo "  sudo systemctl start genie-ai-runtime    # LLM server (wait ~10s for model load)"
+fi
 echo "  sudo systemctl start genie-core   # Voice AI + chat API on :3000"
 echo "  sudo systemctl start genie-api    # System dashboard on :3080"
 echo "  sudo systemctl start genie-governor"

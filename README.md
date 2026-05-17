@@ -36,8 +36,8 @@ Voice in, voice out, controls Home Assistant, no cloud.**
    └────────┘   └────────┘   └──────┬───────┘   └───────┘
                                     │
                        memory ◄─────┼─────► local LLM
-                       (SQLite)     │       (llama.cpp by default,
-                                    │        genie-ai-runtime opt-in
+                       (SQLite)     │       (genie-ai-runtime by default,
+                                    │        llama.cpp still selectable
                                     │        via [services.llm].backend)
                                     ▼
                           Home Assistant
@@ -72,7 +72,7 @@ This repo is the Rust agent runtime for a very specific product shape:
 - a local household memory system
 - safe handoff to a home-control runtime
 - transitional Home Assistant support while `genie-home-runtime` is not yet split out
-- pluggable local LLM backend (`llama.cpp` default; `genie-ai-runtime` selectable via `[services.llm].backend = "genie_ai_runtime"`)
+- pluggable local LLM backend (`genie-ai-runtime` default on Jetson; `llama.cpp` remains selectable via `[services.llm].backend = "llama_cpp"`)
 - a privacy-first and security-first system
 - a memory-footprint-conscious runtime built for constrained edge hardware
 - a household trust model that exposes redacted posture, not raw config files
@@ -156,9 +156,9 @@ logic, response style, channels, and skill routing.
 
 At a high level:
 
-1. The local model server is `llama.cpp` by default; the
-   `genie-ai-runtime` Jetson-tuned runtime is selectable per-deployment
-   via `[services.llm].backend = "genie_ai_runtime"` in `geniepod.toml`.
+1. The local model server defaults to `genie-ai-runtime` on Jetson; the
+   legacy `llama.cpp` server remains selectable per-deployment via
+   `[services.llm].backend = "llama_cpp"` in `geniepod.toml`.
    Backend identity flows through `LlmClient::backend_name()` into
    logs, `/api/health`, and `genie-ctl status` for operator visibility.
 2. `genie-core` handles prompts, tool calls, memory, chat, and voice orchestration.
