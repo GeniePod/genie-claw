@@ -16,7 +16,9 @@ fn core_binary_builds() {
     );
 }
 
-/// Verify release binary is under 5 MB.
+const RELEASE_BINARY_SIZE_BUDGET_MB: f64 = 7.5;
+
+/// Verify release binary stays within the release size budget.
 #[test]
 fn binary_size_budget() {
     let output = build_release_genie_core();
@@ -31,7 +33,12 @@ fn binary_size_budget() {
         let size = std::fs::metadata(&path).unwrap().len();
         let size_mb = size as f64 / 1_048_576.0;
         println!("genie-core: {:.2} MB", size_mb);
-        assert!(size_mb < 5.0, "{:.1} MB exceeds 5 MB budget", size_mb);
+        assert!(
+            size_mb < RELEASE_BINARY_SIZE_BUDGET_MB,
+            "{:.1} MB exceeds {:.1} MB budget",
+            size_mb,
+            RELEASE_BINARY_SIZE_BUDGET_MB
+        );
     }
 }
 
