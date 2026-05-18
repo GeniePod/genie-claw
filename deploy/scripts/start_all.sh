@@ -21,6 +21,14 @@ read_llm_unit() {
     ' "$CONFIG_FILE" 2>/dev/null || true
 }
 
+read_llm_url() {
+    "${AWK[@]}" -F'"' '
+        /^\[services\.llm\]/ { in_llm = 1; next }
+        /^\[/ && !/^\[services\.llm\]/ { in_llm = 0 }
+        in_llm && /^url = / { print $2; exit }
+    ' "$CONFIG_FILE" 2>/dev/null || true
+}
+
 read_wakeword_script() {
     "${AWK[@]}" -F'"' '
         /^\[core\]/ { in_core = 1; next }
@@ -138,9 +146,40 @@ start_unit() {
     echo "OK"
 }
 
+wait_for_http_health() {
+    local label="$1"
+    local url="$2"
+    local attempts="${3:-180}"
+
+    if [ -z "$url" ]; then
+        echo "  FAILED: no health URL configured for $label"
+        return 1
+    fi
+    if ! command -v curl > /dev/null 2>&1; then
+        echo "  FAILED: curl is required to wait for $label health"
+        return 1
+    fi
+
+    printf "  Waiting for %s health (%s) ... " "$label" "$url"
+    for _ in $(seq 1 "$attempts"); do
+        if curl -fsS --max-time 2 "$url" > /dev/null 2>&1; then
+            echo "OK"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "FAILED"
+    return 1
+}
+
 raw_llm_unit="$(read_llm_unit)"
 configured_llm_unit="$(normalize_unit "$raw_llm_unit")"
 configured_warmup_unit="$(warmup_unit_for "$configured_llm_unit")"
+configured_llm_url="$(read_llm_url)"
+if [ -z "$configured_llm_url" ]; then
+    configured_llm_url="http://127.0.0.1:8080/health"
+fi
 wakeword_script="$(read_wakeword_script)"
 wakeword_enabled=1
 if [ -z "$wakeword_script" ]; then
@@ -168,6 +207,7 @@ UNITS=(
 echo "=== GeniePod start all ==="
 echo ""
 echo "Configured LLM unit: $configured_llm_unit"
+echo "Configured LLM health: $configured_llm_url"
 if [ "$wakeword_enabled" = "1" ]; then
     echo "Wake word script: $wakeword_script"
 else
@@ -187,6 +227,14 @@ failed=()
 for unit in "${UNITS[@]}"; do
     if ! start_unit "$unit"; then
         failed+=("$unit")
+        continue
+    fi
+
+    if [ "$unit" = "$configured_llm_unit" ]; then
+        if ! wait_for_http_health "$configured_llm_unit" "$configured_llm_url"; then
+            failed+=("$configured_llm_unit health")
+            break
+        fi
     fi
 done
 

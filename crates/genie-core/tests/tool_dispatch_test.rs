@@ -268,6 +268,12 @@ fn start_all_uses_configured_llm_backend() {
         "start_all should read [services.llm].systemd_unit"
     );
     assert!(
+        contents.contains("read_llm_url")
+            && contents.contains("wait_for_http_health")
+            && contents.contains("Configured LLM health"),
+        "start_all should wait for the configured LLM health endpoint before memory-heavy services"
+    );
+    assert!(
         contents.contains("read_wakeword_script")
             && contents.contains("wakeword_script is empty; push-to-talk mode"),
         "start_all should honor empty [core].wakeword_script as push-to-talk mode"
@@ -388,8 +394,8 @@ fn genie_ai_runtime_service_preserves_model_page_cache() {
         "genie-ai-runtime.service should use INT8 KV to fit enough context under memory pressure"
     );
     assert!(
-        contents.contains("GENIEPOD_AI_RUNTIME_CONTEXT=8192"),
-        "genie-ai-runtime.service should request the Jetson-tested 8k context size"
+        contents.contains("GENIEPOD_AI_RUNTIME_CONTEXT=4096"),
+        "genie-ai-runtime.service should default to the Jetson-stable 4k context size"
     );
     assert!(
         contents.contains(
