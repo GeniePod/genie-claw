@@ -137,6 +137,7 @@ async function pollTegrastats() {
 }
 
 function serviceStatus(s) {
+  if (s.source === 'config') return { label: 'Disabled', color: 'var(--text2)', dot: 'dot-unknown' };
   if (s.healthy) return { label: 'Healthy', color: 'var(--green)', dot: 'dot-up' };
   if (s.load_state === 'not-found') return { label: 'Missing', color: 'var(--text2)', dot: 'dot-unknown' };
   if (s.active_state === 'failed') return { label: 'Failed', color: 'var(--red)', dot: 'dot-down' };

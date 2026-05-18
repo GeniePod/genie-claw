@@ -21,6 +21,15 @@ read_llm_unit() {
     ' "$CONFIG_FILE" 2>/dev/null || true
 }
 
+read_wakeword_script() {
+    "${AWK[@]}" -F'"' '
+        /^\[core\]/ { in_core = 1; next }
+        /^\[/ && !/^\[core\]/ { in_core = 0 }
+        in_core && /^wakeword_script = / { found = 1; print $2; exit }
+        END { if (!found) print "__missing__" }
+    ' "$CONFIG_FILE" 2>/dev/null || true
+}
+
 normalize_unit() {
     local unit="$1"
     case "$unit" in
@@ -79,11 +88,27 @@ is_warmup_unit() {
     esac
 }
 
+skip_disabled_unit() {
+    local unit="$1"
+    local reason="$2"
+    echo "  Skip: $unit ($reason)"
+    if unit_exists "$unit"; then
+        "${SYSTEMCTL[@]}" stop "$unit" > /dev/null 2>&1 || true
+        "${SYSTEMCTL[@]}" reset-failed "$unit" > /dev/null 2>&1 || true
+    fi
+}
+
 start_unit() {
     local unit="$1"
     if [ -z "$unit" ]; then
         return 0
     fi
+
+    if [ "$unit" = "genie-wakeword.service" ] && [ "$wakeword_enabled" != "1" ]; then
+        skip_disabled_unit "$unit" "wakeword_script is empty; push-to-talk mode"
+        return 0
+    fi
+
     if ! unit_exists "$unit"; then
         if is_optional_unit "$unit"; then
             echo "  Skip: $unit (unit not installed)"
@@ -116,6 +141,14 @@ start_unit() {
 raw_llm_unit="$(read_llm_unit)"
 configured_llm_unit="$(normalize_unit "$raw_llm_unit")"
 configured_warmup_unit="$(warmup_unit_for "$configured_llm_unit")"
+wakeword_script="$(read_wakeword_script)"
+wakeword_enabled=1
+if [ -z "$wakeword_script" ]; then
+    wakeword_enabled=0
+elif [ "$wakeword_script" = "__missing__" ]; then
+    # Missing key falls back to genie-core's compiled default.
+    wakeword_script="/opt/geniepod/bin/genie-wake-listen.py"
+fi
 
 UNITS=(
     genie-audio.service
@@ -135,6 +168,11 @@ UNITS=(
 echo "=== GeniePod start all ==="
 echo ""
 echo "Configured LLM unit: $configured_llm_unit"
+if [ "$wakeword_enabled" = "1" ]; then
+    echo "Wake word script: $wakeword_script"
+else
+    echo "Wake word: disabled (push-to-talk mode)"
+fi
 echo "Reloading systemd units..."
 "${SYSTEMCTL[@]}" daemon-reload
 

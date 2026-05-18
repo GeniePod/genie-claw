@@ -268,6 +268,15 @@ fn start_all_uses_configured_llm_backend() {
         "start_all should read [services.llm].systemd_unit"
     );
     assert!(
+        contents.contains("read_wakeword_script")
+            && contents.contains("wakeword_script is empty; push-to-talk mode"),
+        "start_all should honor empty [core].wakeword_script as push-to-talk mode"
+    );
+    assert!(
+        contents.contains("reset-failed \"$unit\""),
+        "start_all should clear stale failed state for disabled optional services"
+    );
+    assert!(
         contents.contains("other_llm_units_for"),
         "start_all should stop the non-selected LLM backend before starting"
     );
