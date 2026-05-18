@@ -403,6 +403,26 @@ fn chat_ui_uses_animated_writing_indicator() {
     );
 }
 
+/// Verify the chat UI header reflects `/api/health` status and LLM state.
+#[test]
+fn chat_ui_reflects_api_health_status() {
+    let path = workspace_root().join("crates/genie-core/src/chat_ui.html");
+    let contents = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        contents.contains("function applyHealthStatus"),
+        "chat UI should map health JSON to header state"
+    );
+    assert!(
+        contents.contains("data.status === 'ok'") && contents.contains("data.llm === 'connected'"),
+        "chat UI should require both ok status and connected LLM before showing Connected"
+    );
+    assert!(
+        contents.contains("LLM offline") && contents.contains("dot degraded"),
+        "chat UI should show a degraded state when the LLM is offline"
+    );
+}
+
 /// Verify the model cache helper can inspect GGUF page-cache residency.
 #[test]
 fn model_cache_status_helper_reports_residency() {

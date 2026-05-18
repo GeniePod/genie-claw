@@ -8,7 +8,7 @@
 :root {
   --bg: #0a0e14; --surface: #131920; --border: #1e2730;
   --text: #e0e6ed; --text2: #8899aa; --accent: #00d4ff;
-  --green: #00e676; --red: #ff5252; --user-bg: #1a2332; --bot-bg: #0f1820;
+  --green: #00e676; --amber: #ffab40; --red: #ff5252; --user-bg: #1a2332; --bot-bg: #0f1820;
   --tool-bg: #1a1a2e; --tool-border: #7c4dff;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -36,6 +36,7 @@ header .dot {
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--green); display: inline-block;
 }
+header .dot.degraded { background: var(--amber); }
 header .dot.offline { background: var(--red); }
 header button {
   background: none; border: 1px solid var(--border); color: var(--text2);
@@ -164,12 +165,22 @@ const statusText = document.getElementById('status-text');
 
 let sending = false;
 
+function applyHealthStatus(data) {
+  if (data.status === 'ok' && data.llm === 'connected') {
+    statusDot.className = 'dot';
+    statusText.textContent = 'Connected';
+    return;
+  }
+  statusDot.className = 'dot degraded';
+  statusText.textContent = data.llm === 'offline' ? 'LLM offline' : 'Degraded';
+}
+
 async function checkHealth() {
   try {
     const r = await fetch('/api/health');
+    if (!r.ok) throw new Error('health unavailable');
     const data = await r.json();
-    statusDot.className = 'dot';
-    statusText.textContent = 'Connected';
+    applyHealthStatus(data);
   } catch {
     statusDot.className = 'dot offline';
     statusText.textContent = 'Offline';
