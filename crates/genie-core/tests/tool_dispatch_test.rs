@@ -115,6 +115,57 @@ fn setup_script_warns_about_missing_audio_helper() {
     );
 }
 
+/// Verify LLM backend auto-fallback can patch a root-owned config and fails loudly.
+#[test]
+fn setup_script_privileged_llm_backend_patch_is_checked() {
+    let path = workspace_root().join("deploy/setup-jetson.sh");
+    let contents = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        contents.contains("CONFIGURED_BACKEND=\"$(sudo awk"),
+        "setup script should read the configured LLM backend through sudo"
+    );
+    assert!(
+        contents.contains("if ! sudo awk -v nb=\"$new_backend\" -v nu=\"$new_unit\""),
+        "setup script should read the chmod 600 root-owned config through sudo"
+    );
+    assert!(
+        contents.contains("sudo mktemp /tmp/geniepod.toml."),
+        "setup script should create a root-owned temp file for the patched config"
+    );
+    assert!(
+        contents.contains("ERROR: failed to rewrite $cfg for patching"),
+        "setup script should report failed config rewrites"
+    );
+    assert!(
+        contents.contains("| sudo tee \"$tmp\" > /dev/null"),
+        "setup script should write the patched temp file through sudo tee"
+    );
+    assert!(
+        contents.contains("ERROR: failed to install patched $cfg"),
+        "setup script should report failed config installs"
+    );
+    assert!(
+        contents.contains("sudo rm -f \"$tmp\""),
+        "setup script should clean up the root-owned temp file through sudo"
+    );
+    assert!(
+        contents.contains("if ! patch_services_llm_backend \"llama_cpp\" \"genie-llm.service\""),
+        "llama.cpp fallback should check patch failure"
+    );
+    assert!(
+        contents.contains(
+            "if ! patch_services_llm_backend \"genie_ai_runtime\" \"genie-ai-runtime.service\""
+        ),
+        "genie-ai-runtime fallback should check patch failure"
+    );
+    assert!(
+        contents
+            .contains("auto-fallback could not patch $CONFIG_DIR/geniepod.toml; aborting setup"),
+        "setup should abort instead of enabling services against an unpatched config"
+    );
+}
+
 /// Verify the Jetson restart helper script is syntactically valid.
 #[test]
 fn jetson_restart_script_is_valid_shell() {

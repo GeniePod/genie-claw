@@ -361,7 +361,7 @@ else
     echo "  NOT FOUND: llama-server (legacy fallback backend)"
 fi
 
-CONFIGURED_BACKEND="$(awk -F'"' '/^backend = / {print $2; exit}' "$CONFIG_DIR/geniepod.toml" 2>/dev/null || true)"
+CONFIGURED_BACKEND="$(sudo awk -F'"' '/^backend = / {print $2; exit}' "$CONFIG_DIR/geniepod.toml" 2>/dev/null || true)"
 [ -z "$CONFIGURED_BACKEND" ] && CONFIGURED_BACKEND="genie_ai_runtime"
 # Normalize the hyphenated alias documented next to backend = in the toml.
 case "$CONFIGURED_BACKEND" in
@@ -382,8 +382,11 @@ patch_services_llm_backend() {
     local new_unit="$2"
     local cfg="$CONFIG_DIR/geniepod.toml"
     local tmp
-    tmp="$(mktemp)"
-    awk -v nb="$new_backend" -v nu="$new_unit" '
+    if ! tmp="$(sudo mktemp /tmp/geniepod.toml.XXXXXX)"; then
+        echo "  ERROR: failed to create temp file for patching $cfg" >&2
+        return 1
+    fi
+    if ! sudo awk -v nb="$new_backend" -v nu="$new_unit" '
         BEGIN { in_llm = 0 }
         /^\[services\.llm\]/   { in_llm = 1; print; next }
         /^\[/ && !/^\[services\.llm\]/ { in_llm = 0 }
@@ -398,8 +401,17 @@ patch_services_llm_backend() {
             next
         }
         { print }
-    ' "$cfg" > "$tmp" && sudo install -m 600 "$tmp" "$cfg"
-    rm -f "$tmp"
+    ' "$cfg" | sudo tee "$tmp" > /dev/null; then
+        echo "  ERROR: failed to rewrite $cfg for patching" >&2
+        sudo rm -f "$tmp"
+        return 1
+    fi
+    if ! sudo install -m 600 "$tmp" "$cfg"; then
+        echo "  ERROR: failed to install patched $cfg" >&2
+        sudo rm -f "$tmp"
+        return 1
+    fi
+    sudo rm -f "$tmp"
 }
 
 if [ "$CONFIGURED_BACKEND" = "genie_ai_runtime" ] && [ "$HAVE_JETSON_LLM" = "false" ]; then
@@ -415,7 +427,10 @@ if [ "$CONFIGURED_BACKEND" = "genie_ai_runtime" ] && [ "$HAVE_JETSON_LLM" = "fal
         echo "        To run the default backend instead, install it via:"
         echo "            bash $0 --runtime genie-ai-runtime"
         echo "        then re-run setup-jetson.sh (or hand-edit geniepod.toml back)."
-        patch_services_llm_backend "llama_cpp" "genie-llm.service"
+        if ! patch_services_llm_backend "llama_cpp" "genie-llm.service"; then
+            echo "  ERROR: auto-fallback could not patch $CONFIG_DIR/geniepod.toml; aborting setup." >&2
+            exit 1
+        fi
     else
         echo ""
         echo "  ERROR: configured backend (genie_ai_runtime) is not installed"
@@ -437,7 +452,10 @@ elif [ "$CONFIGURED_BACKEND" = "llama_cpp" ] && [ "$HAVE_LLAMA" = "false" ]; the
         echo "        Patching $CONFIG_DIR/geniepod.toml:"
         echo "            backend      = \"genie_ai_runtime\""
         echo "            systemd_unit = \"genie-ai-runtime.service\""
-        patch_services_llm_backend "genie_ai_runtime" "genie-ai-runtime.service"
+        if ! patch_services_llm_backend "genie_ai_runtime" "genie-ai-runtime.service"; then
+            echo "  ERROR: auto-fallback could not patch $CONFIG_DIR/geniepod.toml; aborting setup." >&2
+            exit 1
+        fi
     else
         echo ""
         echo "  ERROR: configured backend (llama_cpp) is not installed and no"
