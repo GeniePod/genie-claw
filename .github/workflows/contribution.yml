@@ -5,10 +5,18 @@
 # The check is intentionally lightweight: it confirms structure, not content
 # quality. Reviewers still have to read what you wrote and decide whether the
 # verification path is reasonable for the change.
+#
+# `pull_request_target` (not `pull_request`) so the workflow runs from the
+# base branch's copy of this file — that way the check fires on every PR
+# regardless of whether the PR head was branched before this workflow
+# existed. Safe because the job only reads `github.event.pull_request.body`
+# from the event payload; it never checks out or executes PR-controlled code.
+# (The standard `pull_request_target` security caveat is about running
+# untrusted PR code with secret access. We do neither.)
 name: Contribution
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, edited, synchronize, reopened]
     branches: [main]
 

@@ -7,7 +7,10 @@
 - `CONTRIBUTING.md`, `SECURITY.md`, `.github/PULL_REQUEST_TEMPLATE.md`,
   and `.github/workflows/contribution.yml` — formal contribution guide
   + private-disclosure security policy + PR template +
-  `Contribution / PR body checklist` CI job. Quality / engineering /
+  `Contribution / PR body checklist` CI job (triggered via
+  `pull_request_target` so the check runs from the base branch's
+  workflow definition — fires on every PR regardless of whether the
+  PR head pre-dates the workflow). Quality / engineering /
   bug-fix contributions are explicitly welcomed; every PR must include
   a `## Real Behavior Proof` section in the body (CI enforces structure,
   reviewer reads the content) so reviewers can see what was actually
