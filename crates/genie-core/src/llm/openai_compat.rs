@@ -172,10 +172,12 @@ impl RequestProfile {
     }
 }
 
-const GENIE_RUNTIME_MAX_BODY_BYTES: usize = 24 * 1024;
-const GENIE_RUNTIME_BODY_OVERHEAD_BYTES: usize = 768;
+const GENIE_RUNTIME_MAX_BODY_BYTES: usize = 4 * 1024;
+const GENIE_RUNTIME_BODY_OVERHEAD_BYTES: usize = 512;
+const GENIE_RUNTIME_CONTEXT_MAX_BYTES: usize = 900;
 const GENIE_RUNTIME_COMPACT_SYSTEM: &str =
     "You are GeniePod Home. Answer the user's latest request directly and concisely.";
+const GENIE_RUNTIME_COMPACT_SYSTEM_PREFIX: &str = "You are GeniePod Home. Reply briefly for voice. Use a tool only when required. Tool calls must be ONLY JSON: {\"tool\":\"tool_name\",\"arguments\":{}}. No markdown.";
 
 impl OpenAiCompatClient {
     pub fn new(backend_name: &'static str, host: &str, port: u16) -> Self {
@@ -509,19 +511,29 @@ fn parse_status_line(line: &str) -> u16 {
 }
 
 fn compact_genie_runtime_messages(messages: &[Message], max_body_bytes: usize) -> Vec<Message> {
-    let system_messages = messages
+    let system_text = messages
         .iter()
         .filter(|m| m.role == "system")
-        .cloned()
-        .collect::<Vec<_>>();
-    let has_system_context = !system_messages.is_empty();
+        .map(|m| m.content.trim())
+        .filter(|m| !m.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut compacted = if system_text.is_empty() {
+        Vec::new()
+    } else {
+        vec![Message {
+            role: "system".into(),
+            content: compact_genie_runtime_system(&system_text),
+        }]
+    };
+    let has_system_context = !compacted.is_empty();
 
     let Some(latest_idx) = messages
         .iter()
         .rposition(|m| m.role == "user")
         .or_else(|| messages.iter().rposition(|m| m.role != "system"))
     else {
-        return system_messages;
+        return compacted;
     };
 
     let latest_source = &messages[latest_idx];
@@ -537,7 +549,6 @@ fn compact_genie_runtime_messages(messages: &[Message], max_body_bytes: usize) -
         },
     };
 
-    let mut compacted = system_messages;
     let body_budget = max_body_bytes.saturating_sub(GENIE_RUNTIME_BODY_OVERHEAD_BYTES);
     let mut estimated_bytes = estimate_messages_bytes(&compacted) + estimate_message_bytes(&latest);
     let mut retained_history = Vec::new();
@@ -559,6 +570,125 @@ fn compact_genie_runtime_messages(messages: &[Message], max_body_bytes: usize) -
     compacted.extend(retained_history);
     compacted.push(latest);
     compacted
+}
+
+fn compact_genie_runtime_system(system_text: &str) -> String {
+    let mut sections = vec![GENIE_RUNTIME_COMPACT_SYSTEM_PREFIX.to_string()];
+    let tool_lines = compact_genie_runtime_tool_lines(system_text);
+    if !tool_lines.is_empty() {
+        sections.push(format!("Tools:\n{}", tool_lines.join("\n")));
+    }
+
+    sections.push(compact_genie_runtime_rules(system_text));
+
+    if let Some(context) = compact_household_context(system_text) {
+        sections.push(format!("Household context:\n{context}"));
+    }
+
+    sections.join("\n\n")
+}
+
+fn compact_genie_runtime_tool_lines(system_text: &str) -> Vec<String> {
+    let specs = [
+        (
+            "home_control",
+            "home_control {entity, action, value?} - control safe home devices/scenes",
+        ),
+        (
+            "home_status",
+            "home_status {entity} - query Home Assistant state",
+        ),
+        (
+            "home_undo",
+            "home_undo {} - undo last reversible home action",
+        ),
+        (
+            "action_history",
+            "action_history {} - recent actions/pending confirmations",
+        ),
+        ("set_timer", "set_timer {seconds, label?}"),
+        ("get_time", "get_time {}"),
+        ("get_weather", "get_weather {location, forecast?}"),
+        ("web_search", "web_search {query, limit?, fresh?}"),
+        ("system_info", "system_info {}"),
+        ("calculate", "calculate {expression}"),
+        ("play_media", "play_media {query}"),
+        ("memory_recall", "memory_recall {query}"),
+        ("memory_status", "memory_status {}"),
+        ("memory_forget", "memory_forget {query}"),
+        ("memory_store", "memory_store {content, category?}"),
+        ("hello_world", "hello_world {name?} - demo greeting only"),
+    ];
+
+    specs
+        .iter()
+        .filter(|(name, _)| system_text.contains(name))
+        .map(|(_, line)| format!("- {line}"))
+        .collect()
+}
+
+fn compact_genie_runtime_rules(system_text: &str) -> String {
+    let mut rules = vec![
+        "If no tool is needed, answer naturally in 1-3 short sentences.",
+        "Use calculate for math, get_weather for weather, get_time for time, and system_info for system/Home Assistant/memory diagnostics.",
+        "Use memory_recall when the user asks what you remember, what you know about them, or asks for their name.",
+        "Use memory_store only when the user explicitly asks you to remember/save something; never store secrets.",
+    ];
+
+    if system_text.contains("web_search") {
+        rules.push("Use web_search only for current/recent public facts or explicit web lookup; never send private secrets.");
+    }
+    if system_text.contains("home_control") {
+        rules.push("Use home_control/home_status for smart-home requests; risky actions may require local confirmation.");
+    } else if system_text.contains("Home control is currently unavailable") {
+        rules.push("Home control is unavailable; say Home Assistant is not connected if asked to control a device.");
+    }
+    if system_text.contains("hello_world") {
+        rules.push("Use hello_world only for explicit hello_world demo requests.");
+    }
+
+    format!("Rules:\n- {}", rules.join("\n- "))
+}
+
+fn compact_household_context(system_text: &str) -> Option<String> {
+    let markers = ["Relevant household context:\n", "## Household Context\n"];
+    let (marker_pos, marker_len) = markers
+        .iter()
+        .filter_map(|marker| system_text.rfind(marker).map(|pos| (pos, marker.len())))
+        .max_by_key(|(pos, _)| *pos)?;
+
+    let tail = &system_text[marker_pos + marker_len..];
+    let context = tail
+        .split("\n## ")
+        .next()
+        .unwrap_or(tail)
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && *line != "(no household context yet)"
+                && *line != "Relevant household context:"
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if context.is_empty() {
+        None
+    } else {
+        Some(truncate_utf8(&context, GENIE_RUNTIME_CONTEXT_MAX_BYTES).to_string())
+    }
+}
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].trim_end()
 }
 
 fn estimate_messages_bytes(messages: &[Message]) -> usize {
@@ -710,7 +840,10 @@ mod tests {
         let messages = vec![
             Message {
                 role: "system".into(),
-                content: "tool manifest memory_recall household context ".repeat(128),
+                content: format!(
+                    "{}\n\nRelevant household context:\nJared lives here.\n",
+                    "tool manifest memory_recall household context ".repeat(128)
+                ),
             },
             Message {
                 role: "assistant".into(),
@@ -734,15 +867,15 @@ mod tests {
         assert_eq!(json["messages"].as_array().unwrap().len(), 2);
         assert_eq!(json["messages"][0]["role"], "system");
         assert!(serialized_messages.contains("memory_recall"));
-        assert!(serialized_messages.contains("household context"));
+        assert!(serialized_messages.contains("Jared lives here"));
         assert!(serialized_messages.contains("Say hello from the GeniePod web UI."));
-        assert!(!serialized_messages.contains("GeniePod Home"));
+        assert!(serialized_messages.contains("GeniePod Home"));
         assert!(!serialized_messages.contains("older assistant turn"));
         assert!(prepared.body.len() < GENIE_RUNTIME_MAX_BODY_BYTES);
     }
 
     #[test]
-    fn genie_runtime_profile_keeps_runtime_prompt_under_expanded_budget() {
+    fn genie_runtime_profile_compacts_runtime_prompt_under_4k_budget() {
         let profile = RequestProfile::genie_ai_runtime();
         let messages = vec![
             Message {
@@ -761,11 +894,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
         let serialized_messages = json["messages"].to_string();
 
-        assert!(!prepared.compacted);
-        assert!(prepared.body.len() > 4 * 1024);
+        assert!(prepared.compacted);
         assert!(prepared.body.len() < GENIE_RUNTIME_MAX_BODY_BYTES);
         assert!(serialized_messages.contains("memory_recall"));
         assert!(serialized_messages.contains("What is my name?"));
+        assert!(serialized_messages.contains("GeniePod Home"));
+        assert!(!serialized_messages.contains("tool manifest tool manifest"));
     }
 
     #[test]
