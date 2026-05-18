@@ -200,6 +200,22 @@ fn makefile_deploys_restart_helper() {
     );
 }
 
+/// Verify systemd deploy replaces stale or masked unit-file symlinks.
+#[test]
+fn makefile_installs_systemd_units_instead_of_copying_through_symlinks() {
+    let path = workspace_root().join("Makefile");
+    let contents = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        contents.contains("sudo install -m 0644 \"$$unit\""),
+        "Makefile should replace stale/masked unit files instead of copying through symlinks"
+    );
+    assert!(
+        !contents.contains("sudo cp /tmp/genie-*.service"),
+        "Makefile should not use cp for systemd units; cp follows masked-unit symlinks"
+    );
+}
+
 /// Verify the restart helper does not bounce llama.cpp on routine app updates.
 #[test]
 fn restart_helper_skips_llm_service() {
