@@ -331,10 +331,21 @@ fn genie_restart_all_hard_mode_performs_full_memory_reset() {
         .find("Dropping page cache")
         .expect("drop_caches echo line");
     let swap_pos = contents.find("Freeing swap").expect("swap echo line");
-    let start_pos = contents.find("\"$START_ALL\"").expect("START_ALL invocation");
-    assert!(stop_pos < reap_pos, "stop_all must run before reaping orphans");
-    assert!(reap_pos < drop_pos, "orphan reap must run before drop_caches");
-    assert!(drop_pos < swap_pos, "drop_caches must run before swap reset");
+    let start_pos = contents
+        .find("\"$START_ALL\"")
+        .expect("START_ALL invocation");
+    assert!(
+        stop_pos < reap_pos,
+        "stop_all must run before reaping orphans"
+    );
+    assert!(
+        reap_pos < drop_pos,
+        "orphan reap must run before drop_caches"
+    );
+    assert!(
+        drop_pos < swap_pos,
+        "drop_caches must run before swap reset"
+    );
     assert!(swap_pos < start_pos, "swap reset must run before start_all");
 }
 
