@@ -201,6 +201,7 @@ fn jetson_lifecycle_scripts_are_valid_shell() {
         "deploy/scripts/genie-restart-all.sh",
         "deploy/scripts/start_all.sh",
         "deploy/scripts/stop_all.sh",
+        "deploy/scripts/genie-model-cache-status.sh",
     ] {
         let path = workspace_root().join(script);
         assert!(path.exists(), "{script} should exist");
@@ -224,7 +225,12 @@ fn makefile_deploys_lifecycle_helpers() {
     let path = workspace_root().join("Makefile");
     let contents = std::fs::read_to_string(&path).unwrap();
 
-    for script in ["genie-restart-all.sh", "start_all.sh", "stop_all.sh"] {
+    for script in [
+        "genie-restart-all.sh",
+        "start_all.sh",
+        "stop_all.sh",
+        "genie-model-cache-status.sh",
+    ] {
         assert!(
             contents.contains(&format!("deploy/scripts/{script}")),
             "Makefile should copy {script} during deploy"
@@ -257,6 +263,42 @@ fn start_all_uses_configured_llm_backend() {
     assert!(
         contents.contains("is_warmup_unit") && contents.contains("start --no-block"),
         "start_all should queue warmup units without blocking the lifecycle script"
+    );
+}
+
+/// Verify genie-ai-runtime service preserves warm GGUF pages across restarts.
+#[test]
+fn genie_ai_runtime_service_preserves_model_page_cache() {
+    let path = workspace_root().join("deploy/systemd/genie-ai-runtime.service");
+    let contents = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        !contents.contains("ExecStartPre="),
+        "genie-ai-runtime.service should not force cold model reloads"
+    );
+    assert!(
+        contents.contains("page cache") && contents.contains("issue #69"),
+        "service should document why page cache is preserved"
+    );
+}
+
+/// Verify the model cache helper can inspect GGUF page-cache residency.
+#[test]
+fn model_cache_status_helper_reports_residency() {
+    let path = workspace_root().join("deploy/scripts/genie-model-cache-status.sh");
+    let contents = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        contents.contains("llm_model_path"),
+        "helper should default to the configured LLM model path"
+    );
+    assert!(
+        contents.contains("mincore"),
+        "helper should use Linux mincore to inspect page residency"
+    );
+    assert!(
+        contents.contains("Resident:"),
+        "helper should print resident model bytes"
     );
 }
 

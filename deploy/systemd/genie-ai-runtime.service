@@ -10,8 +10,8 @@ Conflicts=genie-llm.service
 
 [Service]
 Type=simple
-# Drop page cache before loading model — Jetson NvMap needs contiguous blocks.
-ExecStartPre=/bin/sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
+# Keep the GGUF in page cache across restarts when the kernel can. Clearing
+# VM caches here made every runtime restart cold-load Qwen3 again (issue #69).
 # v1.0.0 only accepts `-m <model> -p <port>`. Any llama.cpp-style flags
 # (--n-gpu-layers, --flash-attn, --ctx-size, --threads) are intentionally
 # absent — the runtime hard-codes its own Jetson-tuned defaults.
