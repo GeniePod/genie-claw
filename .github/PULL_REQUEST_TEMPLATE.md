@@ -2,6 +2,11 @@
 Thanks for contributing to GenieClaw! Please fill this template in honestly.
 The "Real Behavior Proof" section is required and enforced by CI.
 See CONTRIBUTING.md for the full rules.
+
+NOTE: Strip any AI-attribution footer (e.g. "🤖 Generated with Claude Code")
+from your PR body before submitting. Using AI tooling to draft the PR is
+fine; attribution in the PR body and in git history stays with the human
+contributor. CI enforces this.
 -->
 
 ## Summary

@@ -10,7 +10,11 @@
   `Contribution / PR body checklist` CI job (triggered via
   `pull_request_target` so the check runs from the base branch's
   workflow definition — fires on every PR regardless of whether the
-  PR head pre-dates the workflow). Quality / engineering /
+  PR head pre-dates the workflow). Checklist also blocks PR bodies
+  that include AI-attribution footers like `🤖 Generated with Claude
+  Code` (case-insensitive, matches the bracketed-link form as well)
+  to keep PR attribution with the human contributor; same spirit as
+  the existing no-`Co-Authored-By: Claude` commit-trailer rule. Quality / engineering /
   bug-fix contributions are explicitly welcomed; every PR must include
   a `## Real Behavior Proof` section in the body (CI enforces structure,
   reviewer reads the content) so reviewers can see what was actually

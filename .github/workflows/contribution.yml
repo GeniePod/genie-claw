@@ -40,6 +40,16 @@ jobs:
               exit 1
           fi
 
+          # Block AI-attribution footers in PR body. Using Claude Code (or any
+          # other AI agent) to help draft the PR is fine — but `git log`,
+          # `git shortlog`, and the PR description record attribution to the
+          # human contributor, not the tool. Strip the trailer before
+          # submitting. See CONTRIBUTING.md "Commit hygiene".
+          if printf '%s' "$PR_BODY" | grep -Eqi 'Generated[[:space:]]+with[[:space:]]+\[?Claude[[:space:]]+Code\]?'; then
+              echo "::error::PR body contains an AI-attribution footer (e.g. '🤖 Generated with Claude Code'). Strip it before submitting — see CONTRIBUTING.md 'Commit hygiene'."
+              exit 1
+          fi
+
           # Allow Dependabot / Renovate / release automation to skip the
           # human-written proof requirement. These are bot PRs whose
           # contents are mechanically generated.

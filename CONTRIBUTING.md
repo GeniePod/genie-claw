@@ -93,6 +93,7 @@ All checks must be green before merge. We squash-merge PRs, with the maintainer 
 - Write commit subjects in the imperative mood, scoped if useful: `fix(voice/stt): per-call nonce on transcribe_pcm tempfile`.
 - Keep commit bodies useful — explain *why*, not *what*. The diff already shows what changed.
 - Do **not** add `Co-Authored-By: Claude` / Copilot / other AI-assistant trailers to commit messages. Tools to draft code are fine; we keep `git log` attribution to the human contributor so credit is unambiguous.
+- Do **not** include AI-generated attribution footers like `🤖 Generated with Claude Code` (or any variant) in **PR bodies** either. Enforced by the `Contribution / PR body checklist` CI job. Same reason as the commit-trailer rule: attribution stays with the human contributor.
 - Don't `--no-verify` past pre-commit hooks. Fix the underlying issue.
 
 ## Security disclosures
