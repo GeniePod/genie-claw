@@ -1,0 +1,75 @@
+# Contribution checklist: enforces the CONTRIBUTING.md requirement that every
+# PR body documents real-world verification. See CONTRIBUTING.md "Required:
+# Real Behavior Proof" for the human-readable spec.
+#
+# The check is intentionally lightweight: it confirms structure, not content
+# quality. Reviewers still have to read what you wrote and decide whether the
+# verification path is reasonable for the change.
+name: Contribution
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-body-checklist:
+    name: PR body checklist
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify PR body has Real Behavior Proof section
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [ -z "${PR_BODY:-}" ]; then
+              echo "::error::PR body is empty. See CONTRIBUTING.md — every PR must include a 'Real Behavior Proof' section."
+              exit 1
+          fi
+
+          # Allow Dependabot / Renovate / release automation to skip the
+          # human-written proof requirement. These are bot PRs whose
+          # contents are mechanically generated.
+          case "${PR_TITLE:-}" in
+              "chore(deps)"*|"chore(deps-dev)"*|"build(deps)"*|"deps:"*|"release:"*|"Release "*)
+                  echo "Bot / release PR — skipping proof check (title prefix matched)."
+                  exit 0
+                  ;;
+          esac
+
+          # Hard requirement: a "Real Behavior Proof" heading exists.
+          if ! printf '%s' "$PR_BODY" | grep -Eqi '^##+[[:space:]]+Real Behavior Proof[[:space:]]*$'; then
+              echo "::error::PR body must include a '## Real Behavior Proof' section. See CONTRIBUTING.md and the PR template."
+              exit 1
+          fi
+
+          # That section must not be empty (i.e., the boilerplate must have
+          # been replaced with actual content). We check for at least one
+          # non-blank, non-HTML-comment line between the proof heading and
+          # the next heading (or end of body).
+          proof_body="$(printf '%s' "$PR_BODY" | awk '
+              BEGIN { in_section = 0 }
+              /^##+[[:space:]]+Real Behavior Proof[[:space:]]*$/ { in_section = 1; next }
+              in_section && /^##+[[:space:]]/ { in_section = 0 }
+              in_section { print }
+          ' | grep -Ev '^[[:space:]]*$' | grep -Ev '^[[:space:]]*<!--' | grep -Ev '^[[:space:]]*-->')"
+
+          if [ -z "$proof_body" ]; then
+              echo "::error::'## Real Behavior Proof' section is empty. Fill in 'What I ran' and 'What I observed' (or the equivalent narrative — see CONTRIBUTING.md)."
+              exit 1
+          fi
+
+          # Require at least one of the two acknowledgement checkboxes to be
+          # ticked. This is the minimum signal that the contributor read the
+          # template instead of pasting an empty section.
+          if ! printf '%s' "$PR_BODY" | grep -Eq '^[[:space:]]*-[[:space:]]*\[[xX]\]'; then
+              echo "::error::At least one checkbox under '## Real Behavior Proof' must be ticked (use '- [x]')."
+              exit 1
+          fi
+
+          echo "OK: PR body has a non-empty 'Real Behavior Proof' section with at least one ticked acknowledgement checkbox."

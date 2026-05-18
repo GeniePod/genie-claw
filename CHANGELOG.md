@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added
+
+- `CONTRIBUTING.md`, `SECURITY.md`, `.github/PULL_REQUEST_TEMPLATE.md`,
+  and `.github/workflows/contribution.yml` — formal contribution guide
+  + private-disclosure security policy + PR template +
+  `Contribution / PR body checklist` CI job. Quality / engineering /
+  bug-fix contributions are explicitly welcomed; every PR must include
+  a `## Real Behavior Proof` section in the body (CI enforces structure,
+  reviewer reads the content) so reviewers can see what was actually
+  run and where, not just what CI checked. Security disclosures go to
+  <contact@genieclaw.org> privately rather than the public issue tracker;
+  scope, in-scope/out-of-scope categories, and response timeline are
+  documented in `SECURITY.md`. Dependabot / Renovate / release PRs
+  are exempt from the proof requirement via a title-prefix allowlist
+  in the checklist workflow. README's bottom-of-file gets a brief
+  "Contributing" + "Security" pair of sections pointing at the
+  canonical docs.
+
 ## 1.0.0-alpha.9 - 2026-05-18
 
 Alpha 9 is the **CI / supply-chain hardening + voice-frontend maturation**
