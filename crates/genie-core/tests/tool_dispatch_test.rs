@@ -254,6 +254,10 @@ fn start_all_uses_configured_llm_backend() {
         contents.contains("other_llm_units_for"),
         "start_all should stop the non-selected LLM backend before starting"
     );
+    assert!(
+        contents.contains("is_warmup_unit") && contents.contains("start --no-block"),
+        "start_all should queue warmup units without blocking the lifecycle script"
+    );
 }
 
 /// Verify systemd deploy replaces stale or masked unit-file symlinks.

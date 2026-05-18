@@ -67,6 +67,18 @@ is_optional_unit() {
     esac
 }
 
+is_warmup_unit() {
+    local unit="$1"
+    case "$unit" in
+        *-warmup.service)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 start_unit() {
     local unit="$1"
     if [ -z "$unit" ]; then
@@ -81,13 +93,24 @@ start_unit() {
         return 1
     fi
 
+    if is_warmup_unit "$unit"; then
+        printf "  Queuing %s ... " "$unit"
+        if "${SYSTEMCTL[@]}" start --no-block "$unit"; then
+            echo "OK"
+        else
+            echo "FAILED"
+            return 1
+        fi
+        return 0
+    fi
+
     printf "  Starting %s ... " "$unit"
-    if "${SYSTEMCTL[@]}" start "$unit"; then
-        echo "OK"
-    else
+    if ! "${SYSTEMCTL[@]}" start "$unit"; then
         echo "FAILED"
         return 1
     fi
+
+    echo "OK"
 }
 
 raw_llm_unit="$(read_llm_unit)"
