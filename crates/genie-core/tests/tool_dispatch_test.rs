@@ -162,6 +162,10 @@ fn setup_script_privileged_llm_backend_patch_is_checked() {
         "setup script should pass the resolved nvcc path to CMake"
     );
     assert!(
+        contents.contains("-DJLLM_BUILD_SERVER=ON"),
+        "setup script should build the jetson-llm-server binary required by systemd"
+    );
+    assert!(
         contents.contains("ERROR: CUDA compiler nvcc not found."),
         "setup script should fail clearly when nvcc is missing"
     );

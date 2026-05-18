@@ -163,6 +163,7 @@ install_genie_ai_runtime() {
     cd "$build_dir"
     cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
+        -DJLLM_BUILD_SERVER=ON \
         -DCMAKE_CUDA_COMPILER="$cuda_compiler" \
         -DCUDAToolkit_ROOT="$cuda_root"
     cmake --build build -j"$(nproc)"
