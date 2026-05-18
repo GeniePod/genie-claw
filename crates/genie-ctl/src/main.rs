@@ -32,8 +32,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-const CORE_URL: &str = "127.0.0.1:3000";
 const GOVERNOR_SOCK: &str = "/run/geniepod/governor.sock";
+
+/// HTTP `host:port` for genie-core, from `[core].bind_host` and `[core].port`.
+fn core_addr_from_config(config: &Config) -> String {
+    let host = config.core.bind_host.trim();
+    let host = if host.is_empty() {
+        "127.0.0.1"
+    } else if host == "0.0.0.0" || host == "::" {
+        // genie-core may listen on all interfaces; local CLI should use loopback.
+        "127.0.0.1"
+    } else {
+        host
+    };
+    format!("{host}:{}", config.core.port)
+}
+
+fn load_core_addr() -> Result<String> {
+    Ok(core_addr_from_config(&Config::load()?))
+}
 const SKILL_RESTART_HINT: &str =
     "Restart genie-core to load skill changes, or wait until the next startup.";
 
@@ -215,7 +232,10 @@ SUBCOMMANDS:
 
 fn cmd_version() {
     println!("genie-ctl v{}", env!("CARGO_PKG_VERSION"));
-    println!("  core: {}", CORE_URL);
+    match load_core_addr() {
+        Ok(addr) => println!("  core: {}", addr),
+        Err(err) => println!("  core: (config error: {err})"),
+    }
     println!("  governor: {}", GOVERNOR_SOCK);
 }
 
@@ -751,6 +771,7 @@ fn remove_skill(target: &str, skills_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn cmd_status() -> Result<()> {
+    let core = load_core_addr()?;
     // Try governor first.
     if let Some(gov) = governor_cmd(r#"{"cmd":"status"}"#).await {
         let mode = gov
@@ -773,7 +794,7 @@ async fn cmd_status() -> Result<()> {
     }
 
     // Try core health.
-    match http_get(CORE_URL, "/api/health").await {
+    match http_get(&core, "/api/health").await {
         Ok(body) => {
             let data: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
@@ -832,8 +853,9 @@ async fn cmd_mode(mode: &str) -> Result<()> {
 }
 
 async fn cmd_chat(message: &str) -> Result<()> {
+    let core = load_core_addr()?;
     let body = serde_json::json!({"message": message}).to_string();
-    let response = http_post_with_origin(CORE_URL, "/api/chat", &body, "api").await?;
+    let response = http_post_with_origin(&core, "/api/chat", &body, "api").await?;
     let data: serde_json::Value = serde_json::from_str(&response)?;
 
     if let Some(resp) = data.get("response").and_then(|v| v.as_str()) {
@@ -905,13 +927,14 @@ fn parse_search_limit(value: &str) -> Result<u64> {
 }
 
 async fn cmd_search(query: &str, fresh: bool, limit: u64) -> Result<()> {
+    let core = load_core_addr()?;
     let query = query.trim();
     if query.is_empty() {
         anyhow::bail!("Usage: genie-ctl search [--fresh] [--limit N] <query>");
     }
 
     let body = serde_json::json!({"query": query, "fresh": fresh, "limit": limit}).to_string();
-    let response = http_post(CORE_URL, "/api/web-search", &body).await?;
+    let response = http_post(&core, "/api/web-search", &body).await?;
     let data: serde_json::Value = serde_json::from_str(&response)?;
 
     if let Some(resp) = data.get("response").and_then(|v| v.as_str()) {
@@ -928,7 +951,8 @@ async fn cmd_search(query: &str, fresh: bool, limit: u64) -> Result<()> {
 }
 
 async fn cmd_history() -> Result<()> {
-    let body = http_get(CORE_URL, "/api/chat/history").await?;
+    let core = load_core_addr()?;
+    let body = http_get(&core, "/api/chat/history").await?;
     let messages: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
 
     if messages.is_empty() {
@@ -952,7 +976,8 @@ async fn cmd_history() -> Result<()> {
 }
 
 async fn cmd_tools() -> Result<()> {
-    let body = http_get(CORE_URL, "/api/tools").await?;
+    let core = load_core_addr()?;
+    let body = http_get(&core, "/api/tools").await?;
     let tools: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
 
     if tools.is_empty() {
@@ -974,7 +999,8 @@ async fn cmd_tools() -> Result<()> {
 }
 
 async fn cmd_connectivity() -> Result<()> {
-    let body = http_get(CORE_URL, "/api/connectivity").await?;
+    let core = load_core_addr()?;
+    let body = http_get(&core, "/api/connectivity").await?;
     let data: serde_json::Value = serde_json::from_str(&body)?;
 
     let health = data
@@ -1022,7 +1048,8 @@ async fn cmd_connectivity() -> Result<()> {
 }
 
 async fn cmd_health() -> Result<()> {
-    let core_health = match http_get(CORE_URL, "/api/health").await {
+    let core = load_core_addr()?;
+    let core_health = match http_get(&core, "/api/health").await {
         Ok(body) => {
             println!("  [OK]   genie-core");
             serde_json::from_str::<serde_json::Value>(&body).ok()
@@ -1064,7 +1091,8 @@ async fn cmd_health() -> Result<()> {
 }
 
 async fn cmd_conversations() -> Result<()> {
-    let body = http_get(CORE_URL, "/api/conversations").await?;
+    let core = load_core_addr()?;
+    let body = http_get(&core, "/api/conversations").await?;
     let convos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
 
     if convos.is_empty() {
@@ -1155,6 +1183,7 @@ async fn cmd_update_check() -> Result<()> {
 }
 
 async fn cmd_diag() -> Result<()> {
+    let core = load_core_addr()?;
     println!("=== GeniePod Diagnostics ===\n");
 
     // Version.
@@ -1164,7 +1193,7 @@ async fn cmd_diag() -> Result<()> {
     // Core health.
     println!("\n[Services]");
     let services = [
-        ("genie-core", CORE_URL, "/api/health"),
+        ("genie-core", core.as_str(), "/api/health"),
         ("genie-api", "127.0.0.1:3080", "/api/status"),
         ("Home Assistant", "127.0.0.1:8123", "/api/"),
     ];
@@ -1196,7 +1225,7 @@ async fn cmd_diag() -> Result<()> {
     }
 
     // Core details.
-    if let Ok(body) = http_get(CORE_URL, "/api/health").await
+    if let Ok(body) = http_get(&core, "/api/health").await
         && let Ok(data) = serde_json::from_str::<serde_json::Value>(&body)
     {
         println!("\n[Core]");
@@ -1330,8 +1359,9 @@ async fn cmd_diag() -> Result<()> {
 }
 
 async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
+    let core = load_core_addr()?;
     let services = [
-        ("genie-core", CORE_URL, "/api/health"),
+        ("genie-core", core.as_str(), "/api/health"),
         ("genie-api", "127.0.0.1:3080", "/api/status"),
         ("Home Assistant", "127.0.0.1:8123", "/api/"),
     ];
@@ -1356,14 +1386,14 @@ async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
         "services": service_status,
         "governor": governor_cmd(r#"{"cmd":"status"}"#).await,
         "core": {
-            "health": http_json_value(CORE_URL, "/api/health").await,
-            "runtime_contract": http_json_value(CORE_URL, "/api/runtime/contract").await,
-            "connectivity": http_json_value(CORE_URL, "/api/connectivity").await,
+            "health": http_json_value(&core, "/api/health").await,
+            "runtime_contract": http_json_value(&core, "/api/runtime/contract").await,
+            "connectivity": http_json_value(&core, "/api/connectivity").await,
         },
         "security": http_json_value("127.0.0.1:3080", "/api/security").await,
         "actuation": {
-            "pending": http_json_value(CORE_URL, "/api/actuation/pending").await,
-            "actions": http_json_value(CORE_URL, "/api/actuation/actions").await,
+            "pending": http_json_value(&core, "/api/actuation/pending").await,
+            "actions": http_json_value(&core, "/api/actuation/actions").await,
             "audit": http_json_value("127.0.0.1:3080", "/api/actuation/audit").await,
         },
         "system": {
@@ -1730,6 +1760,56 @@ mod tests {
         let version = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty());
         assert!(version.contains('.')); // Semver: x.y.z
+    }
+
+    #[test]
+    fn core_addr_from_config_uses_bind_host_and_port() {
+        use genie_common::config::{
+            Config, CoreConfig, GovernorConfig, HealthConfig, ServicesConfig,
+        };
+        use std::path::PathBuf;
+
+        let config = Config {
+            data_dir: PathBuf::from("./data"),
+            core: CoreConfig {
+                port: 3001,
+                bind_host: "127.0.0.1".into(),
+                ..CoreConfig::default()
+            },
+            governor: GovernorConfig::default(),
+            health: HealthConfig::default(),
+            services: ServicesConfig::default(),
+            telegram: Default::default(),
+            web_search: Default::default(),
+            connectivity: Default::default(),
+        };
+
+        assert_eq!(super::core_addr_from_config(&config), "127.0.0.1:3001");
+    }
+
+    #[test]
+    fn core_addr_maps_listen_all_to_loopback_for_local_cli() {
+        use genie_common::config::{
+            Config, CoreConfig, GovernorConfig, HealthConfig, ServicesConfig,
+        };
+        use std::path::PathBuf;
+
+        let config = Config {
+            data_dir: PathBuf::from("./data"),
+            core: CoreConfig {
+                port: 3000,
+                bind_host: "0.0.0.0".into(),
+                ..CoreConfig::default()
+            },
+            governor: GovernorConfig::default(),
+            health: HealthConfig::default(),
+            services: ServicesConfig::default(),
+            telegram: Default::default(),
+            web_search: Default::default(),
+            connectivity: Default::default(),
+        };
+
+        assert_eq!(super::core_addr_from_config(&config), "127.0.0.1:3000");
     }
 
     #[test]

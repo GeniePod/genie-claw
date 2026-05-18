@@ -522,6 +522,14 @@ Total first-reply latency of **~4 seconds** from end-of-user-speech to
 first audible TTS audio, on a 7.6 GB Orin Nano running Phi-4-mini Q4_K_M
 LLM + whisper-small + Piper en_US-amy concurrently.
 
+## Contributing
+
+Quality, engineering, and bug fixes are always welcome. Every PR must include a **Real Behavior Proof** section in the description — a brief statement of what you ran, where you ran it, and what happened (Jetson hardware preferred). CI enforces the structure; reviewers read the content. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
+
+## Security
+
+Found a vulnerability? **Do not open a public issue.** Email <contact@genieclaw.org> with the details. See [SECURITY.md](SECURITY.md) for the response timeline and scope.
+
 ## License
 
 GNU Affero General Public License v3.0

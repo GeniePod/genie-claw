@@ -15,6 +15,54 @@
   consumer halves via `Arc<TtsEngine>`. The first-reply latency banner
   (#19) now reports the true LLM-until-first-sentence figure instead
   of the full-response figure.
+### Changed
+
+- `deploy/scripts/genie-restart-all.sh` rewritten as a full hard-reset:
+  delegates to `stop_all.sh` for the systemd stops, best-effort
+  `pkill -x` reaps known LLM/STT/TTS/audio subprocess names that may
+  have survived the cgroup stop (piper, whisper-server, whisper-cli,
+  jetson-llm-server, jetson-llm, llama-server, deep-filter, sox,
+  ffmpeg), `sync; echo 3 > /proc/sys/vm/drop_caches` releases page
+  cache, `swapoff -a; swapon -a` flushes the swap file to a clean
+  baseline, then delegates to `start_all.sh` to bring the stack back
+  up. Deliberately gives back the warm Qwen3-4B page-cache residency
+  PR #70 preserves across plain `systemctl restart` — the script
+  exists for the post-`make deploy` case where binaries / config /
+  model path may have changed and the prior warm cache is stale.
+  Pass `--soft` to skip the cache + swap reset for a service-only
+  refresh that preserves the warm LLM cache. `swapoff` failure
+  (no swap, or not enough free RAM to absorb the swap contents) is
+  logged and skipped rather than fatal so the script never wedges
+  the box mid-restart. New regression test
+  `genie_restart_all_hard_mode_performs_full_memory_reset` pins
+  the five-step shape (stop → reap → drop_caches → swapoff/swapon
+  → start) and the ordering, so future edits can't quietly drop a
+  step without failing CI.
+
+### Added
+
+- `CONTRIBUTING.md`, `SECURITY.md`, `.github/PULL_REQUEST_TEMPLATE.md`,
+  and `.github/workflows/contribution.yml` — formal contribution guide
+  + private-disclosure security policy + PR template +
+  `Contribution / PR body checklist` CI job (triggered via
+  `pull_request_target` so the check runs from the base branch's
+  workflow definition — fires on every PR regardless of whether the
+  PR head pre-dates the workflow). Checklist also blocks PR bodies
+  that include AI-attribution footers like `🤖 Generated with Claude
+  Code` (case-insensitive, matches the bracketed-link form as well)
+  to keep PR attribution with the human contributor; same spirit as
+  the existing no-`Co-Authored-By: Claude` commit-trailer rule. Quality / engineering /
+  bug-fix contributions are explicitly welcomed; every PR must include
+  a `## Real Behavior Proof` section in the body (CI enforces structure,
+  reviewer reads the content) so reviewers can see what was actually
+  run and where, not just what CI checked. Security disclosures go to
+  <contact@genieclaw.org> privately rather than the public issue tracker;
+  scope, in-scope/out-of-scope categories, and response timeline are
+  documented in `SECURITY.md`. Dependabot / Renovate / release PRs
+  are exempt from the proof requirement via a title-prefix allowlist
+  in the checklist workflow. README's bottom-of-file gets a brief
+  "Contributing" + "Security" pair of sections pointing at the
+  canonical docs.
 
 ## 1.0.0-alpha.9 - 2026-05-18
 

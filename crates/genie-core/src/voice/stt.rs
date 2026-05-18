@@ -1,8 +1,37 @@
 use anyhow::Result;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+
+/// Monotonic per-process counter for unique temp-file suffixes. Pairs with
+/// the PID so two concurrent `transcribe_pcm` calls in the same process
+/// cannot collide on `/tmp/geniepod-stt-*.wav`.
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn next_temp_nonce() -> u64 {
+    TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// RAII guard that deletes a temp file on drop. Ensures cleanup runs on
+/// every exit path — `?`-propagated errors and panic-unwinds included.
+struct TempFile(String);
+
+impl TempFile {
+    fn new(path: String) -> Self {
+        Self(path)
+    }
+    fn path(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 /// "Speech end" marker for the #19 latency banner: stamped inside
 /// `record_audio` the moment arecord returns, before DFN/sox preprocessing
@@ -167,11 +196,11 @@ impl SttEngine {
     /// Transcribe raw PCM audio bytes (16kHz, 16-bit, mono).
     /// Writes to a temp WAV file, then transcribes.
     pub async fn transcribe_pcm(&self, pcm_data: &[u8], sample_rate: u32) -> Result<Transcript> {
-        let tmp_path = format!("/tmp/geniepod-stt-{}.wav", std::process::id());
-        write_wav(&tmp_path, pcm_data, sample_rate).await?;
-        let result = self.transcribe_file(&tmp_path).await;
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        result
+        let pid = std::process::id();
+        let nonce = next_temp_nonce();
+        let tmp = TempFile::new(format!("/tmp/geniepod-stt-{pid}-{nonce}.wav"));
+        write_wav(tmp.path(), pcm_data, sample_rate).await?;
+        self.transcribe_file(tmp.path()).await
     }
 
     async fn transcribe_via_server(&self, port: u16, wav_path: &str) -> Result<Transcript> {
@@ -901,6 +930,48 @@ mod tests {
         let engine = SttEngine::cli("/opt/geniepod/models/whisper-small.bin");
         assert_eq!(engine.model_path, "/opt/geniepod/models/whisper-small.bin");
         assert_eq!(engine.language_hint, None);
+    }
+
+    // Regression: prior to the per-call nonce, `transcribe_pcm` named its
+    // temp WAV by PID only, so concurrent calls in the same process collided
+    // on `/tmp/geniepod-stt-<pid>.wav` and the later writer would corrupt
+    // the earlier reader's input. The path now embeds an atomic nonce; this
+    // test asserts the nonce actually varies across concurrent calls.
+    #[tokio::test]
+    async fn transcribe_pcm_temp_paths_are_unique_under_concurrency() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        let pid = std::process::id();
+        let observed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let observed = observed.clone();
+            handles.push(tokio::spawn(async move {
+                let nonce = next_temp_nonce();
+                let path = format!("/tmp/geniepod-stt-{pid}-{nonce}.wav");
+                observed.lock().unwrap().insert(path);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(observed.lock().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn temp_file_guard_removes_on_drop() {
+        let pid = std::process::id();
+        let nonce = next_temp_nonce();
+        let path = format!("/tmp/geniepod-stt-droptest-{pid}-{nonce}.wav");
+        tokio::fs::write(&path, b"x").await.unwrap();
+        {
+            let _guard = TempFile::new(path.clone());
+            assert!(tokio::fs::metadata(&path).await.is_ok());
+        }
+        assert!(tokio::fs::metadata(&path).await.is_err());
     }
 
     #[test]

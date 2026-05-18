@@ -52,6 +52,7 @@ pub mod prompt;
 pub mod reasoning;
 pub mod repl;
 pub mod runtime_contract;
+pub mod runtime_mode;
 pub mod security;
 pub mod server;
 pub mod skills;

@@ -13,8 +13,11 @@
 #                                it does NOT rewrite llm_model_path in
 #                                /etc/geniepod/geniepod.toml — flip that
 #                                line by hand once the new model is on disk.
-#   --runtime genie-ai-runtime   Build + install genie-ai-runtime v1.0.0
+#   --runtime genie-ai-runtime   Download + install genie-ai-runtime v1.0.0
 #                                alongside the existing llama.cpp backend.
+#                                Normal setup already installs this when
+#                                [services.llm].backend is genie_ai_runtime;
+#                                this flag is for explicit reinstall/repair.
 #                                Does NOT modify /etc/geniepod/geniepod.toml
 #                                and does NOT stop any running service —
 #                                operator does the cutover by hand per the
@@ -87,95 +90,130 @@ done
 
 # ── --runtime mode: install an alternate LLM backend only ───────
 install_genie_ai_runtime() {
-    local build_dir="$GENIEPOD_DIR/src/genie-ai-runtime"
-    local repo_url="https://github.com/GeniePod/genie-ai-runtime.git"
+    local install_mode="${1:-manual}"
     local tag="v1.0.0"
+    local platform="aarch64-unknown-linux-gnu"
+    local base_url="https://github.com/GeniePod/genie-ai-runtime/releases/download/$tag"
+    local tmp_dir
+    local checksum_file
+    local bin
+    local asset
+    local asset_path
+    local checksum_path
 
     echo "=== GeniePod: install genie-ai-runtime $tag ==="
     echo ""
 
     # 1. Verify prerequisites.
-    echo "[1/4] Checking build prerequisites..."
-    for pkg in cmake g++; do
-        if ! command -v "$pkg" > /dev/null 2>&1; then
-            echo "  Installing $pkg via apt..."
-            sudo apt-get update -qq
-            sudo apt-get install -y "$pkg"
-        fi
-        echo "  OK: $pkg ($("$pkg" --version 2>/dev/null | head -1))"
-    done
-    if ! command -v nvcc > /dev/null 2>&1 && [ ! -d /usr/local/cuda/include ]; then
-        echo "  WARN: CUDA toolkit not detected — JetPack normally ships it."
-        echo "        If the build fails on missing cuBLAS / cuda_runtime.h, install:"
-        echo "          sudo apt-get install -y nvidia-cuda-toolkit"
+    echo "[1/3] Checking download prerequisites..."
+    if ! command -v wget > /dev/null 2>&1; then
+        echo "  Installing wget via apt..."
+        sudo apt-get update -qq
+        sudo apt-get install -y wget
+    fi
+    if ! command -v sha256sum > /dev/null 2>&1; then
+        echo "  Installing coreutils via apt..."
+        sudo apt-get update -qq
+        sudo apt-get install -y coreutils
+    fi
+    echo "  OK: wget ($(wget --version 2>/dev/null | head -1))"
+    echo "  OK: sha256sum ($(sha256sum --version 2>/dev/null | head -1))"
+
+    # 2. Download and verify the pinned release assets.
+    echo "[2/3] Downloading prebuilt runtime assets..."
+    tmp_dir="$(mktemp -d /tmp/genie-ai-runtime.XXXXXX)"
+    checksum_file="$tmp_dir/SHA256SUMS"
+    if ! wget -q --show-progress -O "$checksum_file" "$base_url/SHA256SUMS"; then
+        rm -rf "$tmp_dir"
+        echo "  ERROR: failed to download $base_url/SHA256SUMS" >&2
+        echo "         Upload v1.0.0 release assets before running setup:" >&2
+        echo "           SHA256SUMS" >&2
+        echo "           jetson-llm-v1.0.0-aarch64-unknown-linux-gnu" >&2
+        echo "           jetson-llm-server-v1.0.0-aarch64-unknown-linux-gnu" >&2
+        exit 1
     fi
 
-    # 2. Clone the pinned release.
-    echo "[2/4] Fetching $repo_url @ $tag ..."
-    sudo mkdir -p "$(dirname "$build_dir")"
-    sudo chown -R "$(whoami):$(whoami)" "$(dirname "$build_dir")"
-    if [ -d "$build_dir/.git" ]; then
-        echo "  Existing checkout found — fetching $tag and resetting."
-        git -C "$build_dir" fetch --tags --depth 1 origin "$tag"
-        git -C "$build_dir" checkout --quiet "tags/$tag"
-        git -C "$build_dir" clean -fdx
-    else
-        rm -rf "$build_dir"
-        git clone --branch "$tag" --depth 1 "$repo_url" "$build_dir"
-    fi
-
-    # 3. Build (10-20 min on Orin Nano).
-    echo "[3/4] Building (Release, $(nproc) jobs — this takes 10-20 min on Orin Nano)..."
-    cd "$build_dir"
-    cmake -B build -DCMAKE_BUILD_TYPE=Release
-    cmake --build build -j"$(nproc)"
-
-    # 4. Install binaries. Refuse to overwrite if something looks wrong.
-    echo "[4/4] Installing binaries to $GENIEPOD_DIR/bin/ ..."
     for bin in jetson-llm-server jetson-llm; do
-        if [ ! -f "build/$bin" ]; then
-            echo "  ERROR: build/$bin not produced — build output unexpected." >&2
+        asset="$bin-$tag-$platform"
+        asset_path="$tmp_dir/$asset"
+        checksum_path="$tmp_dir/$asset.sha256"
+        if ! wget -q --show-progress -O "$asset_path" "$base_url/$asset"; then
+            rm -rf "$tmp_dir"
+            echo "  ERROR: failed to download $base_url/$asset" >&2
             exit 1
         fi
-        sudo install -Dm755 "build/$bin" "$GENIEPOD_DIR/bin/$bin"
+        if ! awk -v name="$asset" '$2 == name || $2 == "*" name { print; found = 1 } END { exit found ? 0 : 1 }' "$checksum_file" > "$checksum_path"; then
+            rm -rf "$tmp_dir"
+            echo "  ERROR: SHA256SUMS does not contain an entry for $asset" >&2
+            exit 1
+        fi
+        if ! (cd "$tmp_dir" && sha256sum -c "$(basename "$checksum_path")"); then
+            rm -rf "$tmp_dir"
+            echo "  ERROR: checksum verification failed for $asset" >&2
+            exit 1
+        fi
+        if command -v file > /dev/null 2>&1 && ! file "$asset_path" | grep -q "ELF.*aarch64"; then
+            rm -rf "$tmp_dir"
+            echo "  ERROR: $asset is not an aarch64 ELF binary" >&2
+            exit 1
+        fi
+    done
+
+    # 3. Install binaries. Refuse to overwrite if something looks wrong.
+    echo "[3/3] Installing binaries to $GENIEPOD_DIR/bin/ ..."
+    for bin in jetson-llm-server jetson-llm; do
+        asset="$bin-$tag-$platform"
+        asset_path="$tmp_dir/$asset"
+        if [ ! -f "$asset_path" ]; then
+            rm -rf "$tmp_dir"
+            echo "  ERROR: downloaded asset missing: $asset" >&2
+            exit 1
+        fi
+        sudo install -Dm755 "$asset_path" "$GENIEPOD_DIR/bin/$bin"
         echo "  OK: $bin ($(du -h "$GENIEPOD_DIR/bin/$bin" | cut -f1))"
     done
+    rm -rf "$tmp_dir"
 
     echo ""
     echo "=== genie-ai-runtime $tag installed ==="
     echo ""
-    echo "NOTE: jetson-llm-server installed but not yet selected as the LLM backend."
-    echo "      Your existing llama.cpp setup is unchanged."
-    echo ""
-    echo "To run genie-ai-runtime instead of llama.cpp:"
-    echo "  1. Stop the current llama.cpp backend:"
-    echo "       sudo systemctl stop genie-llm"
-    echo "  2. Edit /etc/geniepod/geniepod.toml:"
-    echo "       [services.llm]"
-    echo "       backend      = \"genie_ai_runtime\""
-    echo "       systemd_unit = \"genie-ai-runtime.service\""
-    echo "  3. Start the new backend:"
-    echo "       sudo systemctl daemon-reload"
-    echo "       sudo systemctl enable --now genie-ai-runtime.service"
-    echo "       sudo systemctl enable --now genie-ai-runtime-warmup.service"
-    echo "  4. Restart genie-core to pick up the config change:"
-    echo "       sudo systemctl restart genie-core"
-    echo ""
-    echo "To roll back to llama.cpp:"
-    echo "  1. sudo systemctl stop genie-ai-runtime genie-ai-runtime-warmup"
-    echo "  2. Edit /etc/geniepod/geniepod.toml:"
-    echo "       [services.llm]"
-    echo "       backend      = \"llama_cpp\""
-    echo "       systemd_unit = \"genie-llm.service\""
-    echo "  3. sudo systemctl start genie-llm"
-    echo "  4. sudo systemctl restart genie-core"
-    echo ""
-    echo "Verify:"
-    echo "  genie-ctl status            # should report llm_backend"
-    echo "  systemctl status genie-ai-runtime.service"
+    if [ "$install_mode" = "auto" ]; then
+        echo "NOTE: jetson-llm-server installed. Continuing setup will select"
+        echo "      genie-ai-runtime and enable its systemd units."
+    else
+        echo "NOTE: jetson-llm-server installed but not yet selected as the LLM backend."
+        echo "      Your existing llama.cpp setup is unchanged."
+        echo ""
+        echo "To run genie-ai-runtime instead of llama.cpp:"
+        echo "  1. Stop the current llama.cpp backend:"
+        echo "       sudo systemctl stop genie-llm"
+        echo "  2. Edit /etc/geniepod/geniepod.toml:"
+        echo "       [services.llm]"
+        echo "       backend      = \"genie_ai_runtime\""
+        echo "       systemd_unit = \"genie-ai-runtime.service\""
+        echo "  3. Start the new backend:"
+        echo "       sudo systemctl daemon-reload"
+        echo "       sudo systemctl enable --now genie-ai-runtime.service"
+        echo "       sudo systemctl enable --now genie-ai-runtime-warmup.service"
+        echo "  4. Restart genie-core to pick up the config change:"
+        echo "       sudo systemctl restart genie-core"
+        echo ""
+        echo "To roll back to llama.cpp:"
+        echo "  1. sudo systemctl stop genie-ai-runtime genie-ai-runtime-warmup"
+        echo "  2. Edit /etc/geniepod/geniepod.toml:"
+        echo "       [services.llm]"
+        echo "       backend      = \"llama_cpp\""
+        echo "       systemd_unit = \"genie-llm.service\""
+        echo "  3. sudo systemctl start genie-llm"
+        echo "  4. sudo systemctl restart genie-core"
+        echo ""
+        echo "Verify:"
+        echo "  genie-ctl status            # should report llm_backend"
+        echo "  systemctl status genie-ai-runtime.service"
+    fi
 }
 
-# --runtime is install-only: do the build/install and exit before the
+# --runtime is install-only: do the download/install and exit before the
 # rest of the Jetson setup runs. Validation happens here so an unknown
 # value fails fast, before we resolve any model paths.
 if [ -n "$RUNTIME_TO_INSTALL" ]; then
@@ -326,22 +364,133 @@ if [ -n "$MODEL_CHOICE" ] && [ "$MODEL_CHOICE" != "qwen3-4b" ]; then
     fi
 fi
 
-# 5. Check LLM runtimes.
+# 5. Check LLM runtimes and resolve the *effective* backend.
+#
+# The configured default in geniepod.toml is genie_ai_runtime (issue #52 / PR
+# #55). On a fresh deploy, install that default backend automatically when its
+# binary (`jetson-llm-server`) isn't on disk yet.
+#
+# Resolution policy:
+#   - configured backend's binary present → use that backend.
+#   - configured = genie_ai_runtime, binary missing
+#       → build/install genie-ai-runtime, keep the default backend selected,
+#         and patch geniepod.toml so runtime, systemd, and operator output agree.
+#   - configured = llama_cpp, binary missing, jetson-llm-server present
+#       → symmetric auto-fallback to genie_ai_runtime.
+#   - neither binary present → don't enable any LLM unit in [6/6]; print
+#     a remediation block and let the rest of setup continue (whisper/
+#     piper still install cleanly, operator fixes LLM and re-runs).
 echo "[5/6] Checking LLM runtimes..."
-if [ -f "$GENIEPOD_DIR/bin/jetson-llm-server" ]; then
+
+HAVE_JETSON_LLM=false
+[ -f "$GENIEPOD_DIR/bin/jetson-llm-server" ] && HAVE_JETSON_LLM=true
+HAVE_LLAMA=false
+[ -f "$GENIEPOD_DIR/bin/llama-server" ] && HAVE_LLAMA=true
+
+if [ "$HAVE_JETSON_LLM" = "true" ]; then
     echo "  OK: jetson-llm-server"
 else
-    echo "  NOT FOUND: jetson-llm-server"
-    echo "    Default backend (genie-ai-runtime) requires it. Install via:"
-    echo "      bash $0 --runtime genie-ai-runtime"
-    echo "    Or set [services.llm].backend = \"llama_cpp\" in geniepod.toml"
-    echo "    to use the legacy llama.cpp path instead."
+    echo "  NOT FOUND: jetson-llm-server (default backend binary)"
 fi
-
-if [ -f "$GENIEPOD_DIR/bin/llama-server" ]; then
+if [ "$HAVE_LLAMA" = "true" ]; then
     echo "  OK: llama-server (legacy fallback backend)"
 else
-    echo "  NOT FOUND: llama-server (optional fallback)"
+    echo "  NOT FOUND: llama-server (legacy fallback backend)"
+fi
+
+CONFIGURED_BACKEND="$(sudo awk -F'"' '/^backend = / {print $2; exit}' "$CONFIG_DIR/geniepod.toml" 2>/dev/null || true)"
+[ -z "$CONFIGURED_BACKEND" ] && CONFIGURED_BACKEND="genie_ai_runtime"
+# Normalize the hyphenated alias documented next to backend = in the toml.
+case "$CONFIGURED_BACKEND" in
+    llama-cpp)         CONFIGURED_BACKEND="llama_cpp" ;;
+    genie-ai-runtime)  CONFIGURED_BACKEND="genie_ai_runtime" ;;
+esac
+
+EFFECTIVE_BACKEND="$CONFIGURED_BACKEND"
+SKIP_LLM_UNITS=false
+
+patch_services_llm_backend() {
+    # Rewrite the [services.llm] section's `backend = ...` and
+    # `systemd_unit = ...` values to the requested target, in place,
+    # without touching surrounding comments or other sections. awk is
+    # used instead of sed so that "systemd_unit =" in [services.core]
+    # right above can't be hit by accident.
+    local new_backend="$1"
+    local new_unit="$2"
+    local cfg="$CONFIG_DIR/geniepod.toml"
+    local tmp
+    if ! tmp="$(sudo mktemp /tmp/geniepod.toml.XXXXXX)"; then
+        echo "  ERROR: failed to create temp file for patching $cfg" >&2
+        return 1
+    fi
+    if ! sudo awk -v nb="$new_backend" -v nu="$new_unit" '
+        BEGIN { in_llm = 0 }
+        /^\[services\.llm\]/   { in_llm = 1; print; next }
+        /^\[/ && !/^\[services\.llm\]/ { in_llm = 0 }
+        in_llm && /^backend = "[^"]*"/ {
+            sub(/^backend = "[^"]*"/, "backend = \"" nb "\"")
+            print
+            next
+        }
+        in_llm && /^systemd_unit = "[^"]*"/ {
+            sub(/^systemd_unit = "[^"]*"/, "systemd_unit = \"" nu "\"")
+            print
+            next
+        }
+        { print }
+    ' "$cfg" | sudo tee "$tmp" > /dev/null; then
+        echo "  ERROR: failed to rewrite $cfg for patching" >&2
+        sudo rm -f "$tmp"
+        return 1
+    fi
+    if ! sudo install -m 600 "$tmp" "$cfg"; then
+        echo "  ERROR: failed to install patched $cfg" >&2
+        sudo rm -f "$tmp"
+        return 1
+    fi
+    sudo rm -f "$tmp"
+}
+
+if [ "$CONFIGURED_BACKEND" = "genie_ai_runtime" ] && [ "$HAVE_JETSON_LLM" = "false" ]; then
+    EFFECTIVE_BACKEND="genie_ai_runtime"
+    echo ""
+    echo "  NOTE: configured backend (genie_ai_runtime) is not installed."
+    echo "        Installing genie-ai-runtime now; this is the default backend."
+    echo "        This build can take 10-20 minutes on Jetson Orin Nano."
+    install_genie_ai_runtime auto
+    HAVE_JETSON_LLM=true
+    echo "  OK: jetson-llm-server (installed)"
+    echo "        Patching $CONFIG_DIR/geniepod.toml:"
+    echo "            backend      = \"genie_ai_runtime\""
+    echo "            systemd_unit = \"genie-ai-runtime.service\""
+    if ! patch_services_llm_backend "genie_ai_runtime" "genie-ai-runtime.service"; then
+        echo "  ERROR: default runtime install succeeded but $CONFIG_DIR/geniepod.toml could not be patched; aborting setup." >&2
+        exit 1
+    fi
+elif [ "$CONFIGURED_BACKEND" = "llama_cpp" ] && [ "$HAVE_LLAMA" = "false" ]; then
+    if [ "$HAVE_JETSON_LLM" = "true" ]; then
+        EFFECTIVE_BACKEND="genie_ai_runtime"
+        echo ""
+        echo "  NOTE: configured backend (llama_cpp) is not installed."
+        echo "        Auto-falling back to genie_ai_runtime so this box leaves"
+        echo "        setup in a working state (issue #60)."
+        echo "        Patching $CONFIG_DIR/geniepod.toml:"
+        echo "            backend      = \"genie_ai_runtime\""
+        echo "            systemd_unit = \"genie-ai-runtime.service\""
+        if ! patch_services_llm_backend "genie_ai_runtime" "genie-ai-runtime.service"; then
+            echo "  ERROR: auto-fallback could not patch $CONFIG_DIR/geniepod.toml; aborting setup." >&2
+            exit 1
+        fi
+    else
+        echo ""
+        echo "  ERROR: configured backend (llama_cpp) is not installed and no"
+        echo "         genie-ai-runtime fallback is available either."
+        echo "         Step [6/6] will NOT enable any LLM systemd unit."
+        echo "         Install llama.cpp's llama-server to $GENIEPOD_DIR/bin/"
+        echo "         OR run: bash $0 --runtime genie-ai-runtime"
+        echo "         then re-run this script."
+        SKIP_LLM_UNITS=true
+    fi
 fi
 
 if command -v docker > /dev/null 2>&1 && docker compose version > /dev/null 2>&1; then
@@ -542,12 +691,15 @@ fi
 
 # Enable core services. genie-audio runs the I2S/AHUB route setup at boot
 # (no-op if /opt/geniepod/bin/genie-audio-init is missing, see ConditionPathExists).
-LLM_BACKEND="$(awk -F'"' '/^backend = / {print $2; exit}' "$CONFIG_DIR/geniepod.toml" 2>/dev/null || true)"
-if [ -z "$LLM_BACKEND" ]; then
-    LLM_BACKEND="genie_ai_runtime"
-fi
-
-if [ "$LLM_BACKEND" = "llama_cpp" ] || [ "$LLM_BACKEND" = "llama-cpp" ]; then
+#
+# LLM service selection consumes the EFFECTIVE_BACKEND resolved in step [5/6]
+# above. That variable already accounts for installing or falling back between
+# supported backends, so reading geniepod.toml again here would re-introduce
+# stale-config bugs.
+if [ "$SKIP_LLM_UNITS" = "true" ]; then
+    echo "  Skipping LLM units — no backend binary is installed (see step [5/6])."
+    LLM_SERVICES=""
+elif [ "$EFFECTIVE_BACKEND" = "llama_cpp" ]; then
     LLM_SERVICES="genie-llm genie-llm-warmup"
 else
     LLM_SERVICES="genie-ai-runtime genie-ai-runtime-warmup"
@@ -570,8 +722,14 @@ fi
 echo ""
 echo "=== Setup complete ==="
 echo ""
-echo "Start services:"
-if [ "$LLM_BACKEND" = "llama_cpp" ] || [ "$LLM_BACKEND" = "llama-cpp" ]; then
+echo "Start/stop services:"
+echo "  /opt/geniepod/bin/start_all.sh"
+echo "  /opt/geniepod/bin/stop_all.sh"
+echo ""
+echo "Manual start:"
+if [ "$SKIP_LLM_UNITS" = "true" ]; then
+    echo "  (skip the LLM start line — no backend is installed yet; see step [5/6])"
+elif [ "$EFFECTIVE_BACKEND" = "llama_cpp" ]; then
     echo "  sudo systemctl start genie-llm    # LLM server (wait ~10s for model load)"
 else
     echo "  sudo systemctl start genie-ai-runtime    # LLM server (wait ~10s for model load)"
@@ -581,12 +739,12 @@ echo "  sudo systemctl start genie-api    # System dashboard on :3080"
 echo "  sudo systemctl start genie-governor"
 echo "  sudo systemctl start genie-health"
 echo ""
-echo "Or start all at once:"
-echo "  sudo systemctl start geniepod.target"
-echo ""
 echo "Check status:"
 echo "  genie-ctl status"
 echo "  genie-ctl health"
+echo ""
+echo "Check model weight cache:"
+echo "  /opt/geniepod/bin/genie-model-cache-status.sh"
 echo ""
 echo "After future updates:"
 echo "  /opt/geniepod/bin/genie-restart-all.sh"

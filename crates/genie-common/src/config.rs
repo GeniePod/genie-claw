@@ -474,6 +474,22 @@ pub struct TelegramVoiceConfig {
     /// 16 kHz mono WAV that Whisper consumes.
     #[serde(default = "defaults::telegram_voice_ffmpeg_path")]
     pub ffmpeg_path: PathBuf,
+
+    /// Reply to incoming voice messages with a synthesized voice message
+    /// instead of (or in addition to) text. Phase 2 of issue #42: Piper
+    /// synthesizes WAV, ffmpeg encodes it as OGG/Opus, the bot uploads via
+    /// the Telegram `sendVoice` endpoint. Falls back to text on any failure
+    /// (Piper missing, ffmpeg missing, sendVoice error, etc.) so no reply is
+    /// ever silently dropped.
+    #[serde(default)]
+    pub reply_as_voice: bool,
+
+    /// Hard cap on the assistant text fed to Piper. Long-form responses
+    /// produce long voice messages that hit Telegram's 1 MB sendVoice limit;
+    /// when the text is over this length the bot falls back to text reply.
+    /// Tuned for the 60–90 s of OGG/Opus that comfortably fits under 1 MB.
+    #[serde(default = "defaults::telegram_voice_max_reply_chars")]
+    pub max_reply_chars: usize,
 }
 
 impl Default for TelegramVoiceConfig {
@@ -483,6 +499,8 @@ impl Default for TelegramVoiceConfig {
             max_voice_duration_secs: defaults::telegram_voice_max_duration_secs(),
             delete_temp_audio: defaults::telegram_voice_delete_temp_audio(),
             ffmpeg_path: defaults::telegram_voice_ffmpeg_path(),
+            reply_as_voice: false,
+            max_reply_chars: defaults::telegram_voice_max_reply_chars(),
         }
     }
 }
@@ -1472,6 +1490,12 @@ mod defaults {
     }
     pub fn telegram_voice_ffmpeg_path() -> PathBuf {
         PathBuf::from("ffmpeg")
+    }
+    pub fn telegram_voice_max_reply_chars() -> usize {
+        // Roughly the upper bound that comfortably encodes under Telegram's
+        // 1 MB sendVoice limit at Piper's typical OGG/Opus output rate.
+        // Long-form replies fall back to text.
+        800
     }
     pub fn web_search_enabled() -> bool {
         true

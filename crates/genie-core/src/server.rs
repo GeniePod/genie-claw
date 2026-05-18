@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -12,6 +14,24 @@ use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
 use crate::tools::ToolDispatcher;
 use crate::tools::{RequestOrigin, ToolExecutionContext};
+
+const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
+
+struct StaticHtml {
+    body: &'static str,
+}
+
+impl StaticHtml {
+    const fn new(body: &'static str) -> Self {
+        Self { body }
+    }
+
+    fn response(&self) -> (u16, &'static str, String) {
+        (200, HTML_CONTENT_TYPE, self.body.to_owned())
+    }
+}
+
+const CHAT_UI: StaticHtml = StaticHtml::new(include_str!("chat_ui.html"));
 
 /// HTTP chat server for genie-core.
 ///
@@ -45,6 +65,7 @@ pub struct ChatServer {
     memory: Memory,
     conversations: ConversationStore,
     current_conv_id: Mutex<String>,
+    chat_turn_lock: Mutex<()>,
     system_prompt: String,
     max_history: usize,
     model_family: ModelFamily,
@@ -80,6 +101,7 @@ impl ChatServer {
             memory,
             conversations,
             current_conv_id: Mutex::new(conv_id),
+            chat_turn_lock: Mutex::new(()),
             system_prompt,
             max_history,
             model_family,
@@ -87,11 +109,12 @@ impl ChatServer {
         })
     }
 
-    /// Serve HTTP requests sequentially.
+    /// Serve HTTP requests on the current-thread runtime.
     ///
-    /// Single-threaded by design: home appliance with <10 concurrent users.
-    /// LLM calls are the bottleneck (seconds), not HTTP handling (microseconds).
-    pub async fn serve(&self, bind_host: &str, port: u16) -> Result<()> {
+    /// Requests are accepted concurrently on one OS thread so health/dashboard
+    /// probes stay responsive while a chat turn is waiting on the local LLM.
+    /// Chat turns themselves are still serialized with `chat_turn_lock`.
+    pub async fn serve(self, bind_host: &str, port: u16) -> Result<()> {
         let bind_host = bind_host.trim();
         let bind_host = if bind_host.is_empty() {
             "127.0.0.1"
@@ -108,12 +131,95 @@ impl ChatServer {
         let listener = TcpListener::bind(&addr).await?;
         tracing::info!(addr = %addr, "genie-core HTTP server listening");
 
-        loop {
-            let (stream, _) = listener.accept().await?;
-            if let Err(e) = handle_request(stream, self).await {
-                tracing::debug!(error = %e, "request error");
-            }
+        let ctx = Rc::new(self);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                loop {
+                    let (stream, _) = listener.accept().await?;
+                    let request_ctx = Rc::clone(&ctx);
+                    tokio::task::spawn_local(async move {
+                        if let Err(e) = handle_request(stream, request_ctx.as_ref()).await {
+                            tracing::debug!(error = %e, "request error");
+                        }
+                    });
+                }
+                #[allow(unreachable_code)]
+                Ok(())
+            })
+            .await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestRoute<'a> {
+    Root,
+    ChatStream,
+    Chat,
+    History,
+    Clear,
+    Conversations,
+    Tools,
+    RuntimeContract,
+    WebSearchStatus,
+    WebSearchPost,
+    Health,
+    Connectivity,
+    ActuationPending,
+    ActuationActions,
+    ActuationConfirm,
+    MemoriesList,
+    MemoriesUpdate,
+    MemoriesDelete,
+    MemoriesReorder,
+    OpenAiChat,
+    Models,
+    Options,
+    Export(&'a str),
+    NotFound,
+}
+
+fn classify_route<'a>(method: &str, path: &'a str) -> RequestRoute<'a> {
+    match (method, path) {
+        ("GET", "/" | "/index.html") => RequestRoute::Root,
+        ("POST", "/api/chat/stream") => RequestRoute::ChatStream,
+        ("POST", "/api/chat") => RequestRoute::Chat,
+        ("GET", "/api/chat/history") => RequestRoute::History,
+        ("POST", "/api/chat/clear") => RequestRoute::Clear,
+        ("GET", "/api/conversations") => RequestRoute::Conversations,
+        ("GET", "/api/tools") => RequestRoute::Tools,
+        ("GET", "/api/runtime/contract") => RequestRoute::RuntimeContract,
+        ("GET", "/api/web-search") => RequestRoute::WebSearchStatus,
+        ("POST", "/api/web-search") => RequestRoute::WebSearchPost,
+        ("GET", "/api/health") => RequestRoute::Health,
+        ("GET", "/api/connectivity") => RequestRoute::Connectivity,
+        ("GET", "/api/actuation/pending") => RequestRoute::ActuationPending,
+        ("GET", "/api/actuation/actions") => RequestRoute::ActuationActions,
+        ("POST", "/api/actuation/confirm") => RequestRoute::ActuationConfirm,
+        ("GET", "/api/memories") => RequestRoute::MemoriesList,
+        ("POST", "/api/memories/update") => RequestRoute::MemoriesUpdate,
+        ("POST", "/api/memories/delete") => RequestRoute::MemoriesDelete,
+        ("POST", "/api/memories/reorder") => RequestRoute::MemoriesReorder,
+        ("POST", "/v1/chat/completions") => RequestRoute::OpenAiChat,
+        ("GET", "/v1/models") => RequestRoute::Models,
+        ("OPTIONS", _) => RequestRoute::Options,
+        ("GET", path) if path.starts_with("/api/chat/export") => {
+            RequestRoute::Export(path.split("id=").nth(1).unwrap_or(""))
         }
+        _ => RequestRoute::NotFound,
+    }
+}
+
+async fn with_chat_turn_lock<T>(lock: &Mutex<()>, fut: impl std::future::Future<Output = T>) -> T {
+    let _guard = lock.lock().await;
+    fut.await
+}
+
+fn normalized_origin(request_origin: RequestOrigin) -> RequestOrigin {
+    if matches!(request_origin, RequestOrigin::Unknown) {
+        RequestOrigin::Api
+    } else {
+        request_origin
     }
 }
 
@@ -125,6 +231,7 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
     let connectivity = ctx.connectivity.as_ref();
     let conversations = &ctx.conversations;
     let current_conv_id = &ctx.current_conv_id;
+    let chat_turn_lock = &ctx.chat_turn_lock;
     let system_prompt = &ctx.system_prompt;
     let max_history = ctx.max_history;
     let model_family = ctx.model_family;
@@ -169,7 +276,9 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
     };
 
     // Route.
-    if method == "POST" && path == "/api/chat/stream" {
+    let route = classify_route(method, path);
+    if matches!(route, RequestRoute::ChatStream) {
+        let _guard = chat_turn_lock.lock().await;
         if let Err(e) = handle_chat_stream(
             &mut writer,
             body.as_deref(),
@@ -181,11 +290,7 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
             system_prompt,
             max_history,
             model_family,
-            if matches!(request_origin, RequestOrigin::Unknown) {
-                RequestOrigin::Api
-            } else {
-                request_origin
-            },
+            normalized_origin(request_origin),
         )
         .await
         {
@@ -194,36 +299,31 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
         return Ok(());
     }
 
-    let (status, content_type, response_body) = match (method, path) {
-        ("GET", "/" | "/index.html") => (
-            200,
-            "text/html; charset=utf-8",
-            include_str!("chat_ui.html").into(),
-        ),
-        ("POST", "/api/chat") => {
-            handle_chat(
-                body.as_deref(),
-                llm,
-                tools,
-                memory,
-                conversations,
-                current_conv_id,
-                system_prompt,
-                max_history,
-                model_family,
-                if matches!(request_origin, RequestOrigin::Unknown) {
-                    RequestOrigin::Api
-                } else {
-                    request_origin
-                },
+    let (status, content_type, response_body) = match route {
+        RequestRoute::Root => CHAT_UI.response(),
+        RequestRoute::Chat => {
+            with_chat_turn_lock(
+                chat_turn_lock,
+                handle_chat(
+                    body.as_deref(),
+                    llm,
+                    tools,
+                    memory,
+                    conversations,
+                    current_conv_id,
+                    system_prompt,
+                    max_history,
+                    model_family,
+                    normalized_origin(request_origin),
+                ),
             )
             .await
         }
-        ("GET", "/api/chat/history") => handle_history(conversations, current_conv_id).await,
-        ("POST", "/api/chat/clear") => handle_clear(conversations, current_conv_id).await,
-        ("GET", "/api/conversations") => handle_list_conversations(conversations),
-        ("GET", "/api/tools") => handle_list_tools(tools),
-        ("GET", "/api/runtime/contract") => {
+        RequestRoute::History => handle_history(conversations, current_conv_id).await,
+        RequestRoute::Clear => handle_clear(conversations, current_conv_id).await,
+        RequestRoute::Conversations => handle_list_conversations(conversations),
+        RequestRoute::Tools => handle_list_tools(tools),
+        RequestRoute::RuntimeContract => {
             handle_runtime_contract(
                 tools,
                 connectivity,
@@ -236,9 +336,9 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
             )
             .await
         }
-        ("GET", "/api/web-search") => handle_web_search_status(tools),
-        ("POST", "/api/web-search") => handle_web_search(body.as_deref(), tools).await,
-        ("GET", "/api/health") => {
+        RequestRoute::WebSearchStatus => handle_web_search_status(tools),
+        RequestRoute::WebSearchPost => handle_web_search(body.as_deref(), tools).await,
+        RequestRoute::Health => {
             handle_health(
                 llm,
                 tools,
@@ -252,43 +352,35 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
             )
             .await
         }
-        ("GET", "/api/connectivity") => handle_connectivity(connectivity).await,
-        ("GET", "/api/actuation/pending") => handle_actuation_pending(tools),
-        ("GET", "/api/actuation/actions") => handle_actuation_actions(tools),
-        ("POST", "/api/actuation/confirm") => {
-            handle_actuation_confirm(body.as_deref(), tools).await
-        }
-        ("GET", "/api/memories") => handle_memories_list(memory),
-        ("POST", "/api/memories/update") => handle_memories_update(body.as_deref(), memory),
-        ("POST", "/api/memories/delete") => handle_memories_delete(body.as_deref(), memory),
-        ("POST", "/api/memories/reorder") => handle_memories_reorder(body.as_deref(), memory),
-        ("POST", "/v1/chat/completions") => {
-            handle_openai_chat(
-                body.as_deref(),
-                llm,
-                tools,
-                memory,
-                system_prompt,
-                max_history,
-                model_family,
-                if matches!(request_origin, RequestOrigin::Unknown) {
-                    RequestOrigin::Api
-                } else {
-                    request_origin
-                },
+        RequestRoute::Connectivity => handle_connectivity(connectivity).await,
+        RequestRoute::ActuationPending => handle_actuation_pending(tools),
+        RequestRoute::ActuationActions => handle_actuation_actions(tools),
+        RequestRoute::ActuationConfirm => handle_actuation_confirm(body.as_deref(), tools).await,
+        RequestRoute::MemoriesList => handle_memories_list(memory),
+        RequestRoute::MemoriesUpdate => handle_memories_update(body.as_deref(), memory),
+        RequestRoute::MemoriesDelete => handle_memories_delete(body.as_deref(), memory),
+        RequestRoute::MemoriesReorder => handle_memories_reorder(body.as_deref(), memory),
+        RequestRoute::OpenAiChat => {
+            with_chat_turn_lock(
+                chat_turn_lock,
+                handle_openai_chat(
+                    body.as_deref(),
+                    llm,
+                    tools,
+                    memory,
+                    system_prompt,
+                    max_history,
+                    model_family,
+                    normalized_origin(request_origin),
+                ),
             )
             .await
         }
-        ("GET", "/v1/models") => handle_list_models(),
-        ("OPTIONS", _) => (200, "text/plain", String::new()),
-        _ => {
-            // Check for query params: /api/chat/export?id=X
-            if method == "GET" && path.starts_with("/api/chat/export") {
-                let conv_id = path.split("id=").nth(1).unwrap_or("");
-                handle_export(conversations, conv_id)
-            } else {
-                (404, "application/json", r#"{"error":"not found"}"#.into())
-            }
+        RequestRoute::Models => handle_list_models(),
+        RequestRoute::Options => (200, "text/plain", String::new()),
+        RequestRoute::Export(conv_id) => handle_export(conversations, conv_id),
+        RequestRoute::NotFound | RequestRoute::ChatStream => {
+            (404, "application/json", r#"{"error":"not found"}"#.into())
         }
     };
 

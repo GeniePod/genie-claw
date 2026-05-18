@@ -60,9 +60,26 @@ header button:hover { border-color: var(--accent); color: var(--accent); }
   align-self: flex-start; background: var(--bot-bg);
   border: 1px solid var(--border); border-bottom-left-radius: 4px;
 }
-.msg.bot.streaming:empty::before {
-  content: '...';
+.msg.bot.streaming {
   color: var(--text2);
+  display: flex; align-items: center; gap: .5rem;
+}
+.writing-dots {
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.writing-dots span {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); opacity: .35;
+  animation: writing-pulse 1.2s infinite ease-in-out;
+}
+.writing-dots span:nth-child(2) { animation-delay: .16s; }
+.writing-dots span:nth-child(3) { animation-delay: .32s; }
+@keyframes writing-pulse {
+  0%, 80%, 100% { opacity: .35; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-5px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .writing-dots span { animation: none; opacity: .75; }
 }
 .msg.tool {
   align-self: flex-start; background: var(--tool-bg);
@@ -184,6 +201,12 @@ function addMessage(role, content, toolName) {
 function addStreamingMessage() {
   const div = document.createElement('div');
   div.className = 'msg bot streaming';
+  div.setAttribute('aria-busy', 'true');
+  div.setAttribute('aria-live', 'polite');
+  div.innerHTML = [
+    '<span class="writing-label">Agent writing</span>',
+    '<span class="writing-dots" aria-hidden="true"><span></span><span></span><span></span></span>'
+  ].join('');
   messagesEl.appendChild(div);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   return div;
@@ -191,12 +214,14 @@ function addStreamingMessage() {
 
 function setMessageText(div, content) {
   div.className = 'msg bot';
+  div.removeAttribute('aria-busy');
   div.textContent = content;
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 function setMessageTool(div, toolName, content) {
   div.className = 'msg tool';
+  div.removeAttribute('aria-busy');
   div.innerHTML = `<div class="label">Tool: <span class="tool-name">${esc(toolName)}</span></div>${esc(content)}`;
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }

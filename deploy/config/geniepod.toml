@@ -182,11 +182,17 @@ alert_webhook_url = ""            # Optional local notifier endpoint.
 # Voice-message ingestion (issue #42). Reuses the configured whisper-server
 # (core.whisper_port > 0) or whisper-cli; needs `ffmpeg` on $PATH for the
 # OGG/Opus → 16 kHz mono WAV transcode.
+# Phase 2 (reply_as_voice) reuses `core.piper_path` + `core.piper_model`
+# to synthesize the reply, then ffmpeg encodes WAV → OGG/Opus and the bot
+# uploads via Telegram `sendVoice`. Falls back to text on any failure.
 # [telegram.voice]
 # enabled = false                  # Off by default — opt-in.
 # max_voice_duration_secs = 60     # Hard limit; longer messages are rejected.
 # delete_temp_audio = true         # Remove /tmp/geniepod-tg-voice-*.{ogg,wav} after handling.
 # ffmpeg_path = "ffmpeg"           # Override if ffmpeg isn't on PATH.
+# reply_as_voice = false           # Phase 2 of #42 — voice-out via sendVoice.
+# max_reply_chars = 800            # Replies longer than this fall back to text
+#                                  # so we don't blow the sendVoice 1 MB cap.
 
 # Public web search tool. Default provider is DuckDuckGo Instant Answer, which needs no API key.
 # For a private/local path, run SearXNG and set provider = "searxng" with base_url.

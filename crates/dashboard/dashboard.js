@@ -136,6 +136,20 @@ async function pollTegrastats() {
   }
 }
 
+function serviceStatus(s) {
+  if (s.healthy) return { label: 'Healthy', color: 'var(--green)', dot: 'dot-up' };
+  if (s.load_state === 'not-found') return { label: 'Missing', color: 'var(--text2)', dot: 'dot-unknown' };
+  if (s.active_state === 'failed') return { label: 'Failed', color: 'var(--red)', dot: 'dot-down' };
+  if (s.active_state && s.active_state !== 'active') {
+    return {
+      label: s.sub_state || s.active_state,
+      color: 'var(--yellow)',
+      dot: 'dot-unknown',
+    };
+  }
+  return { label: s.error || 'Unknown', color: 'var(--red)', dot: 'dot-down' };
+}
+
 async function pollServices() {
   const data = await fetchJson('/api/services');
   const tbody = document.getElementById('services-body');
@@ -147,13 +161,13 @@ async function pollServices() {
   }
 
   tbody.innerHTML = data.map(s => {
-    const dotClass = s.healthy ? 'dot-up' : 'dot-down';
-    const status = s.healthy ? 'Healthy' : (s.error || 'Down');
-    const statusColor = s.healthy ? 'var(--green)' : 'var(--red)';
+    const status = serviceStatus(s);
+    const latency = s.response_ms == null ? '--' : `${s.response_ms}ms`;
+    const detail = s.unit ? `<div class="small">${escapeHtml(s.unit)}</div>` : '';
     return `<tr>
-      <td><span class="dot ${dotClass}"></span>${s.service}</td>
-      <td style="color:${statusColor}">${status}</td>
-      <td>${s.response_ms}ms</td>
+      <td><span class="dot ${status.dot}"></span>${escapeHtml(s.service)}${detail}</td>
+      <td style="color:${status.color}">${escapeHtml(status.label)}</td>
+      <td>${latency}</td>
     </tr>`;
   }).join('');
 }

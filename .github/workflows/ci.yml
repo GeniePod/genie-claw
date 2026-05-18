@@ -64,3 +64,36 @@ jobs:
         run: cargo test --workspace --locked --all-targets
       - name: cargo test --doc
         run: cargo test --workspace --locked --doc
+
+  # Chat-only build axis (issue #59 / closes acceptance criterion #8 from
+  # #41 + #57). Guards `cargo {clippy,test} --no-default-features` on
+  # genie-core + genie-ctl so the voice-gated cfgs (and the latent
+  # telegram-gated cleanups from #57) don't silently bit-rot on the
+  # macOS / Windows / chat-bot deployment path. Scoped to the two crates
+  # that declare a `voice` feature; running --workspace would just
+  # duplicate the existing --workspace job. Distinct rust-cache shared-key
+  # because the feature-set produces a different target/ graph than the
+  # default --workspace axis.
+  no-default-features:
+    name: cargo clippy + test (--no-default-features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-nodefault
+      - name: cargo clippy --no-default-features
+        run: |
+          cargo clippy \
+            -p genie-core -p genie-ctl \
+            --no-default-features --all-targets --locked \
+            -- -D warnings
+      - name: cargo test --no-default-features
+        run: |
+          cargo test \
+            -p genie-core -p genie-ctl \
+            --no-default-features --all-targets --locked

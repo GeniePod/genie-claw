@@ -21,9 +21,10 @@ pub struct TelegramRuntimeConfig {
 /// Voice-message ingestion settings for the Telegram channel (issue #42).
 ///
 /// The Telegram adapter stays out of process boundaries with `voice/*`
-/// modules — it speaks to Whisper directly via the same HTTP server or
-/// `whisper-cli` subprocess the on-device voice loop uses, so a chat-only
-/// deployment without ALSA still gets voice-in.
+/// modules — it speaks to Whisper / Piper directly via subprocess + HTTP,
+/// the same way the on-device voice loop drives them, so a chat-only
+/// deployment without ALSA still gets voice-in (phase 1) and voice-out
+/// (phase 2).
 #[derive(Debug, Clone)]
 pub struct TelegramVoiceRuntimeConfig {
     pub enabled: bool,
@@ -34,6 +35,11 @@ pub struct TelegramVoiceRuntimeConfig {
     pub whisper_cli_path: PathBuf,
     pub whisper_model: PathBuf,
     pub stt_language: String,
+    // Phase 2 (issue #42): voice reply via Piper → ffmpeg → sendVoice.
+    pub reply_as_voice: bool,
+    pub max_reply_chars: usize,
+    pub piper_path: PathBuf,
+    pub piper_model: PathBuf,
 }
 
 pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
@@ -289,7 +295,176 @@ impl TelegramApi {
         );
 
         let core_response = self.chat_core(chat_id, &transcript).await?;
-        self.send_text(chat_id, &core_response).await?;
+        self.send_reply(chat_id, &core_response).await?;
+        Ok(())
+    }
+
+    /// Phase 2 of issue #42: route an assistant reply through the
+    /// voice-out path when `reply_as_voice = true` and the conditions
+    /// are met. Falls back to plain `send_text` on any failure so the
+    /// user is never left without a reply.
+    async fn send_reply(&self, chat_id: i64, text: &str) -> Result<()> {
+        let voice_cfg = &self.config.voice;
+
+        match voice_reply_gate(text, voice_cfg.reply_as_voice, voice_cfg.max_reply_chars) {
+            VoiceReplyGate::Text => return self.send_text(chat_id, text).await,
+            VoiceReplyGate::SkipOverLength { chars } => {
+                tracing::info!(
+                    chat_id,
+                    reply_chars = chars,
+                    cap = voice_cfg.max_reply_chars,
+                    "telegram voice reply skipped: reply over max_reply_chars; sending text"
+                );
+                return self.send_text(chat_id, text).await;
+            }
+            VoiceReplyGate::Voice => {}
+        }
+
+        let trimmed = text.trim();
+        let pid = std::process::id();
+        let nonce = rand_nonce();
+        let wav_path = format!("/tmp/geniepod-tg-reply-{pid}-{nonce}.wav");
+        let ogg_path = format!("/tmp/geniepod-tg-reply-{pid}-{nonce}.ogg");
+
+        let _cleanup = TempCleanup::new(
+            voice_cfg.delete_temp_audio,
+            ogg_path.clone(),
+            wav_path.clone(),
+        );
+
+        if let Err(e) = self.synthesize_reply_to_wav(trimmed, &wav_path).await {
+            tracing::warn!(error = %e, "telegram voice reply: piper synth failed; falling back to text");
+            return self.send_text(chat_id, text).await;
+        }
+
+        if let Err(e) = self.wav_to_ogg_opus(&wav_path, &ogg_path).await {
+            tracing::warn!(error = %e, "telegram voice reply: ffmpeg ogg encode failed; falling back to text");
+            return self.send_text(chat_id, text).await;
+        }
+
+        if let Err(e) = self.send_voice(chat_id, &ogg_path).await {
+            tracing::warn!(error = %e, "telegram voice reply: sendVoice failed; falling back to text");
+            return self.send_text(chat_id, text).await;
+        }
+
+        tracing::info!(chat_id, "telegram voice reply sent");
+        Ok(())
+    }
+
+    async fn synthesize_reply_to_wav(&self, text: &str, wav_path: &str) -> Result<()> {
+        // Piper reads text from stdin, writes WAV to --output_file. Matches
+        // the file-mode invocation in voice/tts.rs but kept inline so the
+        // adapter doesn't pull in the `voice` Cargo feature.
+        let voice_cfg = &self.config.voice;
+        let mut piper = Command::new(&voice_cfg.piper_path)
+            .args([
+                "--model",
+                &voice_cfg.piper_model.to_string_lossy(),
+                "--output_file",
+                wav_path,
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to spawn piper at {:?}", voice_cfg.piper_path))?;
+
+        // Newlines confuse Piper; collapse to spaces like voice/tts.rs does.
+        let one_line = text.replace('\n', " ");
+        if let Some(mut stdin) = piper.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(one_line.as_bytes())
+                .await
+                .context("write piper stdin")?;
+            stdin.write_all(b"\n").await.context("write piper stdin")?;
+        }
+
+        let output = piper.wait_with_output().await.context("await piper")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("piper failed: {}", stderr.trim());
+        }
+
+        // Empty WAV = nothing useful synthesized; treat as failure so the
+        // caller falls back to text.
+        let meta = tokio::fs::metadata(wav_path)
+            .await
+            .with_context(|| format!("stat {wav_path}"))?;
+        if meta.len() < 128 {
+            anyhow::bail!("piper produced empty/undersized WAV ({} bytes)", meta.len());
+        }
+        Ok(())
+    }
+
+    async fn wav_to_ogg_opus(&self, wav_path: &str, ogg_path: &str) -> Result<()> {
+        // ffmpeg ships with libopus in all standard distros and on JetPack.
+        // The format Telegram's sendVoice expects is OGG/Opus; the explicit
+        // container + codec args here let ffmpeg pick conservative bitrate
+        // defaults that comfortably fit voice-message reads under the
+        // sendVoice 1 MB cap for typical Piper output lengths.
+        let voice_cfg = &self.config.voice;
+        let output = Command::new(&voice_cfg.ffmpeg_path)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                wav_path,
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "24k",
+                "-ac",
+                "1",
+                "-f",
+                "ogg",
+                ogg_path,
+            ])
+            .output()
+            .await
+            .with_context(|| format!("failed to spawn ffmpeg at {:?}", voice_cfg.ffmpeg_path))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("ffmpeg ogg/opus encode failed: {}", stderr.trim());
+        }
+        Ok(())
+    }
+
+    async fn send_voice(&self, chat_id: i64, ogg_path: &str) -> Result<()> {
+        let bytes = tokio::fs::read(ogg_path)
+            .await
+            .with_context(|| format!("read ogg {ogg_path}"))?;
+
+        let file_part = reqwest::multipart::Part::bytes(bytes)
+            .file_name("reply.ogg")
+            .mime_str("audio/ogg")
+            .context("invalid mime for voice part")?;
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("voice", file_part);
+
+        let resp: TelegramEnvelope<serde_json::Value> = self
+            .client
+            .post(self.method_url("sendVoice"))
+            .multipart(form)
+            .send()
+            .await
+            .context("Telegram sendVoice request failed")?
+            .error_for_status()
+            .context("Telegram sendVoice HTTP error")?
+            .json()
+            .await
+            .context("Telegram sendVoice JSON decode failed")?;
+
+        if !resp.ok {
+            anyhow::bail!(
+                "Telegram sendVoice API error: {}",
+                resp.description.unwrap_or_else(|| "unknown error".into())
+            );
+        }
         Ok(())
     }
 
@@ -620,6 +795,30 @@ fn clean_transcript(raw: &str) -> String {
     trimmed.to_string()
 }
 
+/// Pure decision for the voice-reply gate. Extracted from `send_reply` so
+/// the policy can be unit-tested without spinning up HTTP or subprocesses.
+#[derive(Debug, PartialEq, Eq)]
+enum VoiceReplyGate {
+    /// Send the assistant reply as plain text.
+    Text,
+    /// Reply was over `max_reply_chars` — skip the voice path. Caller logs.
+    SkipOverLength { chars: usize },
+    /// Try the voice-reply pipeline (Piper → ffmpeg → sendVoice).
+    Voice,
+}
+
+fn voice_reply_gate(text: &str, reply_as_voice: bool, max_chars: usize) -> VoiceReplyGate {
+    let trimmed = text.trim();
+    if !reply_as_voice || trimmed.is_empty() {
+        return VoiceReplyGate::Text;
+    }
+    let chars = trimmed.chars().count();
+    if chars > max_chars {
+        return VoiceReplyGate::SkipOverLength { chars };
+    }
+    VoiceReplyGate::Voice
+}
+
 fn strip_bot_mention(text: &str) -> String {
     text.split_whitespace()
         .filter(|part| !part.starts_with('@'))
@@ -729,8 +928,8 @@ struct CoreChatResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        TELEGRAM_MAX_MESSAGE_LEN, clean_transcript, configured_language, split_message,
-        strip_bot_mention,
+        TELEGRAM_MAX_MESSAGE_LEN, VoiceReplyGate, clean_transcript, configured_language,
+        split_message, strip_bot_mention, voice_reply_gate,
     };
 
     #[test]
@@ -772,6 +971,54 @@ mod tests {
         assert_eq!(
             clean_transcript("turn off the lights"),
             "turn off the lights"
+        );
+    }
+
+    #[test]
+    fn voice_reply_gate_off_returns_text() {
+        // reply_as_voice = false → always text, regardless of length.
+        assert_eq!(voice_reply_gate("hello", false, 100), VoiceReplyGate::Text);
+        assert_eq!(voice_reply_gate("", false, 100), VoiceReplyGate::Text);
+    }
+
+    #[test]
+    fn voice_reply_gate_empty_text_returns_text() {
+        // Empty / whitespace replies don't synthesize — they'd produce
+        // empty WAV and waste a Piper invocation.
+        assert_eq!(voice_reply_gate("", true, 100), VoiceReplyGate::Text);
+        assert_eq!(voice_reply_gate("   \n\t", true, 100), VoiceReplyGate::Text);
+    }
+
+    #[test]
+    fn voice_reply_gate_over_cap_skips_with_char_count() {
+        let long = "a".repeat(150);
+        assert_eq!(
+            voice_reply_gate(&long, true, 100),
+            VoiceReplyGate::SkipOverLength { chars: 150 }
+        );
+    }
+
+    #[test]
+    fn voice_reply_gate_under_cap_returns_voice() {
+        assert_eq!(
+            voice_reply_gate("turn off the lights", true, 100),
+            VoiceReplyGate::Voice
+        );
+        // Exactly at the cap is still voice (uses `>` not `>=`).
+        let at_cap = "x".repeat(100);
+        assert_eq!(voice_reply_gate(&at_cap, true, 100), VoiceReplyGate::Voice);
+    }
+
+    #[test]
+    fn voice_reply_gate_char_count_uses_unicode_chars_not_bytes() {
+        // 5 multi-byte chars should count as 5, not 15 bytes — otherwise
+        // a Japanese / Chinese reply would be skipped at a much shorter
+        // human-perceived length.
+        let s = "東京こんにちは"; // 7 chars, ~21 bytes
+        assert_eq!(voice_reply_gate(s, true, 7), VoiceReplyGate::Voice);
+        assert_eq!(
+            voice_reply_gate(s, true, 6),
+            VoiceReplyGate::SkipOverLength { chars: 7 }
         );
     }
 
