@@ -2,10 +2,26 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
+
+/// Process-local monotonic counter for telegram tempfile suffixes. Paired
+/// with the PID at every use site so two concurrent voice handlers in the
+/// same process cannot collide on `/tmp/geniepod-tg-{voice,reply}-*.{ogg,wav}`.
+///
+/// Mirrors `voice::stt::TEMP_NONCE` (commit 65114f0 / issue #67) which fixed
+/// the same hazard for the on-device STT path. That commit's "Out of scope"
+/// note enumerated several other PID-only tempfile sites left for later but
+/// did not list `telegram.rs`; these two sites were missed, and become
+/// load-bearing once `handle_update` spawns concurrently per issue #77.
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn next_temp_nonce() -> u64 {
+    TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone)]
 pub struct TelegramRuntimeConfig {
@@ -228,7 +244,7 @@ impl TelegramApi {
         }
 
         let pid = std::process::id();
-        let nonce: u32 = rand_nonce();
+        let nonce = next_temp_nonce();
         let ogg_path = format!("/tmp/geniepod-tg-voice-{pid}-{nonce}.ogg");
         let wav_path = format!("/tmp/geniepod-tg-voice-{pid}-{nonce}.wav");
 
@@ -322,7 +338,7 @@ impl TelegramApi {
 
         let trimmed = text.trim();
         let pid = std::process::id();
-        let nonce = rand_nonce();
+        let nonce = next_temp_nonce();
         let wav_path = format!("/tmp/geniepod-tg-reply-{pid}-{nonce}.wav");
         let ogg_path = format!("/tmp/geniepod-tg-reply-{pid}-{nonce}.ogg");
 
@@ -743,16 +759,6 @@ impl Drop for TempCleanup {
     }
 }
 
-/// Cheap unique suffix to keep concurrent voice messages from colliding on
-/// `/tmp` paths when whisper-server allows parallel transcribes.
-fn rand_nonce() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
-}
-
 /// Normalize the configured STT language ("auto", "" → None; everything else
 /// passed through trimmed). Mirrors `voice::language::configured_language`
 /// without requiring the `voice` feature to be on.
@@ -929,8 +935,44 @@ struct CoreChatResponse {
 mod tests {
     use super::{
         TELEGRAM_MAX_MESSAGE_LEN, VoiceReplyGate, clean_transcript, configured_language,
-        split_message, strip_bot_mention, voice_reply_gate,
+        next_temp_nonce, split_message, strip_bot_mention, voice_reply_gate,
     };
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    #[test]
+    fn next_temp_nonce_is_unique_under_concurrent_callers() {
+        // The previous nonce source (`subsec_nanos()` of `SystemTime::now`)
+        // routinely collided on Jetson, where the architected ARM generic
+        // timer's ~32 ns resolution meant two spawned voice handlers landed
+        // on the same value. `AtomicU64::fetch_add` cannot collide. This
+        // test would deterministically fail with the old impl when run on
+        // a machine with coarse `subsec_nanos()` granularity; it passes
+        // here because every call increments the counter exactly once.
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 256;
+        let seen: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let seen = Arc::clone(&seen);
+                thread::spawn(move || {
+                    let mut local = Vec::with_capacity(PER_THREAD);
+                    for _ in 0..PER_THREAD {
+                        local.push(next_temp_nonce());
+                    }
+                    let mut seen = seen.lock().unwrap();
+                    for n in local {
+                        assert!(seen.insert(n), "duplicate nonce: {n}");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(seen.lock().unwrap().len(), THREADS * PER_THREAD);
+    }
 
     #[test]
     fn telegram_split_keeps_short_message() {
