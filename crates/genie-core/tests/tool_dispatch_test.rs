@@ -154,6 +154,18 @@ fn setup_script_privileged_llm_backend_patch_is_checked() {
         "setup script should install the default runtime during normal setup"
     );
     assert!(
+        contents.contains("find_cuda_compiler()"),
+        "setup script should resolve nvcc before building the default runtime"
+    );
+    assert!(
+        contents.contains("-DCMAKE_CUDA_COMPILER=\"$cuda_compiler\""),
+        "setup script should pass the resolved nvcc path to CMake"
+    );
+    assert!(
+        contents.contains("ERROR: CUDA compiler nvcc not found."),
+        "setup script should fail clearly when nvcc is missing"
+    );
+    assert!(
         !contents.contains("Auto-falling back to llama.cpp"),
         "setup script should not silently downgrade the default backend to llama.cpp"
     );

@@ -88,12 +88,30 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# ── Runtime install helpers ─────────────────────────────────────
+find_cuda_compiler() {
+    local candidate
+    if command -v nvcc > /dev/null 2>&1; then
+        command -v nvcc
+        return 0
+    fi
+    for candidate in /usr/local/cuda/bin/nvcc /usr/local/cuda-*/bin/nvcc; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ── --runtime mode: install an alternate LLM backend only ───────
 install_genie_ai_runtime() {
     local install_mode="${1:-manual}"
     local build_dir="$GENIEPOD_DIR/src/genie-ai-runtime"
     local repo_url="https://github.com/GeniePod/genie-ai-runtime.git"
     local tag="v1.0.0"
+    local cuda_compiler
+    local cuda_root
 
     echo "=== GeniePod: install genie-ai-runtime $tag ==="
     echo ""
@@ -108,11 +126,20 @@ install_genie_ai_runtime() {
         fi
         echo "  OK: $pkg ($("$pkg" --version 2>/dev/null | head -1))"
     done
-    if ! command -v nvcc > /dev/null 2>&1 && [ ! -d /usr/local/cuda/include ]; then
-        echo "  WARN: CUDA toolkit not detected — JetPack normally ships it."
-        echo "        If the build fails on missing cuBLAS / cuda_runtime.h, install:"
-        echo "          sudo apt-get install -y nvidia-cuda-toolkit"
+    if ! cuda_compiler="$(find_cuda_compiler)"; then
+        echo "  ERROR: CUDA compiler nvcc not found." >&2
+        echo "         genie-ai-runtime builds from CUDA source and needs nvcc." >&2
+        echo "         Install the JetPack CUDA compiler package, then re-run setup:" >&2
+        echo "           sudo apt-get update" >&2
+        echo "           sudo apt-get install -y nvidia-cuda-toolkit" >&2
+        echo "         If nvcc is already installed, add it to PATH or symlink it under" >&2
+        echo "         /usr/local/cuda/bin/nvcc." >&2
+        exit 1
     fi
+    cuda_root="$(dirname "$(dirname "$cuda_compiler")")"
+    export CUDACXX="$cuda_compiler"
+    export PATH="$(dirname "$cuda_compiler"):$PATH"
+    echo "  OK: nvcc ($cuda_compiler)"
 
     # 2. Clone the pinned release.
     echo "[2/4] Fetching $repo_url @ $tag ..."
@@ -131,7 +158,10 @@ install_genie_ai_runtime() {
     # 3. Build (10-20 min on Orin Nano).
     echo "[3/4] Building (Release, $(nproc) jobs — this takes 10-20 min on Orin Nano)..."
     cd "$build_dir"
-    cmake -B build -DCMAKE_BUILD_TYPE=Release
+    cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_COMPILER="$cuda_compiler" \
+        -DCUDAToolkit_ROOT="$cuda_root"
     cmake --build build -j"$(nproc)"
 
     # 4. Install binaries. Refuse to overwrite if something looks wrong.
