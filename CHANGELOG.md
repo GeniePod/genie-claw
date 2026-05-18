@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Changed
+
+- `deploy/scripts/genie-restart-all.sh` rewritten as a full hard-reset:
+  delegates to `stop_all.sh` for the systemd stops, best-effort
+  `pkill -x` reaps known LLM/STT/TTS/audio subprocess names that may
+  have survived the cgroup stop (piper, whisper-server, whisper-cli,
+  jetson-llm-server, jetson-llm, llama-server, deep-filter, sox,
+  ffmpeg), `sync; echo 3 > /proc/sys/vm/drop_caches` releases page
+  cache, `swapoff -a; swapon -a` flushes the swap file to a clean
+  baseline, then delegates to `start_all.sh` to bring the stack back
+  up. Deliberately gives back the warm Qwen3-4B page-cache residency
+  PR #70 preserves across plain `systemctl restart` — the script
+  exists for the post-`make deploy` case where binaries / config /
+  model path may have changed and the prior warm cache is stale.
+  Pass `--soft` to skip the cache + swap reset for a service-only
+  refresh that preserves the warm LLM cache. `swapoff` failure
+  (no swap, or not enough free RAM to absorb the swap contents) is
+  logged and skipped rather than fatal so the script never wedges
+  the box mid-restart. New regression test
+  `genie_restart_all_hard_mode_performs_full_memory_reset` pins
+  the five-step shape (stop → reap → drop_caches → swapoff/swapon
+  → start) and the ordering, so future edits can't quietly drop a
+  step without failing CI.
+
 ### Added
 
 - `CONTRIBUTING.md`, `SECURITY.md`, `.github/PULL_REQUEST_TEMPLATE.md`,

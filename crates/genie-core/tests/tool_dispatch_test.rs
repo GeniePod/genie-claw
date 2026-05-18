@@ -284,6 +284,60 @@ fn start_all_uses_configured_llm_backend() {
     );
 }
 
+/// Pin the hard-reset shape of genie-restart-all.sh so future edits can't
+/// quietly drop the orphan reap / cache drop / swap free steps.
+#[test]
+fn genie_restart_all_hard_mode_performs_full_memory_reset() {
+    let path = workspace_root().join("deploy/scripts/genie-restart-all.sh");
+    let contents = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        contents.contains("stop_all.sh"),
+        "genie-restart-all should delegate to stop_all.sh before reset"
+    );
+    assert!(
+        contents.contains("pkill -x"),
+        "genie-restart-all should reap orphaned subprocesses by exact basename"
+    );
+    assert!(
+        contents.contains("drop_caches"),
+        "genie-restart-all --hard should drop page cache"
+    );
+    assert!(
+        contents.contains("swapoff -a") && contents.contains("swapon -a"),
+        "genie-restart-all --hard should free + re-enable swap"
+    );
+    assert!(
+        contents.contains("start_all.sh"),
+        "genie-restart-all should delegate to start_all.sh after reset"
+    );
+    assert!(
+        contents.contains("--soft"),
+        "genie-restart-all should expose --soft to skip the cache+swap reset (preserves PR #70 warm cache)"
+    );
+    assert!(
+        contents.contains("PR #70") || contents.contains("issue #69"),
+        "genie-restart-all should document the warm-cache trade-off relative to PR #70 / issue #69"
+    );
+
+    // Ordering invariant against the imperative code section (matched via
+    // strings that only appear in the code body, not the doc-comment header):
+    //   stop_all → reap orphans → drop page cache → free swap → start_all.
+    let stop_pos = contents.find("\"$STOP_ALL\"").expect("STOP_ALL invocation");
+    let reap_pos = contents
+        .find("Reaping orphaned subprocesses")
+        .expect("reap echo line");
+    let drop_pos = contents
+        .find("Dropping page cache")
+        .expect("drop_caches echo line");
+    let swap_pos = contents.find("Freeing swap").expect("swap echo line");
+    let start_pos = contents.find("\"$START_ALL\"").expect("START_ALL invocation");
+    assert!(stop_pos < reap_pos, "stop_all must run before reaping orphans");
+    assert!(reap_pos < drop_pos, "orphan reap must run before drop_caches");
+    assert!(drop_pos < swap_pos, "drop_caches must run before swap reset");
+    assert!(swap_pos < start_pos, "swap reset must run before start_all");
+}
+
 /// Verify genie-ai-runtime service preserves warm GGUF pages across restarts.
 #[test]
 fn genie_ai_runtime_service_preserves_model_page_cache() {
