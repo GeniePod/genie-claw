@@ -110,6 +110,7 @@ install_genie_ai_runtime() {
     local build_dir="$GENIEPOD_DIR/src/genie-ai-runtime"
     local repo_url="https://github.com/GeniePod/genie-ai-runtime.git"
     local tag="v1.0.0"
+    local cuda_bin_dir
     local cuda_compiler
     local cuda_root
 
@@ -136,9 +137,11 @@ install_genie_ai_runtime() {
         echo "         /usr/local/cuda/bin/nvcc." >&2
         exit 1
     fi
-    cuda_root="$(dirname "$(dirname "$cuda_compiler")")"
+    cuda_bin_dir="$(dirname "$cuda_compiler")"
+    cuda_root="$(dirname "$cuda_bin_dir")"
     export CUDACXX="$cuda_compiler"
-    export PATH="$(dirname "$cuda_compiler"):$PATH"
+    PATH="$cuda_bin_dir:$PATH"
+    export PATH
     echo "  OK: nvcc ($cuda_compiler)"
 
     # 2. Clone the pinned release.
