@@ -16,7 +16,11 @@ fn core_binary_builds() {
     );
 }
 
-const RELEASE_BINARY_SIZE_BUDGET_MB: f64 = 7.5;
+/// genie-core release-binary size ceiling. Raised from the alpha-era
+/// 5.0 MB budget after legitimate growth from the runtime backend,
+/// voice, runtime mode, and concurrent server work. Keep it tight enough
+/// that another large dependency or module forces a deliberate decision.
+const RELEASE_BINARY_SIZE_BUDGET_MB: f64 = 6.0;
 
 /// Verify release binary stays within the release size budget.
 #[test]
