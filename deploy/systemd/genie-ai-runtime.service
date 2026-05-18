@@ -1,0 +1,43 @@
+[Unit]
+Description=GeniePod LLM Server (genie-ai-runtime / jllm-server)
+Documentation=https://github.com/GeniePod/genie-ai-runtime
+Documentation=https://github.com/GeniePod/genie-claw/issues/27
+After=network.target
+ConditionPathExists=/opt/geniepod/bin/jllm-server
+
+[Service]
+Type=simple
+# Drop page cache before loading model — Jetson NvMap needs contiguous blocks.
+ExecStartPre=/bin/sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
+ExecStart=/opt/geniepod/bin/jllm-server \
+    --model ${GENIEPOD_LLM_MODEL} \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --ctx-size 2048 \
+    --n-gpu-layers 999 \
+    --threads 4 \
+    --parallel 1
+# The jllm-server flag surface intentionally mirrors llama-server so the
+# OpenAI-compatible client in genie-core works against either backend without
+# code changes. Issue #27 tracks the opt-in rollout; flip
+# [services.llm].backend = "genie_ai_runtime" in geniepod.toml after
+# installing /opt/geniepod/bin/jllm-server.
+
+Environment=GENIEPOD_LLM_MODEL=/opt/geniepod/models/phi-4-mini-instruct-q4_k_m.gguf
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+
+# CPU pinning for voice latency stability (issue #25). Inference is GPU-bound
+# (--n-gpu-layers 999), so one dedicated core is enough to host CUDA dispatch
+# + sampler + tokenizer without contending with whisper (2-3) or genie-core
+# (5). --threads=4 above stays as-is; with a single-core affinity the four
+# worker threads time-share core 4 — fine for the GPU-bound critical path.
+CPUAffinity=4
+
+# GPU needs full system access
+ProtectSystem=no
+SupplementaryGroups=video render
+
+[Install]
+WantedBy=geniepod.target
