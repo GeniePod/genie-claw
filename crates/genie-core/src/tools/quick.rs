@@ -24,6 +24,10 @@ pub fn route(text: &str) -> Option<ToolCall> {
         return Some(tool("memory_status", serde_json::json!({})));
     }
 
+    if let Some(query) = memory_recall_query(&normalized) {
+        return Some(tool("memory_recall", serde_json::json!({ "query": query })));
+    }
+
     if asks_system_status(&normalized) || asks_home_assistant_status(&normalized) {
         return Some(tool("system_info", serde_json::json!({})));
     }
@@ -113,6 +117,53 @@ fn asks_memory_status(text: &str) -> bool {
             "memory index",
         ],
     )
+}
+
+fn memory_recall_query(text: &str) -> Option<String> {
+    if contains_any(
+        text,
+        &[
+            "what is my name",
+            "whats my name",
+            "what s my name",
+            "do you know my name",
+            "do you remember my name",
+            "remember my name",
+            "who am i",
+        ],
+    ) {
+        return Some("name".into());
+    }
+
+    for prefix in [
+        "what do you remember about ",
+        "what do you know about ",
+        "do you remember ",
+        "search memory for ",
+        "search memories for ",
+        "recall memory for ",
+        "recall memories for ",
+    ] {
+        if let Some(query) = text.strip_prefix(prefix).map(str::trim)
+            && !query.is_empty()
+            && query != "that"
+        {
+            return Some(query.to_string());
+        }
+    }
+
+    if matches!(
+        text,
+        "what do you remember"
+            | "what do you know about me"
+            | "what do you remember about me"
+            | "what do you know about us"
+            | "what do you remember about us"
+    ) {
+        return Some("me".into());
+    }
+
+    None
 }
 
 fn asks_home_undo(text: &str) -> bool {
@@ -544,6 +595,24 @@ mod tests {
     }
 
     #[test]
+    fn routes_identity_memory_questions_to_memory_recall() {
+        let call = route("What is my name?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "name");
+
+        let call = route("do you remember my name").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "name");
+    }
+
+    #[test]
+    fn routes_explicit_memory_search_to_memory_recall() {
+        let call = route("search memory for Jared").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "jared");
+    }
+
+    #[test]
     fn routes_undo_to_home_undo() {
         let call = route("undo that").unwrap();
         assert_eq!(call.name, "home_undo");
@@ -605,11 +674,6 @@ mod tests {
         let call = route("look up ESP32 C6 Thread support").unwrap();
         assert_eq!(call.name, "web_search");
         assert_eq!(call.arguments["query"], "esp32 c6 thread support");
-    }
-
-    #[test]
-    fn does_not_route_memory_search_to_web() {
-        assert!(route("search memory for Jared").is_none());
     }
 
     #[test]
