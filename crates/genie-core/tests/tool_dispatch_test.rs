@@ -194,37 +194,65 @@ fn setup_script_privileged_llm_backend_patch_is_checked() {
     );
 }
 
-/// Verify the Jetson restart helper script is syntactically valid.
+/// Verify the Jetson lifecycle helper scripts are syntactically valid.
 #[test]
-fn jetson_restart_script_is_valid_shell() {
-    let path = workspace_root().join("deploy/scripts/genie-restart-all.sh");
-    assert!(path.exists(), "restart helper script should exist");
+fn jetson_lifecycle_scripts_are_valid_shell() {
+    for script in [
+        "deploy/scripts/genie-restart-all.sh",
+        "deploy/scripts/start_all.sh",
+        "deploy/scripts/stop_all.sh",
+    ] {
+        let path = workspace_root().join(script);
+        assert!(path.exists(), "{script} should exist");
 
-    let output = std::process::Command::new("bash")
-        .args(["-n", path.to_str().unwrap()])
-        .output()
-        .expect("failed to run bash -n");
+        let output = std::process::Command::new("bash")
+            .args(["-n", path.to_str().unwrap()])
+            .output()
+            .expect("failed to run bash -n");
 
-    assert!(
-        output.status.success(),
-        "restart helper script has invalid shell syntax: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        assert!(
+            output.status.success(),
+            "{script} has invalid shell syntax: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
-/// Verify the deploy pipeline copies the Jetson restart helper script.
+/// Verify the deploy pipeline copies the Jetson lifecycle helper scripts.
 #[test]
-fn makefile_deploys_restart_helper() {
+fn makefile_deploys_lifecycle_helpers() {
     let path = workspace_root().join("Makefile");
     let contents = std::fs::read_to_string(&path).unwrap();
 
+    for script in ["genie-restart-all.sh", "start_all.sh", "stop_all.sh"] {
+        assert!(
+            contents.contains(&format!("deploy/scripts/{script}")),
+            "Makefile should copy {script} during deploy"
+        );
+        assert!(
+            contents.contains(&format!("$(INSTALL_DIR)/bin/{script}")),
+            "Makefile should install {script} into /opt/geniepod/bin"
+        );
+    }
+}
+
+/// Verify start_all follows the configured backend instead of starting both LLMs.
+#[test]
+fn start_all_uses_configured_llm_backend() {
+    let path = workspace_root().join("deploy/scripts/start_all.sh");
+    let contents = std::fs::read_to_string(&path).unwrap();
+
     assert!(
-        contents.contains("deploy/scripts/genie-restart-all.sh"),
-        "Makefile should copy the restart helper script during deploy"
+        contents.contains("Configured LLM unit"),
+        "start_all should report the selected LLM unit"
     );
     assert!(
-        contents.contains("$(INSTALL_DIR)/bin/genie-restart-all.sh"),
-        "Makefile should install the restart helper into /opt/geniepod/bin"
+        contents.contains("read_llm_unit"),
+        "start_all should read [services.llm].systemd_unit"
+    );
+    assert!(
+        contents.contains("other_llm_units_for"),
+        "start_all should stop the non-selected LLM backend before starting"
     );
 }
 
