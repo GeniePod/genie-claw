@@ -132,7 +132,7 @@ and audio subprocesses share cores. Each `genie-*` systemd unit ships with a
 | --- | --- |
 | 0–1 | Kernel, ALSA, MQTT broker, `genie-api`, `genie-governor`, `genie-health`, `genie-wakeword` |
 | 2–3 | `whisper-server` (STT decode, two threads) |
-| 4   | `llama-server` / `jllm-server` (GPU-bound; one core hosts CUDA dispatch + sampler — whichever LLM backend is active) |
+| 4   | `llama-server` / `jetson-llm-server` (GPU-bound; one core hosts CUDA dispatch + sampler — whichever LLM backend is active) |
 | 5   | `genie-core` and all audio children it spawns (`piper`, `sox`, `deep-filter`, `arecord`, `aplay`) |
 
 `genie-wakeword` retains `SCHED_FIFO` at priority 50 so the continuous audio
