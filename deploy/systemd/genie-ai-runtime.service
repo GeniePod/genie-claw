@@ -31,6 +31,13 @@ Restart=on-failure
 RestartSec=5
 TimeoutStartSec=120
 
+# CPU pinning for voice latency stability (issue #25). Inference is GPU-bound
+# (jetson-llm-server offloads to Jetson iGPU), so one dedicated core is enough
+# to host CUDA dispatch + sampler + tokenizer without contending with whisper
+# (2-3) or genie-core (5). Mirrors genie-llm.service; only one of the two units
+# runs at a time (Conflicts=genie-llm.service above), so both can claim core 4.
+CPUAffinity=4
+
 # GPU needs full system access
 ProtectSystem=no
 SupplementaryGroups=video render
