@@ -150,14 +150,18 @@ fn setup_script_privileged_llm_backend_patch_is_checked() {
         "setup script should clean up the root-owned temp file through sudo"
     );
     assert!(
-        contents.contains("if ! patch_services_llm_backend \"llama_cpp\" \"genie-llm.service\""),
-        "llama.cpp fallback should check patch failure"
+        contents.contains("Installing genie-ai-runtime now; this is the default backend"),
+        "setup script should install the default runtime during normal setup"
+    );
+    assert!(
+        !contents.contains("Auto-falling back to llama.cpp"),
+        "setup script should not silently downgrade the default backend to llama.cpp"
     );
     assert!(
         contents.contains(
             "if ! patch_services_llm_backend \"genie_ai_runtime\" \"genie-ai-runtime.service\""
         ),
-        "genie-ai-runtime fallback should check patch failure"
+        "genie-ai-runtime selection should check patch failure"
     );
     assert!(
         contents

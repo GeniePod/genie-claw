@@ -15,6 +15,9 @@
 #                                line by hand once the new model is on disk.
 #   --runtime genie-ai-runtime   Build + install genie-ai-runtime v1.0.0
 #                                alongside the existing llama.cpp backend.
+#                                Normal setup already installs this when
+#                                [services.llm].backend is genie_ai_runtime;
+#                                this flag is for explicit reinstall/repair.
 #                                Does NOT modify /etc/geniepod/geniepod.toml
 #                                and does NOT stop any running service —
 #                                operator does the cutover by hand per the
@@ -87,6 +90,7 @@ done
 
 # ── --runtime mode: install an alternate LLM backend only ───────
 install_genie_ai_runtime() {
+    local install_mode="${1:-manual}"
     local build_dir="$GENIEPOD_DIR/src/genie-ai-runtime"
     local repo_url="https://github.com/GeniePod/genie-ai-runtime.git"
     local tag="v1.0.0"
@@ -144,35 +148,40 @@ install_genie_ai_runtime() {
     echo ""
     echo "=== genie-ai-runtime $tag installed ==="
     echo ""
-    echo "NOTE: jetson-llm-server installed but not yet selected as the LLM backend."
-    echo "      Your existing llama.cpp setup is unchanged."
-    echo ""
-    echo "To run genie-ai-runtime instead of llama.cpp:"
-    echo "  1. Stop the current llama.cpp backend:"
-    echo "       sudo systemctl stop genie-llm"
-    echo "  2. Edit /etc/geniepod/geniepod.toml:"
-    echo "       [services.llm]"
-    echo "       backend      = \"genie_ai_runtime\""
-    echo "       systemd_unit = \"genie-ai-runtime.service\""
-    echo "  3. Start the new backend:"
-    echo "       sudo systemctl daemon-reload"
-    echo "       sudo systemctl enable --now genie-ai-runtime.service"
-    echo "       sudo systemctl enable --now genie-ai-runtime-warmup.service"
-    echo "  4. Restart genie-core to pick up the config change:"
-    echo "       sudo systemctl restart genie-core"
-    echo ""
-    echo "To roll back to llama.cpp:"
-    echo "  1. sudo systemctl stop genie-ai-runtime genie-ai-runtime-warmup"
-    echo "  2. Edit /etc/geniepod/geniepod.toml:"
-    echo "       [services.llm]"
-    echo "       backend      = \"llama_cpp\""
-    echo "       systemd_unit = \"genie-llm.service\""
-    echo "  3. sudo systemctl start genie-llm"
-    echo "  4. sudo systemctl restart genie-core"
-    echo ""
-    echo "Verify:"
-    echo "  genie-ctl status            # should report llm_backend"
-    echo "  systemctl status genie-ai-runtime.service"
+    if [ "$install_mode" = "auto" ]; then
+        echo "NOTE: jetson-llm-server installed. Continuing setup will select"
+        echo "      genie-ai-runtime and enable its systemd units."
+    else
+        echo "NOTE: jetson-llm-server installed but not yet selected as the LLM backend."
+        echo "      Your existing llama.cpp setup is unchanged."
+        echo ""
+        echo "To run genie-ai-runtime instead of llama.cpp:"
+        echo "  1. Stop the current llama.cpp backend:"
+        echo "       sudo systemctl stop genie-llm"
+        echo "  2. Edit /etc/geniepod/geniepod.toml:"
+        echo "       [services.llm]"
+        echo "       backend      = \"genie_ai_runtime\""
+        echo "       systemd_unit = \"genie-ai-runtime.service\""
+        echo "  3. Start the new backend:"
+        echo "       sudo systemctl daemon-reload"
+        echo "       sudo systemctl enable --now genie-ai-runtime.service"
+        echo "       sudo systemctl enable --now genie-ai-runtime-warmup.service"
+        echo "  4. Restart genie-core to pick up the config change:"
+        echo "       sudo systemctl restart genie-core"
+        echo ""
+        echo "To roll back to llama.cpp:"
+        echo "  1. sudo systemctl stop genie-ai-runtime genie-ai-runtime-warmup"
+        echo "  2. Edit /etc/geniepod/geniepod.toml:"
+        echo "       [services.llm]"
+        echo "       backend      = \"llama_cpp\""
+        echo "       systemd_unit = \"genie-llm.service\""
+        echo "  3. sudo systemctl start genie-llm"
+        echo "  4. sudo systemctl restart genie-core"
+        echo ""
+        echo "Verify:"
+        echo "  genie-ctl status            # should report llm_backend"
+        echo "  systemctl status genie-ai-runtime.service"
+    fi
 }
 
 # --runtime is install-only: do the build/install and exit before the
@@ -329,15 +338,14 @@ fi
 # 5. Check LLM runtimes and resolve the *effective* backend.
 #
 # The configured default in geniepod.toml is genie_ai_runtime (issue #52 / PR
-# #55). On a fresh deploy without `--runtime genie-ai-runtime` the binary it
-# needs (`jetson-llm-server`) isn't on disk yet, which used to leave step
-# [6/6] enabling units that couldn't start (issue #60).
+# #55). On a fresh deploy, install that default backend automatically when its
+# binary (`jetson-llm-server`) isn't on disk yet.
 #
-# Resolution policy (issue #60, Option A):
+# Resolution policy:
 #   - configured backend's binary present → use that backend.
-#   - configured = genie_ai_runtime, binary missing, llama-server present
-#       → auto-fallback to llama_cpp; patch geniepod.toml so the runtime,
-#         systemd, and the operator's eyes all agree; print a loud NOTE.
+#   - configured = genie_ai_runtime, binary missing
+#       → build/install genie-ai-runtime, keep the default backend selected,
+#         and patch geniepod.toml so runtime, systemd, and operator output agree.
 #   - configured = llama_cpp, binary missing, jetson-llm-server present
 #       → symmetric auto-fallback to genie_ai_runtime.
 #   - neither binary present → don't enable any LLM unit in [6/6]; print
@@ -415,32 +423,20 @@ patch_services_llm_backend() {
 }
 
 if [ "$CONFIGURED_BACKEND" = "genie_ai_runtime" ] && [ "$HAVE_JETSON_LLM" = "false" ]; then
-    if [ "$HAVE_LLAMA" = "true" ]; then
-        EFFECTIVE_BACKEND="llama_cpp"
-        echo ""
-        echo "  NOTE: configured backend (genie_ai_runtime) is not installed."
-        echo "        Auto-falling back to llama.cpp so this box leaves setup"
-        echo "        in a working state (issue #60)."
-        echo "        Patching $CONFIG_DIR/geniepod.toml:"
-        echo "            backend      = \"llama_cpp\""
-        echo "            systemd_unit = \"genie-llm.service\""
-        echo "        To run the default backend instead, install it via:"
-        echo "            bash $0 --runtime genie-ai-runtime"
-        echo "        then re-run setup-jetson.sh (or hand-edit geniepod.toml back)."
-        if ! patch_services_llm_backend "llama_cpp" "genie-llm.service"; then
-            echo "  ERROR: auto-fallback could not patch $CONFIG_DIR/geniepod.toml; aborting setup." >&2
-            exit 1
-        fi
-    else
-        echo ""
-        echo "  ERROR: configured backend (genie_ai_runtime) is not installed"
-        echo "         and no llama.cpp fallback is available either."
-        echo "         Step [6/6] will NOT enable any LLM systemd unit."
-        echo "         Remediate with one of:"
-        echo "           bash $0 --runtime genie-ai-runtime    # install the default"
-        echo "         OR install llama.cpp's llama-server to $GENIEPOD_DIR/bin/"
-        echo "         then re-run this script."
-        SKIP_LLM_UNITS=true
+    EFFECTIVE_BACKEND="genie_ai_runtime"
+    echo ""
+    echo "  NOTE: configured backend (genie_ai_runtime) is not installed."
+    echo "        Installing genie-ai-runtime now; this is the default backend."
+    echo "        This build can take 10-20 minutes on Jetson Orin Nano."
+    install_genie_ai_runtime auto
+    HAVE_JETSON_LLM=true
+    echo "  OK: jetson-llm-server (installed)"
+    echo "        Patching $CONFIG_DIR/geniepod.toml:"
+    echo "            backend      = \"genie_ai_runtime\""
+    echo "            systemd_unit = \"genie-ai-runtime.service\""
+    if ! patch_services_llm_backend "genie_ai_runtime" "genie-ai-runtime.service"; then
+        echo "  ERROR: default runtime install succeeded but $CONFIG_DIR/geniepod.toml could not be patched; aborting setup." >&2
+        exit 1
     fi
 elif [ "$CONFIGURED_BACKEND" = "llama_cpp" ] && [ "$HAVE_LLAMA" = "false" ]; then
     if [ "$HAVE_JETSON_LLM" = "true" ]; then
@@ -668,9 +664,9 @@ fi
 # (no-op if /opt/geniepod/bin/genie-audio-init is missing, see ConditionPathExists).
 #
 # LLM service selection consumes the EFFECTIVE_BACKEND resolved in step [5/6]
-# above (issue #60). That variable already accounts for the auto-fallback
-# from genie_ai_runtime → llama_cpp when jetson-llm-server isn't installed,
-# so reading geniepod.toml again here would re-introduce the bug.
+# above. That variable already accounts for installing or falling back between
+# supported backends, so reading geniepod.toml again here would re-introduce
+# stale-config bugs.
 if [ "$SKIP_LLM_UNITS" = "true" ]; then
     echo "  Skipping LLM units — no backend binary is installed (see step [5/6])."
     LLM_SERVICES=""
