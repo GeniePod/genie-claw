@@ -1421,15 +1421,26 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    // Each test gets its own subdirectory so the canonical memory layout
+    // (`memory/`, `namespaces/`, `events/`) doesn't collide across parallel
+    // tests. `rebuild_root_memory_file` does `remove_dir_all` on `namespaces/`
+    // before rewriting it; sharing one dir caused tests to race-wipe each
+    // other's files when run with multiple test threads.
     fn temp_memory() -> Memory {
+        Memory::open(&temp_memory_path("test")).unwrap()
+    }
+
+    fn temp_memory_path(label: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "geniepod-mem-test-{}-{}.db",
+        let dir = std::env::temp_dir().join(format!(
+            "geniepod-mem-{}-{}-{}",
+            label,
             std::process::id(),
             id
         ));
-        let _ = std::fs::remove_file(&path);
-        Memory::open(&path).unwrap()
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("memory.db")
     }
 
     #[test]
@@ -1486,11 +1497,7 @@ mod tests {
     #[test]
     fn evergreen_memories_dont_decay() {
         let mem = Memory::open_with_half_life(
-            &std::env::temp_dir().join(format!(
-                "geniepod-mem-evergreen-{}-{}.db",
-                std::process::id(),
-                TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
-            )),
+            &temp_memory_path("evergreen"),
             0.001, // Extreme decay — everything decays almost instantly.
         )
         .unwrap();
@@ -1670,12 +1677,7 @@ mod tests {
 
     #[test]
     fn open_backfills_policy_columns_for_existing_rows() {
-        let path = std::env::temp_dir().join(format!(
-            "geniepod-mem-backfill-{}-{}.db",
-            std::process::id(),
-            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_file(&path);
+        let path = temp_memory_path("backfill");
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(

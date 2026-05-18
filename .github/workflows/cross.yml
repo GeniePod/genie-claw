@@ -1,0 +1,75 @@
+name: Cross-compile (aarch64 / Jetson)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  AARCH64_TARGET: aarch64-unknown-linux-gnu
+
+concurrency:
+  group: cross-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  jetson:
+    name: aarch64-unknown-linux-gnu release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cross-jetson
+          key: ${{ env.AARCH64_TARGET }}
+
+      - name: cargo build --release (Jetson target)
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: |
+          cargo build --release --locked --target ${AARCH64_TARGET} \
+            -p genie-core
+          cargo build --release --locked --target ${AARCH64_TARGET} \
+            -p genie-ctl -p genie-governor -p genie-health -p genie-api
+
+      - name: Verify all 5 Jetson binaries built
+        run: |
+          set -euo pipefail
+          out="target/${AARCH64_TARGET}/release"
+          for bin in genie-core genie-ctl genie-governor genie-health genie-api; do
+            test -f "$out/$bin" || { echo "missing: $out/$bin"; exit 1; }
+            file "$out/$bin" | grep -q "ARM aarch64" \
+              || { echo "$bin is not an aarch64 ELF"; exit 1; }
+          done
+          ls -lh "$out"/genie-core "$out"/genie-ctl "$out"/genie-governor \
+                 "$out"/genie-health "$out"/genie-api
+
+      - name: Upload Jetson binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: genie-jetson-aarch64-${{ github.sha }}
+          path: |
+            target/aarch64-unknown-linux-gnu/release/genie-core
+            target/aarch64-unknown-linux-gnu/release/genie-ctl
+            target/aarch64-unknown-linux-gnu/release/genie-governor
+            target/aarch64-unknown-linux-gnu/release/genie-health
+            target/aarch64-unknown-linux-gnu/release/genie-api
+          if-no-files-found: error
+          retention-days: 14

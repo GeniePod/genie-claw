@@ -448,6 +448,61 @@ pub struct TelegramConfig {
     /// Bypass the allowlist and accept messages from any chat.
     #[serde(default)]
     pub allow_all_chats: bool,
+
+    /// Voice-message handling for the Telegram channel (issue #42).
+    #[serde(default)]
+    pub voice: TelegramVoiceConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TelegramVoiceConfig {
+    /// Enable voice-message ingestion. When false, voice messages get a polite
+    /// text reply explaining that voice is not enabled on this deployment.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Hard cap on accepted voice duration. Telegram includes a `duration`
+    /// field; anything longer is rejected before download.
+    #[serde(default = "defaults::telegram_voice_max_duration_secs")]
+    pub max_voice_duration_secs: u32,
+
+    /// Delete the downloaded `.ogg` and transcoded `.wav` after handling.
+    #[serde(default = "defaults::telegram_voice_delete_temp_audio")]
+    pub delete_temp_audio: bool,
+
+    /// Path to the `ffmpeg` binary used to transcode Telegram OGG/Opus to the
+    /// 16 kHz mono WAV that Whisper consumes.
+    #[serde(default = "defaults::telegram_voice_ffmpeg_path")]
+    pub ffmpeg_path: PathBuf,
+
+    /// Reply to incoming voice messages with a synthesized voice message
+    /// instead of (or in addition to) text. Phase 2 of issue #42: Piper
+    /// synthesizes WAV, ffmpeg encodes it as OGG/Opus, the bot uploads via
+    /// the Telegram `sendVoice` endpoint. Falls back to text on any failure
+    /// (Piper missing, ffmpeg missing, sendVoice error, etc.) so no reply is
+    /// ever silently dropped.
+    #[serde(default)]
+    pub reply_as_voice: bool,
+
+    /// Hard cap on the assistant text fed to Piper. Long-form responses
+    /// produce long voice messages that hit Telegram's 1 MB sendVoice limit;
+    /// when the text is over this length the bot falls back to text reply.
+    /// Tuned for the 60–90 s of OGG/Opus that comfortably fits under 1 MB.
+    #[serde(default = "defaults::telegram_voice_max_reply_chars")]
+    pub max_reply_chars: usize,
+}
+
+impl Default for TelegramVoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_voice_duration_secs: defaults::telegram_voice_max_duration_secs(),
+            delete_temp_audio: defaults::telegram_voice_delete_temp_audio(),
+            ffmpeg_path: defaults::telegram_voice_ffmpeg_path(),
+            reply_as_voice: false,
+            max_reply_chars: defaults::telegram_voice_max_reply_chars(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -556,8 +611,7 @@ pub struct Esp32C6UartConfig {
 pub struct ServiceEndpoint {
     pub url: String,
     pub systemd_unit: String,
-    /// LLM backend selector. Only meaningful for `services.llm`; defaults
-    /// preserve the legacy llama.cpp path for existing configs.
+    /// LLM backend selector. Only meaningful for `services.llm`.
     #[serde(default)]
     pub backend: LlmBackendKind,
 }
@@ -566,10 +620,10 @@ pub struct ServiceEndpoint {
 #[serde(rename_all = "snake_case")]
 pub enum LlmBackendKind {
     #[default]
-    #[serde(alias = "llama-cpp")]
-    LlamaCpp,
     #[serde(alias = "genie-ai-runtime")]
     GenieAiRuntime,
+    #[serde(alias = "llama-cpp")]
+    LlamaCpp,
 }
 
 impl Config {
@@ -792,8 +846,8 @@ impl Default for ServicesConfig {
             },
             llm: ServiceEndpoint {
                 url: "http://127.0.0.1:8080/health".into(),
-                systemd_unit: "genie-llm.service".into(),
-                backend: LlmBackendKind::LlamaCpp,
+                systemd_unit: "genie-ai-runtime.service".into(),
+                backend: LlmBackendKind::GenieAiRuntime,
             },
             homeassistant: None,
             nextcloud: None,
@@ -811,6 +865,7 @@ impl Default for TelegramConfig {
             poll_timeout_secs: defaults::telegram_poll_timeout_secs(),
             allowed_chat_ids: Vec::new(),
             allow_all_chats: false,
+            voice: TelegramVoiceConfig::default(),
         }
     }
 }
@@ -956,16 +1011,16 @@ bind_host = "0.0.0.0"
     }
 
     #[test]
-    fn llm_service_backend_defaults_to_llama_cpp() {
+    fn llm_service_backend_defaults_to_genie_ai_runtime() {
         let service: ServiceEndpoint = toml::from_str(
             r#"
 url = "http://127.0.0.1:8080/health"
-systemd_unit = "genie-llm.service"
+systemd_unit = "genie-ai-runtime.service"
 "#,
         )
         .unwrap();
 
-        assert_eq!(service.backend, LlmBackendKind::LlamaCpp);
+        assert_eq!(service.backend, LlmBackendKind::GenieAiRuntime);
     }
 
     #[test]
@@ -1426,6 +1481,21 @@ mod defaults {
     }
     pub fn telegram_poll_timeout_secs() -> u64 {
         30
+    }
+    pub fn telegram_voice_max_duration_secs() -> u32 {
+        60
+    }
+    pub fn telegram_voice_delete_temp_audio() -> bool {
+        true
+    }
+    pub fn telegram_voice_ffmpeg_path() -> PathBuf {
+        PathBuf::from("ffmpeg")
+    }
+    pub fn telegram_voice_max_reply_chars() -> usize {
+        // Roughly the upper bound that comfortably encodes under Telegram's
+        // 1 MB sendVoice limit at Piper's typical OGG/Opus output rate.
+        // Long-form replies fall back to text.
+        800
     }
     pub fn web_search_enabled() -> bool {
         true

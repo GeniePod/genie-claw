@@ -1,0 +1,12 @@
+# Ruff config for genie-claw's helper Python scripts under deploy/scripts/.
+# These scripts target the Python that ships with Jetson's Ubuntu 22.04 image.
+
+target-version = "py310"
+line-length = 100
+
+[lint]
+# E402 (module-level import not at top of file) is intentionally allowed:
+# the wakeword scripts have to suppress ALSA stderr and silence scipy/numpy
+# warnings *before* importing pyaudio / openwakeword, otherwise the C-level
+# diagnostics leak into the protocol stdout.
+ignore = ["E402"]

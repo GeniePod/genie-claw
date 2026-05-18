@@ -14,7 +14,7 @@ name = "genie-core"
 path = "src/main.rs"
 
 [features]
-default = ["telegram", "llama-cpp", "genie-ai-runtime"]
+default = ["telegram", "llama-cpp", "genie-ai-runtime", "voice"]
 telegram = []
 # LLM backend feature surface (declared per issue #32 closeout).
 # Both default-on so today's builds are byte-identical.
@@ -23,6 +23,14 @@ telegram = []
 # regression is caught automatically rather than silently bit-rotting.
 llama-cpp = []
 genie-ai-runtime = []
+# Voice subsystem (issue #41). Gates the STT/TTS/AEC/wakeword pipeline,
+# the `VoiceOrchestrator`, and the `voice_loop::run` dispatcher. Default-on
+# so today's Jetson builds are byte-identical; `--no-default-features`
+# (or `--no-default-features --features telegram,llama-cpp,...`) produces
+# a chat-only binary that builds on macOS / Windows hosts which don't
+# have ALSA. A voice-tagged `geniepod.toml` still deploys cleanly: the
+# runtime logs one warning and falls through to the chat path.
+voice = []
 
 [dependencies]
 genie-common = { workspace = true }
@@ -38,7 +46,7 @@ libloading = "0.8"
 toml = { workspace = true }
 genie-skill-sdk = { path = "../genie-skill-sdk" }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 
 [dev-dependencies]
 toml = { workspace = true }

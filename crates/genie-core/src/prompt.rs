@@ -344,6 +344,41 @@ mod tests {
         ));
     }
 
+    // Issue #44: Qwen3-4B is the canonical opt-in alternative paired with
+    // genie-ai-runtime. Lock the exact filename setup-jetson.sh writes to
+    // disk so a future detector refactor cannot silently drop it back into
+    // ModelFamily::Generic (which would route through the small-model prompt
+    // shape and lose the JSON tool-call instructions).
+    #[test]
+    fn detect_qwen3_4b_canonical_filename() {
+        assert!(matches!(
+            ModelFamily::from_model_name("Qwen3-4B-Q4_K_M.gguf"),
+            ModelFamily::Qwen
+        ));
+        assert!(matches!(
+            ModelFamily::from_model_name("Qwen3-4B-Instruct-Q4_K_M.gguf"),
+            ModelFamily::Qwen
+        ));
+    }
+
+    #[test]
+    fn qwen3_4b_uses_capable_prompt_shape() {
+        let builder = PromptBuilder::from_model_name("Qwen3-4B-Q4_K_M.gguf");
+        let tools = vec![crate::tools::dispatch::ToolDef {
+            name: "get_time".into(),
+            description: "Get current time".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let mem_path = std::env::temp_dir().join("prompt-test-qwen3-4b.db");
+        let _ = std::fs::remove_file(&mem_path);
+        let memory = Memory::open(&mem_path).unwrap();
+
+        let prompt = builder.build(&tools, &memory);
+        assert!(prompt.contains("ONLY a JSON object"));
+        assert!(prompt.contains("Do NOT wrap the JSON in markdown code blocks"));
+        assert!(!prompt.contains("EXAMPLES:"));
+    }
+
     #[test]
     fn detect_phi() {
         assert!(matches!(

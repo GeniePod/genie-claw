@@ -167,53 +167,93 @@ async fn main() -> Result<()> {
     }
 
     // Check for voice mode: --voice flag or GENIEPOD_VOICE=1 or config voice_enabled.
-    let voice_mode = std::env::args().any(|a| a == "--voice")
+    let voice_requested = std::env::args().any(|a| a == "--voice")
         || std::env::var("GENIEPOD_VOICE").unwrap_or_default() == "1"
         || config.core.voice_enabled;
+    let wakeword_available =
+        !config.core.wakeword_script.as_os_str().is_empty() && config.core.wakeword_script.exists();
+    let startup_decision =
+        runtime_mode::decide_startup_mode(voice_requested, interactive, wakeword_available);
+
+    // Whether the running binary actually has the voice subsystem compiled in.
+    // When voice was requested but the binary is chat-only (issue #41 feature
+    // gate), emit one warning and fall through to the chat path so an existing
+    // voice-tagged `geniepod.toml` still deploys cleanly on a chat-only build.
+    #[cfg(feature = "voice")]
+    let voice_mode = {
+        if startup_decision.blocked_push_to_talk() {
+            tracing::warn!(
+                "push-to-talk voice mode requested without an interactive terminal and no wakeword script is available; \
+                 running HTTP API only"
+            );
+        }
+        startup_decision.enters_voice()
+    };
+    #[cfg(not(feature = "voice"))]
+    let voice_mode = {
+        if voice_requested {
+            tracing::warn!(
+                "voice mode requested (--voice / GENIEPOD_VOICE=1 / core.voice_enabled) but \
+                 this genie-core build was compiled without the 'voice' feature; falling back \
+                 to chat-only mode. Rebuild with default features (or --features voice) to \
+                 enable the voice loop."
+            );
+        }
+        let _ = startup_decision;
+        false
+    };
 
     if voice_mode {
-        tracing::info!("voice mode — starting voice interaction loop");
-        let voice_cfg = genie_core::voice_loop::VoiceConfig {
-            whisper_model: config.core.whisper_model.to_string_lossy().to_string(),
-            whisper_cli_path: config.core.whisper_cli_path.to_string_lossy().to_string(),
-            whisper_port: config.core.whisper_port,
-            piper_model: config.core.piper_model.to_string_lossy().to_string(),
-            piper_path: config.core.piper_path.to_string_lossy().to_string(),
-            piper_pipe_mode: config.core.piper_pipe_mode,
-            stt_language: config.core.stt_language.clone(),
-            voice_tts_models: config
-                .core
-                .voice_tts_models
-                .iter()
-                .map(|(language, path)| (language.clone(), path.to_string_lossy().to_string()))
-                .collect(),
-            audio_device: config.core.audio_device.clone(),
-            audio_output_device: config.core.audio_output_device.clone(),
-            sample_rate: config.core.audio_sample_rate,
-            audio_denoiser: config.core.audio_denoiser.clone(),
-            deep_filter_path: config.core.deep_filter_path.to_string_lossy().to_string(),
-            deep_filter_atten_lim_db: config.core.deep_filter_atten_lim_db,
-            post_tts_silence_ms: config.core.post_tts_silence_ms,
-            record_secs: config.core.voice_record_secs,
-            llm_model_path: config.core.llm_model_path.to_string_lossy().to_string(),
-            wakeword_script: config.core.wakeword_script.to_string_lossy().to_string(),
-            voice_continuous: config.core.voice_continuous,
-            voice_continuous_secs: config.core.voice_continuous_secs,
-            speaker_identity: genie_core::voice::identity::SpeakerIdentityProvider::from_config(
-                &config.core.speaker_identity,
-            ),
-        };
-        genie_core::voice_loop::run(
-            voice_cfg,
-            &llm,
-            &tool_dispatcher,
-            &mem,
-            &conversations,
-            &system_prompt,
-            config.core.max_history_turns,
-            model_family,
-        )
-        .await
+        #[cfg(feature = "voice")]
+        {
+            tracing::info!("voice mode — starting voice interaction loop");
+            let voice_cfg = genie_core::voice_loop::VoiceConfig {
+                whisper_model: config.core.whisper_model.to_string_lossy().to_string(),
+                whisper_cli_path: config.core.whisper_cli_path.to_string_lossy().to_string(),
+                whisper_port: config.core.whisper_port,
+                piper_model: config.core.piper_model.to_string_lossy().to_string(),
+                piper_path: config.core.piper_path.to_string_lossy().to_string(),
+                piper_pipe_mode: config.core.piper_pipe_mode,
+                stt_language: config.core.stt_language.clone(),
+                voice_tts_models: config
+                    .core
+                    .voice_tts_models
+                    .iter()
+                    .map(|(language, path)| (language.clone(), path.to_string_lossy().to_string()))
+                    .collect(),
+                audio_device: config.core.audio_device.clone(),
+                audio_output_device: config.core.audio_output_device.clone(),
+                sample_rate: config.core.audio_sample_rate,
+                audio_denoiser: config.core.audio_denoiser.clone(),
+                deep_filter_path: config.core.deep_filter_path.to_string_lossy().to_string(),
+                deep_filter_atten_lim_db: config.core.deep_filter_atten_lim_db,
+                post_tts_silence_ms: config.core.post_tts_silence_ms,
+                record_secs: config.core.voice_record_secs,
+                llm_model_path: config.core.llm_model_path.to_string_lossy().to_string(),
+                wakeword_script: config.core.wakeword_script.to_string_lossy().to_string(),
+                voice_continuous: config.core.voice_continuous,
+                voice_continuous_secs: config.core.voice_continuous_secs,
+                speaker_identity: genie_core::voice::identity::SpeakerIdentityProvider::from_config(
+                    &config.core.speaker_identity,
+                ),
+            };
+            genie_core::voice_loop::run(
+                voice_cfg,
+                &llm,
+                &tool_dispatcher,
+                &mem,
+                &conversations,
+                &system_prompt,
+                config.core.max_history_turns,
+                model_family,
+            )
+            .await
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            // Unreachable: voice_mode is forced false above when the feature is off.
+            unreachable!("voice_mode true with feature 'voice' disabled");
+        }
     } else if interactive {
         tracing::info!("interactive mode — starting REPL");
         genie_core::repl::run(
@@ -272,6 +312,20 @@ async fn main() -> Result<()> {
                     poll_timeout_secs: config.telegram.poll_timeout_secs,
                     allowed_chat_ids: config.telegram.allowed_chat_ids.clone(),
                     allow_all_chats: config.telegram.allow_all_chats,
+                    voice: genie_core::telegram::TelegramVoiceRuntimeConfig {
+                        enabled: config.telegram.voice.enabled,
+                        max_voice_duration_secs: config.telegram.voice.max_voice_duration_secs,
+                        delete_temp_audio: config.telegram.voice.delete_temp_audio,
+                        ffmpeg_path: config.telegram.voice.ffmpeg_path.clone(),
+                        whisper_port: config.core.whisper_port,
+                        whisper_cli_path: config.core.whisper_cli_path.clone(),
+                        whisper_model: config.core.whisper_model.clone(),
+                        stt_language: config.core.stt_language.clone(),
+                        reply_as_voice: config.telegram.voice.reply_as_voice,
+                        max_reply_chars: config.telegram.voice.max_reply_chars,
+                        piper_path: config.core.piper_path.clone(),
+                        piper_model: config.core.piper_model.clone(),
+                    },
                 };
 
                 tracing::info!(
@@ -293,6 +347,9 @@ async fn main() -> Result<()> {
     }
 }
 
+// Only used by the telegram adapter (issue #41: dead in chat-only / no-telegram
+// builds, so gate the definition together with its only caller).
+#[cfg(feature = "telegram")]
 fn local_http_host(bind_host: &str) -> String {
     let bind_host = bind_host.trim();
     if bind_host.is_empty() || matches!(bind_host, "0.0.0.0" | "::") {
@@ -316,7 +373,10 @@ fn atty_check() -> bool {
     }
 }
 
-#[cfg(test)]
+// The only tests in this bin target are local_http_host_* which exercise the
+// telegram adapter's bind-host helper. Gate the whole module so chat-only /
+// no-telegram builds don't emit an `unused_imports` lint on `use super::*;`.
+#[cfg(all(test, feature = "telegram"))]
 mod tests {
     use super::*;
 

@@ -9,9 +9,17 @@ description = "GeniePod CLI — device management, status, chat, governor contro
 name = "genie-ctl"
 path = "src/main.rs"
 
+[features]
+# Mirrors the `voice` feature on genie-core (issue #41). Default-on so
+# today's `cargo build` produces the same binary; turning it off
+# (`cargo build -p genie-ctl --no-default-features`) drops the `speaker`
+# subcommand so the CLI builds against a chat-only genie-core too.
+default = ["voice"]
+voice = ["genie-core/voice"]
+
 [dependencies]
 genie-common = { workspace = true }
-genie-core = { path = "../genie-core" }
+genie-core = { path = "../genie-core", default-features = false }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,8 +1,13 @@
 [Unit]
 Description=GeniePod Core — Local Home AI Engine
 Documentation=https://github.com/GeniePod/genie-claw
-After=network.target genie-llm.service genie-mqtt.service
-Wants=genie-llm.service genie-mqtt.service
+# Order after both LLM units so genie-core never starts before whichever
+# backend is configured. genie-ai-runtime.service is the alpha.9 default;
+# genie-llm.service is the llama.cpp fallback. They Conflict= each other,
+# so only one will ever be active at a time and the unused After= entry
+# is a no-op.
+After=network.target genie-mqtt.service genie-ai-runtime.service genie-llm.service
+Wants=genie-mqtt.service genie-ai-runtime.service
 
 [Service]
 Type=simple

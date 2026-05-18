@@ -85,7 +85,7 @@ systemd_unit = "genie-core.service"
 [services.llm]
 url = "http://127.0.0.1:8080/health"
 systemd_unit = "genie-llm.service"
-# backend = "llama_cpp"             # Default. Local llama.cpp `--server` on :8080.
+backend = "llama_cpp"              # Dev default (x86/macOS): local llama.cpp `--server` on :8080.
 # backend = "genie_ai_runtime"      # Jetson-tuned runtime (dev machines typically stay on llama.cpp).
 
 # Uncomment to enable Home Assistant integration during development:

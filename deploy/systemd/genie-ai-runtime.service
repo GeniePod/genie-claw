@@ -1,39 +1,35 @@
 [Unit]
-Description=GeniePod LLM Server (genie-ai-runtime / jllm-server)
+Description=GeniePod AI Runtime (Jetson-tuned LLM, OpenAI-compatible)
 Documentation=https://github.com/GeniePod/genie-ai-runtime
-Documentation=https://github.com/GeniePod/genie-claw/issues/27
 After=network.target
-ConditionPathExists=/opt/geniepod/bin/jllm-server
+# Claim the LLM KV cache before memory-heavy voice/container services start.
+# Jetson testing for issue #75 showed the same `-c 4096` request fitting only
+# ~1.7k ctx after the full stack was resident, but fitting 4k/6k/8k ctx when
+# genie-ai-runtime loaded first.
+Before=genie-whisper.service genie-whisper-warmup.service homeassistant.service genie-core.service
+ConditionPathExists=/opt/geniepod/bin/jetson-llm-server
+# Conflicts with genie-llm.service: both bind :8080. systemd will refuse
+# to start the second one while the first is running, so a misconfigured
+# [services.llm] block fails loudly instead of silently double-binding.
+Conflicts=genie-llm.service
 
 [Service]
 Type=simple
-# Drop page cache before loading model — Jetson NvMap needs contiguous blocks.
-ExecStartPre=/bin/sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
-ExecStart=/opt/geniepod/bin/jllm-server \
-    --model ${GENIEPOD_LLM_MODEL} \
-    --host 0.0.0.0 \
-    --port 8080 \
-    --ctx-size 2048 \
-    --n-gpu-layers 999 \
-    --threads 4 \
-    --parallel 1
-# The jllm-server flag surface intentionally mirrors llama-server so the
-# OpenAI-compatible client in genie-core works against either backend without
-# code changes. Issue #27 tracks the opt-in rollout; flip
-# [services.llm].backend = "genie_ai_runtime" in geniepod.toml after
-# installing /opt/geniepod/bin/jllm-server.
-
-Environment=GENIEPOD_LLM_MODEL=/opt/geniepod/models/phi-4-mini-instruct-q4_k_m.gguf
+# Keep the GGUF in page cache across restarts when the kernel can. Clearing
+# VM caches here made every runtime restart cold-load Qwen3 again (issue #69).
+# Use INT8 KV so the Jetson service can reserve an 8k context on Orin Nano
+# when systemd starts it before memory-heavy services. `-c` is still clamped
+# by runtime memory budget, so boot/start ordering matters.
+ExecStart=/opt/geniepod/bin/jetson-llm-server \
+    -m ${GENIEPOD_LLM_MODEL} \
+    -p 8080 \
+    -c ${GENIEPOD_AI_RUNTIME_CONTEXT} \
+    --int8-kv
+Environment=GENIEPOD_LLM_MODEL=/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf
+Environment=GENIEPOD_AI_RUNTIME_CONTEXT=8192
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=120
-
-# CPU pinning for voice latency stability (issue #25). Inference is GPU-bound
-# (--n-gpu-layers 999), so one dedicated core is enough to host CUDA dispatch
-# + sampler + tokenizer without contending with whisper (2-3) or genie-core
-# (5). --threads=4 above stays as-is; with a single-core affinity the four
-# worker threads time-share core 4 — fine for the GPU-bound critical path.
-CPUAffinity=4
 
 # GPU needs full system access
 ProtectSystem=no

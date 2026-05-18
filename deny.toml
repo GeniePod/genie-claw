@@ -1,0 +1,85 @@
+# cargo-deny configuration for genie-claw.
+#
+# Run locally with:
+#   cargo install --locked cargo-deny
+#   cargo deny check
+#
+# Layout follows the cargo-deny 0.14+ schema (sections: graph, advisories,
+# licenses, bans, sources). The CI workflow uses the action's defaults plus
+# the rules in this file.
+
+[graph]
+all-features = true
+# Skip dev-dependencies for license / ban evaluation — they don't ship in
+# the Jetson binaries.
+exclude-dev = true
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+
+# ── Security advisories ───────────────────────────────────────────
+# Fail on any unpatched RustSec advisory affecting our dependency tree.
+[advisories]
+version = 2
+yanked = "warn"
+ignore = []
+
+# ── Licenses ──────────────────────────────────────────────────────
+# genie-claw itself is AGPL-3.0-only. Allow the common permissive
+# licenses that AGPL-3.0 is one-way-compatible with for upstream deps.
+[licenses]
+version = 2
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+allow = [
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    # webpki-roots ships the Mozilla CA bundle under CDLA-Permissive-2.0,
+    # which is a permissive data-license (no copyleft / no patent terms).
+    "CDLA-Permissive-2.0",
+]
+
+# Permit ring's BoringSSL-derived license bundle.
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ── Bans ──────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+# genie-claw's workspace crates depend on each other via `path = "..."`
+# entries without explicit versions. cargo-deny treats those as wildcard
+# *version* deps unless the crate is marked private (publish = false),
+# but the workspace crates currently carry publishable metadata even
+# though nothing is shipped to crates.io. Until that is reconciled, allow
+# wildcards globally — path deps are resolved locally and aren't a
+# supply-chain risk.
+wildcards = "allow"
+highlight = "all"
+# Crates we explicitly want banned would go here (e.g. yanked impls,
+# known-unmaintained shims). Empty for now.
+deny = []
+skip = []
+skip-tree = []
+
+# ── Sources ───────────────────────────────────────────────────────
+# Only allow dependencies from crates.io. Git deps must be added here
+# explicitly so a supply-chain swap shows up as a CI failure.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

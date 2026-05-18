@@ -11,6 +11,19 @@ pub struct OpenAiCompatClient {
     backend_name: &'static str,
     host: String,
     port: u16,
+    request_profile: RequestProfile,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RequestProfile {
+    Generic,
+    GenieAiRuntime,
+}
+
+#[derive(Debug)]
+struct PreparedChatBody {
+    body: String,
+    compacted: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -22,6 +35,8 @@ pub(crate) struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) temperature: Option<f32>,
     pub(crate) stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) think: Option<bool>,
     /// JSON schema constraint for backends that support OpenAI-compatible
     /// `response_format`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,16 +98,113 @@ struct HttpResponse {
     body: String,
 }
 
+impl RequestProfile {
+    fn generic() -> Self {
+        Self::Generic
+    }
+
+    pub(crate) fn genie_ai_runtime() -> Self {
+        Self::GenieAiRuntime
+    }
+
+    fn prepare_body(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        stream: bool,
+        response_format: Option<ResponseFormat>,
+    ) -> Result<PreparedChatBody> {
+        let body = self.serialize_body(messages, max_tokens, stream, response_format.clone())?;
+        if !matches!(self, Self::GenieAiRuntime) || body.len() <= GENIE_RUNTIME_MAX_BODY_BYTES {
+            return Ok(PreparedChatBody {
+                body,
+                compacted: false,
+            });
+        }
+
+        let compacted_messages = self.compact_messages(messages, GENIE_RUNTIME_MAX_BODY_BYTES);
+        let compacted_body =
+            self.serialize_body(&compacted_messages, max_tokens, stream, response_format)?;
+        Ok(PreparedChatBody {
+            body: compacted_body,
+            compacted: true,
+        })
+    }
+
+    fn serialize_body(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        stream: bool,
+        response_format: Option<ResponseFormat>,
+    ) -> Result<String> {
+        let request = ChatRequest {
+            model: self.model().into(),
+            messages: messages.to_vec(),
+            max_tokens,
+            temperature: Some(0.7),
+            stream,
+            think: self.think_override(),
+            response_format,
+        };
+        Ok(serde_json::to_string(&request)?)
+    }
+
+    fn model(self) -> &'static str {
+        match self {
+            Self::Generic => "default",
+            Self::GenieAiRuntime => "jetson-llm",
+        }
+    }
+
+    fn think_override(self) -> Option<bool> {
+        match self {
+            Self::Generic => None,
+            Self::GenieAiRuntime => Some(false),
+        }
+    }
+
+    fn compact_messages(&self, messages: &[Message], max_body_bytes: usize) -> Vec<Message> {
+        match self {
+            Self::Generic => messages.to_vec(),
+            Self::GenieAiRuntime => compact_genie_runtime_messages(messages, max_body_bytes),
+        }
+    }
+}
+
+const GENIE_RUNTIME_MAX_BODY_BYTES: usize = 24 * 1024;
+const GENIE_RUNTIME_BODY_OVERHEAD_BYTES: usize = 768;
+const GENIE_RUNTIME_COMPACT_SYSTEM: &str =
+    "You are GeniePod Home. Answer the user's latest request directly and concisely.";
+
 impl OpenAiCompatClient {
     pub fn new(backend_name: &'static str, host: &str, port: u16) -> Self {
+        Self::new_with_profile(backend_name, host, port, RequestProfile::generic())
+    }
+
+    pub(crate) fn new_with_profile(
+        backend_name: &'static str,
+        host: &str,
+        port: u16,
+        request_profile: RequestProfile,
+    ) -> Self {
         Self {
             backend_name,
             host: host.to_string(),
             port,
+            request_profile,
         }
     }
 
     pub fn from_url(backend_name: &'static str, url: &str) -> Self {
+        Self::from_url_with_profile(backend_name, url, RequestProfile::generic())
+    }
+
+    pub(crate) fn from_url_with_profile(
+        backend_name: &'static str,
+        url: &str,
+        request_profile: RequestProfile,
+    ) -> Self {
         let stripped = url.strip_prefix("http://").unwrap_or(url);
         let (host_port, _) = stripped.split_once('/').unwrap_or((stripped, ""));
         let (host, port_str) = host_port.split_once(':').unwrap_or((host_port, "8080"));
@@ -101,6 +213,7 @@ impl OpenAiCompatClient {
             backend_name,
             host: host.to_string(),
             port,
+            request_profile,
         }
     }
 
@@ -148,17 +261,27 @@ impl OpenAiCompatClient {
         max_tokens: Option<u32>,
         response_format: Option<ResponseFormat>,
     ) -> Result<String> {
-        let request = ChatRequest {
-            model: "default".into(),
-            messages: messages.to_vec(),
-            max_tokens,
-            temperature: Some(0.7),
-            stream: false,
-            response_format,
-        };
+        let prepared =
+            self.request_profile
+                .prepare_body(messages, max_tokens, false, response_format)?;
+        if prepared.compacted {
+            tracing::debug!(
+                backend = self.backend_name,
+                request_bytes = prepared.body.len(),
+                "compacted OpenAI-compatible chat request"
+            );
+        }
 
-        let body = serde_json::to_string(&request)?;
-        let response = self.http_post("/v1/chat/completions", &body).await?;
+        let response = self
+            .http_post("/v1/chat/completions", &prepared.body)
+            .await?;
+        if response.status == 0 && response.body.trim().is_empty() {
+            anyhow::bail!(
+                "{} closed connection before HTTP status (request_bytes={})",
+                self.backend_name,
+                prepared.body.len()
+            );
+        }
         if response.status != 200 {
             anyhow::bail!(
                 "{} {}: {}",
@@ -194,16 +317,17 @@ impl OpenAiCompatClient {
         max_tokens: Option<u32>,
         on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> Result<String> {
-        let request = ChatRequest {
-            model: "default".into(),
-            messages: messages.to_vec(),
-            max_tokens,
-            temperature: Some(0.7),
-            stream: true,
-            response_format: None,
-        };
+        let prepared = self
+            .request_profile
+            .prepare_body(messages, max_tokens, true, None)?;
+        if prepared.compacted {
+            tracing::debug!(
+                backend = self.backend_name,
+                request_bytes = prepared.body.len(),
+                "compacted OpenAI-compatible streaming chat request"
+            );
+        }
 
-        let body = serde_json::to_string(&request)?;
         let addr = format!("{}:{}", self.host, self.port);
         let stream = TcpStream::connect(&addr).await?;
         let (reader, mut writer) = stream.into_split();
@@ -211,15 +335,15 @@ impl OpenAiCompatClient {
         let http_req = format!(
             "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept: text/event-stream\r\n\r\n{}",
             addr,
-            body.len(),
-            body,
+            prepared.body.len(),
+            prepared.body,
         );
 
         writer.write_all(http_req.as_bytes()).await?;
 
         let mut lines = BufReader::new(reader).lines();
         let mut full_response = String::new();
-        let mut status = 200;
+        let mut status = 0;
         let mut headers_done = false;
 
         while let Some(line) = lines.next_line().await? {
@@ -267,6 +391,13 @@ impl OpenAiCompatClient {
                     }
                 }
             }
+        }
+
+        if !headers_done {
+            anyhow::bail!(
+                "{} closed streaming connection before HTTP status",
+                self.backend_name
+            );
         }
 
         Ok(full_response)
@@ -377,6 +508,67 @@ fn parse_status_line(line: &str) -> u16 {
         .unwrap_or(0)
 }
 
+fn compact_genie_runtime_messages(messages: &[Message], max_body_bytes: usize) -> Vec<Message> {
+    let system_messages = messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_system_context = !system_messages.is_empty();
+
+    let Some(latest_idx) = messages
+        .iter()
+        .rposition(|m| m.role == "user")
+        .or_else(|| messages.iter().rposition(|m| m.role != "system"))
+    else {
+        return system_messages;
+    };
+
+    let latest_source = &messages[latest_idx];
+    let latest = Message {
+        role: "user".into(),
+        content: if has_system_context {
+            latest_source.content.clone()
+        } else {
+            format!(
+                "{}\n\n{}",
+                GENIE_RUNTIME_COMPACT_SYSTEM, latest_source.content
+            )
+        },
+    };
+
+    let mut compacted = system_messages;
+    let body_budget = max_body_bytes.saturating_sub(GENIE_RUNTIME_BODY_OVERHEAD_BYTES);
+    let mut estimated_bytes = estimate_messages_bytes(&compacted) + estimate_message_bytes(&latest);
+    let mut retained_history = Vec::new();
+
+    for message in messages[..latest_idx]
+        .iter()
+        .rev()
+        .filter(|m| m.role != "system")
+    {
+        let message_bytes = estimate_message_bytes(message);
+        if estimated_bytes + message_bytes > body_budget {
+            break;
+        }
+        retained_history.push(message.clone());
+        estimated_bytes += message_bytes;
+    }
+
+    retained_history.reverse();
+    compacted.extend(retained_history);
+    compacted.push(latest);
+    compacted
+}
+
+fn estimate_messages_bytes(messages: &[Message]) -> usize {
+    messages.iter().map(estimate_message_bytes).sum()
+}
+
+fn estimate_message_bytes(message: &Message) -> usize {
+    message.role.len() + message.content.len() + 32
+}
+
 fn should_retry_without_system_role(messages: &[Message], err: &str) -> bool {
     messages.iter().any(|m| m.role == "system") && system_role_not_supported(err)
 }
@@ -475,11 +667,125 @@ mod tests {
             max_tokens: Some(256),
             temperature: Some(0.7),
             stream: false,
+            think: None,
             response_format: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("nemotron-4b"));
         assert!(json.contains("turn on the lights"));
+    }
+
+    #[test]
+    fn generic_request_profile_keeps_full_default_body() {
+        let profile = RequestProfile::generic();
+        let messages = vec![
+            Message {
+                role: "system".into(),
+                content: "keep this full instruction".repeat(128),
+            },
+            Message {
+                role: "user".into(),
+                content: "turn on the lights".into(),
+            },
+        ];
+
+        let prepared = profile
+            .prepare_body(&messages, Some(64), false, None)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
+
+        assert!(!prepared.compacted);
+        assert_eq!(json["model"], "default");
+        assert!(
+            json["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("keep this full instruction")
+        );
+    }
+
+    #[test]
+    fn genie_runtime_profile_compacts_large_core_prompt() {
+        let profile = RequestProfile::genie_ai_runtime();
+        let messages = vec![
+            Message {
+                role: "system".into(),
+                content: "tool manifest memory_recall household context ".repeat(128),
+            },
+            Message {
+                role: "assistant".into(),
+                content: "older assistant turn ".repeat(2_000),
+            },
+            Message {
+                role: "user".into(),
+                content: "Say hello from the GeniePod web UI.".into(),
+            },
+        ];
+
+        let prepared = profile
+            .prepare_body(&messages, Some(64), false, None)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
+        let serialized_messages = json["messages"].to_string();
+
+        assert!(prepared.compacted);
+        assert_eq!(json["model"], "jetson-llm");
+        assert_eq!(json["think"], false);
+        assert_eq!(json["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(json["messages"][0]["role"], "system");
+        assert!(serialized_messages.contains("memory_recall"));
+        assert!(serialized_messages.contains("household context"));
+        assert!(serialized_messages.contains("Say hello from the GeniePod web UI."));
+        assert!(!serialized_messages.contains("GeniePod Home"));
+        assert!(!serialized_messages.contains("older assistant turn"));
+        assert!(prepared.body.len() < GENIE_RUNTIME_MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn genie_runtime_profile_keeps_runtime_prompt_under_expanded_budget() {
+        let profile = RequestProfile::genie_ai_runtime();
+        let messages = vec![
+            Message {
+                role: "system".into(),
+                content: "memory_recall tool manifest household preference ".repeat(160),
+            },
+            Message {
+                role: "user".into(),
+                content: "What is my name?".into(),
+            },
+        ];
+
+        let prepared = profile
+            .prepare_body(&messages, Some(64), false, None)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
+        let serialized_messages = json["messages"].to_string();
+
+        assert!(!prepared.compacted);
+        assert!(prepared.body.len() > 4 * 1024);
+        assert!(prepared.body.len() < GENIE_RUNTIME_MAX_BODY_BYTES);
+        assert!(serialized_messages.contains("memory_recall"));
+        assert!(serialized_messages.contains("What is my name?"));
+    }
+
+    #[test]
+    fn genie_runtime_compaction_falls_back_to_latest_non_system_message() {
+        let messages = vec![
+            Message {
+                role: "system".into(),
+                content: "system".into(),
+            },
+            Message {
+                role: "assistant".into(),
+                content: "assistant fallback".into(),
+            },
+        ];
+
+        let compacted = compact_genie_runtime_messages(&messages, GENIE_RUNTIME_MAX_BODY_BYTES);
+        assert_eq!(compacted.len(), 2);
+        assert_eq!(compacted[0].role, "system");
+        assert_eq!(compacted[1].role, "user");
+        assert!(compacted[1].content.contains("assistant fallback"));
     }
 
     #[test]

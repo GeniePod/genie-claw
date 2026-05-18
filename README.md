@@ -1,5 +1,9 @@
 # GenieClaw
 
+[![CI](https://github.com/GeniePod/genie-claw/actions/workflows/ci.yml/badge.svg)](https://github.com/GeniePod/genie-claw/actions/workflows/ci.yml)
+[![Jetson cross-compile](https://github.com/GeniePod/genie-claw/actions/workflows/cross.yml/badge.svg)](https://github.com/GeniePod/genie-claw/actions/workflows/cross.yml)
+[![Audit](https://github.com/GeniePod/genie-claw/actions/workflows/audit.yml/badge.svg)](https://github.com/GeniePod/genie-claw/actions/workflows/audit.yml)
+
 **A private, always-on AI for your home. Runs entirely on a Jetson Orin Nano.
 Voice in, voice out, controls Home Assistant, no cloud.**
 
@@ -11,11 +15,14 @@ Voice in, voice out, controls Home Assistant, no cloud.**
 
 ![GenieClaw](doc/assets/genie-claw.png)
 
-> **Status:** `v1.0.0-alpha.4`. The voice loop, the Home Assistant integration,
-> and the safety/audit surfaces are working end-to-end on Jetson Orin Nano Super
-> 8 GB (see [`CHANGELOG.md`](CHANGELOG.md) for the alpha.5 verified-deploy notes
-> and the alpha.7 verified voice cycle). Setup is currently a 30-60 min Jetson
-> bring-up, not a one-line install — see [`GETTING_STARTED.md`](GETTING_STARTED.md).
+> **Status:** `v1.0.0-alpha.9`. The voice loop, the Home Assistant integration,
+> the LLM-backend facade (llama.cpp / genie-ai-runtime), Telegram voice
+> ingestion, and the safety/audit surfaces are working end-to-end on Jetson
+> Orin Nano Super 8 GB (see [`CHANGELOG.md`](CHANGELOG.md) for the alpha.5
+> verified-deploy notes, the alpha.7 verified voice cycle, and the alpha.9
+> CI / supply-chain / voice-optional bundle). Setup is currently a 30-60 min
+> Jetson bring-up, not a one-line install — see
+> [`GETTING_STARTED.md`](GETTING_STARTED.md).
 
 ## How it works
 
@@ -29,8 +36,8 @@ Voice in, voice out, controls Home Assistant, no cloud.**
    └────────┘   └────────┘   └──────┬───────┘   └───────┘
                                     │
                        memory ◄─────┼─────► local LLM
-                       (SQLite)     │       (llama.cpp by default,
-                                    │        genie-ai-runtime opt-in
+                       (SQLite)     │       (genie-ai-runtime by default,
+                                    │        llama.cpp still selectable
                                     │        via [services.llm].backend)
                                     ▼
                           Home Assistant
@@ -65,7 +72,7 @@ This repo is the Rust agent runtime for a very specific product shape:
 - a local household memory system
 - safe handoff to a home-control runtime
 - transitional Home Assistant support while `genie-home-runtime` is not yet split out
-- pluggable local LLM backend (`llama.cpp` default; `genie-ai-runtime` selectable via `[services.llm].backend = "genie_ai_runtime"`)
+- pluggable local LLM backend (`genie-ai-runtime` default on Jetson; `llama.cpp` remains selectable via `[services.llm].backend = "llama_cpp"`)
 - a privacy-first and security-first system
 - a memory-footprint-conscious runtime built for constrained edge hardware
 - a household trust model that exposes redacted posture, not raw config files
@@ -149,9 +156,9 @@ logic, response style, channels, and skill routing.
 
 At a high level:
 
-1. The local model server is `llama.cpp` by default; the
-   `genie-ai-runtime` Jetson-tuned runtime is selectable per-deployment
-   via `[services.llm].backend = "genie_ai_runtime"` in `geniepod.toml`.
+1. The local model server defaults to `genie-ai-runtime` on Jetson; the
+   legacy `llama.cpp` server remains selectable per-deployment via
+   `[services.llm].backend = "llama_cpp"` in `geniepod.toml`.
    Backend identity flows through `LlmClient::backend_name()` into
    logs, `/api/health`, and `genie-ctl status` for operator visibility.
 2. `genie-core` handles prompts, tool calls, memory, chat, and voice orchestration.
@@ -286,6 +293,36 @@ The repo includes:
 - Home Assistant container deployment support
 - wake-word helper scripts
 - Docker support for local development
+
+### Recommended LLM Pairing
+
+The bundled default is **Phi-4-mini Q4_K_M** on llama.cpp. `setup-jetson.sh`
+auto-downloads it on first run.
+
+For deployments that want stronger reasoning, cleaner JSON tool calls, and
+better multilingual support (matching the per-language Piper voice models),
+the recommended pairing is **Qwen3-4B Q4_K_M** running on
+[`genie-ai-runtime`](https://github.com/GeniePod/genie-ai-runtime) once the
+runtime backend is enabled (`[services.llm].backend = "genie_ai_runtime"`).
+Qwen3-4B's slower per-token decode is exactly what genie-ai-runtime's
+prefill and TTFT improvements address.
+
+Phase 1 is opt-in only — Phi-4-mini remains the default:
+
+```bash
+# On the Jetson, after `make deploy`:
+sudo /opt/geniepod/setup-jetson.sh --model qwen3-4b
+
+# Then edit /etc/geniepod/geniepod.toml:
+#   llm_model_name = "qwen"
+#   llm_model_path = "/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf"
+# And update GENIEPOD_LLM_MODEL in /etc/systemd/system/genie-llm.service,
+# then: sudo systemctl restart genie-llm genie-core
+```
+
+See [issue #44](https://github.com/GeniePod/genie-claw/issues/44) for the
+full rollout plan; flipping the default ships in Phase 2 alongside
+[issue #33](https://github.com/GeniePod/genie-claw/issues/33).
 
 ## Design Principles
 
@@ -484,6 +521,14 @@ What this confirms:
 Total first-reply latency of **~4 seconds** from end-of-user-speech to
 first audible TTS audio, on a 7.6 GB Orin Nano running Phi-4-mini Q4_K_M
 LLM + whisper-small + Piper en_US-amy concurrently.
+
+## Contributing
+
+Quality, engineering, and bug fixes are always welcome. Every PR must include a **Real Behavior Proof** section in the description — a brief statement of what you ran, where you ran it, and what happened (Jetson hardware preferred). CI enforces the structure; reviewers read the content. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
+
+## Security
+
+Found a vulnerability? **Do not open a public issue.** Email <contact@genieclaw.org> with the details. See [SECURITY.md](SECURITY.md) for the response timeline and scope.
 
 ## License
 

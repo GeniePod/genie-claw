@@ -23,15 +23,34 @@ use genie_core::skills::{
     SkillLoader, SkillManifestAudit, find_manifest_sidecar, manifest_sidecar_candidates,
     skills_dir as runtime_skills_dir,
 };
+#[cfg(feature = "voice")]
 use genie_core::voice::identity::{
     enroll_speaker_file, identify_speaker_file, list_speaker_profiles, remove_speaker_profile,
 };
 use std::path::{Path, PathBuf};
+#[cfg(feature = "voice")]
 use std::process::Command;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-const CORE_URL: &str = "127.0.0.1:3000";
 const GOVERNOR_SOCK: &str = "/run/geniepod/governor.sock";
+
+/// HTTP `host:port` for genie-core, from `[core].bind_host` and `[core].port`.
+fn core_addr_from_config(config: &Config) -> String {
+    let host = config.core.bind_host.trim();
+    let host = if host.is_empty() {
+        "127.0.0.1"
+    } else if host == "0.0.0.0" || host == "::" {
+        // genie-core may listen on all interfaces; local CLI should use loopback.
+        "127.0.0.1"
+    } else {
+        host
+    };
+    format!("{host}:{}", config.core.port)
+}
+
+fn load_core_addr() -> Result<String> {
+    Ok(core_addr_from_config(&Config::load()?))
+}
 const SKILL_RESTART_HINT: &str =
     "Restart genie-core to load skill changes, or wait until the next startup.";
 
@@ -89,11 +108,23 @@ async fn main() -> Result<()> {
             cmd_skill(&args[2..])?;
         }
         "speaker" | "speakers" => {
-            if args.len() < 3 {
-                print_speaker_usage();
+            #[cfg(feature = "voice")]
+            {
+                if args.len() < 3 {
+                    print_speaker_usage();
+                    std::process::exit(1);
+                }
+                cmd_speaker(&args[2..])?;
+            }
+            #[cfg(not(feature = "voice"))]
+            {
+                eprintln!(
+                    "speaker subcommand is unavailable: this genie-ctl build was compiled \
+                     without the 'voice' feature (issue #41). Rebuild with default features \
+                     (or --features voice) to manage local speaker profiles."
+                );
                 std::process::exit(1);
             }
-            cmd_speaker(&args[2..])?;
         }
         "health" => cmd_health().await?,
         "conversations" | "convos" => cmd_conversations().await?,
@@ -119,9 +150,16 @@ async fn main() -> Result<()> {
 }
 
 fn print_usage() {
+    // Gated per issue #41: `speaker` is only listed when this build includes
+    // the `voice` feature, so the help text matches what the binary can do.
+    #[cfg(feature = "voice")]
+    const SPEAKER_HELP_LINE: &str = "    speaker <SUBCOMMAND>\n                        Manage local speaker identity profiles\n";
+    #[cfg(not(feature = "voice"))]
+    const SPEAKER_HELP_LINE: &str = "";
+
     println!(
         "\
-GeniePod CLI v{}
+GeniePod CLI v{version}
 
 USAGE:
     genie-ctl <COMMAND> [ARGS]
@@ -136,8 +174,7 @@ COMMANDS:
     tools               List available tools
     connectivity        Inspect ESP32-C6 Thread/Matter sidecar status
     skill <SUBCOMMAND>  Manage loadable skill modules
-    speaker <SUBCOMMAND>
-                        Manage local speaker identity profiles
+{speaker}\
     health              Service health check
     conversations       List all conversations
     update-check        Check for OTA updates
@@ -145,10 +182,12 @@ COMMANDS:
     support-bundle [P]  Write JSON diagnostics bundle to path P
     version             Show version info
     help                Show this help",
-        env!("CARGO_PKG_VERSION")
+        version = env!("CARGO_PKG_VERSION"),
+        speaker = SPEAKER_HELP_LINE,
     );
 }
 
+#[cfg(feature = "voice")]
 fn print_speaker_usage() {
     println!(
         "\
@@ -193,10 +232,14 @@ SUBCOMMANDS:
 
 fn cmd_version() {
     println!("genie-ctl v{}", env!("CARGO_PKG_VERSION"));
-    println!("  core: {}", CORE_URL);
+    match load_core_addr() {
+        Ok(addr) => println!("  core: {}", addr),
+        Err(err) => println!("  core: (config error: {err})"),
+    }
     println!("  governor: {}", GOVERNOR_SOCK);
 }
 
+#[cfg(feature = "voice")]
 fn cmd_speaker(args: &[String]) -> Result<()> {
     match args[0].as_str() {
         "list" | "ls" => {
@@ -255,6 +298,7 @@ fn cmd_speaker(args: &[String]) -> Result<()> {
     }
 }
 
+#[cfg(feature = "voice")]
 #[derive(Debug, Clone)]
 struct SpeakerCliOptions {
     profile_dir: PathBuf,
@@ -264,6 +308,7 @@ struct SpeakerCliOptions {
     duration_secs: u32,
 }
 
+#[cfg(feature = "voice")]
 fn parse_speaker_options(args: &[String]) -> Result<SpeakerCliOptions> {
     let defaults = default_speaker_options();
     let mut profile_dir = defaults.profile_dir;
@@ -322,6 +367,7 @@ fn parse_speaker_options(args: &[String]) -> Result<SpeakerCliOptions> {
     })
 }
 
+#[cfg(feature = "voice")]
 fn default_speaker_options() -> SpeakerCliOptions {
     Config::load()
         .map(|config| SpeakerCliOptions {
@@ -344,6 +390,7 @@ fn default_speaker_options() -> SpeakerCliOptions {
         })
 }
 
+#[cfg(feature = "voice")]
 fn cmd_speaker_list(profile_dir: &Path) -> Result<()> {
     let profiles = list_speaker_profiles(profile_dir)?;
     if profiles.is_empty() {
@@ -366,6 +413,7 @@ fn cmd_speaker_list(profile_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "voice")]
 fn cmd_speaker_enroll(name: &str, wav: &Path, profile_dir: &Path) -> Result<()> {
     let profile = enroll_speaker_file(profile_dir, name, wav)?;
     println!(
@@ -379,6 +427,7 @@ fn cmd_speaker_enroll(name: &str, wav: &Path, profile_dir: &Path) -> Result<()> 
     Ok(())
 }
 
+#[cfg(feature = "voice")]
 fn cmd_speaker_enroll_live(name: &str, opts: &SpeakerCliOptions) -> Result<()> {
     let wav_path = std::env::temp_dir().join(format!(
         "geniepod-speaker-enroll-{}-{}.wav",
@@ -395,6 +444,7 @@ fn cmd_speaker_enroll_live(name: &str, opts: &SpeakerCliOptions) -> Result<()> {
     result
 }
 
+#[cfg(feature = "voice")]
 fn cmd_speaker_record(output: &Path, opts: &SpeakerCliOptions) -> Result<()> {
     println!(
         "Recording {} seconds on {} -> {}",
@@ -407,6 +457,7 @@ fn cmd_speaker_record(output: &Path, opts: &SpeakerCliOptions) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "voice")]
 fn cmd_speaker_identify(wav: &Path, profile_dir: &Path, min_score: f32) -> Result<()> {
     match identify_speaker_file(profile_dir, wav, min_score)? {
         Some(result) => {
@@ -428,12 +479,14 @@ fn cmd_speaker_identify(wav: &Path, profile_dir: &Path, min_score: f32) -> Resul
     Ok(())
 }
 
+#[cfg(feature = "voice")]
 fn cmd_speaker_remove(name: &str, profile_dir: &Path) -> Result<()> {
     let removed = remove_speaker_profile(profile_dir, name)?;
     println!("Removed speaker profile {}", removed.display());
     Ok(())
 }
 
+#[cfg(feature = "voice")]
 fn record_speaker_wav(output: &Path, opts: &SpeakerCliOptions) -> Result<()> {
     if opts.duration_secs == 0 {
         anyhow::bail!("recording duration must be greater than zero");
@@ -718,6 +771,7 @@ fn remove_skill(target: &str, skills_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn cmd_status() -> Result<()> {
+    let core = load_core_addr()?;
     // Try governor first.
     if let Some(gov) = governor_cmd(r#"{"cmd":"status"}"#).await {
         let mode = gov
@@ -740,7 +794,7 @@ async fn cmd_status() -> Result<()> {
     }
 
     // Try core health.
-    match http_get(CORE_URL, "/api/health").await {
+    match http_get(&core, "/api/health").await {
         Ok(body) => {
             let data: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
@@ -799,8 +853,9 @@ async fn cmd_mode(mode: &str) -> Result<()> {
 }
 
 async fn cmd_chat(message: &str) -> Result<()> {
+    let core = load_core_addr()?;
     let body = serde_json::json!({"message": message}).to_string();
-    let response = http_post_with_origin(CORE_URL, "/api/chat", &body, "api").await?;
+    let response = http_post_with_origin(&core, "/api/chat", &body, "api").await?;
     let data: serde_json::Value = serde_json::from_str(&response)?;
 
     if let Some(resp) = data.get("response").and_then(|v| v.as_str()) {
@@ -872,13 +927,14 @@ fn parse_search_limit(value: &str) -> Result<u64> {
 }
 
 async fn cmd_search(query: &str, fresh: bool, limit: u64) -> Result<()> {
+    let core = load_core_addr()?;
     let query = query.trim();
     if query.is_empty() {
         anyhow::bail!("Usage: genie-ctl search [--fresh] [--limit N] <query>");
     }
 
     let body = serde_json::json!({"query": query, "fresh": fresh, "limit": limit}).to_string();
-    let response = http_post(CORE_URL, "/api/web-search", &body).await?;
+    let response = http_post(&core, "/api/web-search", &body).await?;
     let data: serde_json::Value = serde_json::from_str(&response)?;
 
     if let Some(resp) = data.get("response").and_then(|v| v.as_str()) {
@@ -895,7 +951,8 @@ async fn cmd_search(query: &str, fresh: bool, limit: u64) -> Result<()> {
 }
 
 async fn cmd_history() -> Result<()> {
-    let body = http_get(CORE_URL, "/api/chat/history").await?;
+    let core = load_core_addr()?;
+    let body = http_get(&core, "/api/chat/history").await?;
     let messages: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
 
     if messages.is_empty() {
@@ -919,7 +976,8 @@ async fn cmd_history() -> Result<()> {
 }
 
 async fn cmd_tools() -> Result<()> {
-    let body = http_get(CORE_URL, "/api/tools").await?;
+    let core = load_core_addr()?;
+    let body = http_get(&core, "/api/tools").await?;
     let tools: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
 
     if tools.is_empty() {
@@ -941,7 +999,8 @@ async fn cmd_tools() -> Result<()> {
 }
 
 async fn cmd_connectivity() -> Result<()> {
-    let body = http_get(CORE_URL, "/api/connectivity").await?;
+    let core = load_core_addr()?;
+    let body = http_get(&core, "/api/connectivity").await?;
     let data: serde_json::Value = serde_json::from_str(&body)?;
 
     let health = data
@@ -989,7 +1048,8 @@ async fn cmd_connectivity() -> Result<()> {
 }
 
 async fn cmd_health() -> Result<()> {
-    let core_health = match http_get(CORE_URL, "/api/health").await {
+    let core = load_core_addr()?;
+    let core_health = match http_get(&core, "/api/health").await {
         Ok(body) => {
             println!("  [OK]   genie-core");
             serde_json::from_str::<serde_json::Value>(&body).ok()
@@ -1031,7 +1091,8 @@ async fn cmd_health() -> Result<()> {
 }
 
 async fn cmd_conversations() -> Result<()> {
-    let body = http_get(CORE_URL, "/api/conversations").await?;
+    let core = load_core_addr()?;
+    let body = http_get(&core, "/api/conversations").await?;
     let convos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
 
     if convos.is_empty() {
@@ -1122,6 +1183,7 @@ async fn cmd_update_check() -> Result<()> {
 }
 
 async fn cmd_diag() -> Result<()> {
+    let core = load_core_addr()?;
     println!("=== GeniePod Diagnostics ===\n");
 
     // Version.
@@ -1131,7 +1193,7 @@ async fn cmd_diag() -> Result<()> {
     // Core health.
     println!("\n[Services]");
     let services = [
-        ("genie-core", CORE_URL, "/api/health"),
+        ("genie-core", core.as_str(), "/api/health"),
         ("genie-api", "127.0.0.1:3080", "/api/status"),
         ("Home Assistant", "127.0.0.1:8123", "/api/"),
     ];
@@ -1163,7 +1225,7 @@ async fn cmd_diag() -> Result<()> {
     }
 
     // Core details.
-    if let Ok(body) = http_get(CORE_URL, "/api/health").await
+    if let Ok(body) = http_get(&core, "/api/health").await
         && let Ok(data) = serde_json::from_str::<serde_json::Value>(&body)
     {
         println!("\n[Core]");
@@ -1297,8 +1359,9 @@ async fn cmd_diag() -> Result<()> {
 }
 
 async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
+    let core = load_core_addr()?;
     let services = [
-        ("genie-core", CORE_URL, "/api/health"),
+        ("genie-core", core.as_str(), "/api/health"),
         ("genie-api", "127.0.0.1:3080", "/api/status"),
         ("Home Assistant", "127.0.0.1:8123", "/api/"),
     ];
@@ -1323,14 +1386,14 @@ async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
         "services": service_status,
         "governor": governor_cmd(r#"{"cmd":"status"}"#).await,
         "core": {
-            "health": http_json_value(CORE_URL, "/api/health").await,
-            "runtime_contract": http_json_value(CORE_URL, "/api/runtime/contract").await,
-            "connectivity": http_json_value(CORE_URL, "/api/connectivity").await,
+            "health": http_json_value(&core, "/api/health").await,
+            "runtime_contract": http_json_value(&core, "/api/runtime/contract").await,
+            "connectivity": http_json_value(&core, "/api/connectivity").await,
         },
         "security": http_json_value("127.0.0.1:3080", "/api/security").await,
         "actuation": {
-            "pending": http_json_value(CORE_URL, "/api/actuation/pending").await,
-            "actions": http_json_value(CORE_URL, "/api/actuation/actions").await,
+            "pending": http_json_value(&core, "/api/actuation/pending").await,
+            "actions": http_json_value(&core, "/api/actuation/actions").await,
             "audit": http_json_value("127.0.0.1:3080", "/api/actuation/audit").await,
         },
         "system": {
@@ -1700,6 +1763,56 @@ mod tests {
     }
 
     #[test]
+    fn core_addr_from_config_uses_bind_host_and_port() {
+        use genie_common::config::{
+            Config, CoreConfig, GovernorConfig, HealthConfig, ServicesConfig,
+        };
+        use std::path::PathBuf;
+
+        let config = Config {
+            data_dir: PathBuf::from("./data"),
+            core: CoreConfig {
+                port: 3001,
+                bind_host: "127.0.0.1".into(),
+                ..CoreConfig::default()
+            },
+            governor: GovernorConfig::default(),
+            health: HealthConfig::default(),
+            services: ServicesConfig::default(),
+            telegram: Default::default(),
+            web_search: Default::default(),
+            connectivity: Default::default(),
+        };
+
+        assert_eq!(super::core_addr_from_config(&config), "127.0.0.1:3001");
+    }
+
+    #[test]
+    fn core_addr_maps_listen_all_to_loopback_for_local_cli() {
+        use genie_common::config::{
+            Config, CoreConfig, GovernorConfig, HealthConfig, ServicesConfig,
+        };
+        use std::path::PathBuf;
+
+        let config = Config {
+            data_dir: PathBuf::from("./data"),
+            core: CoreConfig {
+                port: 3000,
+                bind_host: "0.0.0.0".into(),
+                ..CoreConfig::default()
+            },
+            governor: GovernorConfig::default(),
+            health: HealthConfig::default(),
+            services: ServicesConfig::default(),
+            telegram: Default::default(),
+            web_search: Default::default(),
+            connectivity: Default::default(),
+        };
+
+        assert_eq!(super::core_addr_from_config(&config), "127.0.0.1:3000");
+    }
+
+    #[test]
     fn parse_search_args_supports_fresh_flag() {
         let args = vec![
             "--fresh".to_string(),
@@ -1756,6 +1869,7 @@ mod tests {
         assert!(parse_search_args(&args).is_err());
     }
 
+    #[cfg(feature = "voice")]
     #[test]
     fn parse_speaker_options_supports_recording_flags() {
         let args = vec![
@@ -1780,6 +1894,7 @@ mod tests {
         assert_eq!(parsed.duration_secs, 7);
     }
 
+    #[cfg(feature = "voice")]
     #[test]
     fn parse_speaker_options_rejects_unknown_flag() {
         let args = vec!["--bad".to_string()];

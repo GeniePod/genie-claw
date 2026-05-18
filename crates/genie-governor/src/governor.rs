@@ -273,7 +273,7 @@ impl Governor {
     fn llm_service_unit(&self) -> String {
         self.config
             .service_unit_for_alias("llm")
-            .unwrap_or_else(|| "genie-llm.service".into())
+            .unwrap_or_else(|| "genie-ai-runtime.service".into())
     }
 }
 
@@ -318,6 +318,9 @@ mod tests {
     use super::*;
     use genie_common::config::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
     fn test_config() -> Config {
         Config {
@@ -345,7 +348,15 @@ mod tests {
 
     fn make_governor() -> Governor {
         let config = test_config();
-        let db_path = std::env::temp_dir().join("geniepod-test-gov.db");
+        // Each test gets its own DB path so parallel `cargo test` runs don't
+        // collide on the SQLite file with `database is locked`.
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = std::env::temp_dir().join(format!(
+            "geniepod-test-gov-{}-{}.db",
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_file(&db_path);
         let store = Store::open(&db_path).unwrap();
         Governor::new(config, store)
     }

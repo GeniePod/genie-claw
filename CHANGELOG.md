@@ -2,8 +2,198 @@
 
 ## Unreleased
 
+### Changed
+
+- `deploy/scripts/genie-restart-all.sh` rewritten as a full hard-reset:
+  delegates to `stop_all.sh` for the systemd stops, best-effort
+  `pkill -x` reaps known LLM/STT/TTS/audio subprocess names that may
+  have survived the cgroup stop (piper, whisper-server, whisper-cli,
+  jetson-llm-server, jetson-llm, llama-server, deep-filter, sox,
+  ffmpeg), `sync; echo 3 > /proc/sys/vm/drop_caches` releases page
+  cache, `swapoff -a; swapon -a` flushes the swap file to a clean
+  baseline, then delegates to `start_all.sh` to bring the stack back
+  up. Deliberately gives back the warm Qwen3-4B page-cache residency
+  PR #70 preserves across plain `systemctl restart` — the script
+  exists for the post-`make deploy` case where binaries / config /
+  model path may have changed and the prior warm cache is stale.
+  Pass `--soft` to skip the cache + swap reset for a service-only
+  refresh that preserves the warm LLM cache. `swapoff` failure
+  (no swap, or not enough free RAM to absorb the swap contents) is
+  logged and skipped rather than fatal so the script never wedges
+  the box mid-restart. New regression test
+  `genie_restart_all_hard_mode_performs_full_memory_reset` pins
+  the five-step shape (stop → reap → drop_caches → swapoff/swapon
+  → start) and the ordering, so future edits can't quietly drop a
+  step without failing CI.
+
 ### Added
 
+- `CONTRIBUTING.md`, `SECURITY.md`, `.github/PULL_REQUEST_TEMPLATE.md`,
+  and `.github/workflows/contribution.yml` — formal contribution guide
+  + private-disclosure security policy + PR template +
+  `Contribution / PR body checklist` CI job (triggered via
+  `pull_request_target` so the check runs from the base branch's
+  workflow definition — fires on every PR regardless of whether the
+  PR head pre-dates the workflow). Checklist also blocks PR bodies
+  that include AI-attribution footers like `🤖 Generated with Claude
+  Code` (case-insensitive, matches the bracketed-link form as well)
+  to keep PR attribution with the human contributor; same spirit as
+  the existing no-`Co-Authored-By: Claude` commit-trailer rule. Quality / engineering /
+  bug-fix contributions are explicitly welcomed; every PR must include
+  a `## Real Behavior Proof` section in the body (CI enforces structure,
+  reviewer reads the content) so reviewers can see what was actually
+  run and where, not just what CI checked. Security disclosures go to
+  <contact@genieclaw.org> privately rather than the public issue tracker;
+  scope, in-scope/out-of-scope categories, and response timeline are
+  documented in `SECURITY.md`. Dependabot / Renovate / release PRs
+  are exempt from the proof requirement via a title-prefix allowlist
+  in the checklist workflow. README's bottom-of-file gets a brief
+  "Contributing" + "Security" pair of sections pointing at the
+  canonical docs.
+
+## 1.0.0-alpha.9 - 2026-05-18
+
+Alpha 9 is the **CI / supply-chain hardening + voice-frontend maturation**
+release. It absorbs every change that landed on `main` between the
+`v1.0.0-alpha.5` tag and today — the never-tagged narrative milestones
+referenced as "alpha.6" (GPU contention / LLM warmup fixes), "alpha.7"
+(DeepFilterNet capture, half-duplex post-TTS gate, first-reply latency
+banner) and "alpha.8" (LLM backend abstraction, telegram voice, voice
+optional) all roll up here.
+
+Headlines:
+
+- **Verified voice cycle**: ~4 s first reply (285 ms STT + 3679 ms LLM →
+  first audio) on Orin Nano + LyraT V4.3 + Phi-4-mini Q4_K_M, with a
+  first-reply latency banner that prints the 5-phase breakdown so
+  regressions are visible at a glance.
+- **LLM backend is now a config-driven facade** (#32, #35, #38, #39, #40,
+  #43) — `[llm.backend]` selects `llama-cpp` or `genie-ai-runtime`. The
+  v1.0.0 `genie-ai-runtime` install pipeline ships in #56, and the
+  Jetson deploy default flipped to `genie-ai-runtime` + Qwen3-4B Q4_K_M
+  in #55 (closes #52). `llama.cpp` + Phi-4-mini remain the one-line
+  fallback via `[services.llm].backend = "llama_cpp"`.
+- **Voice is now an opt-out Cargo feature** (#41, #57). Default builds
+  are byte-identical for Jetson; `--no-default-features` produces a
+  chat-only binary that compiles on macOS / Windows without ALSA.
+- **Telegram voice ingestion** (#42, #53) — bot users can send voice
+  notes and get a spoken (or text) reply on the same conversation
+  path as the mic-array loop.
+- **CI pipeline** (#34): fmt + clippy + test (#37), aarch64 Jetson
+  cross-compile (#49), cargo-audit + cargo-deny supply-chain (#50),
+  shellcheck + ruff for shell/Python (#51). All green on `main`.
+- **Qwen3-4B Q4_K_M** is now the Jetson default model (#44, #46, #55);
+  Phi-4-mini Q4_K_M remains as the explicit fallback via
+  `setup-jetson.sh --model phi-4-mini`.
+
+Workspace version bumped `1.0.0-alpha.5` → `1.0.0-alpha.9` across all
+seven workspace crates.
+
+### Added
+
+- `.github/workflows/audit.yml` and `deny.toml` — supply-chain audit
+  workflow for issue #34. Runs `rustsec/audit-check` plus
+  `EmbarkStudios/cargo-deny-action` on every `Cargo.{toml,lock}` /
+  `deny.toml` / workflow change and on a Monday-06:00-UTC cron.
+  `deny.toml` codifies the project's license policy
+  (`AGPL-3.0-only` for genie-claw itself; the standard permissive
+  set plus `CDLA-Permissive-2.0` for webpki-roots and `OpenSSL` for
+  ring on the dependency side), pins all packages to crates.io as the
+  only allowed source so a future git dep requires an explicit policy
+  update, and currently runs `wildcards = "allow"` because workspace
+  path-deps would otherwise trip the public-crate exemption logic.
+  Audit badge added at the top of the README.
+- `.github/workflows/cross.yml` — aarch64 Jetson cross-compile workflow
+  for issue #34. Installs `gcc-aarch64-linux-gnu` /
+  `g++-aarch64-linux-gnu`, adds the `aarch64-unknown-linux-gnu` Rust
+  target, then runs the same two-step `cargo build --release --locked
+  --target aarch64-unknown-linux-gnu` recipe `make jetson` uses (with
+  `CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc` and the matching
+  `AR_` override) to produce `genie-core`, `genie-ctl`, `genie-governor`,
+  `genie-health`, and `genie-api`. A post-build verify step asserts
+  each binary is in fact an ELF tagged `ARM aarch64` before uploading
+  them as the `genie-jetson-aarch64-${{ github.sha }}` artifact with a
+  14-day retention. Catches the cross-compile breakage that previously
+  only surfaced at `make jetson` / `make deploy` time. Jetson badge added
+  at the top of the README.
+- Opt-in Qwen3-4B model download in `setup-jetson.sh` (issue #44, Phase 1).
+  `deploy/setup-jetson.sh --model qwen3-4b` fetches
+  `Qwen3-4B-Q4_K_M.gguf` from `Qwen/Qwen3-4B-GGUF` into
+  `/opt/geniepod/models/`. `--model phi-4-mini` is also accepted as an
+  explicit form of today's default. The flag only changes the download
+  target; it does not rewrite `llm_model_path` in
+  `/etc/geniepod/geniepod.toml`, so existing Phi-4-mini deployments stay
+  on Phi-4-mini until the operator flips the config line by hand. The
+  recommended pairing is Qwen3-4B + `genie-ai-runtime` once both are
+  installed — see the new "Recommended LLM Pairing" section in README.
+  `geniepod.toml` carries commented examples for both
+  `llm_model_name = "qwen"` and the matching `llm_model_path`. Regression
+  tests in `prompt.rs` lock the `Qwen3-4B-Q4_K_M.gguf` filename to
+  `ModelFamily::Qwen` so a future detector refactor cannot silently drop
+  it into the small-model prompt shape. The default flip ships in Phase 2
+  alongside the genie-ai-runtime default flip in issue #33.
+- `.github/workflows/ci.yml` — the fmt + clippy + test daily loop for
+  issue #34 (PR #37). Runs `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`, and
+  `cargo test --workspace --locked` (unit, integration, and doc tests) on
+  every push to `main` and every pull request. Each job uses
+  `Swatinem/rust-cache` with a per-job shared key so cached runs stay
+  short. Concurrency group cancels superseded runs on the same ref. CI
+  badge added at the top of the README. Bundles a `rustls-webpki`
+  0.103.12 → 0.103.13 lockfile bump for [RUSTSEC-2026-0104](https://rustsec.org/advisories/RUSTSEC-2026-0104)
+  (reachable panic in CRL parsing on the transitive HTTPS path via
+  `reqwest → hyper-rustls → rustls → rustls-webpki`), plus
+  `temp_memory` / `make_governor` test-isolation fixes
+  (`genie-core/src/memory/mod.rs`, `genie-governor/src/governor.rs`)
+  required for the new `cargo test --workspace` job to be stable under
+  parallel execution.
+- `voice` Cargo feature on `genie-core` and `genie-ctl` (issue #41).
+  Default-on so `cargo build` produces today's Jetson-targeted binary
+  unchanged. `cargo build -p genie-core --no-default-features` (and the
+  matching `-p genie-ctl`) produces a chat-only binary that drops the
+  STT/TTS/AEC/wakeword pipeline, the `VoiceOrchestrator`, the
+  `voice_loop::run` dispatcher, and `genie-ctl`'s `speaker` subcommand:
+    - `pub mod voice;` and `pub mod voice_loop;` in
+      `crates/genie-core/src/lib.rs` are now `#[cfg(feature = "voice")]`.
+    - The voice-mode branch in `crates/genie-core/src/main.rs` is gated;
+      when voice is requested (`--voice` / `GENIEPOD_VOICE=1` /
+      `core.voice_enabled = true`) on a chat-only build, the runtime
+      logs one warning and falls through to the existing chat / HTTP
+      path so deploying an unchanged `geniepod.toml` is a non-event.
+    - `genie-ctl`'s `genie-core` dependency uses
+      `default-features = false`; `genie-ctl`'s own new `voice` feature
+      forwards to `genie-core/voice`. The `speaker` subcommand,
+      `speaker` help line, all `cmd_speaker_*` helpers, and the two
+      `parse_speaker_options` unit tests are `#[cfg(feature = "voice")]`.
+      Invoking `genie-ctl speaker …` on a chat-only build exits with a
+      clear "rebuild with --features voice" message instead of crashing.
+  Knock-on cleanups so `cargo clippy -- -D warnings` is green on both
+  variants: `local_http_host` and its two unit tests in
+  `crates/genie-core/src/main.rs` are now `#[cfg(feature = "telegram")]`
+  (they are only used by the Telegram adapter and were latent dead code
+  on no-telegram builds); the `std::process::Command` import in
+  `crates/genie-ctl/src/main.rs` is `#[cfg(feature = "voice")]` because
+  the only `std::process::Command::new` call lives in `record_speaker_wav`.
+  Release binary on x86_64-linux drops from 4.8 MB to 4.6 MB without
+  voice; the bigger payoff is unblocking macOS / Windows hosts that
+  previously could not compile the ALSA-coupled voice modules.
+  CI matrix coverage (acceptance criterion #8) will be added on top of
+  issue #34's `ci.yml` workflow once that lands; the
+  `cargo build / clippy / test` invocations to add are
+  `-p genie-core -p genie-ctl --no-default-features` next to the
+  existing `--workspace` ones.
+- `.github/workflows/scripts.yml` and `ruff.toml` — shellcheck + ruff
+  workflow for the stretch slice of issue #34. Discovers all
+  tracked `*.sh` and `*.py` files via `git ls-files`, then runs
+  `shellcheck --severity=warning` and `ruff check
+  --output-format=github`. `ruff.toml` pins `target-version = "py310"`
+  (Jetson Ubuntu 22.04) and ignores E402, with an inline comment
+  explaining why: `deploy/scripts/genie-wake-listen.py` and
+  `genie-wakeword.py` legitimately import after redirecting ALSA stderr
+  to `/dev/null` so the C-level diagnostic noise from PyAudio doesn't
+  leak into the protocol stdout. Trigger paths are scoped to `**.sh` /
+  `**.py` / the workflow file itself so Rust-only changes don't spin up
+  this job.
 - First-voice-reply latency banner (issue #19). On the first completed voice
   cycle of a `genie-core` run, the loop prints a one-shot 5-phase breakdown
   from end-of-user-speech to first audible audio:
@@ -121,6 +311,49 @@
   `ggml_reshape_2d` when combined with `--flash-attn on` and the Phi-3/
   Phi-4 attention graph on aarch64 CUDA. Documented inline in the
   service unit; tracked upstream in llama.cpp.
+
+### Changed (Jetson default-backend flip — PR #55, closes #52)
+
+- Jetson deploy defaults flipped to `genie-ai-runtime v1.0.0` + Qwen3-4B
+  Q4_K_M. `deploy/config/geniepod.toml` now ships with
+  `[services.llm].backend = "genie_ai_runtime"`,
+  `systemd_unit = "genie-ai-runtime.service"`, `llm_model_name = "qwen"`,
+  and `llm_model_path = /opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf`.
+  `deploy/config/geniepod.dev.toml` stays on the `llama_cpp` path for
+  local x86/macOS development (explicit `backend = "llama_cpp"` instead
+  of relying on the workspace default). The
+  `LlmBackendKind::default` accordingly flips from `LlamaCpp` to
+  `GenieAiRuntime` in `crates/genie-common/src/config.rs`, and
+  `Governor::llm_service_unit`'s fallback flips to
+  `genie-ai-runtime.service` (`crates/genie-governor/src/governor.rs`).
+- `deploy/setup-jetson.sh` now picks the LLM units to enable from the
+  `[services.llm].backend` line in `geniepod.toml`: defaults to
+  `genie-ai-runtime` + `genie-ai-runtime-warmup`, falls back to
+  `genie-llm` + `genie-llm-warmup` when `backend = "llama_cpp"` (or
+  `"llama-cpp"`). The "Start services" footer prints the matching unit.
+  The Qwen3-4B Q4_K_M download is now the default model when invoked
+  without `--model`; `--model phi-4-mini` selects the prior default
+  as the explicit fallback. The cutover NOTE block from PR #46 still
+  surfaces on `--model phi-4-mini` re-runs (predicate flipped from
+  "not phi-4-mini" to "not qwen3-4b") with prompt-template /
+  systemd-unit guidance updated for the new default. Runtime install
+  remains opt-in via `--runtime genie-ai-runtime` (issue #54 / PR #56);
+  the setup script now points operators at that flag when
+  `jetson-llm-server` is missing instead of duplicating the build logic.
+- `deploy/systemd/genie-core.service` now orders
+  `After=… genie-ai-runtime.service genie-llm.service` with
+  `Wants=… genie-ai-runtime.service`, so `genie-core` waits for whichever
+  LLM unit the operator has enabled (the two units `Conflicts=` each
+  other, so only one is active at a time and the unused `After=` entry
+  is a no-op).
+- `deploy/systemd/genie-governor.service` adds
+  `/etc/systemd/system/genie-ai-runtime.service.d` to `ReadWritePaths=`
+  so the governor's drop-in writer can land context-size adjustments
+  on the new unit's config dir as well as the legacy
+  `genie-llm.service.d`.
+- `README.md` and `ARCHITECTURE.md` flip the "default vs selectable"
+  wording for the LLM backend (genie-ai-runtime is the Jetson default;
+  llama.cpp is the selectable fallback).
 
 ## 1.0.0-alpha.5 - 2026-05-11
 

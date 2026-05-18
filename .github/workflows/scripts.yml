@@ -1,0 +1,68 @@
+name: Scripts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.sh"
+      - "**.py"
+      - ".github/workflows/scripts.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.sh"
+      - "**.py"
+      - ".github/workflows/scripts.yml"
+
+concurrency:
+  group: scripts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Run shellcheck on all .sh files
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files '*.sh')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no shell scripts to check"
+            exit 0
+          fi
+          printf '%s\n' "${files[@]}"
+          shellcheck --severity=warning "${files[@]}"
+
+  ruff:
+    name: ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install --no-cache-dir 'ruff==0.6.*'
+      - name: Discover Python files
+        id: discover
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files '*.py')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no python files to check"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s\n' "${files[@]}"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+      - name: ruff check
+        if: steps.discover.outputs.found == 'true'
+        run: ruff check --output-format=github .

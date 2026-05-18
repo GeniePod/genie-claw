@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::openai_compat::OpenAiCompatClient;
+use super::openai_compat::{OpenAiCompatClient, RequestProfile};
 use super::{LlmBackendClient, Message, ResponseFormat};
 
 /// Adapter for the `genie-ai-runtime` OpenAI-compatible chat API surface.
@@ -12,13 +12,22 @@ pub struct GenieAiRuntimeBackend {
 impl GenieAiRuntimeBackend {
     pub fn new(host: &str, port: u16) -> Self {
         Self {
-            inner: OpenAiCompatClient::new("genie-ai-runtime", host, port),
+            inner: OpenAiCompatClient::new_with_profile(
+                "genie-ai-runtime",
+                host,
+                port,
+                RequestProfile::genie_ai_runtime(),
+            ),
         }
     }
 
     pub fn from_url(url: &str) -> Self {
         Self {
-            inner: OpenAiCompatClient::from_url("genie-ai-runtime", url),
+            inner: OpenAiCompatClient::from_url_with_profile(
+                "genie-ai-runtime",
+                url,
+                RequestProfile::genie_ai_runtime(),
+            ),
         }
     }
 }
