@@ -13,7 +13,7 @@
 #                                it does NOT rewrite llm_model_path in
 #                                /etc/geniepod/geniepod.toml — flip that
 #                                line by hand once the new model is on disk.
-#   --runtime genie-ai-runtime   Build + install genie-ai-runtime v1.0.0
+#   --runtime genie-ai-runtime   Download + install genie-ai-runtime v1.0.0
 #                                alongside the existing llama.cpp backend.
 #                                Normal setup already installs this when
 #                                [services.llm].backend is genie_ai_runtime;
@@ -88,96 +88,91 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# ── Runtime install helpers ─────────────────────────────────────
-find_cuda_compiler() {
-    local candidate
-    if command -v nvcc > /dev/null 2>&1; then
-        command -v nvcc
-        return 0
-    fi
-    for candidate in /usr/local/cuda/bin/nvcc /usr/local/cuda-*/bin/nvcc; do
-        if [ -x "$candidate" ]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-    return 1
-}
-
 # ── --runtime mode: install an alternate LLM backend only ───────
 install_genie_ai_runtime() {
     local install_mode="${1:-manual}"
-    local build_dir="$GENIEPOD_DIR/src/genie-ai-runtime"
-    local repo_url="https://github.com/GeniePod/genie-ai-runtime.git"
     local tag="v1.0.0"
-    local cuda_bin_dir
-    local cuda_compiler
-    local cuda_root
+    local platform="aarch64-unknown-linux-gnu"
+    local base_url="https://github.com/GeniePod/genie-ai-runtime/releases/download/$tag"
+    local tmp_dir
+    local checksum_file
+    local bin
+    local asset
+    local asset_path
+    local checksum_path
 
     echo "=== GeniePod: install genie-ai-runtime $tag ==="
     echo ""
 
     # 1. Verify prerequisites.
-    echo "[1/4] Checking build prerequisites..."
-    for pkg in cmake g++; do
-        if ! command -v "$pkg" > /dev/null 2>&1; then
-            echo "  Installing $pkg via apt..."
-            sudo apt-get update -qq
-            sudo apt-get install -y "$pkg"
-        fi
-        echo "  OK: $pkg ($("$pkg" --version 2>/dev/null | head -1))"
-    done
-    if ! cuda_compiler="$(find_cuda_compiler)"; then
-        echo "  ERROR: CUDA compiler nvcc not found." >&2
-        echo "         genie-ai-runtime builds from CUDA source and needs nvcc." >&2
-        echo "         Install the JetPack CUDA compiler package, then re-run setup:" >&2
-        echo "           sudo apt-get update" >&2
-        echo "           sudo apt-get install -y nvidia-cuda-toolkit" >&2
-        echo "         If nvcc is already installed, add it to PATH or symlink it under" >&2
-        echo "         /usr/local/cuda/bin/nvcc." >&2
+    echo "[1/3] Checking download prerequisites..."
+    if ! command -v wget > /dev/null 2>&1; then
+        echo "  Installing wget via apt..."
+        sudo apt-get update -qq
+        sudo apt-get install -y wget
+    fi
+    if ! command -v sha256sum > /dev/null 2>&1; then
+        echo "  Installing coreutils via apt..."
+        sudo apt-get update -qq
+        sudo apt-get install -y coreutils
+    fi
+    echo "  OK: wget ($(wget --version 2>/dev/null | head -1))"
+    echo "  OK: sha256sum ($(sha256sum --version 2>/dev/null | head -1))"
+
+    # 2. Download and verify the pinned release assets.
+    echo "[2/3] Downloading prebuilt runtime assets..."
+    tmp_dir="$(mktemp -d /tmp/genie-ai-runtime.XXXXXX)"
+    checksum_file="$tmp_dir/SHA256SUMS"
+    if ! wget -q --show-progress -O "$checksum_file" "$base_url/SHA256SUMS"; then
+        rm -rf "$tmp_dir"
+        echo "  ERROR: failed to download $base_url/SHA256SUMS" >&2
+        echo "         Upload v1.0.0 release assets before running setup:" >&2
+        echo "           SHA256SUMS" >&2
+        echo "           jetson-llm-v1.0.0-aarch64-unknown-linux-gnu" >&2
+        echo "           jetson-llm-server-v1.0.0-aarch64-unknown-linux-gnu" >&2
         exit 1
     fi
-    cuda_bin_dir="$(dirname "$cuda_compiler")"
-    cuda_root="$(dirname "$cuda_bin_dir")"
-    export CUDACXX="$cuda_compiler"
-    PATH="$cuda_bin_dir:$PATH"
-    export PATH
-    echo "  OK: nvcc ($cuda_compiler)"
 
-    # 2. Clone the pinned release.
-    echo "[2/4] Fetching $repo_url @ $tag ..."
-    sudo mkdir -p "$(dirname "$build_dir")"
-    sudo chown -R "$(whoami):$(whoami)" "$(dirname "$build_dir")"
-    if [ -d "$build_dir/.git" ]; then
-        echo "  Existing checkout found — fetching $tag and resetting."
-        git -C "$build_dir" fetch --tags --depth 1 origin "$tag"
-        git -C "$build_dir" checkout --quiet "tags/$tag"
-        git -C "$build_dir" clean -fdx
-    else
-        rm -rf "$build_dir"
-        git clone --branch "$tag" --depth 1 "$repo_url" "$build_dir"
-    fi
-
-    # 3. Build (10-20 min on Orin Nano).
-    echo "[3/4] Building (Release, $(nproc) jobs — this takes 10-20 min on Orin Nano)..."
-    cd "$build_dir"
-    cmake -B build \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DJLLM_BUILD_SERVER=ON \
-        -DCMAKE_CUDA_COMPILER="$cuda_compiler" \
-        -DCUDAToolkit_ROOT="$cuda_root"
-    cmake --build build -j"$(nproc)"
-
-    # 4. Install binaries. Refuse to overwrite if something looks wrong.
-    echo "[4/4] Installing binaries to $GENIEPOD_DIR/bin/ ..."
     for bin in jetson-llm-server jetson-llm; do
-        if [ ! -f "build/$bin" ]; then
-            echo "  ERROR: build/$bin not produced — build output unexpected." >&2
+        asset="$bin-$tag-$platform"
+        asset_path="$tmp_dir/$asset"
+        checksum_path="$tmp_dir/$asset.sha256"
+        if ! wget -q --show-progress -O "$asset_path" "$base_url/$asset"; then
+            rm -rf "$tmp_dir"
+            echo "  ERROR: failed to download $base_url/$asset" >&2
             exit 1
         fi
-        sudo install -Dm755 "build/$bin" "$GENIEPOD_DIR/bin/$bin"
+        if ! awk -v name="$asset" '$2 == name || $2 == "*" name { print; found = 1 } END { exit found ? 0 : 1 }' "$checksum_file" > "$checksum_path"; then
+            rm -rf "$tmp_dir"
+            echo "  ERROR: SHA256SUMS does not contain an entry for $asset" >&2
+            exit 1
+        fi
+        if ! (cd "$tmp_dir" && sha256sum -c "$(basename "$checksum_path")"); then
+            rm -rf "$tmp_dir"
+            echo "  ERROR: checksum verification failed for $asset" >&2
+            exit 1
+        fi
+        if command -v file > /dev/null 2>&1 && ! file "$asset_path" | grep -q "ELF.*aarch64"; then
+            rm -rf "$tmp_dir"
+            echo "  ERROR: $asset is not an aarch64 ELF binary" >&2
+            exit 1
+        fi
+    done
+
+    # 3. Install binaries. Refuse to overwrite if something looks wrong.
+    echo "[3/3] Installing binaries to $GENIEPOD_DIR/bin/ ..."
+    for bin in jetson-llm-server jetson-llm; do
+        asset="$bin-$tag-$platform"
+        asset_path="$tmp_dir/$asset"
+        if [ ! -f "$asset_path" ]; then
+            rm -rf "$tmp_dir"
+            echo "  ERROR: downloaded asset missing: $asset" >&2
+            exit 1
+        fi
+        sudo install -Dm755 "$asset_path" "$GENIEPOD_DIR/bin/$bin"
         echo "  OK: $bin ($(du -h "$GENIEPOD_DIR/bin/$bin" | cut -f1))"
     done
+    rm -rf "$tmp_dir"
 
     echo ""
     echo "=== genie-ai-runtime $tag installed ==="
@@ -218,7 +213,7 @@ install_genie_ai_runtime() {
     fi
 }
 
-# --runtime is install-only: do the build/install and exit before the
+# --runtime is install-only: do the download/install and exit before the
 # rest of the Jetson setup runs. Validation happens here so an unknown
 # value fails fast, before we resolve any model paths.
 if [ -n "$RUNTIME_TO_INSTALL" ]; then

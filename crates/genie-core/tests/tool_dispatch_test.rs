@@ -154,20 +154,28 @@ fn setup_script_privileged_llm_backend_patch_is_checked() {
         "setup script should install the default runtime during normal setup"
     );
     assert!(
-        contents.contains("find_cuda_compiler()"),
-        "setup script should resolve nvcc before building the default runtime"
+        contents.contains("Downloading prebuilt runtime assets"),
+        "setup script should download the default runtime from release assets"
     );
     assert!(
-        contents.contains("-DCMAKE_CUDA_COMPILER=\"$cuda_compiler\""),
-        "setup script should pass the resolved nvcc path to CMake"
+        contents.contains("SHA256SUMS"),
+        "setup script should download release checksums"
     );
     assert!(
-        contents.contains("-DJLLM_BUILD_SERVER=ON"),
-        "setup script should build the jetson-llm-server binary required by systemd"
+        contents.contains("sha256sum -c"),
+        "setup script should verify downloaded runtime checksums"
     );
     assert!(
-        contents.contains("ERROR: CUDA compiler nvcc not found."),
-        "setup script should fail clearly when nvcc is missing"
+        contents.contains("jetson-llm-server-v1.0.0-aarch64-unknown-linux-gnu"),
+        "setup script should document the required server release asset"
+    );
+    assert!(
+        !contents.contains("git clone --branch \"$tag\""),
+        "setup script should not clone the runtime repo during normal install"
+    );
+    assert!(
+        !contents.contains("cmake --build build"),
+        "setup script should not build the runtime from source during setup"
     );
     assert!(
         !contents.contains("Auto-falling back to llama.cpp"),
