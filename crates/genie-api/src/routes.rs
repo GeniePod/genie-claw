@@ -101,6 +101,7 @@ struct ServiceTarget {
     service: String,
     unit: String,
     latency_url: Option<String>,
+    disabled_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,46 +226,60 @@ fn dashboard_service_targets(config: &Config) -> Vec<ServiceTarget> {
             service: "core".into(),
             unit: config.services.core.systemd_unit.clone(),
             latency_url: Some(config.services.core.url.clone()),
+            disabled_reason: None,
         },
         ServiceTarget {
             service: "llm".into(),
             unit: config.services.llm.systemd_unit.clone(),
             latency_url: Some(config.services.llm.url.clone()),
+            disabled_reason: None,
         },
         ServiceTarget {
             service: "api".into(),
             unit: "genie-api.service".into(),
             latency_url: Some("http://127.0.0.1:3080/api/status".into()),
+            disabled_reason: None,
         },
         ServiceTarget {
             service: "health".into(),
             unit: "genie-health.service".into(),
             latency_url: None,
+            disabled_reason: None,
         },
         ServiceTarget {
             service: "governor".into(),
             unit: "genie-governor.service".into(),
             latency_url: None,
+            disabled_reason: None,
         },
         ServiceTarget {
             service: "mqtt".into(),
             unit: "genie-mqtt.service".into(),
             latency_url: None,
+            disabled_reason: None,
         },
         ServiceTarget {
             service: "audio".into(),
             unit: "genie-audio.service".into(),
             latency_url: None,
+            disabled_reason: None,
         },
         ServiceTarget {
             service: "whisper".into(),
             unit: "genie-whisper.service".into(),
             latency_url: None,
+            disabled_reason: None,
         },
         ServiceTarget {
             service: "wakeword".into(),
             unit: "genie-wakeword.service".into(),
             latency_url: None,
+            disabled_reason: config
+                .core
+                .wakeword_script
+                .as_os_str()
+                .is_empty()
+                .then(|| "disabled in config (push-to-talk mode)".into()),
         },
         ServiceTarget {
             service: "homeassistant".into(),
@@ -279,6 +294,7 @@ fn dashboard_service_targets(config: &Config) -> Vec<ServiceTarget> {
                 .homeassistant
                 .as_ref()
                 .map(|service| service.url.clone()),
+            disabled_reason: None,
         },
     ];
 
@@ -287,6 +303,7 @@ fn dashboard_service_targets(config: &Config) -> Vec<ServiceTarget> {
             service: "nextcloud".into(),
             unit: nextcloud.systemd_unit.clone(),
             latency_url: Some(nextcloud.url.clone()),
+            disabled_reason: None,
         });
     }
     if let Some(jellyfin) = &config.services.jellyfin {
@@ -294,6 +311,7 @@ fn dashboard_service_targets(config: &Config) -> Vec<ServiceTarget> {
             service: "jellyfin".into(),
             unit: jellyfin.systemd_unit.clone(),
             latency_url: Some(jellyfin.url.clone()),
+            disabled_reason: None,
         });
     }
 
@@ -303,6 +321,7 @@ fn dashboard_service_targets(config: &Config) -> Vec<ServiceTarget> {
 fn unique_units(targets: &[ServiceTarget]) -> Vec<String> {
     targets
         .iter()
+        .filter(|target| target.disabled_reason.is_none())
         .map(|target| target.unit.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -318,6 +337,24 @@ fn merge_service_rows(
     targets
         .iter()
         .map(|target| {
+            if let Some(reason) = &target.disabled_reason {
+                return ServiceRow {
+                    service: target.service.clone(),
+                    unit: target.unit.clone(),
+                    healthy: true,
+                    response_ms: None,
+                    latency_source: "not_applicable",
+                    error: Some(reason.clone()),
+                    last_check: None,
+                    source: "config",
+                    load_state: "disabled".into(),
+                    active_state: "inactive".into(),
+                    sub_state: "disabled".into(),
+                    unit_file_state: "disabled".into(),
+                    result: "success".into(),
+                };
+            }
+
             let health_row = health.get(&target.service);
             let live_row = live_latency.get(&target.service);
             let systemd_row = systemd
@@ -380,6 +417,9 @@ async fn collect_live_latency_rows(
     let mut rows = BTreeMap::new();
 
     for target in targets {
+        if target.disabled_reason.is_some() {
+            continue;
+        }
         if health.contains_key(&target.service) {
             continue;
         }
@@ -898,17 +938,41 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_targets_mark_wakeword_disabled_when_config_empty() {
+        let mut config = test_config();
+        config.core.wakeword_script = PathBuf::new();
+
+        let targets = dashboard_service_targets(&config);
+        let wakeword = targets
+            .iter()
+            .find(|target| target.service == "wakeword")
+            .unwrap();
+        let units = unique_units(&targets);
+
+        assert_eq!(
+            wakeword.disabled_reason.as_deref(),
+            Some("disabled in config (push-to-talk mode)")
+        );
+        assert!(
+            !units.contains(&"genie-wakeword.service".into()),
+            "disabled wakeword should not require a systemd probe"
+        );
+    }
+
+    #[test]
     fn service_rows_merge_health_and_systemd_status() {
         let targets = vec![
             ServiceTarget {
                 service: "core".into(),
                 unit: "genie-core.service".into(),
                 latency_url: Some("http://127.0.0.1:3000/api/health".into()),
+                disabled_reason: None,
             },
             ServiceTarget {
                 service: "api".into(),
                 unit: "genie-api.service".into(),
                 latency_url: Some("http://127.0.0.1:3080/api/status".into()),
+                disabled_reason: None,
             },
         ];
         let health = BTreeMap::from([(
@@ -974,6 +1038,7 @@ mod tests {
             service: "wakeword".into(),
             unit: "genie-wakeword.service".into(),
             latency_url: None,
+            disabled_reason: None,
         }];
         let systemd = BTreeMap::from([(
             "genie-wakeword.service".into(),
@@ -995,5 +1060,39 @@ mod tests {
         assert_eq!(wakeword.latency_source, "not_applicable");
         assert_eq!(wakeword.error.as_deref(), Some("failed"));
         assert_eq!(wakeword.source, "systemd");
+    }
+
+    #[test]
+    fn disabled_wakeword_rows_ignore_stale_failed_systemd_state() {
+        let targets = vec![ServiceTarget {
+            service: "wakeword".into(),
+            unit: "genie-wakeword.service".into(),
+            latency_url: None,
+            disabled_reason: Some("disabled in config (push-to-talk mode)".into()),
+        }];
+        let systemd = BTreeMap::from([(
+            "genie-wakeword.service".into(),
+            SystemdRow {
+                load_state: "loaded".into(),
+                active_state: "failed".into(),
+                sub_state: "failed".into(),
+                unit_file_state: "disabled".into(),
+                result: "exit-code".into(),
+                error: None,
+            },
+        )]);
+
+        let rows = merge_service_rows(&targets, &BTreeMap::new(), &BTreeMap::new(), &systemd);
+        let wakeword = rows.first().unwrap();
+
+        assert!(wakeword.healthy);
+        assert_eq!(wakeword.response_ms, None);
+        assert_eq!(wakeword.latency_source, "not_applicable");
+        assert_eq!(
+            wakeword.error.as_deref(),
+            Some("disabled in config (push-to-talk mode)")
+        );
+        assert_eq!(wakeword.source, "config");
+        assert_eq!(wakeword.sub_state, "disabled");
     }
 }

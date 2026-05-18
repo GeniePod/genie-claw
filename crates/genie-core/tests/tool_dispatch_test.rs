@@ -268,6 +268,15 @@ fn start_all_uses_configured_llm_backend() {
         "start_all should read [services.llm].systemd_unit"
     );
     assert!(
+        contents.contains("read_wakeword_script")
+            && contents.contains("wakeword_script is empty; push-to-talk mode"),
+        "start_all should honor empty [core].wakeword_script as push-to-talk mode"
+    );
+    assert!(
+        contents.contains("reset-failed \"$unit\""),
+        "start_all should clear stale failed state for disabled optional services"
+    );
+    assert!(
         contents.contains("other_llm_units_for"),
         "start_all should stop the non-selected LLM backend before starting"
     );
@@ -411,6 +420,26 @@ fn chat_ui_uses_animated_writing_indicator() {
     assert!(
         !contents.contains(".msg.bot.streaming:empty::before"),
         "chat UI should not rely on an empty pseudo-element placeholder"
+    );
+}
+
+/// Verify the chat UI header reflects `/api/health` status and LLM state.
+#[test]
+fn chat_ui_reflects_api_health_status() {
+    let path = workspace_root().join("crates/genie-core/src/chat_ui.html");
+    let contents = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        contents.contains("function applyHealthStatus"),
+        "chat UI should map health JSON to header state"
+    );
+    assert!(
+        contents.contains("data.status === 'ok'") && contents.contains("data.llm === 'connected'"),
+        "chat UI should require both ok status and connected LLM before showing Connected"
+    );
+    assert!(
+        contents.contains("LLM offline") && contents.contains("dot degraded"),
+        "chat UI should show a degraded state when the LLM is offline"
     );
 }
 
