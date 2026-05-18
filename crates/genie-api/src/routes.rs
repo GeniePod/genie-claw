@@ -236,8 +236,8 @@ fn dashboard_service_targets(config: &Config) -> Vec<ServiceTarget> {
         },
         ServiceTarget {
             service: "api".into(),
-            unit: "genie-api.service".into(),
-            latency_url: Some("http://127.0.0.1:3080/api/status".into()),
+            unit: config.services.api.systemd_unit.clone(),
+            latency_url: Some(config.services.api.url.clone()),
             disabled_reason: None,
         },
         ServiceTarget {
