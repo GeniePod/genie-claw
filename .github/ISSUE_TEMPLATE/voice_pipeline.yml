@@ -1,0 +1,122 @@
+name: Voice pipeline issue
+description: Wake word, VAD, STT (Whisper), LLM, TTS (Piper), or first-reply latency banner — anything in the voice loop.
+title: "[voice] "
+labels: ["bug", "voice"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for any issue in the **wake → VAD → STT → LLM → TTS**
+        loop. The structured fields collect the context needed to diagnose
+        latency, accuracy, or routing problems without a back-and-forth.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence — what's wrong in the voice loop?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Which stage(s) are affected?
+      multiple: true
+      options:
+        - Wake word / VAD
+        - STT (Whisper)
+        - Agent layer (prompt assembly / memory / tool dispatch)
+        - LLM (genie-ai-runtime or llama.cpp)
+        - TTS (Piper)
+        - First-reply latency banner / cycle timing
+        - Half-duplex gate / capture during TTS
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Voice mode
+      options:
+        - Continuous (wake word)
+        - Push-to-talk
+        - Telegram voice (inbound)
+        - Telegram voice (outbound)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        Command, utterance, expected behavior. If safe to share, attach a
+        short capture (`/tmp/geniepod-rec-*.wav`).
+    validations:
+      required: true
+
+  - type: textarea
+    id: latency_banner
+    attributes:
+      label: First-reply latency banner output
+      description: |
+        Paste the `=== first voice reply latency ===` block from `genie-core`
+        stdout or `journalctl -u genie-core` if this is a latency-related issue.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: stt_model
+    attributes:
+      label: STT model
+      placeholder: "e.g. ggml-small.bin, ggml-medium.bin"
+    validations:
+      required: false
+
+  - type: input
+    id: llm_backend
+    attributes:
+      label: LLM backend + model
+      placeholder: "genie-ai-runtime / phi-4-mini-instruct-q4_k_m.gguf"
+    validations:
+      required: false
+
+  - type: input
+    id: tts_voice
+    attributes:
+      label: TTS voice
+      placeholder: "e.g. en_US-amy-medium.onnx"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware
+      options:
+        - Jetson Orin Nano Super 8 GB
+        - Jetson Orin Nano 8 GB (non-Super)
+        - Jetson Orin NX 16 GB
+        - Jetson AGX Orin
+        - Other Jetson (specify in additional context)
+        - Non-Jetson (x86_64 dev / cross-build host)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: GenieClaw version / commit
+      placeholder: "v1.0.0-alpha.9 or commit SHA"
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+    validations:
+      required: false
