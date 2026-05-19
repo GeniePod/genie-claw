@@ -692,6 +692,19 @@ impl Config {
     /// Resolve the configured genie-api HTTP endpoint.
     pub fn api_service(&self) -> &ServiceEndpoint {
         &self.services.api
+    /// TCP `host:port` for local HTTP clients proxying to genie-core.
+    ///
+    /// Uses `[core].bind_host` and `[core].port`. Maps `0.0.0.0` / `::` to
+    /// `127.0.0.1` because local callers should use loopback even when core
+    /// listens on all interfaces.
+    pub fn core_http_addr(&self) -> String {
+        let host = self.core.bind_host.trim();
+        let host = if host.is_empty() || host == "0.0.0.0" || host == "::" {
+            "127.0.0.1"
+        } else {
+            host
+        };
+        format!("{host}:{}", self.core.port)
     }
 
     /// Resolve the configured Home Assistant endpoint, if this deployment uses one.
@@ -1041,6 +1054,22 @@ systemd_unit = "genie-llm.service"
     fn core_bind_host_defaults_to_localhost() {
         let config = test_config();
         assert_eq!(config.core.bind_host, "127.0.0.1");
+    }
+
+    #[test]
+    fn core_http_addr_uses_bind_host_and_port() {
+        let mut config = test_config();
+        config.core.port = 3001;
+        config.core.bind_host = "127.0.0.1".into();
+        assert_eq!(config.core_http_addr(), "127.0.0.1:3001");
+    }
+
+    #[test]
+    fn core_http_addr_maps_listen_all_to_loopback() {
+        let mut config = test_config();
+        config.core.port = 3000;
+        config.core.bind_host = "0.0.0.0".into();
+        assert_eq!(config.core_http_addr(), "127.0.0.1:3000");
     }
 
     #[test]

@@ -630,8 +630,8 @@ struct CoreProxyResponse {
     body: String,
 }
 
-pub async fn get_actuation_pending(_config: &Config) -> Response {
-    match proxy_core_json("GET", "/api/actuation/pending", None).await {
+pub async fn get_actuation_pending(config: &Config) -> Response {
+    match proxy_core_json(config, "GET", "/api/actuation/pending", None).await {
         Ok(proxy) => Response {
             status: proxy.status,
             content_type: "application/json",
@@ -645,8 +645,8 @@ pub async fn get_actuation_pending(_config: &Config) -> Response {
     }
 }
 
-pub async fn get_runtime_contract(_config: &Config) -> Response {
-    match proxy_core_json("GET", "/api/runtime/contract", None).await {
+pub async fn get_runtime_contract(config: &Config) -> Response {
+    match proxy_core_json(config, "GET", "/api/runtime/contract", None).await {
         Ok(proxy) => Response {
             status: proxy.status,
             content_type: "application/json",
@@ -660,8 +660,8 @@ pub async fn get_runtime_contract(_config: &Config) -> Response {
     }
 }
 
-pub async fn get_actuation_actions(_config: &Config) -> Response {
-    match proxy_core_json("GET", "/api/actuation/actions", None).await {
+pub async fn get_actuation_actions(config: &Config) -> Response {
+    match proxy_core_json(config, "GET", "/api/actuation/actions", None).await {
         Ok(proxy) => Response {
             status: proxy.status,
             content_type: "application/json",
@@ -711,7 +711,7 @@ pub async fn get_actuation_audit(config: &Config) -> Response {
     }
 }
 
-pub async fn post_actuation_confirm(_config: &Config, body: Option<&str>) -> Response {
+pub async fn post_actuation_confirm(config: &Config, body: Option<&str>) -> Response {
     let Some(body) = body else {
         return Response {
             status: 400,
@@ -720,7 +720,7 @@ pub async fn post_actuation_confirm(_config: &Config, body: Option<&str>) -> Res
         };
     };
 
-    match proxy_core_json("POST", "/api/actuation/confirm", Some(body)).await {
+    match proxy_core_json(config, "POST", "/api/actuation/confirm", Some(body)).await {
         Ok(proxy) => Response {
             status: proxy.status,
             content_type: "application/json",
@@ -734,8 +734,8 @@ pub async fn post_actuation_confirm(_config: &Config, body: Option<&str>) -> Res
     }
 }
 
-pub async fn get_memories(_config: &Config) -> Response {
-    match proxy_core_json("GET", "/api/memories", None).await {
+pub async fn get_memories(config: &Config) -> Response {
+    match proxy_core_json(config, "GET", "/api/memories", None).await {
         Ok(proxy) => Response {
             status: proxy.status,
             content_type: "application/json",
@@ -749,40 +749,7 @@ pub async fn get_memories(_config: &Config) -> Response {
     }
 }
 
-pub async fn post_memory_update(_config: &Config, body: Option<&str>) -> Response {
-    let Some(body) = body else {
-        return Response {
-            status: 400,
-            content_type: "application/json",
-            body: r#"{"error":"missing body"}"#.into(),
-        };
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(body) {
-        Ok(req) => req,
-        Err(e) => {
-            return Response {
-                status: 400,
-                content_type: "application/json",
-                body: serde_json::json!({ "error": e.to_string() }).to_string(),
-            };
-        }
-    };
-    let payload = serde_json::to_string(&parsed).unwrap_or_else(|_| body.to_string());
-    match proxy_core_json("POST", "/api/memories/update", Some(&payload)).await {
-        Ok(proxy) => Response {
-            status: proxy.status,
-            content_type: "application/json",
-            body: proxy.body,
-        },
-        Err(e) => Response {
-            status: 502,
-            content_type: "application/json",
-            body: serde_json::json!({ "error": e }).to_string(),
-        },
-    }
-}
-
-pub async fn post_memory_delete(_config: &Config, body: Option<&str>) -> Response {
+pub async fn post_memory_update(config: &Config, body: Option<&str>) -> Response {
     let Some(body) = body else {
         return Response {
             status: 400,
@@ -801,7 +768,7 @@ pub async fn post_memory_delete(_config: &Config, body: Option<&str>) -> Respons
         }
     };
     let payload = serde_json::to_string(&parsed).unwrap_or_else(|_| body.to_string());
-    match proxy_core_json("POST", "/api/memories/delete", Some(&payload)).await {
+    match proxy_core_json(config, "POST", "/api/memories/update", Some(&payload)).await {
         Ok(proxy) => Response {
             status: proxy.status,
             content_type: "application/json",
@@ -815,7 +782,7 @@ pub async fn post_memory_delete(_config: &Config, body: Option<&str>) -> Respons
     }
 }
 
-pub async fn post_memory_reorder(_config: &Config, body: Option<&str>) -> Response {
+pub async fn post_memory_delete(config: &Config, body: Option<&str>) -> Response {
     let Some(body) = body else {
         return Response {
             status: 400,
@@ -834,7 +801,40 @@ pub async fn post_memory_reorder(_config: &Config, body: Option<&str>) -> Respon
         }
     };
     let payload = serde_json::to_string(&parsed).unwrap_or_else(|_| body.to_string());
-    match proxy_core_json("POST", "/api/memories/reorder", Some(&payload)).await {
+    match proxy_core_json(config, "POST", "/api/memories/delete", Some(&payload)).await {
+        Ok(proxy) => Response {
+            status: proxy.status,
+            content_type: "application/json",
+            body: proxy.body,
+        },
+        Err(e) => Response {
+            status: 502,
+            content_type: "application/json",
+            body: serde_json::json!({ "error": e }).to_string(),
+        },
+    }
+}
+
+pub async fn post_memory_reorder(config: &Config, body: Option<&str>) -> Response {
+    let Some(body) = body else {
+        return Response {
+            status: 400,
+            content_type: "application/json",
+            body: r#"{"error":"missing body"}"#.into(),
+        };
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return Response {
+                status: 400,
+                content_type: "application/json",
+                body: serde_json::json!({ "error": e.to_string() }).to_string(),
+            };
+        }
+    };
+    let payload = serde_json::to_string(&parsed).unwrap_or_else(|_| body.to_string());
+    match proxy_core_json(config, "POST", "/api/memories/reorder", Some(&payload)).await {
         Ok(proxy) => Response {
             status: proxy.status,
             content_type: "application/json",
@@ -849,6 +849,7 @@ pub async fn post_memory_reorder(_config: &Config, body: Option<&str>) -> Respon
 }
 
 async fn proxy_core_json(
+    config: &Config,
     method: &str,
     path: &str,
     body: Option<&str>,
@@ -856,12 +857,17 @@ async fn proxy_core_json(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let mut stream = TcpStream::connect("127.0.0.1:3000")
+    let addr = config.core_http_addr();
+    let host = addr
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(addr.as_str());
+    let mut stream = TcpStream::connect(&addr)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{addr}: {e}"))?;
     let body_str = body.unwrap_or("");
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body_str.len(),
         body_str
     );
@@ -910,6 +916,13 @@ mod tests {
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
         }
+    }
+
+    #[test]
+    fn core_proxy_addr_uses_configured_core_port() {
+        let mut config = test_config();
+        config.core.port = 3001;
+        assert_eq!(config.core_http_addr(), "127.0.0.1:3001");
     }
 
     #[test]

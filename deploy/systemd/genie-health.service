@@ -14,6 +14,10 @@ WatchdogSec=60
 MemoryMax=32M
 CPUWeight=20
 
+# Pin to the system bucket (issue #25) — health monitor is a periodic poller,
+# keep it off the inference cores (2-5).
+CPUAffinity=0 1
+
 # Security hardening
 ProtectSystem=strict
 ProtectHome=yes

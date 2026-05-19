@@ -175,9 +175,10 @@ GenieClaw is intentionally narrower than a broad general-agent stack.
 That is a hardware decision as much as a product decision. In practical Jetson
 Orin Nano 8 GB testing, heavier agent shells can require very large context
 windows just to stay coherent, which drives up KV cache size, first-token
-latency, and overall memory pressure. Even `8192` context can already be tight
-on this class of device, and the result is often slower replies and worse
-appliance behavior.
+latency, and overall memory pressure. GenieClaw defaults to a 4096-token
+runtime context on this class of device because larger contexts can be too
+tight across full-stack restarts, causing slower replies or worse appliance
+behavior.
 
 For GenieClaw, that means:
 

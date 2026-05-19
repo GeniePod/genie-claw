@@ -22,6 +22,12 @@ Restart=on-failure
 RestartSec=5
 TimeoutStartSec=120
 
+# CPU pinning for voice latency stability (issue #25). Dedicate two cores to
+# whisper-server so STT decode does not contend with llama-server (core 4) or
+# the audio capture / TTS pipeline (cores 0-1 and 5). --threads=2 matches the
+# affinity so each decode thread gets its own core.
+CPUAffinity=2 3
+
 # GPU needs full system access (same posture as genie-llm).
 ProtectSystem=no
 SupplementaryGroups=video render

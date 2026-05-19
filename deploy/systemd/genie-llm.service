@@ -32,6 +32,14 @@ Restart=on-failure
 RestartSec=5
 TimeoutStartSec=120
 
+# CPU pinning for voice latency stability (issue #25). Inference is GPU-bound
+# (--n-gpu-layers 999), so one dedicated core is enough to host CUDA dispatch
+# + sampler + tokenizer without contending with whisper (2-3) or genie-core
+# (5). --threads=4 above stays as-is for now; with a single-core affinity the
+# four worker threads time-share core 4 — fine for the GPU-bound critical path
+# but worth revisiting (--threads 1 or 2) if prompt-eval shows scheduler churn.
+CPUAffinity=4
+
 # GPU needs full system access
 ProtectSystem=no
 SupplementaryGroups=video render

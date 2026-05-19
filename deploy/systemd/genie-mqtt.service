@@ -9,6 +9,10 @@ Restart=always
 RestartSec=3
 MemoryMax=16M
 
+# Pin to the system bucket (issue #25) — broker traffic is light and event-
+# driven, keep it off the inference cores (2-5).
+CPUAffinity=0 1
+
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/opt/geniepod/data/mqtt

@@ -20,6 +20,15 @@ StandardInput=null
 Restart=always
 RestartSec=3
 
+# CPU pinning for voice latency stability (issue #25). Core 5 hosts the
+# orchestrator and every audio child it spawns (piper, sox, deep-filter,
+# arecord, aplay) — they inherit this affinity. Keeping the TTS pipeline on
+# one core shields whisper (2-3) and llama-server (4) from preemption during
+# decode. arecord runs on core 5 by inheritance (not 0-1 as the issue's
+# system-bucket bullet suggests); revisit with per-spawn taskset only if
+# capture jitter shows up under load.
+CPUAffinity=5
+
 # Needs GPU (Whisper TRT, Piper TTS), audio (ALSA/I2S), and network.
 ProtectSystem=no
 SupplementaryGroups=video render audio

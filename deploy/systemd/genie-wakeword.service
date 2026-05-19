@@ -10,8 +10,12 @@ ExecStart=/usr/bin/env python3 /opt/geniepod/bin/genie-wakeword.py
 Restart=always
 RestartSec=1
 
-# Pin to isolated CPU cores for real-time audio processing.
-CPUAffinity=4 5
+# Pin to audio/system cores for real-time wake-word detection (issue #25).
+# Cores 4 and 5 are now reserved for llama-server and genie-core respectively;
+# the wake-word listener belongs alongside ALSA + capture on the system bucket.
+# SCHED_FIFO at priority 50 is kept so the continuous audio loop isn't
+# preempted by best-effort system tasks sharing these cores.
+CPUAffinity=0 1
 CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=50
 

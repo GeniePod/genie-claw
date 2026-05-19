@@ -120,6 +120,48 @@ Operator decisions before enabling stricter policy:
 - Use `[core.tool_policy]` allowlists/denylists per channel when a surface should be less capable than local dashboard/API.
 - Keep `unknown` out of physical actuation origins unless there is a controlled reason to allow it.
 
+## CPU Pinning (Voice Latency Stability)
+
+The Jetson Orin Nano has six CPU cores. The voice path (wake → STT → LLM → TTS
+→ playback) is sensitive to scheduler jitter when multiple inference servers
+and audio subprocesses share cores. Each `genie-*` systemd unit ships with a
+`CPUAffinity=` directive that partitions the six cores into four buckets
+(issue #25):
+
+| Cores | Workload |
+| --- | --- |
+| 0–1 | Kernel, ALSA, MQTT broker, `genie-api`, `genie-governor`, `genie-health`, `genie-wakeword` |
+| 2–3 | `whisper-server` (STT decode, two threads) |
+| 4   | `llama-server` / `jetson-llm-server` (GPU-bound; one core hosts CUDA dispatch + sampler — whichever LLM backend is active) |
+| 5   | `genie-core` and all audio children it spawns (`piper`, `sox`, `deep-filter`, `arecord`, `aplay`) |
+
+`genie-wakeword` retains `SCHED_FIFO` at priority 50 so the continuous audio
+loop is not preempted by best-effort work sharing cores 0–1.
+
+Verify pinning after a deploy / restart:
+
+```bash
+# Per-service: confirm the unit and its children are on the expected cores.
+for svc in genie-core genie-llm genie-ai-runtime genie-whisper genie-wakeword genie-api \
+           genie-governor genie-health genie-mqtt; do
+    pid=$(systemctl show -p MainPID --value "${svc}.service")
+    [ "$pid" != "0" ] && printf "%-18s PID=%s  affinity=%s\n" \
+        "$svc" "$pid" "$(taskset -pc "$pid" | awk -F': ' '{print $2}')"
+done
+
+# All threads of one service (useful for whisper / llama with multi-threading):
+ps -L -o pid,tid,psr,comm -p "$(pidof whisper-server)"
+
+# Live core distribution while a voice cycle runs (Jetson-specific):
+sudo tegrastats --interval 250
+```
+
+Acceptance signal (issue #25): ten consecutive voice cycles should hold STT
+latency within ±100 ms of the median once warmup has completed. If variance
+persists after Option 1, the next step is kernel-level `isolcpus=2,3,4,5` on
+the bootloader command line — that is intentionally out of scope here because
+it requires a Jetson reflash / extlinux.conf edit.
+
 ## Runtime Data And State
 
 Default production data location:
