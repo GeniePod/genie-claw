@@ -216,6 +216,18 @@ The current product target is **GeniePod Home**:
 
 ## Roadmap
 
+### Milestones
+
+- [M1 — Stable Voice Loop on `genie-ai-runtime` v1](https://github.com/GeniePod/genie-claw/milestone/1) — *active*
+- [M2 — Native Telegram, Stable Memory, Clarified Agent Harness](https://github.com/GeniePod/genie-claw/milestone/2) — *planned*
+- [M3 — Smart Home Native: HA + `genie-home-runtime` + First Skill + Security Hardening](https://github.com/GeniePod/genie-claw/milestone/3) — *planned*
+- [M4 — Community Buildout: Discord, X, Reddit, GitHub → 500 stars](https://github.com/GeniePod/genie-claw/milestone/4) — *planned*
+- [M5 — Hardware, OS, and Mobile App: GeniePod Home V1 appliance shape](https://github.com/GeniePod/genie-claw/milestone/5) — *planned*
+- [M6 — Ship GeniePod Home V1 + `genie-hub` skill ecosystem + premium audio](https://github.com/GeniePod/genie-claw/milestone/6) — *planned*
+- [M7 — AI Model Optimization + Public Home Dataset + `genie-ai-model` Fine-Tuning](https://github.com/GeniePod/genie-claw/milestone/7) — *planned*
+- [M8 — Satellite Devices: Contactless Sleep Tracker + Multi-Room Satellite Speaker](https://github.com/GeniePod/genie-claw/milestone/8) — *planned*
+- [M9 — Product Line: GeniePod Home / Pro / Max + Tiered Stack Integration](https://github.com/GeniePod/genie-claw/milestone/9) — *planned*
+
 ### Milestone 1 — stable voice loop on `genie-ai-runtime` v1
 
 The first milestone is intentionally narrow: stabilize one end-to-end path
