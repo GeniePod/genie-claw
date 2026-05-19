@@ -147,7 +147,7 @@ M1 closes when, on a clean Jetson Orin Nano Super 8 GB:
 - [ ] 100 consecutive voice cycles pass with zero stalls and zero silent drops
 - [ ] system prompt SHA is identical across full-stack restart
 - [ ] memory recall test set (≥ 20 cases) passes ≥ 95%
-- [ ] tool dispatch ACL + rate-limit + audit log proven by integration test
+- [x] tool dispatch ACL + rate-limit + audit log proven by integration test
 - [ ] `genie-ai-runtime` v1 backend stable for 24h continuous run
 - [ ] CI green on: fmt, clippy, test, aarch64 cross-compile, audit, deny, shellcheck, ruff, AI-attribution check, proof-checklist
 
