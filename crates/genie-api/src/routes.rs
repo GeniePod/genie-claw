@@ -225,7 +225,10 @@ fn dashboard_service_targets(config: &Config) -> Vec<ServiceTarget> {
         ServiceTarget {
             service: "core".into(),
             unit: config.services.core.systemd_unit.clone(),
-            latency_url: Some(config.services.core.url.clone()),
+            // Derive from `[core].port` / `[core].bind_host` so the dashboard
+            // Services row stays aligned with where core actually listens,
+            // even when `[services.core].url` is stale. See issue #121.
+            latency_url: Some(config.core_health_url()),
             disabled_reason: None,
         },
         ServiceTarget {
@@ -948,6 +951,27 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn dashboard_core_target_uses_derived_health_url() {
+        // Regression for #121: when [core].port is overridden without also
+        // updating [services.core].url, the dashboard Services row for core
+        // must probe the derived URL so it does not show false DOWN.
+        let mut config = test_config();
+        config.core.port = 3001;
+        config.services.core.url = "http://127.0.0.1:3000/api/health".into();
+
+        let targets = dashboard_service_targets(&config);
+        let core_target = targets
+            .iter()
+            .find(|target| target.service == "core")
+            .expect("core target should always be present");
+
+        assert_eq!(
+            core_target.latency_url.as_deref(),
+            Some("http://127.0.0.1:3001/api/health"),
+        );
     }
 
     #[test]

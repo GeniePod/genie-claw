@@ -657,6 +657,18 @@ impl Config {
         format!("{host}:{}", self.core.port)
     }
 
+    /// Health-probe URL for genie-core, always derived from `[core].port` and
+    /// `[core].bind_host` rather than `[services.core].url`.
+    ///
+    /// Local probes (genie-health, the dashboard Services row) must agree with
+    /// where core actually listens. Sourcing from `[services.core].url` lets
+    /// the two drift when an operator overrides `[core].port` without also
+    /// updating the services URL, producing false DOWN signals while the
+    /// service is healthy on the configured port.
+    pub fn core_health_url(&self) -> String {
+        format!("http://{}/api/health", self.core_http_addr())
+    }
+
     /// Resolve the configured Home Assistant endpoint, if this deployment uses one.
     pub fn homeassistant_service(&self) -> Option<&ServiceEndpoint> {
         self.services.homeassistant.as_ref()
@@ -969,6 +981,47 @@ mod tests {
         config.core.port = 3000;
         config.core.bind_host = "0.0.0.0".into();
         assert_eq!(config.core_http_addr(), "127.0.0.1:3000");
+    }
+
+    #[test]
+    fn core_health_url_uses_default_port() {
+        let config = test_config();
+        assert_eq!(config.core_health_url(), "http://127.0.0.1:3000/api/health");
+    }
+
+    #[test]
+    fn core_health_url_tracks_custom_core_port() {
+        // Regression: operator changes only [core].port without touching
+        // [services.core].url — the derived URL must follow the new port so
+        // health probes don't hit the stale default.
+        let mut config = test_config();
+        config.core.port = 3001;
+        assert_eq!(config.core_health_url(), "http://127.0.0.1:3001/api/health");
+    }
+
+    #[test]
+    fn core_health_url_maps_listen_all_to_loopback() {
+        let mut config = test_config();
+        config.core.bind_host = "0.0.0.0".into();
+        assert_eq!(config.core_health_url(), "http://127.0.0.1:3000/api/health");
+    }
+
+    #[test]
+    fn core_health_url_honors_custom_bind_host() {
+        let mut config = test_config();
+        config.core.bind_host = "10.0.0.5".into();
+        config.core.port = 4000;
+        assert_eq!(config.core_health_url(), "http://10.0.0.5:4000/api/health");
+    }
+
+    #[test]
+    fn core_health_url_ignores_stale_services_core_url() {
+        // Even if [services.core].url is left at the default :3000, switching
+        // [core].port must take precedence in the derived URL.
+        let mut config = test_config();
+        config.core.port = 3001;
+        config.services.core.url = "http://127.0.0.1:3000/api/health".into();
+        assert_eq!(config.core_health_url(), "http://127.0.0.1:3001/api/health");
     }
 
     #[test]
