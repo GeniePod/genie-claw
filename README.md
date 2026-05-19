@@ -214,6 +214,48 @@ The current product target is **GeniePod Home**:
 - built around privacy, security, and bounded extensions
 - designed to feel stable, understandable, and privacy-respecting
 
+## Roadmap
+
+### Milestone 1 — stable voice loop on `genie-ai-runtime` v1
+
+The first milestone is intentionally narrow: stabilize one end-to-end path
+(voice in, voice out) on the current first release of `genie-ai-runtime`,
+and nothing else. Breadth comes after M1.
+
+In scope:
+
+- **system prompt path** — deterministic prompt assembly, reproducible across restarts, no silent prompt drift between runs
+- **`genie-ai-runtime` v1 integration reliability** — every chat/voice cycle reaches the runtime, every response parses cleanly, every failure mode surfaces in `/api/health` and `genie-ctl status`
+- **memory recall** — household context written to SQLite is retrievable and referenced in subsequent turns; recall failures are observable, not silent
+- **tool dispatch** — the tool-call gate routes correctly, applies per-origin ACLs, rate-limits, and audits; every dispatched tool either completes or fails loudly
+- **voice pipeline strength** — wake → VAD → STT → LLM → TTS round-trip under the alpha latency budget on Jetson Orin Nano Super 8 GB; no silent stalls, no torn audio, no stuck push-to-talk loops
+
+Out of scope for M1:
+
+- new channels beyond the existing voice + Telegram phase 2 bridges
+- new skills / skill marketplace work
+- Home Assistant feature expansion (current transitional adapter only)
+- `genie-home-runtime` split-out
+- hardware variants beyond Orin Nano Super 8 GB
+- web UI features off the M1 observability path
+
+PRs outside this scope are welcome but will be tagged `post-m1` and queued.
+
+**Contribution surface during M1**: bug reports and PRs are welcome in **both**
+[`GeniePod/genie-claw`](https://github.com/GeniePod/genie-claw) and
+[`GeniePod/genie-ai-runtime`](https://github.com/GeniePod/genie-ai-runtime). If
+a bug crosses the boundary, file it where the symptom appears; a maintainer
+will move or mirror it.
+
+M1 closes when, on a clean Jetson Orin Nano Super 8 GB:
+
+- [ ] 100 consecutive voice cycles pass with zero stalls and zero silent drops
+- [ ] system prompt SHA is identical across full-stack restart
+- [ ] memory recall test set (≥ 20 cases) passes ≥ 95%
+- [ ] tool dispatch ACL + rate-limit + audit log proven by integration test
+- [ ] `genie-ai-runtime` v1 backend stable for 24h continuous run
+- [ ] CI green on: fmt, clippy, test, aarch64 cross-compile, audit, deny, shellcheck, ruff, AI-attribution check, proof-checklist
+
 ## Quick Start
 
 If you just want to run the software locally:
