@@ -469,3 +469,7 @@ Found a vulnerability? **Do not open a public issue.** Email <contact@genieclaw.
 GNU Affero General Public License v3.0
 
 See [LICENSE](LICENSE).
+
+## Acknowledgements
+
+Together we advance. Thanks to the [gittensor community](https://gittensor.io/repositories) for supporting this project.
