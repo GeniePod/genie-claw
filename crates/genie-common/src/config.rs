@@ -414,6 +414,11 @@ pub struct HealthConfig {
 pub struct ServicesConfig {
     pub core: ServiceEndpoint,
     pub llm: ServiceEndpoint,
+
+    /// Local genie-api dashboard / proxy HTTP endpoint.
+    #[serde(default = "defaults::api_service_endpoint")]
+    pub api: ServiceEndpoint,
+
     pub homeassistant: Option<ServiceEndpoint>,
 
     #[serde(default)]
@@ -626,6 +631,48 @@ pub enum LlmBackendKind {
     LlamaCpp,
 }
 
+/// Parse an `http://` service URL into `(host:port, path)` for local HTTP clients.
+///
+/// `default_port` is used when the URL omits an explicit port (e.g. `8123` for Home Assistant).
+pub fn service_http_probe(url: &str, default_port: u16) -> Result<(String, String), String> {
+    let rest = url.trim();
+    let rest = rest
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("unsupported service URL '{url}': only http:// is supported"))?;
+
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], rest[idx..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return Err(format!("invalid service URL '{url}': missing host"));
+    }
+
+    let path = if path.is_empty() { "/".into() } else { path };
+
+    let (host, port) = if authority.starts_with('[') {
+        let end = authority
+            .find(']')
+            .ok_or_else(|| format!("invalid IPv6 service URL '{url}'"))?;
+        let host = &authority[1..end];
+        let port = authority[end + 1..]
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        (host.to_string(), port)
+    } else if let Some((host, port_str)) = authority.rsplit_once(':')
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        (host.to_string(), port)
+    } else {
+        (authority.to_string(), default_port)
+    };
+
+    Ok((format!("{host}:{port}"), path))
+}
+
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let path = std::env::var("GENIEPOD_CONFIG")
@@ -640,6 +687,11 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("failed to read config {}: {}", path.display(), e))?;
         let config: Config = toml::from_str(&contents)?;
         Ok(config)
+    }
+
+    /// Resolve the configured genie-api HTTP endpoint.
+    pub fn api_service(&self) -> &ServiceEndpoint {
+        &self.services.api
     }
 
     /// Resolve the configured Home Assistant endpoint, if this deployment uses one.
@@ -662,7 +714,7 @@ impl Config {
     /// Whether the current deployment should manage a given service alias.
     pub fn manages_service_alias(&self, alias: &str) -> bool {
         match alias {
-            "core" | "genie-core" | "llm" | "genie-llm" => true,
+            "core" | "genie-core" | "llm" | "genie-llm" | "api" | "genie-api" => true,
             "homeassistant" => self.services.homeassistant.is_some(),
             "nextcloud" => self.services.nextcloud.is_some(),
             "jellyfin" => self.services.jellyfin.is_some(),
@@ -677,6 +729,7 @@ impl Config {
         match alias {
             "core" | "genie-core" => Some(self.services.core.systemd_unit.clone()),
             "llm" | "genie-llm" => Some(self.services.llm.systemd_unit.clone()),
+            "api" | "genie-api" => Some(self.services.api.systemd_unit.clone()),
             "homeassistant" => self
                 .services
                 .homeassistant
@@ -849,6 +902,7 @@ impl Default for ServicesConfig {
                 systemd_unit: "genie-ai-runtime.service".into(),
                 backend: LlmBackendKind::GenieAiRuntime,
             },
+            api: defaults::api_service_endpoint(),
             homeassistant: None,
             nextcloud: None,
             jellyfin: None,
@@ -932,6 +986,55 @@ mod tests {
         let config = test_config();
         assert!(config.homeassistant_service().is_none());
         assert!(!config.manages_service_alias("homeassistant"));
+    }
+
+    #[test]
+    fn api_service_has_default_probe_url() {
+        let config = test_config();
+        assert_eq!(
+            config.api_service().url,
+            "http://127.0.0.1:3080/api/status"
+        );
+    }
+
+    #[test]
+    fn service_http_probe_parses_host_port_and_path() {
+        let (addr, path) =
+            service_http_probe("http://192.168.1.50:8123/api/", 8123).unwrap();
+        assert_eq!(addr, "192.168.1.50:8123");
+        assert_eq!(path, "/api/");
+    }
+
+    #[test]
+    fn service_http_probe_uses_default_port_when_missing() {
+        let (addr, path) = service_http_probe("http://homeassistant.local/", 8123).unwrap();
+        assert_eq!(addr, "homeassistant.local:8123");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn service_http_probe_parses_api_status_url() {
+        let (addr, path) =
+            service_http_probe("http://127.0.0.1:3080/api/status", 3080).unwrap();
+        assert_eq!(addr, "127.0.0.1:3080");
+        assert_eq!(path, "/api/status");
+    }
+
+    #[test]
+    fn services_config_deserializes_without_explicit_api_section() {
+        let config: ServicesConfig = toml::from_str(
+            r#"
+[core]
+url = "http://127.0.0.1:3000/api/health"
+systemd_unit = "genie-core.service"
+
+[llm]
+url = "http://127.0.0.1:8080/health"
+systemd_unit = "genie-llm.service"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.api.url, "http://127.0.0.1:3080/api/status");
     }
 
     #[test]
@@ -1328,6 +1431,7 @@ device_path = "/dev/spidev1.0"
 }
 
 mod defaults {
+    use super::{LlmBackendKind, ServiceEndpoint};
     use std::path::PathBuf;
 
     pub fn data_dir() -> PathBuf {
@@ -1362,6 +1466,13 @@ mod defaults {
     }
     pub fn alert_webhook_url() -> String {
         String::new()
+    }
+    pub fn api_service_endpoint() -> ServiceEndpoint {
+        ServiceEndpoint {
+            url: "http://127.0.0.1:3080/api/status".into(),
+            systemd_unit: "genie-api.service".into(),
+            backend: LlmBackendKind::default(),
+        }
     }
     pub fn core_port() -> u16 {
         3000

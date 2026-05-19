@@ -18,7 +18,7 @@
 //!   genie-ctl version         Show version info
 
 use anyhow::Result;
-use genie_common::config::Config;
+use genie_common::config::{Config, service_http_probe};
 use genie_core::skills::{
     SkillLoader, SkillManifestAudit, find_manifest_sidecar, manifest_sidecar_candidates,
     skills_dir as runtime_skills_dir,
@@ -51,6 +51,26 @@ fn core_addr_from_config(config: &Config) -> String {
 fn load_core_addr() -> Result<String> {
     Ok(core_addr_from_config(&Config::load()?))
 }
+
+/// HTTP probes for optional stack services declared in `geniepod.toml`.
+fn configured_http_probes(config: &Config) -> Vec<(&'static str, String, u16)> {
+    let mut probes = vec![("genie-api", config.services.api.url.clone(), 3080_u16)];
+    if let Some(ha) = config.homeassistant_service() {
+        probes.push(("Home Assistant", ha.url.clone(), 8123));
+    }
+    probes
+}
+
+async fn probe_http_service(name: &str, url: &str, default_port: u16) {
+    match service_http_probe(url, default_port) {
+        Ok((addr, path)) => match http_get(&addr, &path).await {
+            Ok(_) => println!("  [OK]   {}", name),
+            Err(_) => println!("  [DOWN] {}", name),
+        },
+        Err(reason) => println!("  [SKIP] {} ({})", name, reason),
+    }
+}
+
 const SKILL_RESTART_HINT: &str =
     "Restart genie-core to load skill changes, or wait until the next startup.";
 
@@ -1048,7 +1068,8 @@ async fn cmd_connectivity() -> Result<()> {
 }
 
 async fn cmd_health() -> Result<()> {
-    let core = load_core_addr()?;
+    let config = Config::load()?;
+    let core = core_addr_from_config(&config);
     let core_health = match http_get(&core, "/api/health").await {
         Ok(body) => {
             println!("  [OK]   genie-core");
@@ -1069,16 +1090,8 @@ async fn cmd_health() -> Result<()> {
         }
     }
 
-    // Check each remaining HTTP service.
-    let services = [
-        ("Home Assistant", "127.0.0.1:8123", "/api/"),
-        ("genie-api", "127.0.0.1:3080", "/api/status"),
-    ];
-    for (name, addr, path) in &services {
-        match http_get(addr, path).await {
-            Ok(_) => println!("  [OK]   {}", name),
-            Err(_) => println!("  [DOWN] {}", name),
-        }
+    for (name, url, default_port) in configured_http_probes(&config) {
+        probe_http_service(name, &url, default_port).await;
     }
 
     // Governor (Unix socket, not HTTP).
@@ -1183,7 +1196,8 @@ async fn cmd_update_check() -> Result<()> {
 }
 
 async fn cmd_diag() -> Result<()> {
-    let core = load_core_addr()?;
+    let config = Config::load()?;
+    let core = core_addr_from_config(&config);
     println!("=== GeniePod Diagnostics ===\n");
 
     // Version.
@@ -1192,17 +1206,21 @@ async fn cmd_diag() -> Result<()> {
 
     // Core health.
     println!("\n[Services]");
-    let services = [
-        ("genie-core", core.as_str(), "/api/health"),
-        ("genie-api", "127.0.0.1:3080", "/api/status"),
-        ("Home Assistant", "127.0.0.1:8123", "/api/"),
-    ];
-    for (name, addr, path) in &services {
-        let status = match http_get(addr, path).await {
-            Ok(_) => "UP",
-            Err(_) => "DOWN",
+    let status = match http_get(&core, "/api/health").await {
+        Ok(_) => "UP",
+        Err(_) => "DOWN",
+    };
+    println!("  {:20} {}", "genie-core", status);
+
+    for (name, url, default_port) in configured_http_probes(&config) {
+        let line_status = match service_http_probe(&url, default_port) {
+            Ok((addr, path)) => match http_get(&addr, &path).await {
+                Ok(_) => "UP",
+                Err(_) => "DOWN",
+            },
+            Err(_) => "SKIP",
         };
-        println!("  {:20} {}", name, status);
+        println!("  {:20} {}", name, line_status);
     }
     let gov_status = match governor_cmd(r#"{"cmd":"status"}"#).await {
         Some(_) => "UP",
@@ -1359,22 +1377,49 @@ async fn cmd_diag() -> Result<()> {
 }
 
 async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
-    let core = load_core_addr()?;
-    let services = [
-        ("genie-core", core.as_str(), "/api/health"),
-        ("genie-api", "127.0.0.1:3080", "/api/status"),
-        ("Home Assistant", "127.0.0.1:8123", "/api/"),
-    ];
+    let config = Config::load()?;
+    let core = core_addr_from_config(&config);
+    let (api_addr, api_probe_error) = match service_http_probe(&config.services.api.url, 3080) {
+        Ok((addr, _path)) => (addr, None::<String>),
+        Err(reason) => (String::new(), Some(reason)),
+    };
 
-    let mut service_status = Vec::new();
-    for (name, addr, path) in &services {
-        service_status.push(serde_json::json!({
-            "service": name,
-            "addr": addr,
-            "path": path,
-            "reachable": http_get(addr, path).await.is_ok(),
-        }));
+    let mut service_status = vec![serde_json::json!({
+        "service": "genie-core",
+        "addr": core,
+        "path": "/api/health",
+        "reachable": http_get(&core, "/api/health").await.is_ok(),
+    })];
+
+    for (name, url, default_port) in configured_http_probes(&config) {
+        let entry = match service_http_probe(&url, default_port) {
+            Ok((addr, path)) => serde_json::json!({
+                "service": name,
+                "url": url,
+                "addr": addr,
+                "path": path,
+                "reachable": http_get(&addr, &path).await.is_ok(),
+            }),
+            Err(reason) => serde_json::json!({
+                "service": name,
+                "url": url,
+                "reachable": false,
+                "error": reason,
+            }),
+        };
+        service_status.push(entry);
     }
+
+    let api_security = if api_probe_error.is_none() {
+        http_json_value(&api_addr, "/api/security").await
+    } else {
+        serde_json::Value::Null
+    };
+    let api_actuation_audit = if api_probe_error.is_none() {
+        http_json_value(&api_addr, "/api/actuation/audit").await
+    } else {
+        serde_json::Value::Null
+    };
 
     let bundle = serde_json::json!({
         "schema_version": 1,
@@ -1390,11 +1435,11 @@ async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
             "runtime_contract": http_json_value(&core, "/api/runtime/contract").await,
             "connectivity": http_json_value(&core, "/api/connectivity").await,
         },
-        "security": http_json_value("127.0.0.1:3080", "/api/security").await,
+        "security": api_security,
         "actuation": {
             "pending": http_json_value(&core, "/api/actuation/pending").await,
             "actions": http_json_value(&core, "/api/actuation/actions").await,
-            "audit": http_json_value("127.0.0.1:3080", "/api/actuation/audit").await,
+            "audit": api_actuation_audit,
         },
         "system": {
             "meminfo": read_file_lines("/proc/meminfo", 8),
