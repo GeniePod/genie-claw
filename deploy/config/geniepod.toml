@@ -233,6 +233,10 @@ backend = "genie_ai_runtime"      # Default on Jetson. OpenAI-compatible genie-a
                                   # to roll back to the legacy llama.cpp server path.
                                   # Accepts hyphenated aliases too: "llama-cpp" / "genie-ai-runtime".
 
+[services.api]
+url = "http://127.0.0.1:3080/api/status"
+systemd_unit = "genie-api.service"
+
 # Uncomment to enable Home Assistant integration:
 # [services.homeassistant]
 # url = "http://127.0.0.1:8123/"
