@@ -11,7 +11,12 @@ use genie_core::ha::{
 };
 use genie_core::tools::{RequestOrigin, ToolCall, ToolDispatcher, ToolExecutionContext};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Each test gets its own audit directory. Using only `process::id()` collides when
+/// `cargo test` runs integration tests in parallel within one process.
+static TEST_RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Mirrors production layout: `<data_dir>/runtime/tool-audit.jsonl` and
 /// `<data_dir>/safety/actuation-audit.jsonl`.
@@ -23,8 +28,12 @@ struct TestAuditPaths {
 
 impl TestAuditPaths {
     fn new() -> Self {
-        let data_dir =
-            std::env::temp_dir().join(format!("genie-tool-gate-it-{}", std::process::id()));
+        let run = TEST_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let data_dir = std::env::temp_dir().join(format!(
+            "genie-tool-gate-it-{}-{}",
+            std::process::id(),
+            run
+        ));
         let _ = std::fs::remove_dir_all(&data_dir);
         Self {
             tool_audit: data_dir.join("runtime/tool-audit.jsonl"),
@@ -52,7 +61,10 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
     contents
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("audit line must be valid JSON"))
+        .map(|line| {
+            serde_json::from_str(line.trim())
+                .unwrap_or_else(|e| panic!("audit line must be valid JSON: {e}\n{line:?}"))
+        })
         .collect()
 }
 
