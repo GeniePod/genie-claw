@@ -23,7 +23,8 @@ struct TestAuditPaths {
 
 impl TestAuditPaths {
     fn new() -> Self {
-        let data_dir = std::env::temp_dir().join(format!("genie-tool-gate-it-{}", std::process::id()));
+        let data_dir =
+            std::env::temp_dir().join(format!("genie-tool-gate-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         Self {
             tool_audit: data_dir.join("runtime/tool-audit.jsonl"),
@@ -226,7 +227,11 @@ async fn tool_gate_acl_denies_disallowed_origin_and_audits() {
     );
 
     let events = read_jsonl(&paths.tool_audit);
-    assert_eq!(events.len(), 1, "denied tool call must appear in tool audit");
+    assert_eq!(
+        events.len(),
+        1,
+        "denied tool call must appear in tool audit"
+    );
     assert_eq!(events[0]["tool"], "get_time");
     assert_eq!(events[0]["origin"], "telegram");
     assert_eq!(events[0]["success"], false);
@@ -264,7 +269,11 @@ async fn tool_gate_rate_limit_allows_n_then_denies_and_audits() {
     let first = dispatcher.execute_with_context(&call, ctx).await;
     let second = dispatcher.execute_with_context(&call, ctx).await;
 
-    assert!(first.success, "first call within rate limit: {}", first.output);
+    assert!(
+        first.success,
+        "first call within rate limit: {}",
+        first.output
+    );
     assert!(!second.success, "second call must be rate-limited");
     assert!(second.output.contains("rate limit"));
 
@@ -457,7 +466,10 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
     );
     assert_append_only(&paths.tool_audit, tool_len_2);
     let tool_len_final = read_jsonl(&paths.tool_audit).len();
-    assert_eq!(tool_len_final, 4, "every dispatch must append one tool-audit line");
+    assert_eq!(
+        tool_len_final, 4,
+        "every dispatch must append one tool-audit line"
+    );
 
     let actuation_events = read_jsonl(&paths.actuation_audit);
     assert_eq!(
