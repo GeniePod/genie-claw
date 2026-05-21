@@ -4,15 +4,13 @@ use genie_common::config::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::actuation::{
-    ActionLedger, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager, PendingConfirmation,
-    RecordedAction, RequestOrigin, now_ms,
+    ActionLedger, AuditError, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager,
+    PendingConfirmation, RecordedAction, RequestOrigin, append_json_line, now_ms,
 };
 use super::home;
 use super::timer;
@@ -103,21 +101,28 @@ impl ToolAuditLogger {
         }
     }
 
-    fn append(&self, event: ToolAuditEvent) {
+    /// Append a tool-audit event. Mirrors `AuditLogger::append` — see that
+    /// method for the failure semantics. Returns `Ok(())` when the logger is
+    /// disabled.
+    fn append(&self, event: ToolAuditEvent) -> Result<(), AuditError> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
         let _guard = self.lock.lock().expect("tool audit logger lock");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        append_json_line(path, &event)
+    }
+
+    /// Append-and-log-on-failure wrapper. Use this from sites with no
+    /// recovery path; use [`append`] when the caller needs to react to the
+    /// failure (e.g. a "no audit, no action" code path).
+    fn append_or_log(&self, event: ToolAuditEvent) {
+        if let Err(err) = self.append(event) {
+            tracing::error!(
+                error = %err,
+                path = ?self.path,
+                "tool-audit event dropped due to IO failure"
+            );
         }
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-            return;
-        };
-        let Ok(line) = serde_json::to_string(&event) else {
-            return;
-        };
-        let _ = writeln!(file, "{line}");
     }
 
     fn path(&self) -> Option<&std::path::Path> {
@@ -551,7 +556,7 @@ impl ToolDispatcher {
         started: Instant,
         result: &ToolResult,
     ) {
-        self.tool_audit_logger.append(ToolAuditEvent {
+        self.tool_audit_logger.append_or_log(ToolAuditEvent {
             ts_ms: now_ms(),
             tool: call.name.clone(),
             origin: exec_ctx.request_origin,
@@ -591,7 +596,7 @@ impl ToolDispatcher {
                 "actuation from '{}' is not allowed by channel policy",
                 exec_ctx.request_origin.as_policy_key()
             );
-            self.audit_logger.append(AuditEvent {
+            self.audit_logger.append_or_log(AuditEvent {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedPolicy,
                 origin: exec_ctx.request_origin,
@@ -611,7 +616,7 @@ impl ToolDispatcher {
             .check_and_record(&self.actuation_safety, exec_ctx.request_origin)
         {
             let reason = err.to_string();
-            self.audit_logger.append(AuditEvent {
+            self.audit_logger.append_or_log(AuditEvent {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedRuntime,
                 origin: exec_ctx.request_origin,
@@ -658,7 +663,7 @@ impl ToolDispatcher {
                         confidence,
                     )
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::Executed,
                     origin: exec_ctx.request_origin,
@@ -681,7 +686,7 @@ impl ToolDispatcher {
                     &reason,
                     exec_ctx.request_origin,
                 );
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::ConfirmationIssued,
                     origin: exec_ctx.request_origin,
@@ -708,7 +713,7 @@ impl ToolDispatcher {
                 } else {
                     AuditStatus::Failed
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status,
                     origin: exec_ctx.request_origin,
@@ -2242,5 +2247,54 @@ mod tests {
         assert!(output.contains("Person-scoped memories: 0"));
         assert!(output.contains("Private memories: 0"));
         assert!(output.contains("Restricted memories: 0"));
+    }
+
+    fn sample_tool_audit_event() -> ToolAuditEvent {
+        ToolAuditEvent {
+            ts_ms: 1,
+            tool: "calc".into(),
+            origin: RequestOrigin::Repl,
+            success: true,
+            duration_ms: 1,
+            argument_keys: vec!["expr".into()],
+            output_chars: 3,
+        }
+    }
+
+    #[test]
+    fn tool_audit_logger_disabled_appends_ok() {
+        // Disabled mirror of the actuation logger test: no path → no IO → Ok.
+        let logger = ToolAuditLogger::default();
+        assert!(logger.append(sample_tool_audit_event()).is_ok());
+        logger.append_or_log(sample_tool_audit_event());
+    }
+
+    #[test]
+    fn tool_audit_logger_surfaces_blocked_parent_error() {
+        // Same parent-is-a-file trick used for the actuation logger; ensures
+        // ToolAuditLogger now reports IO failures instead of silently dropping
+        // the event.
+        let dir = std::env::temp_dir().join(format!(
+            "geniepod-tool-audit-blocked-parent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("setup: create temp dir");
+        let blocking_file = dir.join("blocking_file");
+        std::fs::write(&blocking_file, "not a directory")
+            .expect("setup: create blocking regular file");
+        let audit_path = blocking_file.join("tool-audit.jsonl");
+
+        let logger = ToolAuditLogger::new(&audit_path);
+        let err = logger
+            .append(sample_tool_audit_event())
+            .expect_err("append must surface the IO failure");
+        assert!(
+            matches!(err, AuditError::CreateDir(_) | AuditError::Open(_)),
+            "expected CreateDir or Open variant, got {err:?}"
+        );
+        logger.append_or_log(sample_tool_audit_event());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -284,6 +286,57 @@ pub struct AuditEvent {
     pub undo_of: Option<u64>,
 }
 
+/// Errors that can occur while appending an event to an on-disk audit log.
+///
+/// Each variant identifies which underlying step failed so callers can
+/// distinguish e.g. a misconfigured path (`CreateDir` / `Open`) from a
+/// disk-pressure failure (`Write`). The inner errors are preserved so the
+/// `io::ErrorKind` and serde detail remain available for structured logging.
+#[derive(Debug)]
+pub enum AuditError {
+    CreateDir(io::Error),
+    Open(io::Error),
+    Serialize(serde_json::Error),
+    Write(io::Error),
+}
+
+impl fmt::Display for AuditError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CreateDir(err) => write!(f, "audit log: create parent directory: {err}"),
+            Self::Open(err) => write!(f, "audit log: open file for append: {err}"),
+            Self::Serialize(err) => write!(f, "audit log: serialize event: {err}"),
+            Self::Write(err) => write!(f, "audit log: write line: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for AuditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CreateDir(err) | Self::Open(err) | Self::Write(err) => Some(err),
+            Self::Serialize(err) => Some(err),
+        }
+    }
+}
+
+/// Append a single JSON-encoded line to `path`, creating parent directories
+/// as needed. Returns the specific `AuditError` for the failed step so the
+/// caller can surface it to logs / metrics. Shared by `AuditLogger` and
+/// `ToolAuditLogger` so both have identical behavior under IO failure.
+pub(crate) fn append_json_line<T: Serialize>(path: &Path, payload: &T) -> Result<(), AuditError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(AuditError::CreateDir)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(AuditError::Open)?;
+    let line = serde_json::to_string(payload).map_err(AuditError::Serialize)?;
+    writeln!(file, "{line}").map_err(AuditError::Write)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AuditLogger {
     path: Option<PathBuf>,
@@ -302,21 +355,31 @@ impl AuditLogger {
         }
     }
 
-    pub fn append(&self, event: AuditEvent) {
+    /// Append an audit event. Returns the specific failure kind on IO or
+    /// serialization error so callers can log structured detail (or refuse
+    /// to proceed if their security posture is "no audit, no action").
+    ///
+    /// When the logger is `disabled()`, returns `Ok(())` without doing any IO.
+    pub fn append(&self, event: AuditEvent) -> Result<(), AuditError> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
         let _guard = self.lock.lock().expect("audit logger lock");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        append_json_line(path, &event)
+    }
+
+    /// Convenience wrapper for callers that have no recovery path: appends
+    /// the event and, on failure, emits a `tracing::error!` with the path and
+    /// underlying error. The error is intentionally swallowed — use [`append`]
+    /// directly if you need to react to the failure.
+    pub fn append_or_log(&self, event: AuditEvent) {
+        if let Err(err) = self.append(event) {
+            tracing::error!(
+                error = %err,
+                path = ?self.path,
+                "audit event dropped due to IO failure"
+            );
         }
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-            return;
-        };
-        let Ok(line) = serde_json::to_string(&event) else {
-            return;
-        };
-        let _ = writeln!(file, "{line}");
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -522,37 +585,121 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let logger = AuditLogger::new(&path);
 
-        logger.append(AuditEvent {
-            ts_ms: 100,
-            status: AuditStatus::Executed,
-            origin: RequestOrigin::Voice,
-            entity: "kitchen light".into(),
-            action: "turn_on".into(),
-            value: None,
-            reason: "home action executed".into(),
-            token: None,
-            confidence: Some(0.9),
-            action_id: Some(1),
-            undo_of: None,
-        });
-        logger.append(AuditEvent {
-            ts_ms: 200,
-            status: AuditStatus::ConfirmationIssued,
-            origin: RequestOrigin::Voice,
-            entity: "front door".into(),
-            action: "unlock".into(),
-            value: None,
-            reason: "needs confirmation".into(),
-            token: Some("act-test".into()),
-            confidence: None,
-            action_id: None,
-            undo_of: None,
-        });
+        logger
+            .append(AuditEvent {
+                ts_ms: 100,
+                status: AuditStatus::Executed,
+                origin: RequestOrigin::Voice,
+                entity: "kitchen light".into(),
+                action: "turn_on".into(),
+                value: None,
+                reason: "home action executed".into(),
+                token: None,
+                confidence: Some(0.9),
+                action_id: Some(1),
+                undo_of: None,
+            })
+            .expect("append should succeed against a writable temp path");
+        logger
+            .append(AuditEvent {
+                ts_ms: 200,
+                status: AuditStatus::ConfirmationIssued,
+                origin: RequestOrigin::Voice,
+                entity: "front door".into(),
+                action: "unlock".into(),
+                value: None,
+                reason: "needs confirmation".into(),
+                token: Some("act-test".into()),
+                confidence: None,
+                action_id: None,
+                undo_of: None,
+            })
+            .expect("append should succeed against a writable temp path");
 
         let actions = logger.read_recent_executed_actions(10);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].entity, "kitchen light");
         assert_eq!(actions[0].inverse_action.as_deref(), Some("turn_off"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn sample_audit_event() -> AuditEvent {
+        AuditEvent {
+            ts_ms: 1,
+            status: AuditStatus::Executed,
+            origin: RequestOrigin::Repl,
+            entity: "kitchen light".into(),
+            action: "turn_on".into(),
+            value: None,
+            reason: "test".into(),
+            token: None,
+            confidence: None,
+            action_id: Some(1),
+            undo_of: None,
+        }
+    }
+
+    #[test]
+    fn append_returns_ok_when_logger_is_disabled() {
+        let logger = AuditLogger::disabled();
+        // Disabled loggers must succeed silently — they have no path to fail on.
+        assert!(logger.append(sample_audit_event()).is_ok());
+        // The append_or_log wrapper must also be a no-op without panicking.
+        logger.append_or_log(sample_audit_event());
+    }
+
+    #[test]
+    fn append_returns_error_when_parent_path_is_a_file() {
+        // Force a deterministic IO failure: place a regular file where the
+        // audit log's parent directory would be. `create_dir_all` and
+        // `OpenOptions::open` will both refuse, producing `CreateDir` (Unix)
+        // or `Open` (Windows) depending on platform; we accept either.
+        let dir = std::env::temp_dir().join(format!(
+            "geniepod-audit-blocked-parent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("setup: create temp dir");
+        let blocking_file = dir.join("blocking_file");
+        std::fs::write(&blocking_file, "not a directory")
+            .expect("setup: create blocking regular file");
+        let audit_path = blocking_file.join("audit.jsonl");
+
+        let logger = AuditLogger::new(&audit_path);
+        let err = logger
+            .append(sample_audit_event())
+            .expect_err("append must surface the IO failure");
+        assert!(
+            matches!(err, AuditError::CreateDir(_) | AuditError::Open(_)),
+            "expected CreateDir or Open variant, got {err:?}"
+        );
+        // And the convenience wrapper must swallow the same error without
+        // panicking — that contract is what callers depend on.
+        logger.append_or_log(sample_audit_event());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_writes_jsonl_line_with_event_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-audit-roundtrip-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let logger = AuditLogger::new(&path);
+
+        logger
+            .append(sample_audit_event())
+            .expect("append should succeed against a writable temp path");
+
+        let contents = std::fs::read_to_string(&path).expect("read back audit file");
+        let line = contents.lines().next().expect("at least one line written");
+        let parsed: AuditEvent =
+            serde_json::from_str(line).expect("written line round-trips as AuditEvent");
+        assert_eq!(parsed.entity, "kitchen light");
+        assert_eq!(parsed.status, AuditStatus::Executed);
+
         let _ = std::fs::remove_file(&path);
     }
 }
