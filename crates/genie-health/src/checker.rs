@@ -24,6 +24,36 @@ pub struct HealthMonitor {
     failure_counts: std::collections::HashMap<String, u32>,
 }
 
+/// Materialize `(name, probe_url)` pairs for every service the health monitor
+/// owns. Core's URL is derived from `[core].port` / `[core].bind_host` via
+/// `Config::core_health_url()` so the probe always tracks where core actually
+/// listens, even when `[services.core].url` is left at the default after an
+/// operator changes the listen port.
+///
+/// Kept as a free function (rather than a `&self` method) so unit tests can
+/// exercise it without constructing a `HealthMonitor`, which would open the
+/// SQLite log DB at `config.data_dir` and contend with parallel tests on the
+/// same path.
+fn collect_endpoints(config: &Config) -> Vec<(String, String)> {
+    let mut endpoints = vec![
+        ("core".into(), config.core_health_url()),
+        ("llm".into(), config.services.llm.url.clone()),
+    ];
+
+    if let Some(ref ha) = config.services.homeassistant {
+        endpoints.push(("homeassistant".into(), ha.url.clone()));
+    }
+
+    if let Some(ref nc) = config.services.nextcloud {
+        endpoints.push(("nextcloud".into(), nc.url.clone()));
+    }
+    if let Some(ref jf) = config.services.jellyfin {
+        endpoints.push(("jellyfin".into(), jf.url.clone()));
+    }
+
+    endpoints
+}
+
 impl HealthMonitor {
     pub fn new(config: Config) -> Result<Self> {
         let db_path = config.data_dir.join("health.db");
@@ -85,7 +115,7 @@ impl HealthMonitor {
         // Owned `(name, url)` pairs so the alert / DB writes below don't
         // borrow `self`. `collect_endpoints` already resolves the core URL
         // from `[core].port` so this loop can stay generic.
-        let services = self.collect_endpoints();
+        let services = collect_endpoints(&self.config);
 
         for (name, url) in &services {
             let status = check_http(name, url).await;
@@ -129,31 +159,6 @@ impl HealthMonitor {
         let _ = self
             .db
             .execute("DELETE FROM health_log WHERE ts_ms < ?1", [cutoff]);
-    }
-
-    /// Materialize `(name, probe_url)` pairs for every service this monitor
-    /// owns. Core's URL is derived from `[core].port` / `[core].bind_host` via
-    /// `Config::core_health_url()` so the probe always tracks where core
-    /// actually listens, even when `[services.core].url` is left at the
-    /// default after an operator changes the listen port.
-    fn collect_endpoints(&self) -> Vec<(String, String)> {
-        let mut endpoints = vec![
-            ("core".into(), self.config.core_health_url()),
-            ("llm".into(), self.config.services.llm.url.clone()),
-        ];
-
-        if let Some(ref ha) = self.config.services.homeassistant {
-            endpoints.push(("homeassistant".into(), ha.url.clone()));
-        }
-
-        if let Some(ref nc) = self.config.services.nextcloud {
-            endpoints.push(("nextcloud".into(), nc.url.clone()));
-        }
-        if let Some(ref jf) = self.config.services.jellyfin {
-            endpoints.push(("jellyfin".into(), jf.url.clone()));
-        }
-
-        endpoints
     }
 
     async fn send_alert(&self, status: &ServiceStatus) {
@@ -331,8 +336,11 @@ mod tests {
 
     #[test]
     fn collect_endpoints_skips_unconfigured_homeassistant() {
-        let monitor = HealthMonitor::new(test_config()).unwrap();
-        let endpoints = monitor.collect_endpoints();
+        // Call the free function directly so the test does not construct a
+        // HealthMonitor — that would open the SQLite log DB at
+        // `config.data_dir` and contend with other tests under the parallel
+        // cargo test runner on the same path.
+        let endpoints = collect_endpoints(&test_config());
         let names: Vec<&str> = endpoints.iter().map(|(name, _)| name.as_str()).collect();
 
         assert!(names.contains(&"core"));
@@ -348,8 +356,7 @@ mod tests {
         config.core.port = 3001;
         config.services.core.url = "http://127.0.0.1:3000/api/health".into();
 
-        let monitor = HealthMonitor::new(config).unwrap();
-        let endpoints = monitor.collect_endpoints();
+        let endpoints = collect_endpoints(&config);
         let core_url = endpoints
             .iter()
             .find(|(name, _)| name == "core")
@@ -367,8 +374,7 @@ mod tests {
         let mut config = test_config();
         config.services.llm.url = "http://127.0.0.1:9999/v1/health".into();
 
-        let monitor = HealthMonitor::new(config).unwrap();
-        let endpoints = monitor.collect_endpoints();
+        let endpoints = collect_endpoints(&config);
         let llm_url = endpoints
             .iter()
             .find(|(name, _)| name == "llm")
