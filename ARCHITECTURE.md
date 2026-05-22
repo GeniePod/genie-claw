@@ -6,6 +6,7 @@ This repository should be understood as the Rust agent runtime that sits above:
 
 - custom Jetson hardware
 - GenieOS, the custom L4T and system image layer
+- `genie-voice-runtime`, the external voice runtime for wake/VAD/STT/TTS/audio
 - `genie-home-runtime`, the future AI-native home automation runtime
 - `genie-ai-runtime`, the future Jetson-only LLM inference runtime
 
@@ -25,9 +26,10 @@ Application Layer
   Web app, mobile app, dashboard, setup, memory manager, confirmations
 
 GenieClaw Agent Layer
-  Offline voice, memory, tools, skills, channel adapters, agent policy
+  Agent policy, memory, tools, skills, channel adapters, spoken behavior
 
 Runtime Layer
+  genie-voice-runtime: wake, VAD, STT, TTS, audio streaming
   genie-home-runtime: device graph, automations, actuation safety, MCP
   genie-ai-runtime: Jetson-only LLM inference, CUDA kernels, model serving
 
@@ -42,7 +44,7 @@ Hardware Layer
 
 GenieClaw owns the human-facing intelligence loop:
 
-- wake/speech interaction and spoken response behavior
+- spoken response behavior and voice-session policy
 - prompt construction and reasoning-mode selection
 - memory capture, policy, recall, and dashboard management
 - skill and tool routing
@@ -68,6 +70,7 @@ These responsibilities belong in lower or upper layers:
 - Matter/Thread/Zigbee/BLE device graph and automation engine: `genie-home-runtime`
 - final physical actuation safety checks: `genie-home-runtime`
 - llama.cpp fork, CUDA kernels, model memory planner: `genie-ai-runtime`
+- wake word, VAD, STT, TTS, ALSA/audio-device handling, denoise, and AEC: `genie-voice-runtime`
 - full product app, account UX, mobile push, installer workflows: application layer
 
 This repo can keep transitional implementations while those layers are still forming, but the code should be structured so those boundaries can be replaced by stable clients.
@@ -79,6 +82,7 @@ The current repo still contains pragmatic adapters used to ship on Jetson now.
 | Current adapter | Long-term replacement | Notes |
 | --- | --- | --- |
 | `genie-ai-runtime` OpenAI-compatible client (default on Jetson) | `llama.cpp` client (selectable fallback) | Both backends ship behind the `LlmClient` facade; per-deployment selection via `[services.llm].backend` in `geniepod.toml`. Backend identity surfaces in `/api/health`, startup logs, and `genie-ctl status`. |
+| In-repo voice pipeline under `crates/genie-core/src/voice/` and `voice_loop.rs` | [`genie-voice-runtime`](https://github.com/GeniePod/genie-voice-runtime) | Keep current code as a transitional Jetson bring-up path. New wake/VAD/STT/TTS/audio ownership should move to the external runtime. GenieClaw should consume transcripts and issue speak commands. |
 | Home Assistant provider | `genie-home-runtime` MCP/API client | Keep HA-specific behavior behind `ha/` and tools/home boundaries. |
 | Actuation safety in `genie-core` | final safety in `genie-home-runtime` | Keep current safety as an agent-side guard and confirmation layer. |
 | `genie-api` dashboard | application layer | Keep it operational and lightweight; avoid making it the long-term product app. |
@@ -94,7 +98,7 @@ The repo should trend toward these conceptual modules, even if existing file nam
 | Agent orchestration | `crates/genie-core/src/server.rs`, `repl.rs`, `voice_loop.rs`, `reasoning.rs`, `prompt.rs` |
 | AI runtime client | `crates/genie-core/src/llm/` |
 | Home runtime client | `crates/genie-core/src/ha/`, `tools/home.rs` |
-| Voice pipeline | `crates/genie-core/src/voice/`, `voice_loop.rs` |
+| Voice runtime client | transitional `crates/genie-core/src/voice/`, `voice_loop.rs`; target external client for `genie-voice-runtime` |
 | Memory system | `crates/genie-core/src/memory/`, `conversation.rs` |
 | Tool and skill routing | `crates/genie-core/src/tools/`, `skills/` |
 | Channel adapters | `server.rs`, `repl.rs`, `telegram.rs`, `genie-ctl` |
@@ -110,6 +114,11 @@ runtime clients -> lower runtimes or transitional external systems
 ```
 
 Code in memory, voice, prompt, and channels should not learn Home Assistant internals. Code in agent orchestration should not learn model-server implementation details beyond the `LlmClient` contract.
+
+Voice code has one additional rule: GenieClaw may own spoken agent behavior,
+but it should not own the long-term audio pipeline. Wake word, VAD, STT, TTS,
+audio-device handling, denoise, AEC, and streaming voice events belong in
+`genie-voice-runtime`.
 
 ## Process Topology Today
 
@@ -138,10 +147,12 @@ Target deployment:
 genie-ai-runtime
         ^
         |
+genie-voice-runtime ---- transcript/speak events
+        ^                         |
+        |                         v
 genie-claw
         |
         +---- web/mobile apps
-        +---- local voice pipeline
         +---- skills and channels
         v
 genie-home-runtime
@@ -215,6 +226,7 @@ Short-term rule:
 Long-term direction:
 
 - `genie-claw`: agent layer repository and product brain
+- `genie-voice-runtime`: voice I/O runtime for wake, VAD, STT, TTS, and audio streaming
 - `genie-home-runtime`: home automation and physical actuation runtime
 - `genie-ai-runtime`: Jetson-only inference runtime
 - `genie-os`: custom L4T image and hardware bring-up layer
@@ -227,6 +239,7 @@ The clean architecture path is incremental:
 2. Keep Home Assistant and LLM backends behind narrow adapter traits (LLM side resolved via the `LlmClient` facade in `crates/genie-core/src/llm/`).
 3. Move physical actuation authority downward into `genie-home-runtime` when it exists.
 4. Move Jetson model-server specialization downward into `genie-ai-runtime`.
-5. Keep GenieClaw focused on voice, memory, skills, tools, channels, and household interaction.
+5. Move voice/audio pipeline ownership downward into `genie-voice-runtime`.
+6. Keep GenieClaw focused on agent policy, memory, skills, tools, channels, and household interaction.
 
 This prevents the agent repo from becoming a single large mixed runtime while still allowing today’s Jetson appliance to keep working.

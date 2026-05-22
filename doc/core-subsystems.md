@@ -191,23 +191,34 @@ Responsibilities:
 - ingest TOML and text sources into memory
 - normalize and deduplicate profile facts
 
-## Voice Stack
+## Voice Runtime Boundary
 
-Source:
+Current transitional source:
 
 - `crates/genie-core/src/voice_loop.rs`
 - `crates/genie-core/src/voice/*.rs`
 
-Responsibilities:
+Long-term owner:
 
-- audio recording and wake-word integration
-- STT client/CLI execution
-- conservative voice intent gating for shared-room wake flows
-- speaker-identity provider boundary, including optional local biometric profile matching and memory-context plumbing into voice read paths
-- language detection and language-specific TTS model selection
-- output formatting for speech
-- streaming spoken responses
-- basic DSP, gating, echo cancellation, and VAD support
+- [`genie-voice-runtime`](https://github.com/GeniePod/genie-voice-runtime)
+
+GenieClaw should own:
+
+- spoken agent behavior
+- transcript-to-agent routing
+- response text generation
+- memory/tool/home-intent policy for voice-origin requests
+- shared-room safety policy
+
+`genie-voice-runtime` should own:
+
+- wake word
+- VAD
+- STT
+- TTS
+- capture/playback device handling
+- denoise and acoustic echo control
+- voice session streaming events
 
 Notable modules:
 
@@ -222,6 +233,10 @@ Notable modules:
 - `dsp.rs`
 - `aec.rs`
 - `vad.rs`
+
+These modules remain a Jetson alpha bring-up path until the external runtime is
+production-ready. New voice-pipeline implementation should target
+`genie-voice-runtime` unless it is strictly an agent-layer behavior change.
 
 ## Security And Guardrails
 

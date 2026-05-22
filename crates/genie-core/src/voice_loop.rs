@@ -894,7 +894,6 @@ async fn voice_cycle(
 
     // Step 3: Transcribe.
     eprintln!("[voice] Transcribing...");
-    let stt_start = std::time::Instant::now();
     let transcript = match stt_engine.transcribe_file(&wav_path).await {
         Ok(t) => t,
         Err(e) => {
@@ -904,14 +903,101 @@ async fn voice_cycle(
         }
     };
 
+    process_transcript(
+        transcript,
+        ProcessTranscriptInputs {
+            voice_cfg,
+            audio_device,
+            llm,
+            tools,
+            memory,
+            conversations,
+            system_prompt,
+            max_history,
+            model_family,
+            conv_id,
+            wav_path: Some(&wav_path),
+            tts_engine_override: None,
+            t_preprocess_done,
+        },
+    )
+    .await
+}
+
+/// Inputs threaded through `process_transcript` (extracted from
+/// `voice_cycle` for #21 AC-B). Most fields are forwarded directly;
+/// `wav_path` and `tts_engine_override` exist so the integration test
+/// can drive the orchestration without a real WAV on disk and without
+/// spawning Piper.
+pub struct ProcessTranscriptInputs<'a> {
+    pub voice_cfg: &'a VoiceConfig,
+    pub audio_device: &'a str,
+    pub llm: &'a LlmClient,
+    pub tools: &'a ToolDispatcher,
+    pub memory: &'a Memory,
+    pub conversations: &'a ConversationStore,
+    pub system_prompt: &'a str,
+    pub max_history: usize,
+    pub model_family: ModelFamily,
+    pub conv_id: &'a str,
+    /// Recording path for speaker identity + cleanup. `None` in tests
+    /// where the transcript came from `SttEngine::mock` and no WAV
+    /// exists on disk.
+    pub wav_path: Option<&'a str>,
+    /// Test hook: when `Some`, the LLM-to-TTS streaming bridge uses a
+    /// snapshot of this engine instead of building one via
+    /// `tts_engine_for_language(voice_cfg, ...)`. Tests pass
+    /// `Some(&TtsEngine::silent())` so Piper / aplay never spawn.
+    pub tts_engine_override: Option<&'a tts::TtsEngine>,
+    /// Latency-banner marker for the (preprocess -> STT) phase. Tests
+    /// can pass `std::time::Instant::now()`; the banner output is
+    /// informational and is fine with arbitrary tiny deltas.
+    pub t_preprocess_done: std::time::Instant,
+}
+
+/// Post-record orchestration of a voice cycle: intent gate, speaker
+/// identity, memory recall, quick-tool fast path, LLM streaming + TTS,
+/// tool dispatch, conversation persistence, latency banner, memory
+/// extract. Extracted from `voice_cycle` so
+/// `tests/voice_loop_integration.rs` can drive the full path end-to-end
+/// with `SttEngine::mock`, `LlmClient::mock`, and `TtsEngine::silent`
+/// (issue #21 AC-B / IS-1).
+///
+/// Returns `false` only when the caller should exit the outer voice
+/// loop — today nothing here ever signals exit, so this always returns
+/// `true`.
+pub async fn process_transcript(
+    transcript: stt::Transcript,
+    inputs: ProcessTranscriptInputs<'_>,
+) -> bool {
+    let ProcessTranscriptInputs {
+        voice_cfg,
+        audio_device,
+        llm,
+        tools,
+        memory,
+        conversations,
+        system_prompt,
+        max_history,
+        model_family,
+        conv_id,
+        wav_path,
+        tts_engine_override,
+        t_preprocess_done,
+    } = inputs;
+
     let text = transcript.text.trim().to_string();
     if text.is_empty() {
-        let _ = tokio::fs::remove_file(&wav_path).await;
+        if let Some(path) = wav_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
         eprintln!("[voice] No speech detected.");
         return true;
     }
     if let VoiceIntentDecision::Reject(reason) = intent::assess_transcript(&text) {
-        let _ = tokio::fs::remove_file(&wav_path).await;
+        if let Some(path) = wav_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
         eprintln!(
             "[voice] Ignoring low-confidence transcript ({}): \"{}\"",
             reason, text
@@ -925,12 +1011,14 @@ async fn voice_cycle(
     let speaker = voice_cfg
         .speaker_identity
         .identify(&identity::SpeakerIdentityRequest {
-            wav_path: Some(&wav_path),
+            wav_path,
             transcript: &text,
             detected_language: response_language.as_deref(),
         });
     let read_context = identity::build_memory_read_context(&text, &speaker);
-    let _ = tokio::fs::remove_file(&wav_path).await;
+    if let Some(path) = wav_path {
+        let _ = tokio::fs::remove_file(path).await;
+    }
 
     // T1 for the latency banner (#19): STT response is in.
     let t_stt_done = std::time::Instant::now();
@@ -995,11 +1083,13 @@ async fn voice_cycle(
     // Step 4: LLM → streaming TTS (speak each sentence as it completes).
     eprintln!("[voice] Thinking...");
     let llm_start = std::time::Instant::now();
-    let tts_engine = Arc::new(tts_engine_for_language(
-        voice_cfg,
-        audio_device,
-        response_language.as_deref(),
-    ));
+    let tts_engine = Arc::new(match tts_engine_override {
+        // Test path (#21 AC-B): caller passes in `&TtsEngine::silent()`.
+        // Snapshot it into an owned copy so we can wrap in `Arc` for the
+        // streaming task without forcing the caller to give up ownership.
+        Some(engine) => engine.snapshot(),
+        None => tts_engine_for_language(voice_cfg, audio_device, response_language.as_deref()),
+    });
 
     let response =
         match streaming::stream_and_speak(llm, &messages, 256, Arc::clone(&tts_engine)).await {

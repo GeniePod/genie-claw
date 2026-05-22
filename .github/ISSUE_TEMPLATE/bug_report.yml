@@ -1,0 +1,97 @@
+name: Bug report
+description: Something is broken or behaves incorrectly. Please include Jetson context — it almost always matters.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. GenieClaw is an edge-first
+        home AI agent with Jetson as the flagship target, so hardware and
+        JetPack context are often load-bearing.
+
+        If this is specifically a **voice-pipeline** or **audio-chain** bug,
+        please use those dedicated templates instead — their structured fields
+        capture the right context up-front.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence — what is broken?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Concrete steps. Commands, config, what you did.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware
+      options:
+        - Jetson Orin Nano Super 8 GB
+        - Jetson Orin Nano 8 GB (non-Super)
+        - Jetson Orin NX 16 GB
+        - Jetson AGX Orin
+        - Other Jetson (specify in additional context)
+        - Non-Jetson (x86_64 dev / cross-build host)
+    validations:
+      required: true
+
+  - type: input
+    id: jetpack
+    attributes:
+      label: JetPack / L4T version
+      placeholder: "e.g. JetPack 6.1 / L4T R36.4"
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: GenieClaw version / commit
+      placeholder: "v1.0.0-alpha.9 or commit SHA"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Output from `journalctl -u genie-core`, `genie-ctl status`, or
+        `/api/health` if relevant. Trim long logs — leave the failure window.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+    validations:
+      required: false

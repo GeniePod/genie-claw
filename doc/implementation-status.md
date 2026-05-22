@@ -28,7 +28,7 @@ Status labels:
 | Home action safety in agent layer | Implemented | `crates/genie-core/src/tools/actuation.rs`, `crates/genie-core/src/ha/policy.rs` | Origin allowlist, target confidence thresholds, sensitive-action confirmation tokens, rate limits, action ledger, bounded undo, and append-only audit log. |
 | Runtime contract | Implemented | `crates/genie-core/src/runtime_contract.rs`, `crates/genie-core/src/server.rs` | Prompt/tool/policy/hydration fingerprints, optional drift detection, and boot contract log. |
 | Household security posture | Implemented | `crates/genie-api/src/routes.rs`, `crates/genie-core/src/security/*` | Dashboard exposes redacted posture instead of raw config. Security helpers include audit, credential isolation, env sanitization, injection scanning, loop guard, sandbox helpers, and taint tracking. |
-| Voice pipeline modules | Implemented | `crates/genie-core/src/voice_loop.rs`, `crates/genie-core/src/voice/*` | ALSA recording path, STT client/CLI boundary, language detection, intent gating, formatting, TTS, streaming, VAD/DSP/noise/AEC modules. Production quality depends on installed audio hardware and models. |
+| Voice pipeline modules | Transitional | `crates/genie-core/src/voice_loop.rs`, `crates/genie-core/src/voice/*` | Current Jetson alpha bring-up path. Long-term ownership belongs in `genie-voice-runtime`; GenieClaw should consume transcripts and issue speak commands rather than own wake/VAD/STT/TTS/audio. |
 | Optional local speaker identity | Implemented | `crates/genie-core/src/voice/identity.rs`, `crates/genie-ctl/src/main.rs` | Local WAV-derived profile enrollment/matching and voice memory-context routing. This is household routing, not hostile-user authentication. |
 | Native skill loading | Implemented | `crates/genie-core/src/skills/*`, `crates/genie-skill-sdk/*` | Loads native `.so` skills through a narrow ABI, exposes skills as tools, and audits sidecar manifest metadata. |
 | Skill policy | Implemented | `crates/genie-common/src/config.rs`, `crates/genie-core/src/skills/loader.rs` | Can require manifests, require signature material presence, and deny permission labels. Cryptographic signature verification is not implemented. |
@@ -57,6 +57,7 @@ Status labels:
 | --- | --- | --- |
 | `genie-home-runtime` | Planned / separate repo | Rust AI-native home automation engine, device graph, automations, MCP server, deterministic final physical safety layer. |
 | `genie-ai-runtime` | Planned / separate repo | Jetson-only C++ inference runtime customized from `llama.cpp`, optimized CUDA kernels, and memory planner. |
+| `genie-voice-runtime` | Initial / separate repo | External voice runtime for wake, VAD, STT, TTS, audio streaming, and voice session protocol. |
 | `genie-os` | Planned / separate repo | Custom L4T image, board bring-up, drivers, OTA base image, service supervision, ESP-Hosted-NG OS integration. |
 | Full Matter/Thread/Zigbee/BLE production stack | Planned outside this repo | Lower connectivity/home-runtime layers. |
 | Full vector/cuVS semantic memory backend | Planned design only | `VECTOR_MEMORY.md` describes the rollout. Current runtime uses SQLite FTS, not embeddings/vector search. |

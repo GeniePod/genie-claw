@@ -130,7 +130,16 @@ impl ChatServer {
         let addr = format!("{}:{}", bind_host, port);
         let listener = TcpListener::bind(&addr).await?;
         tracing::info!(addr = %addr, "genie-core HTTP server listening");
+        self.serve_listener(listener).await
+    }
 
+    /// Accept connections from an already-bound `TcpListener`.
+    ///
+    /// Prefer [`serve`](Self::serve) for production use. This entry-point
+    /// exists so tests can pre-bind to port 0, obtain the OS-assigned port,
+    /// and hand the listener directly to the server — avoiding the
+    /// bind-drop-rebind race that a port-0 `serve()` call would require.
+    pub(crate) async fn serve_listener(self, listener: TcpListener) -> Result<()> {
         let ctx = Rc::new(self);
         let local = tokio::task::LocalSet::new();
         local
@@ -294,7 +303,11 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
         )
         .await
         {
-            tracing::error!(error = %e, "streaming chat failed");
+            if is_client_disconnect_error(&e) {
+                tracing::debug!(error = %e, "client closed connection during stream");
+            } else {
+                tracing::error!(error = %e, "streaming chat failed");
+            }
         }
         return Ok(());
     }
@@ -564,55 +577,75 @@ async fn handle_chat_stream(
     .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let producer = llm.chat_stream(&messages, Some(512), move |token| {
-        let _ = tx.send(token.to_string());
-    });
 
-    let consumer = async {
-        let mut state = StreamState {
-            mode: StreamMode::Undecided,
-            pending: String::new(),
-            emitted_text: false,
-        };
+    // Run producer and consumer in the same block so both are dropped — and
+    // their mutable borrow on `writer` released — before we write the final
+    // "done" event below.
+    let (llm_result, mut state) = {
+        let producer = llm.chat_stream(&messages, Some(512), move |token| {
+            let _ = tx.send(token.to_string());
+        });
 
-        while let Some(token) = rx.recv().await {
-            match state.mode {
-                StreamMode::Text => {
-                    write_stream_event(
-                        writer,
-                        &serde_json::json!({"type":"token","content": token}),
-                    )
-                    .await?;
-                    state.emitted_text = true;
-                }
-                StreamMode::Undecided | StreamMode::Tool => {
-                    state.pending.push_str(&token);
+        let consumer = async {
+            let mut state = StreamState {
+                mode: StreamMode::Undecided,
+                pending: String::new(),
+                emitted_text: false,
+            };
 
-                    if state.mode == StreamMode::Undecided {
-                        match detect_stream_mode(&state.pending) {
-                            StreamMode::Text => {
-                                write_stream_event(
-                                    writer,
-                                    &serde_json::json!({"type":"token","content": state.pending}),
-                                )
-                                .await?;
-                                state.pending.clear();
-                                state.mode = StreamMode::Text;
-                                state.emitted_text = true;
+            while let Some(token) = rx.recv().await {
+                match state.mode {
+                    StreamMode::Text => {
+                        write_stream_event(
+                            writer,
+                            &serde_json::json!({"type":"token","content": token}),
+                        )
+                        .await?;
+                        state.emitted_text = true;
+                    }
+                    StreamMode::Undecided | StreamMode::Tool => {
+                        state.pending.push_str(&token);
+
+                        if state.mode == StreamMode::Undecided {
+                            match detect_stream_mode(&state.pending) {
+                                StreamMode::Text => {
+                                    write_stream_event(
+                                        writer,
+                                        &serde_json::json!({"type":"token","content": state.pending}),
+                                    )
+                                    .await?;
+                                    state.pending.clear();
+                                    state.mode = StreamMode::Text;
+                                    state.emitted_text = true;
+                                }
+                                StreamMode::Tool => state.mode = StreamMode::Tool,
+                                StreamMode::Undecided => {}
                             }
-                            StreamMode::Tool => state.mode = StreamMode::Tool,
-                            StreamMode::Undecided => {}
                         }
                     }
                 }
             }
-        }
 
-        Ok::<StreamState, anyhow::Error>(state)
+            Ok::<StreamState, anyhow::Error>(state)
+        };
+
+        tokio::pin!(producer);
+        tokio::pin!(consumer);
+        // biased: arm 1 is always polled first. If producer is pending, tx is
+        // still alive, so consumer can only exit via a write error (client
+        // disconnect), not via a spurious rx-None race that would produce a
+        // false "stream cancelled" error.
+        let (llm_r, state_r) = tokio::select! {
+            biased;
+            llm_r = &mut producer => (llm_r, consumer.await),
+            state_r = &mut consumer => {
+                tracing::info!("client disconnected mid-stream; cancelling LLM producer");
+                (Err(anyhow::anyhow!("LLM stream cancelled")), state_r)
+            },
+        };
+        (llm_r, state_r?)
     };
 
-    let (llm_result, state_result) = tokio::join!(producer, consumer);
-    let mut state = state_result?;
     let llm_response = llm_result?;
 
     let mut tool_name: Option<String> = None;
@@ -848,6 +881,20 @@ async fn finalize_tool_turn(
 
     let _ = conversations.append(conv_id, "assistant", &sanitized_summary, None);
     sanitized_summary
+}
+
+fn is_client_disconnect_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 async fn write_stream_headers(writer: &mut OwnedWriteHalf, status: u16) -> Result<()> {
@@ -1840,7 +1887,7 @@ mod tests {
     use super::{
         ConnectivityState, StreamMode, detect_stream_mode, handle_actuation_actions, handle_health,
         handle_runtime_contract, handle_web_search, handle_web_search_status,
-        overall_health_status, should_summarize_tool_result,
+        is_client_disconnect_error, overall_health_status, should_summarize_tool_result,
     };
     use crate::connectivity::NullConnectivityController;
     use crate::conversation::ConversationStore;
@@ -2066,5 +2113,197 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("duckduckgo"));
         assert!(body.contains("cache_entries"));
+    }
+
+    #[tokio::test]
+    async fn biased_select_cancels_slow_producer_on_consumer_exit() {
+        // Regression guard for the tokio::join! → tokio::select! (biased) fix:
+        // when the consumer exits first (client disconnect), the producer must
+        // be dropped immediately — not awaited to completion.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let producer_completed = Arc::new(AtomicBool::new(false));
+        let flag = producer_completed.clone();
+
+        let producer = async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            flag.store(true, Ordering::SeqCst);
+            Ok::<String, anyhow::Error>("never reached".into())
+        };
+
+        // Consumer exits immediately — simulates a broken-pipe write error.
+        let consumer = async { Err::<(), anyhow::Error>(anyhow::anyhow!("broken pipe")) };
+
+        let start = std::time::Instant::now();
+        tokio::pin!(producer);
+        tokio::pin!(consumer);
+        let (_llm_r, state_r) = tokio::select! {
+            biased;
+            llm_r = &mut producer => (llm_r, consumer.await),
+            state_r = &mut consumer => (Err(anyhow::anyhow!("LLM stream cancelled")), state_r),
+        };
+
+        assert!(
+            start.elapsed().as_millis() < 500,
+            "select must not block on slow producer after consumer exits"
+        );
+        assert!(state_r.is_err(), "consumer error must be propagated");
+        assert!(
+            !producer_completed.load(Ordering::SeqCst),
+            "producer must be cancelled (dropped), not allowed to complete"
+        );
+    }
+
+    #[test]
+    fn is_client_disconnect_error_detects_broken_pipe() {
+        use std::io;
+        let e = anyhow::Error::from(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
+        assert!(is_client_disconnect_error(&e));
+    }
+
+    #[test]
+    fn is_client_disconnect_error_detects_connection_reset() {
+        use std::io;
+        let e = anyhow::Error::from(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+        assert!(is_client_disconnect_error(&e));
+    }
+
+    #[test]
+    fn is_client_disconnect_error_does_not_match_other_io_errors() {
+        use std::io;
+        let e = anyhow::Error::from(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+        assert!(!is_client_disconnect_error(&e));
+    }
+
+    /// Smoke test for issue #124: dropping a real TCP connection mid-stream
+    /// must cancel the LLM producer task, not let it run to completion.
+    ///
+    /// This test starts a real `ChatServer` on a loopback port, opens a TCP
+    /// connection, sends an HTTP POST to `/api/chat/stream`, waits for the
+    /// first SSE token to arrive (proof the producer is live), then drops the
+    /// TCP socket and asserts that the slow producer never completed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_server_client_disconnect_cancels_llm_producer() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        use crate::connectivity::NullConnectivityController;
+        use crate::conversation::ConversationStore;
+        use crate::llm::{LlmClient, MockLlmBackend};
+        use crate::memory::Memory;
+        use crate::prompt::ModelFamily;
+        use crate::tools::ToolDispatcher;
+        use genie_common::config::ConnectivityConfig;
+
+        // Shared state: did the producer run all the way to the end?
+        let producer_finished = Arc::new(AtomicBool::new(false));
+        // Signal from producer → test: "first token has been handed to on_token".
+        let first_token_sent = Arc::new(tokio::sync::Notify::new());
+
+        // Slow backend: emits one word, notifies, then sleeps 60 s between
+        // each subsequent word.  The test disconnects after the notification,
+        // so the producer must be cancelled while in that sleep.
+        let slow_backend = MockLlmBackend::new(["hello world from genie"])
+            .with_first_token_notify(Arc::clone(&first_token_sent))
+            .with_token_delay(Duration::from_secs(60))
+            .with_completion_flag(Arc::clone(&producer_finished));
+
+        // Unique temp paths so parallel test runs don't share SQLite WAL files.
+        let uid = format!(
+            "genie-disconnect-smoke-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let tmp = std::env::temp_dir();
+        let memory_path = tmp.join(format!("{uid}-memory.db"));
+        let conv_path = tmp.join(format!("{uid}-conv.db"));
+
+        let server = super::ChatServer::new(
+            LlmClient::from_backend(slow_backend),
+            ToolDispatcher::new(None),
+            std::sync::Arc::new(NullConnectivityController::from_config(
+                &ConnectivityConfig::default(),
+            )),
+            Memory::open(&memory_path).unwrap(),
+            ConversationStore::open(&conv_path).unwrap(),
+            "You are a helpful assistant.".into(),
+            10,
+            ModelFamily::Phi,
+            "".into(),
+        )
+        .unwrap();
+
+        // Pre-bind to port 0 so the OS assigns a free port; hand the listener
+        // directly to serve_listener() — no bind-drop-rebind race.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Run server in a local task (ChatServer uses Rc internally).
+        let local = tokio::task::LocalSet::new();
+        let first_token_sent_clone = Arc::clone(&first_token_sent);
+        let producer_finished_clone = Arc::clone(&producer_finished);
+
+        local
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let _ = server.serve_listener(listener).await;
+                });
+
+                // Connect a raw TCP client.
+                let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .unwrap();
+
+                // POST /api/chat/stream with a non-empty message body.
+                let body = r#"{"message":"ping"}"#;
+                let request = format!(
+                    "POST /api/chat/stream HTTP/1.1\r\n\
+                     Host: localhost\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     \r\n\
+                     {}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(request.as_bytes()).await.unwrap();
+
+                // Drain a small read buffer so the server can finish writing
+                // its SSE header + start event before we check the notify.
+                let mut buf = [0u8; 512];
+                let _ = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+
+                // Wait until the producer has handed at least one token to
+                // on_token (and therefore started its inter-token sleep).
+                tokio::time::timeout(Duration::from_secs(5), first_token_sent_clone.notified())
+                    .await
+                    .expect("timed out waiting for first SSE token from mock LLM");
+
+                // Drop the TCP connection — this is the disconnect under test.
+                drop(stream);
+
+                // Give the server one scheduler pass to detect the broken pipe
+                // and cancel the producer future.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+
+                assert!(
+                    !producer_finished_clone.load(Ordering::SeqCst),
+                    "LLM producer must be cancelled on client disconnect, not run to completion"
+                );
+
+                let _ = std::fs::remove_file(&memory_path);
+                let _ = std::fs::remove_file(&conv_path);
+            })
+            .await;
     }
 }

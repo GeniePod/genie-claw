@@ -249,6 +249,14 @@ mod tests {
         assert!(normalize_single_key_tool_call(value, &dispatcher).is_none());
     }
 
+    // The `system_info` tool reads /proc/meminfo (via tegrastats), /proc/uptime,
+    // and /proc/loadavg. On macOS those files do not exist, so the "Memory
+    // available:" line is absent from the rendered output and this assertion
+    // fails. Per issue #21 AC-D1 we gate the test (not the production code) —
+    // the tool itself is Linux-targeted by design, so its end-to-end shape
+    // assertion only makes sense on Linux. macOS dev boxes still exercise the
+    // dispatch / parsing path through the unit tests above.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn try_tool_call_executes_single_key_system_info_shape() {
         let dispatcher = ToolDispatcher::new(None);

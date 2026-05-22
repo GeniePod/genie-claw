@@ -1,0 +1,124 @@
+name: Jetson audio / I2S / LyraT issue
+description: LyraT V4.3, I2S overlay, mic array routing, speaker output, ALSA / amixer, [genie-audio-init] errors.
+title: "[audio] "
+labels: ["bug", "audio", "jetson"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for hardware-side audio issues — LyraT V4.3 wiring,
+        I2S overlay state, ALSA capture/playback device routing, or
+        `[genie-audio-init]` warnings. See
+        [`doc/lyrat-jetson-audio.md`](../blob/main/doc/lyrat-jetson-audio.md)
+        for the canonical setup steps before filing.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence — what's wrong with audio I/O?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which audio surface?
+      multiple: true
+      options:
+        - Capture (mic) — wrong device / no input
+        - Capture (mic) — wrong sample rate or clock (LRCK / BCK)
+        - Playback (speaker) — no output / wrong device
+        - I2S overlay — not applied / wrong pins
+        - LyraT V4.3 ALSA cset / mixer setup
+        - genie-audio systemd service / genie-audio-init script
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        Commands, output of `aplay -l` / `arecord -l`, what you ran, what happened.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: overlay
+    attributes:
+      label: 40-pin I2S overlay applied?
+      description: Result of `sudo /opt/nvidia/jetson-io/jetson-io.py` configuration on the target.
+      options:
+        - "Yes — I2S2 overlay active"
+        - "No — overlay not applied"
+        - "Unsure / not checked"
+    validations:
+      required: true
+
+  - type: textarea
+    id: setup_jetson_output
+    attributes:
+      label: setup-jetson.sh output (relevant section)
+      description: |
+        Paste the `[5e/6] Checking voice runtime prerequisites...` and
+        `[genie-audio-init]` sections from `bash /opt/geniepod/setup-jetson.sh`.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: amixer_state
+    attributes:
+      label: ALSA / amixer state
+      description: |
+        Output of `amixer -c <card> contents` or `amixer -c <card> sget <control>`
+        for the relevant card, if available.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: lyrat_rev
+    attributes:
+      label: LyraT revision
+      placeholder: "e.g. V4.3"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Jetson hardware
+      options:
+        - Jetson Orin Nano Super 8 GB
+        - Jetson Orin Nano 8 GB (non-Super)
+        - Jetson Orin NX 16 GB
+        - Jetson AGX Orin
+        - Other Jetson (specify in additional context)
+    validations:
+      required: true
+
+  - type: input
+    id: jetpack
+    attributes:
+      label: JetPack / L4T version
+      placeholder: "e.g. JetPack 6.1 / L4T R36.4"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: GenieClaw version / commit
+      placeholder: "v1.0.0-alpha.9 or commit SHA"
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+    validations:
+      required: false

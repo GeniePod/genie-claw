@@ -1,5 +1,6 @@
 mod genie_ai_runtime;
 mod llama_cpp;
+mod mock;
 mod openai_compat;
 mod retry;
 
@@ -9,6 +10,7 @@ use genie_common::config::{LlmBackendKind, ServiceEndpoint};
 
 pub use genie_ai_runtime::GenieAiRuntimeBackend;
 pub use llama_cpp::LlamaCppBackend;
+pub use mock::MockLlmBackend;
 pub use openai_compat::{Message, ResponseFormat};
 #[allow(unused_imports)]
 pub use retry::RetryLlmClient;
@@ -79,6 +81,27 @@ impl LlmClient {
     pub fn from_genie_ai_runtime_url(url: &str) -> Self {
         Self {
             backend: Box::new(GenieAiRuntimeBackend::from_url(url)),
+        }
+    }
+
+    /// Construct an in-memory LLM client that replays the given scripted
+    /// replies in order. Used by `tests/voice_loop_integration.rs` (issue #21).
+    pub fn mock<I, S>(replies: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            backend: Box::new(MockLlmBackend::new(replies)),
+        }
+    }
+
+    /// Wrap any `LlmBackendClient` implementation in a client facade.
+    /// Primarily useful in tests that need a custom backend (e.g. a slow
+    /// streaming backend for client-disconnect smoke tests).
+    pub fn from_backend(backend: impl LlmBackendClient + 'static) -> Self {
+        Self {
+            backend: Box::new(backend),
         }
     }
 

@@ -2,17 +2,21 @@
 
 ## Purpose
 
-GenieClaw is the local agent layer for GeniePod Home and the broader Genie
-ecosystem.
+GenieClaw is the limited-context local agent layer for GeniePod Home and the
+broader Genie ecosystem.
 
 The repo is optimized around a narrow goal:
 
-- run locally on Jetson-class hardware
+- run locally on Jetson-class hardware as the flagship target
+- preserve a 4096-token small-context baseline before larger adaptive contexts
 - keep the system understandable and debuggable
+- keep agent/provider/home behavior testable through deterministic harnesses
 - provide everyday household usefulness before broad platform ambition
 - preserve privacy, bounded behavior, and graceful degradation
 
-This is not a cloud orchestration shell and not a generic agent runtime.
+This is not a cloud orchestration shell and not a generic agent runtime. Remote
+or API-key providers can be useful optional adapters, but they must fit the
+limited-context home-agent contract rather than redefine the product.
 
 ## Ecosystem Role
 
@@ -20,9 +24,10 @@ The long-term Genie stack is split by responsibility:
 
 - custom Jetson hardware
 - `genie-os` for custom L4T, drivers, OTA, diagnostics, and service supervision
+- `genie-voice-runtime` for wake/VAD/STT/TTS/audio streaming and voice session events
 - `genie-home-runtime` for device graph, automations, MCP, and final actuation safety
 - `genie-ai-runtime` for Jetson-only LLM inference optimization
-- `genie-claw` for voice, memory, tools, skills, and agent interaction
+- `genie-claw` for agent policy, memory, tools, skills, smart-home intent, and interaction
 - web/mobile apps for setup, control, memory management, and confirmations
 
 This repository is `genie-claw`. Some current integrations still live here as
@@ -31,10 +36,10 @@ should keep those behind narrow boundaries.
 
 For the exact implemented/partial/planned breakdown, use
 [implementation-status.md](implementation-status.md). In short, this repo
-implements the agent runtime, memory, tools, voice pipeline boundaries, local
-HTTP/CLI surfaces, safety gates, and deploy assets. It does not implement the
-final `genie-home-runtime`, `genie-ai-runtime`, `genie-os`, or full
-Matter/Thread device stack.
+implements the agent runtime, memory, tools, a transitional voice adapter,
+local HTTP/CLI surfaces, safety gates, and deploy assets. It does not implement
+the final `genie-voice-runtime`, `genie-home-runtime`, `genie-ai-runtime`,
+`genie-os`, or full Matter/Thread device stack.
 
 ## Main Runtime Modes
 
@@ -47,8 +52,10 @@ Matter/Thread device stack.
    When stdin is interactive, `genie-core` starts a local text REPL instead of
    daemon-only behavior.
 3. Voice mode
-   Enabled by config, `--voice`, or `GENIEPOD_VOICE=1`. The voice loop runs a
-   microphone -> STT -> prompt/tool execution -> TTS pipeline.
+   Enabled by config, `--voice`, or `GENIEPOD_VOICE=1`. Today this still uses a
+   transitional in-repo voice path. Long term, `genie-voice-runtime` owns
+   microphone -> STT and TTS -> speaker, while GenieClaw owns transcript ->
+   prompt/tool execution -> response text.
 
 In daemon mode, Telegram can also be enabled as a side-channel adapter.
 
@@ -78,10 +85,13 @@ Target topology:
 genie-ai-runtime
         ^
         |
+genie-voice-runtime
+        ^
+        |
 genie-claw
         |
         +---- web/mobile apps and local channels
-        +---- voice, memory, tools, skills
+        +---- memory, tools, skills
         v
 genie-home-runtime
         |

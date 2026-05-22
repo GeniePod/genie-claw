@@ -1419,28 +1419,37 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-    // Each test gets its own subdirectory so the canonical memory layout
-    // (`memory/`, `namespaces/`, `events/`) doesn't collide across parallel
-    // tests. `rebuild_root_memory_file` does `remove_dir_all` on `namespaces/`
-    // before rewriting it; sharing one dir caused tests to race-wipe each
-    // other's files when run with multiple test threads.
-    fn temp_memory() -> Memory {
-        Memory::open(&temp_memory_path("test")).unwrap()
-    }
-
+    /// Return a freshly-created unique parent dir and a `memory.db` path
+    /// inside it. `Memory::open` derives
+    /// `canonical_dir = path.parent().join("memory")` and writes promotion
+    /// and namespace markdown files into it, so sharing a parent dir across
+    /// tests causes promotion tests to race on shared files like
+    /// `namespaces/person/preference.md` (issue #21, AC-D2). Every memory
+    /// test path MUST flow through this helper. The `nanos` suffix on top
+    /// of `pid + counter` defends against rapid test-binary reruns that
+    /// could reuse a pid before the previous run's tempdir was cleaned.
     fn temp_memory_path(label: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!(
-            "geniepod-mem-{}-{}-{}",
+            "geniepod-mem-{}-{}-{}-{}",
             label,
             std::process::id(),
-            id
+            id,
+            nanos
         ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("create temp memory dir");
         dir.join("memory.db")
+    }
+
+    fn temp_memory() -> Memory {
+        Memory::open(&temp_memory_path("test")).unwrap()
     }
 
     #[test]

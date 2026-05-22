@@ -12,6 +12,7 @@ Jetson appliance deployment, but the long-term boundary is clear:
 - `genie-governor` and `genie-health` are appliance support services.
 - Home Assistant and `llama.cpp` are transitional lower-runtime adapters.
 - Future `genie-home-runtime` and `genie-ai-runtime` should replace those lower-runtime adapters.
+- `genie-voice-runtime` is the new external owner for wake/VAD/STT/TTS/audio behavior.
 
 For the current truth matrix, see
 [implementation-status.md](implementation-status.md).
@@ -41,14 +42,15 @@ Primary responsibilities:
 - select and execute built-in tools
 - load and execute native skills
 - integrate Home Assistant through a provider boundary
-- run the voice loop
+- run the transitional voice adapter until `genie-voice-runtime` is the production voice path
 - expose connectivity health from the coprocessor boundary
 - optionally run the Telegram adapter
 
 Boundary rule:
 
 `genie-core` may request model inference and physical actions, but it should not
-grow into the optimized model server or the final home automation engine.
+grow into the optimized model server, the final home automation engine, or the
+voice/audio runtime.
 
 Important source roots:
 
@@ -137,6 +139,7 @@ Key files:
 - `genie-core`: `:3000`
 - `llama-server`: `:8080` today; future replacement is `genie-ai-runtime`
 - Home Assistant: commonly `:8123` today; future replacement is `genie-home-runtime`
+- `genie-voice-runtime`: external voice runtime; protocol and port are still stabilizing
 - `genie-api`: separate dashboard service port, depending on deploy setup
 
 ### Local IPC

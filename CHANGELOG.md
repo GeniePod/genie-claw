@@ -15,6 +15,45 @@
   consumer halves via `Arc<TtsEngine>`. The first-reply latency banner
   (#19) now reports the true LLM-until-first-sentence figure instead
   of the full-response figure.
+- **Voice-cycle integration test + mockable surface** (#21). Extracts
+  `voice_loop::process_transcript` from `voice_cycle` so the
+  post-record orchestration (intent gate, speaker identity, memory
+  recall, quick-tool fast path, LLM streaming + TTS, tool dispatch,
+  conversation persistence, latency banner, memory extract) can be
+  driven end-to-end with mocks. Adds `LlmClient::mock(replies)` (new
+  `MockLlmBackend` implementation of the existing `LlmBackendClient`
+  trait, replays scripted replies on both `chat` and `chat_stream`,
+  optional `with_fallback("…")`), `SttEngine::mock(transcripts)` (new
+  `SttMode::Mock` variant with a `MockTranscript` queue;
+  `transcribe_file` pops the next scripted transcript), and
+  `TtsEngine::silent()` (new `TtsMode::Silent` variant; `speak`,
+  `synthesize`, `synthesize_to_file`, `start`, and `stop` all no-op).
+  `TtsEngine::snapshot()` returns a config-only copy so a borrowed
+  `&TtsEngine` can be wrapped in `Arc<TtsEngine>` for
+  `streaming::stream_and_speak`. New integration test at
+  `crates/genie-core/tests/voice_loop_integration.rs` drives
+  `process_transcript` with these mocks and asserts on transcript
+  flow, the conversation store, and the dispatcher's tool-audit
+  JSONL.
+- **Parallel-safe SQLite test paths** (#21). The memory test helper
+  now gives every test a `${tmpdir}/geniepod-mem-${label}-${pid}-${id}-${nanos}/`
+  parent directory; the DB lives at `<dir>/memory.db` and
+  `Memory::open` derives `canonical_dir = <dir>/memory`, so the
+  markdown promotion pipeline (`MEMORY.md`, `namespaces/*/preference.md`,
+  `events/*.jsonl`) is per-test instead of shared. Fixes the
+  `promotion_redacts_person_memory_in_namespace_note` flake the
+  issue calls out. The two bespoke-path memory tests
+  (`evergreen_memories_dont_decay`,
+  `open_backfills_policy_columns_for_existing_rows`) flow through
+  the same `temp_memory_path("label")` helper.
+- **`tools::parser` Linux-only test gate** (#21). The
+  `try_tool_call_executes_single_key_system_info_shape` test asserts
+  the rendered `system_info` tool output contains `Memory available:`,
+  which the production tool only emits on Linux (the line comes from
+  `tegrastats::mem_available_mb()` reading `/proc/meminfo`). Gated
+  behind `#[cfg(target_os = "linux")]` so macOS CI no longer flags a
+  false negative.
+
 ### Changed
 
 - `deploy/scripts/genie-restart-all.sh` rewritten as a full hard-reset:

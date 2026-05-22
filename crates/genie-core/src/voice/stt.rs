@@ -85,6 +85,45 @@ enum SttMode {
     Server { port: u16 },
     /// whisper CLI — transcribe individual WAV files.
     Cli,
+    /// In-memory scripted transcript queue. Used by
+    /// `tests/voice_loop_integration.rs` so the voice cycle can be
+    /// exercised without a real whisper-cpp binary or audio device
+    /// (issue #21, IS-1 / IS-2).
+    Mock {
+        transcripts: std::sync::Mutex<Vec<MockTranscript>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MockTranscript {
+    pub text: String,
+    pub language: Option<String>,
+}
+
+impl MockTranscript {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            language: None,
+        }
+    }
+
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+}
+
+impl From<&str> for MockTranscript {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<String> for MockTranscript {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
 }
 
 /// Transcription result from STT.
@@ -144,6 +183,31 @@ impl SttEngine {
         }
     }
 
+    /// Create an in-memory STT engine that replays the given scripted
+    /// transcripts in order. `transcribe_file` ignores its argument and
+    /// pops the next scripted transcript instead. When the queue is
+    /// exhausted, `transcribe_file` returns an error.
+    ///
+    /// Used by `tests/voice_loop_integration.rs` (issue #21, IS-1 / IS-2).
+    pub fn mock<I, T>(transcripts: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<MockTranscript>,
+    {
+        let mut q: Vec<MockTranscript> = transcripts.into_iter().map(Into::into).collect();
+        q.reverse(); // pop from the back so callers see insertion order
+        Self {
+            mode: SttMode::Mock {
+                transcripts: std::sync::Mutex::new(q),
+            },
+            model_path: String::new(),
+            cli_path: String::new(),
+            language_hint: None,
+            no_gpu: false,
+            child: None,
+        }
+    }
+
     pub fn with_language_hint(mut self, language: Option<String>) -> Self {
         self.language_hint =
             language.and_then(|value| super::language::configured_language(&value));
@@ -179,13 +243,27 @@ impl SttEngine {
         Ok(())
     }
 
-    /// Transcribe a WAV file (works in both modes).
+    /// Transcribe a WAV file (works in all modes).
     pub async fn transcribe_file(&self, wav_path: &str) -> Result<Transcript> {
         let start = std::time::Instant::now();
 
         match &self.mode {
             SttMode::Server { port } => self.transcribe_via_server(*port, wav_path).await,
             SttMode::Cli => self.transcribe_via_cli(wav_path).await,
+            SttMode::Mock { transcripts } => {
+                let mut q = transcripts
+                    .lock()
+                    .expect("mock STT transcript queue poisoned");
+                if let Some(next) = q.pop() {
+                    Ok(Transcript {
+                        text: next.text,
+                        duration_ms: 0,
+                        language: next.language,
+                    })
+                } else {
+                    anyhow::bail!("SttEngine::mock transcript queue exhausted")
+                }
+            }
         }
         .map(|mut t| {
             t.duration_ms = start.elapsed().as_millis() as u64;

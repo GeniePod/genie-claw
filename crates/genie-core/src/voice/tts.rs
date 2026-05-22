@@ -87,6 +87,12 @@ enum TtsMode {
     Pipe,
     /// One-shot per utterance: outputs a WAV file.
     File,
+    /// No-op TTS for tests — `speak`, `synthesize`, `synthesize_to_file`
+    /// return immediately without spawning Piper or aplay. Used by
+    /// `tests/voice_loop_integration.rs` so the voice cycle can be driven
+    /// on hosts with no Piper binary and no audio output device
+    /// (issue #21, IS-1 / IS-2).
+    Silent,
 }
 
 impl TtsEngine {
@@ -109,6 +115,22 @@ impl TtsEngine {
             model_path: model_path.to_string(),
             piper_path: "piper".to_string(),
             mode: TtsMode::File,
+            child: None,
+            sample_rate: 22050,
+            audio_device: String::new(),
+            post_silence_ms: 0,
+        }
+    }
+
+    /// Create a no-op TTS engine for tests. `speak`, `synthesize`,
+    /// `synthesize_to_file`, `start`, and `stop` are no-ops; the engine
+    /// never spawns Piper or aplay. Used by the voice-cycle integration
+    /// test (issue #21).
+    pub fn silent() -> Self {
+        Self {
+            model_path: String::new(),
+            piper_path: String::new(),
+            mode: TtsMode::Silent,
             child: None,
             sample_rate: 22050,
             audio_device: String::new(),
@@ -156,6 +178,24 @@ impl TtsEngine {
         }
     }
 
+    /// Return a config-only copy of this engine (no child process).
+    /// `speak()` and `synthesize()` spawn a fresh Piper per call anyway,
+    /// so the new copy is independently usable. Needed so callers that
+    /// receive a `&TtsEngine` (e.g. the integration test's
+    /// `tts_engine_override`) can move it into an `Arc<TtsEngine>` for
+    /// `streaming::stream_and_speak`.
+    pub fn snapshot(&self) -> Self {
+        Self {
+            model_path: self.model_path.clone(),
+            piper_path: self.piper_path.clone(),
+            mode: self.mode,
+            child: None,
+            sample_rate: self.sample_rate,
+            audio_device: self.audio_device.clone(),
+            post_silence_ms: self.post_silence_ms,
+        }
+    }
+
     /// Start the Piper subprocess (pipe mode only).
     /// Piper stays running and accepts text lines on stdin.
     pub async fn start(&mut self) -> Result<()> {
@@ -187,6 +227,7 @@ impl TtsEngine {
         match &self.mode {
             TtsMode::Pipe => self.synthesize_pipe(text).await,
             TtsMode::File => self.synthesize_file(text).await,
+            TtsMode::Silent => Ok(Vec::new()),
         }
     }
 
@@ -201,6 +242,12 @@ impl TtsEngine {
         // streaming refactor (#26) will fire this earlier. The banner uses it
         // to separate "LLM-thinking" from "first-sentence Piper synth".
         mark_first_speak_called();
+
+        if matches!(self.mode, TtsMode::Silent) {
+            // No-op: the integration test (issue #21) drives the voice cycle
+            // on hosts with no Piper / aplay binaries.
+            return Ok(());
+        }
 
         let clean = text.replace('\n', " ");
         tracing::info!(text_len = text.len(), "speaking via Piper → aplay");
@@ -292,6 +339,13 @@ impl TtsEngine {
 
     /// Synthesize and write directly to a WAV file.
     pub async fn synthesize_to_file(&self, text: &str, output_path: &str) -> Result<()> {
+        if matches!(self.mode, TtsMode::Silent) {
+            // No-op for tests: create an empty file so any downstream
+            // existence check still passes.
+            tokio::fs::write(output_path, &[][..]).await?;
+            return Ok(());
+        }
+
         let clean = text.replace('\'', "'\\''");
 
         let output = Command::new("sh")
