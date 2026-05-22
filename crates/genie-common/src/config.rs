@@ -490,6 +490,14 @@ pub struct TelegramVoiceConfig {
     /// Tuned for the 60–90 s of OGG/Opus that comfortably fits under 1 MB.
     #[serde(default = "defaults::telegram_voice_max_reply_chars")]
     pub max_reply_chars: usize,
+
+    /// Bound on concurrent voice pipelines (download → ffmpeg → whisper-server
+    /// → /api/chat) the adapter will run at once. Issue #77: the poll loop
+    /// now spawns each update, but unbounded fan-out under burst could
+    /// overload ffmpeg / whisper-server. Text-only updates are not gated by
+    /// this knob.
+    #[serde(default = "defaults::telegram_voice_max_parallel_voice")]
+    pub max_parallel_voice: usize,
 }
 
 impl Default for TelegramVoiceConfig {
@@ -501,6 +509,7 @@ impl Default for TelegramVoiceConfig {
             ffmpeg_path: defaults::telegram_voice_ffmpeg_path(),
             reply_as_voice: false,
             max_reply_chars: defaults::telegram_voice_max_reply_chars(),
+            max_parallel_voice: defaults::telegram_voice_max_parallel_voice(),
         }
     }
 }
@@ -1580,6 +1589,14 @@ mod defaults {
         // 1 MB sendVoice limit at Piper's typical OGG/Opus output rate.
         // Long-form replies fall back to text.
         800
+    }
+    pub fn telegram_voice_max_parallel_voice() -> usize {
+        // Two concurrent voice pipelines is enough to satisfy issue #77's
+        // AC #8 (two voice messages from different chats transcribe in
+        // parallel) while leaving headroom for ffmpeg / whisper-server on a
+        // Jetson Orin Nano-class device. Bump in deployment configs if the
+        // host has more CPU / a dedicated whisper-server.
+        2
     }
     pub fn web_search_enabled() -> bool {
         true

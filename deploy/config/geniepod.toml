@@ -193,6 +193,10 @@ alert_webhook_url = ""            # Optional local notifier endpoint.
 # reply_as_voice = false           # Phase 2 of #42 — voice-out via sendVoice.
 # max_reply_chars = 800            # Replies longer than this fall back to text
 #                                  # so we don't blow the sendVoice 1 MB cap.
+# max_parallel_voice = 2           # Issue #77: how many voice pipelines may run
+#                                  # at once. Text-only updates are not gated.
+#                                  # Bump if the host has spare CPU and a
+#                                  # dedicated whisper-server.
 
 # Public web search tool. Default provider is DuckDuckGo Instant Answer, which needs no API key.
 # For a private/local path, run SearXNG and set provider = "searxng" with base_url.

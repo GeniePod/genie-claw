@@ -325,6 +325,7 @@ async fn main() -> Result<()> {
                         max_reply_chars: config.telegram.voice.max_reply_chars,
                         piper_path: config.core.piper_path.clone(),
                         piper_model: config.core.piper_model.clone(),
+                        max_parallel_voice: config.telegram.voice.max_parallel_voice,
                     },
                 };
 
@@ -332,6 +333,8 @@ async fn main() -> Result<()> {
                     poll_timeout_secs = telegram_cfg.poll_timeout_secs,
                     allowed_chats = telegram_cfg.allowed_chat_ids.len(),
                     allow_all_chats = telegram_cfg.allow_all_chats,
+                    voice_enabled = telegram_cfg.voice.enabled,
+                    max_parallel_voice = telegram_cfg.voice.max_parallel_voice,
                     "starting Telegram adapter"
                 );
 
