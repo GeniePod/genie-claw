@@ -111,8 +111,7 @@ impl HealthMonitor {
         for (name, url) in &services {
             let status = check_http(name, url).await;
 
-            // Log to SQLite.
-            let _ = self.db.execute(
+            if let Err(e) = self.db.execute(
                 "INSERT INTO health_log (ts_ms, service, healthy, response_ms, error) VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![
                     ts_ms,
@@ -121,7 +120,13 @@ impl HealthMonitor {
                     status.response_ms,
                     status.error,
                 ],
-            );
+            ) {
+                tracing::error!(
+                    service = %status.name,
+                    error = %e,
+                    "health_log insert failed"
+                );
+            }
 
             if status.healthy {
                 if self.failure_counts.remove(name).is_some() {
@@ -147,9 +152,12 @@ impl HealthMonitor {
 
         // Prune logs older than 24h every ~120 checks (~1 hour at 30s interval).
         let cutoff = ts_ms.saturating_sub(24 * 3600 * 1000);
-        let _ = self
+        if let Err(e) = self
             .db
-            .execute("DELETE FROM health_log WHERE ts_ms < ?1", [cutoff]);
+            .execute("DELETE FROM health_log WHERE ts_ms < ?1", [cutoff])
+        {
+            tracing::error!(error = %e, "health_log prune failed");
+        }
     }
 
     async fn send_alert(&self, status: &ServiceStatus) {
