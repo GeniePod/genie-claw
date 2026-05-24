@@ -5,7 +5,7 @@
 pub fn evaluate(expr: &str) -> Result<f64, String> {
     let tokens = tokenize(expr)?;
     let mut pos = 0;
-    let result = parse_expr(&tokens, &mut pos)?;
+    let result = parse_expr(&tokens, &mut pos, 0)?;
 
     if pos < tokens.len() {
         return Err(format!("unexpected token: {:?}", tokens[pos]));
@@ -13,6 +13,10 @@ pub fn evaluate(expr: &str) -> Result<f64, String> {
 
     Ok(result)
 }
+
+/// Maximum nesting depth for parentheses. Prevents stack overflow from
+/// deeply nested expressions like "(((...)))" that would abort the process.
+const MAX_DEPTH: usize = 128;
 
 #[derive(Debug, Clone)]
 enum Token {
@@ -110,18 +114,18 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
 }
 
 // Recursive descent: expr → term ((+|-) term)*
-fn parse_expr(tokens: &[Token], pos: &mut usize) -> Result<f64, String> {
-    let mut result = parse_term(tokens, pos)?;
+fn parse_expr(tokens: &[Token], pos: &mut usize, depth: usize) -> Result<f64, String> {
+    let mut result = parse_term(tokens, pos, depth)?;
 
     while *pos < tokens.len() {
         match tokens[*pos] {
             Token::Plus => {
                 *pos += 1;
-                result += parse_term(tokens, pos)?;
+                result += parse_term(tokens, pos, depth)?;
             }
             Token::Minus => {
                 *pos += 1;
-                result -= parse_term(tokens, pos)?;
+                result -= parse_term(tokens, pos, depth)?;
             }
             _ => break,
         }
@@ -131,18 +135,18 @@ fn parse_expr(tokens: &[Token], pos: &mut usize) -> Result<f64, String> {
 }
 
 // term → factor ((*|/) factor)*
-fn parse_term(tokens: &[Token], pos: &mut usize) -> Result<f64, String> {
-    let mut result = parse_factor(tokens, pos)?;
+fn parse_term(tokens: &[Token], pos: &mut usize, depth: usize) -> Result<f64, String> {
+    let mut result = parse_factor(tokens, pos, depth)?;
 
     while *pos < tokens.len() {
         match tokens[*pos] {
             Token::Star => {
                 *pos += 1;
-                result *= parse_factor(tokens, pos)?;
+                result *= parse_factor(tokens, pos, depth)?;
             }
             Token::Slash => {
                 *pos += 1;
-                let divisor = parse_factor(tokens, pos)?;
+                let divisor = parse_factor(tokens, pos, depth)?;
                 if divisor == 0.0 {
                     return Err("division by zero".to_string());
                 }
@@ -156,7 +160,7 @@ fn parse_term(tokens: &[Token], pos: &mut usize) -> Result<f64, String> {
 }
 
 // factor → NUMBER | '(' expr ')'
-fn parse_factor(tokens: &[Token], pos: &mut usize) -> Result<f64, String> {
+fn parse_factor(tokens: &[Token], pos: &mut usize, depth: usize) -> Result<f64, String> {
     if *pos >= tokens.len() {
         return Err("unexpected end of expression".to_string());
     }
@@ -168,8 +172,14 @@ fn parse_factor(tokens: &[Token], pos: &mut usize) -> Result<f64, String> {
             Ok(val)
         }
         Token::LParen => {
+            if depth >= MAX_DEPTH {
+                return Err(format!(
+                    "expression nesting too deep (max {} levels)",
+                    MAX_DEPTH
+                ));
+            }
             *pos += 1;
-            let result = parse_expr(tokens, pos)?;
+            let result = parse_expr(tokens, pos, depth + 1)?;
             if *pos >= tokens.len() || !matches!(tokens[*pos], Token::RParen) {
                 return Err("missing closing parenthesis".to_string());
             }
@@ -224,5 +234,25 @@ mod tests {
     fn complex_expression() {
         let result = evaluate("(100 - 32) * 5 / 9").unwrap();
         assert!((result - 37.778).abs() < 0.01); // Fahrenheit to Celsius
+    }
+
+    #[test]
+    fn deeply_nested_parens_returns_error() {
+        // This would overflow the stack without the depth limit
+        let deeply_nested = "(".repeat(5000) + "1" + &")".repeat(5000);
+        let result = evaluate(&deeply_nested);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nesting too deep"));
+    }
+
+    #[test]
+    fn max_depth_boundary() {
+        // Exactly at MAX_DEPTH should work
+        let at_limit = "(".repeat(MAX_DEPTH) + "1" + &")".repeat(MAX_DEPTH);
+        assert!(evaluate(&at_limit).is_ok());
+
+        // One over should fail
+        let over_limit = "(".repeat(MAX_DEPTH + 1) + "1" + &")".repeat(MAX_DEPTH + 1);
+        assert!(evaluate(&over_limit).is_err());
     }
 }
