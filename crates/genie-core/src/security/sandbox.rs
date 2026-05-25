@@ -292,7 +292,10 @@ mod tests {
         let second = "ghp_BBBBBBBBBBBBBBBBBBBBBBBB";
         let text = format!("first {first} and second {second} end");
         let sanitized = sanitize_output(&text);
-        assert!(!sanitized.contains(first), "first token leaked: {sanitized}");
+        assert!(
+            !sanitized.contains(first),
+            "first token leaked: {sanitized}"
+        );
         assert!(
             !sanitized.contains(second),
             "second token leaked: {sanitized}"
