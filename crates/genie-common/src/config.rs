@@ -37,6 +37,9 @@ pub struct Config {
 
     #[serde(default)]
     pub connectivity: ConnectivityConfig,
+
+    #[serde(default)]
+    pub http: HttpServerConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -725,6 +728,56 @@ pub enum WebSearchProvider {
     Searxng,
 }
 
+/// Inbound HTTP-server hardening shared by `genie-core` (`:3000`) and
+/// `genie-api` (`:3080`).
+///
+/// These bounds protect the always-on daemon from an unauthenticated peer on
+/// the LAN: oversized request lines/headers are rejected, a stalled connection
+/// is dropped after `read_timeout_secs`, and the number of concurrent
+/// connections is capped (issue #195). The per-request body cap is fixed per
+/// server (64 KiB for genie-core, 4 KiB for genie-api) and is not part of this
+/// section.
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct HttpServerConfig {
+    /// Max bytes in the request line, newline included.
+    #[serde(default = "defaults::http_max_request_line_bytes")]
+    pub max_request_line_bytes: usize,
+
+    /// Max bytes in any single header line, newline included.
+    #[serde(default = "defaults::http_max_header_line_bytes")]
+    pub max_header_line_bytes: usize,
+
+    /// Max number of header lines per request.
+    #[serde(default = "defaults::http_max_header_count")]
+    pub max_header_count: usize,
+
+    /// Max total bytes across all header lines (the header-phase ceiling).
+    /// Mirrors the existing body cap upward into the header phase.
+    #[serde(default = "defaults::http_max_header_bytes")]
+    pub max_header_bytes: usize,
+
+    /// Deadline for reading one whole request (line + headers + body).
+    #[serde(default = "defaults::http_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+
+    /// Ceiling on concurrently handled connections.
+    #[serde(default = "defaults::http_max_connections")]
+    pub max_connections: usize,
+}
+
+impl Default for HttpServerConfig {
+    fn default() -> Self {
+        Self {
+            max_request_line_bytes: defaults::http_max_request_line_bytes(),
+            max_header_line_bytes: defaults::http_max_header_line_bytes(),
+            max_header_count: defaults::http_max_header_count(),
+            max_header_bytes: defaults::http_max_header_bytes(),
+            read_timeout_secs: defaults::http_read_timeout_secs(),
+            max_connections: defaults::http_max_connections(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ConnectivityConfig {
     /// Enable the external connectivity coprocessor path.
@@ -1313,6 +1366,7 @@ mod tests {
             telegram: TelegramConfig::default(),
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
+            http: HttpServerConfig::default(),
         }
     }
 
@@ -2024,6 +2078,60 @@ expected_runtime_contract_hash = "abc123"
     }
 
     #[test]
+    fn http_server_config_defaults_are_bounded() {
+        let config = test_config();
+        assert_eq!(config.http.max_request_line_bytes, 8 * 1024);
+        assert_eq!(config.http.max_header_line_bytes, 8 * 1024);
+        assert_eq!(config.http.max_header_count, 100);
+        assert_eq!(config.http.max_header_bytes, 64 * 1024);
+        assert_eq!(config.http.read_timeout_secs, 15);
+        assert_eq!(config.http.max_connections, 256);
+    }
+
+    #[test]
+    fn http_server_config_falls_back_when_section_absent() {
+        // Existing deployments have no [http] section yet — the whole config
+        // must still parse and use the hardened defaults.
+        let config: Config = toml::from_str(
+            r#"
+[services.core]
+url = "http://127.0.0.1:3000/api/health"
+systemd_unit = "genie-core.service"
+
+[services.llm]
+url = "http://127.0.0.1:8080/health"
+systemd_unit = "genie-ai-runtime.service"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.http.max_header_bytes, 64 * 1024);
+        assert_eq!(config.http.max_connections, 256);
+    }
+
+    #[test]
+    fn http_server_config_parses_overrides() {
+        let config: HttpServerConfig = toml::from_str(
+            r#"
+max_request_line_bytes = 2048
+max_header_line_bytes = 2048
+max_header_count = 32
+max_header_bytes = 16384
+read_timeout_secs = 5
+max_connections = 16
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_request_line_bytes, 2048);
+        assert_eq!(config.max_header_line_bytes, 2048);
+        assert_eq!(config.max_header_count, 32);
+        assert_eq!(config.max_header_bytes, 16384);
+        assert_eq!(config.read_timeout_secs, 5);
+        assert_eq!(config.max_connections, 16);
+    }
+
+    #[test]
     fn legacy_spi_connectivity_config_still_parses() {
         let config: ConnectivityConfig = toml::from_str(
             r#"
@@ -2264,6 +2372,29 @@ mod defaults {
     }
     pub fn connectivity_device() -> String {
         "esp32c6".into()
+    }
+    pub fn http_max_request_line_bytes() -> usize {
+        8 * 1024
+    }
+    pub fn http_max_header_line_bytes() -> usize {
+        8 * 1024
+    }
+    pub fn http_max_header_count() -> usize {
+        100
+    }
+    pub fn http_max_header_bytes() -> usize {
+        // Mirror the genie-core 64 KiB body cap upward into the header phase.
+        64 * 1024
+    }
+    pub fn http_read_timeout_secs() -> u64 {
+        15
+    }
+    pub fn http_max_connections() -> usize {
+        // Generous headroom over the handful of real clients (dashboard polls
+        // every 5 s, plus voice/Telegram/local apps) while still bounding fan-out
+        // so a connection flood cannot exhaust fds or wedge the single-threaded
+        // genie-core runtime.
+        256
     }
     pub fn esp32c6_uart_device() -> String {
         "/dev/ttyTHS1".into()
