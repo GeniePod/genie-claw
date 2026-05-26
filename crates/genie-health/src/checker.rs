@@ -33,6 +33,14 @@ fn collect_endpoints(config: &Config) -> Vec<(String, String)> {
         ("llm".into(), config.services.llm.url.clone()),
     ];
 
+    match config.api_status_url() {
+        Ok(url) => endpoints.push(("api".into(), url)),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "skipping genie-api health probe; check [services.api].url"
+        ),
+    }
+
     if let Some(ref ha) = config.services.homeassistant {
         endpoints.push(("homeassistant".into(), ha.url.clone()));
     }
@@ -351,6 +359,7 @@ mod tests {
 
         assert!(names.contains(&"core"));
         assert!(names.contains(&"llm"));
+        assert!(names.contains(&"api"));
         assert!(!names.contains(&"homeassistant"));
     }
 
@@ -383,6 +392,33 @@ mod tests {
             .expect("llm endpoint should always be present");
 
         assert_eq!(llm_url, "http://127.0.0.1:9999/v1/health");
+    }
+
+    #[test]
+    fn api_endpoint_url_uses_derived_status_url() {
+        let mut config = test_config();
+        config.services.api.url = "127.0.0.1:4080/api/status".into();
+
+        let endpoints = collect_endpoints(&config);
+        let api_url = endpoints
+            .iter()
+            .find(|(name, _)| name == "api")
+            .map(|(_, url)| url.as_str())
+            .expect("api endpoint should always be present when api_status_url parses");
+
+        assert_eq!(api_url, "http://127.0.0.1:4080/api/status");
+    }
+
+    #[test]
+    fn api_endpoint_omitted_when_status_url_unsupported() {
+        let mut config = test_config();
+        config.services.api.url = "https://api.example/api/status".into();
+
+        let endpoints = collect_endpoints(&config);
+        assert!(
+            !endpoints.iter().any(|(name, _)| name == "api"),
+            "https api url cannot be probed by plain HTTP client"
+        );
     }
 
     fn open_test_db(dir: &std::path::Path) -> Connection {
