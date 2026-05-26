@@ -59,7 +59,7 @@ pub async fn run(
         }
 
         // Persist user message.
-        let _ = conversations.append(&conv_id, "user", text, None);
+        conversations.append_or_log(&conv_id, "user", text, None);
 
         if let Some(call) = tools::quick::route_for_available_tools(
             text,
@@ -88,15 +88,19 @@ pub async fn run(
             .to_string();
 
             eprintln!("\nGeniePod: {}", response);
-            let _ =
-                conversations.append(&conv_id, "assistant", &tool_json, Some(&tool_result.tool));
-            let _ = conversations.append(
+            let _ = conversations.append_or_log(
+                &conv_id,
+                "assistant",
+                &tool_json,
+                Some(&tool_result.tool),
+            );
+            conversations.append_or_log(
                 &conv_id,
                 "system",
                 &format!("Tool: {}", tool_result.output),
                 None,
             );
-            let _ = conversations.append(&conv_id, "assistant", &response, None);
+            conversations.append_or_log(&conv_id, "assistant", &response, None);
 
             let stored = memory::extract::extract_and_store(memory, text);
             if stored > 0 {
@@ -156,13 +160,13 @@ pub async fn run(
                 .await
                 {
                     eprintln!("[TOOL: {}] {}", tool_result.tool, tool_result.output);
-                    let _ = conversations.append(
+                    conversations.append_or_log(
                         &conv_id,
                         "assistant",
                         &response,
                         Some(&tool_result.tool),
                     );
-                    let _ = conversations.append(
+                    conversations.append_or_log(
                         &conv_id,
                         "system",
                         &format!("Tool: {}", tool_result.output),
@@ -180,8 +184,12 @@ pub async fn run(
                     );
 
                     if preserve_raw {
-                        let _ =
-                            conversations.append(&conv_id, "assistant", &tool_result.output, None);
+                        let _ = conversations.append_or_log(
+                            &conv_id,
+                            "assistant",
+                            &tool_result.output,
+                            None,
+                        );
                     } else {
                         // Get follow-up summary.
                         let recent = conversations.get_recent(&conv_id, 6).unwrap_or_default();
@@ -207,13 +215,13 @@ pub async fn run(
                         {
                             Ok(summary) => {
                                 eprintln!();
-                                let _ = conversations.append(&conv_id, "assistant", &summary, None);
+                                conversations.append_or_log(&conv_id, "assistant", &summary, None);
                             }
                             Err(_) => eprintln!(),
                         }
                     }
                 } else {
-                    let _ = conversations.append(&conv_id, "assistant", &response, None);
+                    conversations.append_or_log(&conv_id, "assistant", &response, None);
                 }
             }
             Err(e) => {

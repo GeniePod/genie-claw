@@ -118,6 +118,19 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Append a message, logging SQLite/IO failures instead of silently dropping them.
+    pub fn append_or_log(&self, conv_id: &str, role: &str, content: &str, tool_name: Option<&str>) {
+        if let Err(error) = self.append(conv_id, role, content, tool_name) {
+            tracing::error!(
+                conv_id,
+                role,
+                tool_name,
+                error = %error,
+                "conversation append failed"
+            );
+        }
+    }
+
     /// Get all messages in a conversation.
     pub fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>> {
         let mut stmt = self
@@ -281,6 +294,46 @@ mod tests {
         let convos = store.list().unwrap();
         assert_eq!(convos.len(), 1);
         assert_eq!(convos[0].title, "New conversation");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn append_returns_error_on_readonly_db() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-conv-readonly-{}-{}.db",
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = ConversationStore::open(&path).unwrap();
+        let conv_id = store.create().unwrap();
+        drop(store);
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let store = ConversationStore {
+            conn: Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap(),
+        };
+        let error = store
+            .append(&conv_id, "assistant", "hello", None)
+            .unwrap_err();
+        assert!(
+            !error.to_string().is_empty(),
+            "append should fail on readonly db: {error}"
+        );
+
+        store.append_or_log(&conv_id, "assistant", "hello", None);
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

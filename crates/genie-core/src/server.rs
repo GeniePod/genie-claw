@@ -698,7 +698,7 @@ async fn handle_chat_stream(
             state.pending.clear();
             state.emitted_text = true;
         }
-        let _ = conversations.append(&conv_id, "assistant", &sanitized, None);
+        conversations.append_or_log(&conv_id, "assistant", &sanitized, None);
         sanitized
     };
 
@@ -809,7 +809,7 @@ pub async fn process_chat_turn(
         .await
     } else {
         let sanitized = crate::security::sandbox::sanitize_output(&llm_response);
-        let _ = conversations.append(conv_id, "assistant", &sanitized, None);
+        conversations.append_or_log(conv_id, "assistant", &sanitized, None);
         sanitized
     };
 
@@ -833,8 +833,8 @@ fn finalize_direct_tool_turn(
         "arguments": call.arguments,
     })
     .to_string();
-    let _ = conversations.append(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
-    let _ = conversations.append(
+    conversations.append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+    conversations.append_or_log(
         conv_id,
         "system",
         &format!("Tool result: {}", tool_result.output),
@@ -847,7 +847,7 @@ fn finalize_direct_tool_turn(
         format!("{} failed: {}", tool_result.tool, tool_result.output)
     };
     let sanitized = crate::security::sandbox::sanitize_output(&response);
-    let _ = conversations.append(conv_id, "assistant", &sanitized, None);
+    conversations.append_or_log(conv_id, "assistant", &sanitized, None);
     sanitized
 }
 
@@ -859,8 +859,8 @@ async fn finalize_tool_turn(
     tool_result: &crate::tools::ToolResult,
     model_family: ModelFamily,
 ) -> String {
-    let _ = conversations.append(conv_id, "assistant", llm_response, Some(&tool_result.tool));
-    let _ = conversations.append(
+    conversations.append_or_log(conv_id, "assistant", llm_response, Some(&tool_result.tool));
+    conversations.append_or_log(
         conv_id,
         "system",
         &format!("Tool result: {}", tool_result.output),
@@ -892,7 +892,7 @@ async fn finalize_tool_turn(
     };
     let sanitized_summary = crate::security::sandbox::sanitize_output(&summary);
 
-    let _ = conversations.append(conv_id, "assistant", &sanitized_summary, None);
+    conversations.append_or_log(conv_id, "assistant", &sanitized_summary, None);
     sanitized_summary
 }
 
