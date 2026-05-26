@@ -915,18 +915,24 @@ impl ToolDispatcher {
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
         let health = mem.health()?;
         let promoted = mem.promoted_count()?;
-        let state = if health.quick_check_ok && health.fts_consistent {
+        let state = if health.quick_check_ok && health.fts_consistent && !health.migration_degraded
+        {
             "ok"
         } else {
             "degraded"
         };
 
         Ok(format!(
-            "Memory status: {}. Rows: {}. FTS rows: {}. FTS consistent: {}. Promoted memories: {}. Canonical root: {}. Namespace notes: {}. Daily notes: {}. Event logs: {}. Person-scoped memories: {}. Private memories: {}. Restricted memories: {}.",
+            "Memory status: {}. Rows: {}. FTS rows: {}. FTS consistent: {}. Migration degraded: {}. Promoted memories: {}. Canonical root: {}. Namespace notes: {}. Daily notes: {}. Event logs: {}. Person-scoped memories: {}. Private memories: {}. Restricted memories: {}.",
             state,
             health.memory_rows,
             health.fts_rows,
             if health.fts_consistent { "yes" } else { "no" },
+            if health.migration_degraded {
+                "yes"
+            } else {
+                "no"
+            },
             promoted,
             if health.canonical_root_exists {
                 "present"
@@ -2251,6 +2257,7 @@ mod tests {
         assert!(output.contains("Memory status: ok"));
         assert!(output.contains("Rows: 1"));
         assert!(output.contains("FTS consistent: yes"));
+        assert!(output.contains("Migration degraded: no"));
         assert!(output.contains("Canonical root:"));
         assert!(output.contains("Daily notes: 1"));
         assert!(output.contains("Event logs: 1"));

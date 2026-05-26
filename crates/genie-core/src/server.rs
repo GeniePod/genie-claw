@@ -1106,6 +1106,7 @@ async fn handle_health(
     let llm_ok = llm.health().await;
     let connectivity_health = connectivity.health().await;
     let mem_count = memory.count().unwrap_or(0);
+    let memory_health = memory.health().ok();
     let conv_count = conversations.list().map(|l| l.len()).unwrap_or(0);
     let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
     let runtime_contract = build_runtime_contract_snapshot(
@@ -1127,6 +1128,17 @@ async fn handle_health(
         "llm": if llm_ok { "connected" } else { "offline" },
         "llm_backend": llm.backend_name(),
         "memories": mem_count,
+        "memory": {
+            "count": mem_count,
+            "migration_degraded": memory_health
+                .as_ref()
+                .map(|health| health.migration_degraded)
+                .unwrap_or(true),
+            "fts_consistent": memory_health
+                .as_ref()
+                .map(|health| health.fts_consistent)
+                .unwrap_or(false),
+        },
         "conversations": conv_count,
         "mem_available_mb": mem_avail,
         "connectivity": connectivity_health,
