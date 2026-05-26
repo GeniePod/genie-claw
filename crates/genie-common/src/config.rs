@@ -792,11 +792,11 @@ pub struct ServiceEndpoint {
 /// Result of resolving a configured service URL for the simple TCP probe
 /// path used by `genie-ctl status` / `diag` / `support-bundle`.
 ///
-/// `Http` targets are usable by a plaintext TCP client. Anything else
-/// (today: `https://`, plus unknown schemes that look like a scheme but
-/// aren't `http`) is returned as [`ServiceProbeTarget::UnsupportedScheme`]
-/// so callers can label the row instead of mis-reporting a healthy
-/// service as DOWN by sending plaintext to a TLS port.
+/// `Http` and `Https` targets are probed with the shared client in
+/// [`crate::probe`]. Unknown schemes are returned as
+/// [`ServiceProbeTarget::UnsupportedScheme`] so callers can label the row
+/// instead of mis-reporting a healthy service as DOWN by sending plaintext
+/// to a TLS port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceProbeTarget {
     /// Plain-HTTP probe target.
@@ -807,26 +807,24 @@ pub enum ServiceProbeTarget {
         /// Request path, always starting with `/`.
         path: String,
     },
-    /// Scheme the plain-TCP probe cannot service. `genie-ctl` should skip
-    /// the probe and surface "scheme not supported" rather than DOWN.
-    /// Wiring in a TLS client is tracked separately; see issue #126
-    /// discussion.
+    /// TLS HTTP probe target (`https://` URLs).
+    Https { addr: String, path: String },
+    /// Scheme the probe client cannot service (neither plain nor TLS).
     UnsupportedScheme {
-        /// The scheme as found in the URL (lowercased), e.g. `"https"`.
+        /// The scheme as found in the URL (lowercased), e.g. `"wss"`.
         scheme: String,
     },
 }
 
 /// Parse a configured service URL into a probe target for `genie-ctl`'s
-/// plain-TCP HTTP client.
+/// HTTP/TLS probe client.
 ///
 /// Behavior:
 /// - Bare URLs without a scheme are treated as `http://…`.
 /// - `http://` URLs produce [`ServiceProbeTarget::Http`].
-/// - `https://` (and any other recognized scheme that isn't `http`) produces
-///   [`ServiceProbeTarget::UnsupportedScheme`] — the probe path cannot speak
-///   TLS, so we refuse rather than send plaintext to port 443.
-/// - Missing port defaults to 80 for `http`.
+/// - `https://` URLs produce [`ServiceProbeTarget::Https`].
+/// - Other recognized schemes produce [`ServiceProbeTarget::UnsupportedScheme`].
+/// - Missing port defaults to 80 for `http` and 443 for `https`.
 /// - Missing path defaults to `/`.
 /// - IPv6 hosts must be bracketed (`[::1]`, `[::1]:8123`); brackets are
 ///   preserved in the returned `addr` so the string parses with
@@ -841,21 +839,26 @@ pub fn parse_service_probe_target(url: &str) -> ServiceProbeTarget {
         None => ("http", url),
     };
 
-    if scheme != "http" {
-        return ServiceProbeTarget::UnsupportedScheme {
-            scheme: scheme.to_string(),
-        };
-    }
-
     let (authority, path) = split_authority_and_path(rest);
-    let addr = ensure_port(authority, 80);
     let path = if path.is_empty() {
         "/".to_string()
     } else {
         path.to_string()
     };
 
-    ServiceProbeTarget::Http { addr, path }
+    match scheme {
+        "http" => ServiceProbeTarget::Http {
+            addr: ensure_port(authority, 80),
+            path,
+        },
+        "https" => ServiceProbeTarget::Https {
+            addr: ensure_port(authority, 443),
+            path,
+        },
+        _ => ServiceProbeTarget::UnsupportedScheme {
+            scheme: scheme.to_string(),
+        },
+    }
 }
 
 /// Split a URL into `(lowercased_scheme, rest_after_://)` when it starts
@@ -977,6 +980,10 @@ impl Config {
     pub fn api_http_addr(&self) -> anyhow::Result<String> {
         match parse_service_probe_target(&self.services.api.url) {
             ServiceProbeTarget::Http { addr, .. } => Ok(addr),
+            ServiceProbeTarget::Https { .. } => anyhow::bail!(
+                "genie-api cannot bind from [services.api].url: unsupported scheme \
+                 \"https\" (use http:// for the local bind address)"
+            ),
             ServiceProbeTarget::UnsupportedScheme { scheme } => anyhow::bail!(
                 "genie-api cannot bind from [services.api].url: unsupported scheme \
                  \"{scheme}\" (use http://)"
@@ -1518,14 +1525,13 @@ systemd_unit = "genie-ai-runtime.service"
     }
 
     #[test]
-    fn parse_service_probe_target_rejects_https_as_unsupported() {
-        // Regression for PR #127 review: HTTPS must NOT silently default to
-        // port 443 and then be probed with plaintext over a raw TcpStream —
-        // a healthy HTTPS service would be reported DOWN. Surface it as an
-        // explicit unsupported scheme so the caller can label the row.
+    fn parse_service_probe_target_parses_https_with_default_port() {
         match parse_service_probe_target("https://ha.example/api/") {
-            ServiceProbeTarget::UnsupportedScheme { scheme } => assert_eq!(scheme, "https"),
-            other => panic!("expected UnsupportedScheme for https://, got {other:?}"),
+            ServiceProbeTarget::Https { addr, path } => {
+                assert_eq!(addr, "ha.example:443");
+                assert_eq!(path, "/api/");
+            }
+            other => panic!("expected Https target, got {other:?}"),
         }
     }
 

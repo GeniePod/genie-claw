@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use genie_common::config::Config;
+use genie_common::probe::{ProbeTimeouts, probe_configured_url};
 use rusqlite::Connection;
 use tokio::net::TcpStream;
 use tokio::signal::unix::{SignalKind, signal};
@@ -200,56 +201,12 @@ fn prune_health_log(db: &Connection, cutoff_ts_ms: u64) {
 
 async fn check_http(name: &str, url: &str) -> ServiceStatus {
     let start = std::time::Instant::now();
+    let timeouts = ProbeTimeouts {
+        connect: Duration::from_secs(5),
+        read: Duration::from_secs(5),
+    };
 
-    // Parse host:port from URL for TCP connect.
-    let result = async {
-        let url_parsed = url.strip_prefix("http://").unwrap_or(url);
-        let (host_port, _path) = url_parsed.split_once('/').unwrap_or((url_parsed, ""));
-
-        let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(host_port))
-            .await
-            .map_err(|_| anyhow::anyhow!("timeout"))??;
-
-        // Send a minimal HTTP GET.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let path = url_parsed
-            .find('/')
-            .map(|i| &url_parsed[i..])
-            .unwrap_or("/");
-
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            path, host_port
-        );
-
-        let mut stream = stream;
-        stream.write_all(request.as_bytes()).await?;
-
-        let mut buf = [0u8; 256];
-        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-            .await
-            .map_err(|_| anyhow::anyhow!("read timeout"))??;
-
-        let response = String::from_utf8_lossy(&buf[..n]);
-        if response.starts_with("HTTP/1.") {
-            // Extract status code.
-            let status_code: u16 = response
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if (200..400).contains(&status_code) {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("HTTP {}", status_code))
-            }
-        } else {
-            // Non-HTTP but something responded — treat as alive.
-            Ok(())
-        }
-    }
-    .await;
-
+    let result = probe_configured_url(url, timeouts).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     match result {

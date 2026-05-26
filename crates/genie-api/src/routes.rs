@@ -1,11 +1,10 @@
 use genie_common::config::Config;
+use genie_common::probe::{ProbeTimeouts, probe_configured_url};
 use genie_common::tegrastats;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::process::Command;
 
 use crate::http::Response;
@@ -434,51 +433,16 @@ async fn collect_live_latency_rows(
 
 async fn probe_http_latency(url: &str) -> LiveLatencyRow {
     let start = Instant::now();
-    let result = async {
-        let url = url.strip_prefix("http://").unwrap_or(url);
-        let (host_port, path) = url.split_once('/').unwrap_or((url, ""));
-        let path = format!("/{path}");
-
-        let mut stream =
-            tokio::time::timeout(Duration::from_millis(750), TcpStream::connect(host_port))
-                .await
-                .map_err(|_| "connect timeout".to_string())?
-                .map_err(|e| e.to_string())?;
-
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let mut buf = [0u8; 256];
-        let n = tokio::time::timeout(Duration::from_millis(750), stream.read(&mut buf))
-            .await
-            .map_err(|_| "read timeout".to_string())?
-            .map_err(|e| e.to_string())?;
-
-        let response = String::from_utf8_lossy(&buf[..n]);
-        let status = response
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse::<u16>().ok())
-            .unwrap_or(0);
-
-        if (200..400).contains(&status) {
-            Ok(())
-        } else if status > 0 {
-            Err(format!("HTTP {status}"))
-        } else {
-            Err("invalid HTTP response".into())
-        }
-    }
-    .await;
+    let timeouts = ProbeTimeouts {
+        connect: Duration::from_millis(750),
+        read: Duration::from_millis(750),
+    };
+    let result = probe_configured_url(url, timeouts).await;
 
     LiveLatencyRow {
         healthy: result.is_ok(),
         response_ms: start.elapsed().as_millis() as i64,
-        error: result.err(),
+        error: result.err().map(|e| e.to_string()),
     }
 }
 
