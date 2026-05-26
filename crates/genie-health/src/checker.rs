@@ -244,8 +244,7 @@ async fn check_http(name: &str, url: &str) -> ServiceStatus {
                 Err(anyhow::anyhow!("HTTP {}", status_code))
             }
         } else {
-            // Non-HTTP but something responded — treat as alive.
-            Ok(())
+            Err(anyhow::anyhow!("invalid HTTP response"))
         }
     }
     .await;
@@ -474,5 +473,52 @@ mod tests {
         perms.set_mode(0o644);
         std::fs::set_permissions(&db_path, perms).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn check_http_rejects_non_http_tcp_banner() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = stream.write_all(b"SSH-2.0-OpenSSH_9.0\r\n").await;
+            }
+        });
+
+        let status = check_http("test", &url).await;
+        server.abort();
+
+        assert!(!status.healthy);
+        let err = status.error.unwrap_or_default();
+        assert!(
+            err.contains("invalid HTTP response"),
+            "expected invalid HTTP error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_http_accepts_valid_http_status_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/health");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let status = check_http("test", &url).await;
+        server.abort();
+
+        assert!(status.healthy, "error: {:?}", status.error);
     }
 }
