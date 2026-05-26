@@ -9,6 +9,7 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde::Serialize;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const MAX_QUERY_HASHES: usize = 16;
@@ -38,6 +39,17 @@ pub struct Memory {
     canonical_dir: PathBuf,
     /// Set when schema migration or FTS rebuild failed during [`Memory::open`].
     migration_degraded: bool,
+}
+
+/// Process-wide handle to the single memory store opened at startup.
+pub type SharedMemory = Arc<Mutex<Memory>>;
+
+/// Run a closure against the shared memory store.
+pub fn with_shared_memory<R>(memory: &SharedMemory, f: impl FnOnce(&Memory) -> R) -> R {
+    let guard = memory
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&guard)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,7 +416,13 @@ impl Memory {
 
         // Update recall tracking for returned results.
         for (entry, score) in &scored {
-            let _ = self.update_recall_tracking(entry.id, now, *score, &query_hash);
+            if let Err(error) = self.update_recall_tracking(entry.id, now, *score, &query_hash) {
+                tracing::error!(
+                    memory_id = entry.id,
+                    error = %error,
+                    "memory recall tracking update failed"
+                );
+            }
         }
 
         Ok(scored.into_iter().map(|(e, _)| e).collect())
@@ -459,7 +477,13 @@ impl Memory {
 
         for entry in &entries {
             let score = lexical_overlap_score(query, &entry.content);
-            let _ = self.update_recall_tracking(entry.id, now, score, query_hash);
+            if let Err(error) = self.update_recall_tracking(entry.id, now, score, query_hash) {
+                tracing::error!(
+                    memory_id = entry.id,
+                    error = %error,
+                    "memory recall tracking update failed"
+                );
+            }
         }
 
         Ok(entries)
