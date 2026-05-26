@@ -376,6 +376,15 @@ async fn run_with_wakeword(
                                 text, transcript.duration_ms
                             );
 
+                            // Security: scan for prompt injection
+                            // (issue #196 — follow-up transcripts skip
+                            // process_transcript, so the scan must live here
+                            // too or this path becomes a blind spot).
+                            crate::security::injection::scan_and_warn(
+                                &text,
+                                "voice-followup",
+                            );
+
                             // Build context and process — reuse voice_cycle but skip recording
                             // (we already have the text).
                             let _ = conversations.append(conv_id, "user", &text, None);
@@ -1029,6 +1038,12 @@ pub async fn process_transcript(
         "[voice] You said: \"{}\" (STT: {} ms)",
         text, transcript.duration_ms
     );
+
+    // Security: scan for prompt injection (issue #196 — voice transcripts
+    // hit the same LLM as the HTTP entry points, so they need the same
+    // scanner coverage).
+    crate::security::injection::scan_and_warn(&text, "voice");
+
     let _ = conversations.append(conv_id, "user", &text, None);
 
     if let Some(final_response) = handle_quick_tool_for_voice(

@@ -58,6 +58,11 @@ pub async fn run(
             continue;
         }
 
+        // Security: scan for prompt injection (issue #196 — REPL input hits
+        // the same LLM as the HTTP entry points, so it needs the same
+        // scanner coverage).
+        crate::security::injection::scan_and_warn(text, "repl");
+
         // Persist user message.
         let _ = conversations.append(&conv_id, "user", text, None);
 
