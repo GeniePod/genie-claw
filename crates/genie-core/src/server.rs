@@ -1,13 +1,20 @@
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
+use crate::http_safety::{
+    BODY_READ_TIMEOUT, HEADER_READ_TIMEOUT, LineRead, MAX_CONCURRENT_CONNECTIONS,
+    MAX_HEADER_LINE_BYTES, MAX_REQUEST_LINE_BYTES, MAX_TOTAL_HEADER_BYTES, build_error_response,
+    read_capped_line,
+};
 use crate::llm::{LlmClient, LlmRequestHints, Message};
 use crate::memory::Memory;
 use crate::prompt::ModelFamily;
@@ -146,13 +153,43 @@ impl ChatServer {
     /// bind-drop-rebind race that a port-0 `serve()` call would require.
     pub(crate) async fn serve_listener(self, listener: TcpListener) -> Result<()> {
         let ctx = Rc::new(self);
+        // Cap concurrent connections so a single peer can't spawn unbounded
+        // tasks and force EMFILE. Acquired *before* `accept()` so the OS
+        // socket queue applies backpressure rather than the daemon trying
+        // (and failing) to allocate fds.
+        let connection_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async move {
                 loop {
-                    let (stream, _) = listener.accept().await?;
+                    let permit = match Arc::clone(&connection_permits).acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break, // semaphore closed → graceful shutdown
+                    };
+
+                    let (stream, peer) = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            // Don't propagate. Transient fd exhaustion (EMFILE)
+                            // and other accept errors must NOT terminate the
+                            // server — drop the permit and back off briefly so
+                            // we stop spinning while fds free up.
+                            tracing::warn!(
+                                error = %e,
+                                "accept failed; backing off before retrying"
+                            );
+                            drop(permit);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+
                     let request_ctx = Rc::clone(&ctx);
                     tokio::task::spawn_local(async move {
+                        // Permit dropped when the task completes, releasing
+                        // a slot for the next accept.
+                        let _permit = permit;
+                        let _ = peer;
                         if let Err(e) = handle_request(stream, request_ctx.as_ref()).await {
                             tracing::debug!(error = %e, "request error");
                         }
@@ -254,9 +291,35 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
 
-    // Parse request line.
+    // Parse request line with a hard byte cap + read timeout. An unbounded
+    // read_line() here lets any peer OOM the daemon by sending a giant URI
+    // without a newline; a missing timeout lets them hold the connection
+    // forever and exhaust fds.
     let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line).await?;
+    match read_capped_line(
+        &mut buf_reader,
+        &mut request_line,
+        MAX_REQUEST_LINE_BYTES,
+        HEADER_READ_TIMEOUT,
+    )
+    .await?
+    {
+        LineRead::Ok => {}
+        LineRead::TooLong => {
+            let _ = writer
+                .write_all(build_error_response(414, "request line too long").as_bytes())
+                .await;
+            return Ok(());
+        }
+        LineRead::Timeout => {
+            let _ = writer
+                .write_all(build_error_response(408, "request timed out").as_bytes())
+                .await;
+            return Ok(());
+        }
+        LineRead::Eof => return Ok(()),
+    }
+
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return Ok(());
@@ -264,12 +327,46 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
     let method = parts[0];
     let path = parts[1];
 
-    // Read headers.
+    // Read headers. Each header line is capped individually, and the total
+    // header bytes are capped to bound the worst-case allocation per
+    // connection.
     let mut content_length: usize = 0;
     let mut request_origin = RequestOrigin::Unknown;
+    let mut total_header_bytes = request_line.len();
     loop {
         let mut line = String::new();
-        buf_reader.read_line(&mut line).await?;
+        let outcome = read_capped_line(
+            &mut buf_reader,
+            &mut line,
+            MAX_HEADER_LINE_BYTES,
+            HEADER_READ_TIMEOUT,
+        )
+        .await?;
+        match outcome {
+            LineRead::Ok => {}
+            LineRead::TooLong => {
+                let _ = writer
+                    .write_all(build_error_response(431, "header line too long").as_bytes())
+                    .await;
+                return Ok(());
+            }
+            LineRead::Timeout => {
+                let _ = writer
+                    .write_all(build_error_response(408, "request timed out").as_bytes())
+                    .await;
+                return Ok(());
+            }
+            LineRead::Eof => return Ok(()),
+        }
+
+        total_header_bytes = total_header_bytes.saturating_add(line.len());
+        if total_header_bytes > MAX_TOTAL_HEADER_BYTES {
+            let _ = writer
+                .write_all(build_error_response(431, "headers too large").as_bytes())
+                .await;
+            return Ok(());
+        }
+
         if line.trim().is_empty() {
             break;
         }
@@ -281,11 +378,32 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
         }
     }
 
-    // Read body.
-    let body = if content_length > 0 && content_length < 65536 {
+    // Read body. Bounded by the same content-length ceiling as before, plus
+    // a wall-clock deadline so a slow/silent peer can't pin this task.
+    const MAX_BODY_BYTES: usize = 65536;
+    if content_length > MAX_BODY_BYTES {
+        let _ = writer
+            .write_all(build_error_response(413, "request body too large").as_bytes())
+            .await;
+        return Ok(());
+    }
+    let body = if content_length > 0 {
         let mut buf = vec![0u8; content_length];
-        tokio::io::AsyncReadExt::read_exact(&mut buf_reader, &mut buf).await?;
-        Some(String::from_utf8_lossy(&buf).to_string())
+        let read_res = tokio::time::timeout(
+            BODY_READ_TIMEOUT,
+            tokio::io::AsyncReadExt::read_exact(&mut buf_reader, &mut buf),
+        )
+        .await;
+        match read_res {
+            Ok(Ok(_)) => Some(String::from_utf8_lossy(&buf).to_string()),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_elapsed) => {
+                let _ = writer
+                    .write_all(build_error_response(408, "request body timed out").as_bytes())
+                    .await;
+                return Ok(());
+            }
+        }
     } else {
         None
     };
@@ -2391,6 +2509,198 @@ mod tests {
 
                 let _ = std::fs::remove_file(&memory_path);
                 let _ = std::fs::remove_file(&conv_path);
+            })
+            .await;
+    }
+
+    /// Regression guard for issue #195: a peer sending an over-long request
+    /// line must get a `414` reply and the server must keep accepting new
+    /// connections afterwards (no panic, no OOM, no process exit).
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_request_line_is_rejected_and_server_survives() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        use crate::connectivity::NullConnectivityController;
+        use crate::conversation::ConversationStore;
+        use crate::llm::{LlmClient, MockLlmBackend};
+        use crate::memory::Memory;
+        use crate::prompt::ModelFamily;
+        use crate::tools::ToolDispatcher;
+        use genie_common::config::ConnectivityConfig;
+
+        let uid = format!(
+            "genie-oversized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let tmp = std::env::temp_dir();
+        let memory_path = tmp.join(format!("{uid}-memory.db"));
+        let conv_path = tmp.join(format!("{uid}-conv.db"));
+
+        let prompt = "system prompt";
+        let server = super::ChatServer::new(
+            LlmClient::from_backend(MockLlmBackend::new(["ok"])),
+            ToolDispatcher::new(None),
+            std::sync::Arc::new(NullConnectivityController::from_config(
+                &ConnectivityConfig::default(),
+            )),
+            Memory::open(&memory_path).unwrap(),
+            ConversationStore::open(&conv_path).unwrap(),
+            prompt.into(),
+            crate::prompt_sha::sha256_hex(prompt),
+            10,
+            ModelFamily::Phi,
+            "".into(),
+        )
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let local = tokio::task::LocalSet::new();
+        let memory_cleanup = memory_path.clone();
+        let conv_cleanup = conv_path.clone();
+        local
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let _ = server.serve_listener(listener).await;
+                });
+
+                // Attack: send 16 KB of "A" with no CRLF — twice the cap.
+                let mut attacker = TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .unwrap();
+                let payload = vec![b'A'; 16 * 1024];
+                attacker.write_all(&payload).await.unwrap();
+                attacker.shutdown().await.unwrap();
+
+                // Server must reply with 414 (Request-URI Too Long) and close.
+                let mut response = Vec::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    attacker.read_to_end(&mut response),
+                )
+                .await;
+                let response_str = String::from_utf8_lossy(&response);
+                assert!(
+                    response_str.starts_with("HTTP/1.1 414"),
+                    "expected 414 reply, got: {response_str:?}"
+                );
+
+                // A second, well-formed connection must still succeed — the
+                // attack must NOT have terminated the server.
+                let mut victim = TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .unwrap();
+                victim
+                    .write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut healthy = [0u8; 16];
+                let n = tokio::time::timeout(Duration::from_secs(2), victim.read(&mut healthy))
+                    .await
+                    .expect("server unresponsive after oversized-line attack")
+                    .unwrap();
+                let prefix = String::from_utf8_lossy(&healthy[..n]);
+                assert!(
+                    prefix.starts_with("HTTP/1.1 200"),
+                    "expected 200 from /api/health after attack, got: {prefix:?}"
+                );
+
+                let _ = std::fs::remove_file(&memory_cleanup);
+                let _ = std::fs::remove_file(&conv_cleanup);
+            })
+            .await;
+    }
+
+    /// Regression guard for issue #195: a peer that never sends a CRLF on
+    /// the request line must be timed out and disconnected, not allowed to
+    /// hold the socket forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_request_is_timed_out() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        use crate::connectivity::NullConnectivityController;
+        use crate::conversation::ConversationStore;
+        use crate::llm::{LlmClient, MockLlmBackend};
+        use crate::memory::Memory;
+        use crate::prompt::ModelFamily;
+        use crate::tools::ToolDispatcher;
+        use genie_common::config::ConnectivityConfig;
+
+        let uid = format!(
+            "genie-stalled-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let tmp = std::env::temp_dir();
+        let memory_path = tmp.join(format!("{uid}-memory.db"));
+        let conv_path = tmp.join(format!("{uid}-conv.db"));
+
+        let prompt = "system prompt";
+        let server = super::ChatServer::new(
+            LlmClient::from_backend(MockLlmBackend::new(["ok"])),
+            ToolDispatcher::new(None),
+            std::sync::Arc::new(NullConnectivityController::from_config(
+                &ConnectivityConfig::default(),
+            )),
+            Memory::open(&memory_path).unwrap(),
+            ConversationStore::open(&conv_path).unwrap(),
+            prompt.into(),
+            crate::prompt_sha::sha256_hex(prompt),
+            10,
+            ModelFamily::Phi,
+            "".into(),
+        )
+        .unwrap();
+
+        // Override HEADER_READ_TIMEOUT via a shorter test: we can't change the
+        // const at runtime, so just verify the server eventually responds and
+        // closes within a window longer than the default header timeout
+        // (10 s) — using a bigger ceiling would slow the suite. Use the
+        // existing default but assert closure occurs.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let local = tokio::task::LocalSet::new();
+        let memory_cleanup = memory_path.clone();
+        let conv_cleanup = conv_path.clone();
+        local
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let _ = server.serve_listener(listener).await;
+                });
+
+                // Send a partial request and never finish it.
+                let mut attacker = TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .unwrap();
+                attacker.write_all(b"GET /api/health").await.unwrap();
+                // Don't write CRLF. Wait for the server to time us out.
+
+                let mut buf = Vec::new();
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    attacker.read_to_end(&mut buf),
+                )
+                .await;
+                assert!(
+                    outcome.is_ok(),
+                    "server failed to time out the stalled connection within 15s"
+                );
+
+                let _ = std::fs::remove_file(&memory_cleanup);
+                let _ = std::fs::remove_file(&conv_cleanup);
             })
             .await;
     }

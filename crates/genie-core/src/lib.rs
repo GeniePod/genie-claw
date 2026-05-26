@@ -47,6 +47,7 @@ pub mod connectivity;
 pub mod context;
 pub mod conversation;
 pub mod ha;
+pub mod http_safety;
 pub mod llm;
 pub mod memory;
 pub mod ota;
