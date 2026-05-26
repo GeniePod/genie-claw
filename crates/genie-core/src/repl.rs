@@ -88,7 +88,7 @@ pub async fn run(
             .to_string();
 
             eprintln!("\nGeniePod: {}", response);
-            let _ = conversations.append_or_log(
+            conversations.append_or_log(
                 &conv_id,
                 "assistant",
                 &tool_json,
@@ -184,7 +184,7 @@ pub async fn run(
                     );
 
                     if preserve_raw {
-                        let _ = conversations.append_or_log(
+                        conversations.append_or_log(
                             &conv_id,
                             "assistant",
                             &tool_result.output,

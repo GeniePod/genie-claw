@@ -431,7 +431,7 @@ async fn run_with_wakeword(
                             .await
                             {
                                 Ok(response) => {
-                                    let _ = conversations.append_or_log(
+                                    conversations.append_or_log(
                                         conv_id,
                                         "assistant",
                                         &response,
