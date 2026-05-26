@@ -1,4 +1,9 @@
 //! Plain-TCP and TLS HTTP probes for configured service URLs.
+//!
+//! HTTPS probes verify server certificates against the Mozilla CA bundle shipped
+//! in the `webpki-roots` crate (not the host OS trust store). LAN services with
+//! self-signed certificates — common for local Home Assistant HTTPS — will fail
+//! TLS verification until an opt-in trust policy is added.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -28,7 +33,10 @@ impl Default for ProbeTimeouts {
     }
 }
 
-/// Probe a parsed service URL. Uses system trust roots for `https://` URLs.
+/// Probe a parsed service URL.
+///
+/// `https://` targets use the bundled Mozilla CA roots from `webpki-roots`.
+/// Self-signed LAN certificates (e.g. local Home Assistant HTTPS) are rejected.
 pub async fn probe_service_target(
     target: &ServiceProbeTarget,
     timeouts: ProbeTimeouts,
@@ -138,29 +146,144 @@ async fn read_http_response(
 ) -> Result<(u16, String)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
+
     loop {
-        let n = timeout(read_timeout, stream.read(&mut chunk))
-            .await
-            .map_err(|_| anyhow::anyhow!("read timeout"))??;
-        if n == 0 {
-            break;
+        if let Some(idx) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = idx + 4;
+            let status = parse_http_status(&buf[..header_end])?;
+            let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+            let body = read_http_body(stream, &mut buf, header_end, &headers, read_timeout).await?;
+            return Ok((status, body));
         }
-        buf.extend_from_slice(&chunk[..n]);
+
         if buf.len() > 64 * 1024 {
             anyhow::bail!("response too large");
         }
+
+        let n = read_with_timeout(stream, read_timeout, &mut chunk).await?;
+        if n == 0 {
+            anyhow::bail!("invalid HTTP response");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+async fn read_http_body(
+    stream: &mut (impl AsyncReadExt + Unpin),
+    buf: &mut Vec<u8>,
+    header_end: usize,
+    headers: &str,
+    read_timeout: Duration,
+) -> Result<String> {
+    let mut body = buf.split_off(header_end);
+
+    if headers
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"))
+    {
+        let decoded = read_chunked_body(stream, &mut body, read_timeout).await?;
+        return Ok(String::from_utf8_lossy(&decoded).trim().to_string());
     }
 
-    let header_end = buf
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|idx| idx + 4)
-        .ok_or_else(|| anyhow::anyhow!("invalid HTTP response"))?;
-    let status = parse_http_status(&buf[..header_end.min(buf.len())])?;
-    let body = String::from_utf8_lossy(&buf[header_end..])
-        .trim()
-        .to_string();
-    Ok((status, body))
+    if let Some(content_length) = parse_content_length(headers) {
+        read_fixed_body(stream, &mut body, content_length, read_timeout).await?;
+        return Ok(String::from_utf8_lossy(&body).trim().to_string());
+    }
+
+    // No Content-Length and not chunked — treat headers as complete. Do not
+    // wait for EOF; keep-alive servers would otherwise hit the read timeout.
+    Ok(String::from_utf8_lossy(&body).trim().to_string())
+}
+
+async fn read_fixed_body(
+    stream: &mut (impl AsyncReadExt + Unpin),
+    body: &mut Vec<u8>,
+    content_length: usize,
+    read_timeout: Duration,
+) -> Result<()> {
+    let mut chunk = [0u8; 1024];
+    while body.len() < content_length {
+        if body.len() > 64 * 1024 {
+            anyhow::bail!("response too large");
+        }
+        let n = read_with_timeout(stream, read_timeout, &mut chunk).await?;
+        if n == 0 {
+            anyhow::bail!("invalid HTTP response");
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(content_length);
+    Ok(())
+}
+
+async fn read_chunked_body(
+    stream: &mut (impl AsyncReadExt + Unpin),
+    scratch: &mut Vec<u8>,
+    read_timeout: Duration,
+) -> Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    let mut chunk = [0u8; 1024];
+
+    loop {
+        while !scratch.contains(&b'\n') {
+            if scratch.len() > 64 * 1024 {
+                anyhow::bail!("response too large");
+            }
+            let n = read_with_timeout(stream, read_timeout, &mut chunk).await?;
+            if n == 0 {
+                anyhow::bail!("invalid HTTP response");
+            }
+            scratch.extend_from_slice(&chunk[..n]);
+        }
+
+        let line_end = scratch.iter().position(|&b| b == b'\n').unwrap();
+        let size_line = String::from_utf8_lossy(&scratch[..line_end])
+            .trim()
+            .to_string();
+        let chunk_size =
+            usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
+                .map_err(|_| anyhow::anyhow!("invalid HTTP response"))?;
+        scratch.drain(..=line_end);
+
+        if chunk_size == 0 {
+            return Ok(decoded);
+        }
+
+        while scratch.len() < chunk_size + 2 {
+            if decoded.len() + scratch.len() > 64 * 1024 {
+                anyhow::bail!("response too large");
+            }
+            let n = read_with_timeout(stream, read_timeout, &mut chunk).await?;
+            if n == 0 {
+                anyhow::bail!("invalid HTTP response");
+            }
+            scratch.extend_from_slice(&chunk[..n]);
+        }
+
+        decoded.extend_from_slice(&scratch[..chunk_size]);
+        scratch.drain(..chunk_size + 2);
+    }
+}
+
+async fn read_with_timeout(
+    stream: &mut (impl AsyncReadExt + Unpin),
+    read_timeout: Duration,
+    chunk: &mut [u8; 1024],
+) -> Result<usize> {
+    timeout(read_timeout, stream.read(chunk))
+        .await
+        .map_err(|_| anyhow::anyhow!("read timeout"))?
+        .context("failed to read HTTP response")
+}
+
+fn parse_content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("content-length") {
+            return None;
+        }
+        value.trim().parse().ok()
+    })
 }
 
 async fn write_get_request(
@@ -203,6 +326,7 @@ fn tls_connector() -> Result<TlsConnector> {
     Ok(CONNECTOR
         .get_or_init(|| {
             let mut roots = RootCertStore::empty();
+            // Mozilla CA bundle (webpki-roots), not the host OS trust store.
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let config = ClientConfig::builder()
                 .with_root_certificates(roots)
@@ -287,5 +411,73 @@ mod tests {
         .unwrap();
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_http_get_accepts_keep_alive_without_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            // Leave the socket open — a keep-alive server would not send EOF.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        probe_http_get(
+            &addr.to_string(),
+            "/health",
+            false,
+            ProbeTimeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_secs(2),
+            },
+        )
+        .await
+        .unwrap();
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn probe_http_get_body_reads_content_length_without_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let body = probe_http_get_body(
+            &addr.to_string(),
+            "/health",
+            false,
+            ProbeTimeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_secs(2),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(body, "hello");
+        server.abort();
     }
 }
