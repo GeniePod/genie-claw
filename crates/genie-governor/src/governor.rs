@@ -83,20 +83,36 @@ impl Governor {
             }
             Command::MediaStart => {
                 let ts = store::now_ms();
-                // Create trigger file + transition.
-                let _ = tokio::fs::create_dir_all("/run/geniepod").await;
-                let _ = tokio::fs::write("/run/geniepod/media_mode", b"1").await;
-                let _ = self.transition(ts, Mode::Media).await;
-                serde_json::json!({"ok": true, "mode": "media"}).to_string()
+                let result: Result<Mode, anyhow::Error> = async {
+                    tokio::fs::create_dir_all("/run/geniepod").await?;
+                    tokio::fs::write("/run/geniepod/media_mode", b"1").await?;
+                    self.transition(ts, Mode::Media).await?;
+                    Ok(Mode::Media)
+                }
+                .await;
+                match result {
+                    Ok(mode) => serde_json::json!({"ok": true, "mode": mode}).to_string(),
+                    Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                }
             }
             Command::MediaStop => {
                 let ts = store::now_ms();
-                let _ = tokio::fs::remove_file("/run/geniepod/media_mode").await;
-                // Determine what mode we should return to.
                 let mem_avail = tegrastats::mem_available_mb().unwrap_or(4096);
                 let target = self.determine_mode(mem_avail);
-                let _ = self.transition(ts, target).await;
-                serde_json::json!({"ok": true, "mode": target}).to_string()
+                let result: Result<Mode, anyhow::Error> = async {
+                    if let Err(error) = tokio::fs::remove_file("/run/geniepod/media_mode").await
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        return Err(error.into());
+                    }
+                    self.transition(ts, target).await?;
+                    Ok(target)
+                }
+                .await;
+                match result {
+                    Ok(mode) => serde_json::json!({"ok": true, "mode": mode}).to_string(),
+                    Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                }
             }
             Command::Status => {
                 let mem_avail = tegrastats::mem_available_mb().unwrap_or(0);
