@@ -4,14 +4,13 @@ use genie_common::config::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::actuation::{
-    ActionLedger, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager, PendingConfirmation,
+    ActionLedger, AuditError, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager,
+    PendingConfirmation, append_json_line,
     RecordedAction, RequestOrigin, now_ms,
 };
 use super::home;
@@ -103,21 +102,21 @@ impl ToolAuditLogger {
         }
     }
 
-    fn append(&self, event: ToolAuditEvent) {
+    fn append(&self, event: ToolAuditEvent) -> Result<(), AuditError> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
-        let _guard = self.lock.lock().expect("tool audit logger lock");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        append_json_line(path, &self.lock, &event)
+    }
+
+    fn append_or_log(&self, event: ToolAuditEvent) {
+        if let Err(err) = self.append(event) {
+            tracing::error!(
+                path = ?self.path,
+                error = %err,
+                "tool audit event dropped due to IO failure"
+            );
         }
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-            return;
-        };
-        let Ok(line) = serde_json::to_string(&event) else {
-            return;
-        };
-        let _ = writeln!(file, "{line}");
     }
 
     fn path(&self) -> Option<&std::path::Path> {
@@ -551,7 +550,7 @@ impl ToolDispatcher {
         started: Instant,
         result: &ToolResult,
     ) {
-        self.tool_audit_logger.append(ToolAuditEvent {
+        self.tool_audit_logger.append_or_log(ToolAuditEvent {
             ts_ms: now_ms(),
             tool: call.name.clone(),
             origin: exec_ctx.request_origin,
@@ -591,7 +590,7 @@ impl ToolDispatcher {
                 "actuation from '{}' is not allowed by channel policy",
                 exec_ctx.request_origin.as_policy_key()
             );
-            self.audit_logger.append(AuditEvent {
+            self.audit_logger.append_or_log(AuditEvent {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedPolicy,
                 origin: exec_ctx.request_origin,
@@ -616,7 +615,7 @@ impl ToolDispatcher {
                 .check_and_record(&self.actuation_safety, exec_ctx.request_origin)
         {
             let reason = err.to_string();
-            self.audit_logger.append(AuditEvent {
+            self.audit_logger.append_or_log(AuditEvent {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedRuntime,
                 origin: exec_ctx.request_origin,
@@ -663,7 +662,7 @@ impl ToolDispatcher {
                         confidence,
                     )
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::Executed,
                     origin: exec_ctx.request_origin,
@@ -686,7 +685,7 @@ impl ToolDispatcher {
                     &reason,
                     exec_ctx.request_origin,
                 );
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::ConfirmationIssued,
                     origin: exec_ctx.request_origin,
@@ -713,7 +712,7 @@ impl ToolDispatcher {
                 } else {
                     AuditStatus::Failed
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status,
                     origin: exec_ctx.request_origin,
@@ -1735,6 +1734,46 @@ mod tests {
         let result = dispatcher.execute(&call).await;
         assert!(result.success);
         assert!(!result.output.is_empty());
+    }
+
+    #[test]
+    fn tool_audit_logger_disabled_append_is_ok() {
+        let logger = ToolAuditLogger::default();
+        let result = logger.append(ToolAuditEvent {
+            ts_ms: 1,
+            tool: "get_time".into(),
+            origin: RequestOrigin::Repl,
+            success: true,
+            duration_ms: 0,
+            argument_keys: vec![],
+            output_chars: 0,
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn tool_audit_logger_surfaces_blocked_parent_error() {
+        let blocker = std::env::temp_dir().join(format!(
+            "geniepod-tool-audit-blocker-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not-a-directory").unwrap();
+        let log_path = blocker.join("tool-audit.jsonl");
+        let logger = ToolAuditLogger::new(log_path);
+        let err = logger
+            .append(ToolAuditEvent {
+                ts_ms: 1,
+                tool: "get_time".into(),
+                origin: RequestOrigin::Api,
+                success: true,
+                duration_ms: 1,
+                argument_keys: vec![],
+                output_chars: 0,
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::CreateDir(_)));
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[tokio::test]
