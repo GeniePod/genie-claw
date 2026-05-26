@@ -863,7 +863,7 @@ impl ToolDispatcher {
         let query = memory_query(args);
         let read_context = exec_ctx
             .memory_read_context
-            .unwrap_or_else(|| memory_read_context(args));
+            .unwrap_or_else(crate::memory::policy::MemoryReadContext::shared_room_voice);
 
         let results = crate::memory::recall::recall_with_context(&mem, query, 10, read_context)?;
         if results.is_empty() {
@@ -1169,37 +1169,6 @@ fn memory_query(args: &serde_json::Value) -> &str {
         "user"
     } else {
         raw
-    }
-}
-
-fn memory_read_context(args: &serde_json::Value) -> crate::memory::policy::MemoryReadContext {
-    let identity_confidence = match args
-        .get("identity_confidence")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "high" => crate::memory::policy::IdentityConfidence::High,
-        "medium" => crate::memory::policy::IdentityConfidence::Medium,
-        "low" => crate::memory::policy::IdentityConfidence::Low,
-        _ => crate::memory::policy::IdentityConfidence::Unknown,
-    };
-
-    crate::memory::policy::MemoryReadContext {
-        identity_confidence,
-        explicit_named_person: args
-            .get("explicit_named_person")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        explicit_private_intent: args
-            .get("explicit_private_intent")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        shared_space_voice: args
-            .get("shared_space_voice")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
     }
 }
 
@@ -2165,7 +2134,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_recall_can_use_identity_context_when_provided() {
+    fn memory_recall_unlocks_person_memory_with_verified_exec_ctx() {
+        // Verified identity context from the server/voice layer (in exec_ctx)
+        // must unlock person-scoped memories.
         let db = std::env::temp_dir().join(format!(
             "memory-recall-identity-test-{}.db",
             std::process::id()
@@ -2180,15 +2151,56 @@ mod tests {
 
         let output = dispatcher
             .exec_memory_recall(
-                &serde_json::json!({
-                    "query": "oat milk",
-                    "identity_confidence": "high"
-                }),
-                ToolExecutionContext::default(),
+                &serde_json::json!({ "query": "oat milk" }),
+                ToolExecutionContext {
+                    memory_read_context: Some(crate::memory::policy::MemoryReadContext {
+                        identity_confidence: crate::memory::policy::IdentityConfidence::High,
+                        explicit_named_person: false,
+                        explicit_private_intent: false,
+                        shared_space_voice: true,
+                    }),
+                    ..ToolExecutionContext::default()
+                },
             )
             .unwrap();
 
         assert_eq!(output, "I remember: Maya likes oat milk");
+    }
+
+    #[test]
+    fn memory_recall_llm_args_cannot_elevate_identity_confidence() {
+        // Security regression: the LLM must not bypass the person-scoped memory
+        // policy gate by passing identity_confidence/explicit_named_person in its
+        // tool-call arguments. Those fields are attacker-controlled and must be
+        // ignored when no verified MemoryReadContext is set on exec_ctx.
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-llm-bypass-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        // LLM passes elevated identity signals in args — must NOT unlock person-scoped memory
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({
+                    "query": "oat milk",
+                    "identity_confidence": "high",
+                    "explicit_named_person": true
+                }),
+                ToolExecutionContext::default(), // no verified identity in exec_ctx
+            )
+            .unwrap();
+
+        assert!(
+            !output.contains("Maya likes oat milk"),
+            "LLM args must not bypass person-scoped memory policy, got: {output}"
+        );
     }
 
     #[tokio::test]
