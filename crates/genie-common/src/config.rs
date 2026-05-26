@@ -858,6 +858,33 @@ pub fn parse_service_probe_target(url: &str) -> ServiceProbeTarget {
     ServiceProbeTarget::Http { addr, path }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceUrlDrift {
+    service: &'static str,
+    configured_url: String,
+    services_url_addr: String,
+    listen_addr: String,
+}
+
+fn record_http_url_drift(
+    drifts: &mut Vec<ServiceUrlDrift>,
+    service: &'static str,
+    configured_url: &str,
+    listen_addr: &str,
+) {
+    match parse_service_probe_target(configured_url) {
+        ServiceProbeTarget::Http { addr, .. } if addr != listen_addr => {
+            drifts.push(ServiceUrlDrift {
+                service,
+                configured_url: configured_url.to_string(),
+                services_url_addr: addr,
+                listen_addr: listen_addr.to_string(),
+            });
+        }
+        ServiceProbeTarget::Http { .. } | ServiceProbeTarget::UnsupportedScheme { .. } => {}
+    }
+}
+
 /// Split a URL into `(lowercased_scheme, rest_after_://)` when it starts
 /// with a `scheme://` prefix; otherwise `None`.
 fn split_scheme(url: &str) -> Option<(&'static str, &str)> {
@@ -942,6 +969,7 @@ impl Config {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("failed to read config {}: {}", path.display(), e))?;
         let config: Config = toml::from_str(&contents)?;
+        config.validate_service_url_drift();
         Ok(config)
     }
 
@@ -990,6 +1018,37 @@ impl Config {
     /// `http://…/api/status` URL for dashboard latency probes.
     pub fn api_status_url(&self) -> anyhow::Result<String> {
         Ok(format!("http://{}/api/status", self.api_http_addr()?))
+    }
+
+    /// Compare configured service URLs against derived listen addresses and log
+    /// warnings when they disagree. Does not fail startup.
+    pub fn validate_service_url_drift(&self) {
+        for drift in self.service_url_drifts() {
+            tracing::warn!(
+                service = drift.service,
+                configured_url = %drift.configured_url,
+                services_url_addr = %drift.services_url_addr,
+                listen_addr = %drift.listen_addr,
+                "service URL host:port disagrees with listen address"
+            );
+        }
+    }
+
+    fn service_url_drifts(&self) -> Vec<ServiceUrlDrift> {
+        let mut drifts = Vec::new();
+
+        record_http_url_drift(
+            &mut drifts,
+            "core",
+            &self.services.core.url,
+            &self.core_http_addr(),
+        );
+
+        if let Ok(listen_addr) = self.api_http_addr() {
+            record_http_url_drift(&mut drifts, "api", &self.services.api.url, &listen_addr);
+        }
+
+        drifts
     }
 
     /// Resolve the configured Home Assistant endpoint, if this deployment uses one.
@@ -1610,6 +1669,51 @@ systemd_unit = "genie-ai-runtime.service"
         config.core.port = 3001;
         config.services.core.url = "http://127.0.0.1:3000/api/health".into();
         assert_eq!(config.core_health_url(), "http://127.0.0.1:3001/api/health");
+    }
+
+    #[test]
+    fn validate_service_url_drift_empty_on_aligned_defaults() {
+        let config = test_config();
+        assert!(config.service_url_drifts().is_empty());
+    }
+
+    #[test]
+    fn validate_service_url_drift_detects_stale_core_port() {
+        let mut config = test_config();
+        config.core.port = 3001;
+        config.services.core.url = "http://127.0.0.1:3000/api/health".into();
+
+        let drifts = config.service_url_drifts();
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].service, "core");
+        assert_eq!(drifts[0].services_url_addr, "127.0.0.1:3000");
+        assert_eq!(drifts[0].listen_addr, "127.0.0.1:3001");
+    }
+
+    #[test]
+    fn validate_service_url_drift_detects_core_host_mismatch() {
+        let mut config = test_config();
+        config.core.bind_host = "10.0.0.5".into();
+        config.core.port = 4000;
+        config.services.core.url = "http://127.0.0.1:3000/api/health".into();
+
+        let drifts = config.service_url_drifts();
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].service, "core");
+        assert_eq!(drifts[0].services_url_addr, "127.0.0.1:3000");
+        assert_eq!(drifts[0].listen_addr, "10.0.0.5:4000");
+    }
+
+    #[test]
+    fn validate_service_url_drift_skips_unsupported_api_scheme() {
+        let mut config = test_config();
+        config.services.api.url = "https://api.example/api/status".into();
+        assert!(config.service_url_drifts().is_empty());
+    }
+
+    #[test]
+    fn validate_service_url_drift_no_panic_on_defaults() {
+        test_config().validate_service_url_drift();
     }
 
     #[test]
