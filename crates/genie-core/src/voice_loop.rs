@@ -348,6 +348,11 @@ async fn run_with_wakeword(
                     if let Ok(transcript) = stt_engine.transcribe_file(&followup_path).await {
                         let text = transcript.text.trim().to_string();
                         if !text.is_empty() {
+                            // Security: scan for prompt injection (issue #196).
+                            crate::security::injection::scan_and_warn(
+                                &text,
+                                crate::security::injection::source::VOICE_FOLLOWUP,
+                            );
                             let response_language = transcript.language.clone().or_else(|| {
                                 crate::voice::language::detect_language_from_text(&text)
                             });
@@ -378,7 +383,7 @@ async fn run_with_wakeword(
 
                             // Build context and process — reuse voice_cycle but skip recording
                             // (we already have the text).
-                            let _ = conversations.append(conv_id, "user", &text, None);
+                            conversations.append_or_log(conv_id, "user", &text, None);
 
                             if handle_quick_tool_for_voice(
                                 tools,
@@ -431,8 +436,12 @@ async fn run_with_wakeword(
                             .await
                             {
                                 Ok(response) => {
-                                    let _ =
-                                        conversations.append(conv_id, "assistant", &response, None);
+                                    conversations.append_or_log(
+                                        conv_id,
+                                        "assistant",
+                                        &response,
+                                        None,
+                                    );
                                     eprintln!("[voice] GeniePod: {}", format::for_voice(&response));
                                 }
                                 Err(e) => {
@@ -727,9 +736,9 @@ async fn handle_quick_tool_for_voice(
         })
         .to_string();
 
-        let _ = conversations.append(conv_id, "assistant", &tool_json, Some("web_search"));
-        let _ = conversations.append(conv_id, "system", &format!("Tool: {}", response), None);
-        let _ = conversations.append(conv_id, "assistant", &response, None);
+        conversations.append_or_log(conv_id, "assistant", &tool_json, Some("web_search"));
+        conversations.append_or_log(conv_id, "system", &format!("Tool: {}", response), None);
+        conversations.append_or_log(conv_id, "assistant", &response, None);
 
         let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
         let voice_text = format::for_voice(&voice_response);
@@ -762,14 +771,14 @@ async fn handle_quick_tool_for_voice(
     })
     .to_string();
 
-    let _ = conversations.append(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
-    let _ = conversations.append(
+    conversations.append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+    conversations.append_or_log(
         conv_id,
         "system",
         &format!("Tool: {}", tool_result.output),
         None,
     );
-    let _ = conversations.append(conv_id, "assistant", &response, None);
+    conversations.append_or_log(conv_id, "assistant", &response, None);
 
     let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
     let voice_text = format::for_voice(&response);
@@ -996,6 +1005,8 @@ pub async fn process_transcript(
         eprintln!("[voice] No speech detected.");
         return true;
     }
+    // Security: scan for prompt injection (issue #196).
+    crate::security::injection::scan_and_warn(&text, crate::security::injection::source::VOICE);
     if let VoiceIntentDecision::Reject(reason) = intent::assess_transcript(&text) {
         if let Some(path) = wav_path {
             let _ = tokio::fs::remove_file(path).await;
@@ -1029,7 +1040,7 @@ pub async fn process_transcript(
         "[voice] You said: \"{}\" (STT: {} ms)",
         text, transcript.duration_ms
     );
-    let _ = conversations.append(conv_id, "user", &text, None);
+    conversations.append_or_log(conv_id, "user", &text, None);
 
     if let Some(final_response) = handle_quick_tool_for_voice(
         tools,
@@ -1149,8 +1160,8 @@ pub async fn process_transcript(
             "[voice] Tool: {} → {}",
             tool_result.tool, tool_result.output
         );
-        let _ = conversations.append(conv_id, "assistant", &response, Some(&tool_result.tool));
-        let _ = conversations.append(
+        conversations.append_or_log(conv_id, "assistant", &response, Some(&tool_result.tool));
+        conversations.append_or_log(
             conv_id,
             "system",
             &format!("Tool: {}", tool_result.output),
@@ -1209,10 +1220,10 @@ pub async fn process_transcript(
             }
         };
 
-        let _ = conversations.append(conv_id, "assistant", &summary, None);
+        conversations.append_or_log(conv_id, "assistant", &summary, None);
         (summary, Some(tool_result.tool))
     } else {
-        let _ = conversations.append(conv_id, "assistant", &response, None);
+        conversations.append_or_log(conv_id, "assistant", &response, None);
         (response, None)
     };
 

@@ -188,6 +188,20 @@ interval_secs = 30
 alert_enabled = false
 alert_webhook_url = ""            # Optional local notifier endpoint.
 
+# Inbound HTTP-server hardening, shared by genie-core (:3000) and genie-api
+# (:3080). Bounds the hand-rolled request reader so a single unauthenticated
+# peer on the LAN cannot exhaust memory (an endless header), stall the listener
+# with half-open connections, or fd-exhaust the daemon (issue #195). Defaults
+# are safe; tune only if a first-party client legitimately needs larger headers
+# or more concurrency.
+[http]
+max_request_line_bytes = 8192    # Reject request lines longer than this (431).
+max_header_line_bytes = 8192     # Reject any single header line longer than this (431).
+max_header_count = 100           # Reject more than this many header lines (431).
+max_header_bytes = 65536         # Reject when total header bytes exceed this (431).
+read_timeout_secs = 15           # Drop a connection that stalls mid-request.
+max_connections = 256            # Ceiling on concurrently handled connections.
+
 # Uncomment to enable Telegram long-poll chat integration:
 # [telegram]
 # enabled = true
