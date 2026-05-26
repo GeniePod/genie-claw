@@ -379,19 +379,39 @@ fn is_remote_url(url: &str) -> bool {
     !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SkillPolicyConfig {
     /// Reject skills without a valid sidecar manifest.
     #[serde(default)]
     pub require_manifest: bool,
 
-    /// Reject skills whose manifest does not declare signature material.
+    /// Reject skills whose `.so` bytes are not verified by a detached Ed25519
+    /// signature against a trusted key in `signature_key_dir`. The signature
+    /// is cryptographically checked before the library is loaded; a non-empty
+    /// `signature` field alone does not satisfy this.
     #[serde(default)]
     pub require_signature: bool,
+
+    /// Directory of trusted Ed25519 public keys (`<key_id>.pub`, base64) used
+    /// to verify skill signatures. Lives outside the skills directory so a
+    /// party who can drop a `.so` cannot also add a trusting key.
+    #[serde(default = "defaults::skill_signature_key_dir")]
+    pub signature_key_dir: PathBuf,
 
     /// Reject skills requesting any of these permission labels.
     #[serde(default)]
     pub denied_permissions: Vec<String>,
+}
+
+impl Default for SkillPolicyConfig {
+    fn default() -> Self {
+        Self {
+            require_manifest: false,
+            require_signature: false,
+            signature_key_dir: defaults::skill_signature_key_dir(),
+            denied_permissions: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -878,6 +898,20 @@ fn split_scheme(url: &str) -> Option<(&'static str, &str)> {
     None
 }
 
+/// True if `dir` holds at least one `*.pub` trusted-key file. Used only for
+/// the security-posture report — the loader does the real key parsing — so a
+/// cheap presence check is enough to tell an operator whether
+/// `require_signature` is actually usable as configured.
+fn has_trusted_skill_keys(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("pub"))
+        })
+        .unwrap_or(false)
+}
+
 /// Split `authority[path]` into (authority, path). IPv6 brackets are
 /// respected: the first `/` *after* a closing `]` is the path delimiter,
 /// not any earlier slash that might appear inside `[…]` (it can't today,
@@ -1117,6 +1151,11 @@ impl Config {
         }
         if !self.core.skill_policy.require_signature {
             risk_flags.push("skill_signature_not_required");
+        } else if !has_trusted_skill_keys(&self.core.skill_policy.signature_key_dir) {
+            // require_signature is on but no trusted keys are installed: the
+            // loader fails closed (no skill can load), so flag the misconfig
+            // rather than silently rejecting every skill.
+            risk_flags.push("skill_signature_required_but_no_trusted_keys");
         }
 
         serde_json::json!({
@@ -1168,7 +1207,10 @@ impl Config {
                 "sensitive_multi_target_denied": self.core.actuation_safety.deny_multi_target_sensitive,
                 "available_state_required": self.core.actuation_safety.require_available_state,
                 "skill_manifest_required": self.core.skill_policy.require_manifest,
-                "skill_signature_required": self.core.skill_policy.require_signature
+                "skill_signature_required": self.core.skill_policy.require_signature,
+                "skill_signature_scheme": "ed25519_detached_over_so_bytes",
+                "skill_signature_key_dir": self.core.skill_policy.signature_key_dir.display().to_string(),
+                "skill_signature_trusted_keys_present": has_trusted_skill_keys(&self.core.skill_policy.signature_key_dir)
             },
             "secret_presence": {
                 "homeassistant_token_configured": self.homeassistant_token().is_some(),
@@ -1855,6 +1897,46 @@ denied_permissions = ["network.raw", "filesystem.write"]
             config.denied_permissions,
             vec!["network.raw", "filesystem.write"]
         );
+        // Defaults to the distribution key dir when not overridden.
+        assert_eq!(
+            config.signature_key_dir,
+            PathBuf::from("/etc/geniepod/skill-keys")
+        );
+    }
+
+    #[test]
+    fn skill_policy_signature_key_dir_overridable() {
+        let config: SkillPolicyConfig = toml::from_str(
+            r#"
+require_signature = true
+signature_key_dir = "/custom/keys"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.signature_key_dir, PathBuf::from("/custom/keys"));
+    }
+
+    #[test]
+    fn security_posture_flags_require_signature_without_keys() {
+        let mut config = test_config();
+        config.core.skill_policy.require_signature = true;
+        // Point at a directory with no trusted keys → loader fails closed.
+        config.core.skill_policy.signature_key_dir =
+            PathBuf::from("/nonexistent/geniepod-skill-keys");
+
+        let posture = config.household_security_summary();
+        let flags = posture["risk_flags"].as_array().unwrap();
+        let has = |name: &str| flags.iter().any(|f| f == name);
+        assert!(has("skill_signature_required_but_no_trusted_keys"));
+        assert!(!has("skill_signature_not_required"));
+        assert_eq!(
+            posture["policy"]["skill_signature_required"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            posture["policy"]["skill_signature_trusted_keys_present"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]
@@ -2153,6 +2235,9 @@ mod defaults {
     }
     pub fn speaker_identity_min_score() -> f32 {
         0.82
+    }
+    pub fn skill_signature_key_dir() -> PathBuf {
+        PathBuf::from("/etc/geniepod/skill-keys")
     }
     pub fn tool_policy_enabled() -> bool {
         true

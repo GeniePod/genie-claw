@@ -6,11 +6,13 @@
 use std::path::PathBuf;
 
 pub mod loader;
+pub mod signature;
 
 pub use loader::{
     LoadedSkill, SkillLoadPolicy, SkillLoader, SkillManifest, SkillManifestAudit,
     find_manifest_sidecar, manifest_sidecar_candidates,
 };
+pub use signature::TrustedKeys;
 
 pub const DEFAULT_SKILLS_DIR: &str = "/opt/geniepod/skills";
 

@@ -619,10 +619,14 @@ fn cmd_skill_list() -> Result<()> {
             } else {
                 &skill.manifest.reviewed_by
             };
-            println!(
-                "    reviewed: {}; signed: {}",
-                reviewer, skill.manifest.signed
-            );
+            // `signed` is true only when a trusted key cryptographically
+            // verified the .so bytes; name the key that did.
+            let signed = if skill.manifest.signed {
+                format!("verified (key: {})", skill.manifest.key_id)
+            } else {
+                "no".to_string()
+            };
+            println!("    reviewed: {reviewer}; signed: {signed}");
         }
         if !skill.manifest.error.is_empty() {
             println!("    manifest note: {}", skill.manifest.error);
@@ -2179,7 +2183,9 @@ mod tests {
             installed_skills[0].manifest.permissions,
             vec!["speech.output"]
         );
-        assert!(installed_skills[0].manifest.signed);
+        // A bare "signature" string is not "signed": `signed` is set only by
+        // cryptographic verification against a trusted key, not by presence.
+        assert!(!installed_skills[0].manifest.signed);
 
         let removed = remove_skill("hello_world", &skills_dir).unwrap();
         assert_eq!(removed.file_name().unwrap().to_string_lossy(), "hello.so");

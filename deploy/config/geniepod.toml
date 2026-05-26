@@ -150,7 +150,11 @@ wakeword_script = ""              # Empty = push-to-talk (alpha.5 default).
 # local skills keep loading; enable these after manifests/signatures are ready.
 # [core.skill_policy]
 # require_manifest = false
-# require_signature = false
+# require_signature = false   # when true, only skills whose .so bytes are
+#                             # verified by a trusted Ed25519 key load (checked
+#                             # before dlopen); a non-empty signature string is
+#                             # not enough. Fails closed with no trusted keys.
+# signature_key_dir = "/etc/geniepod/skill-keys"  # holds <key_id>.pub keys
 # denied_permissions = ["network.raw", "filesystem.write"]
 
 # Optional per-origin tool policy. Defaults are allow unless a rule exists.

@@ -48,7 +48,10 @@ expected_runtime_contract_hash = ""  # Optional: pin after a known-good boot.
 
 # [core.skill_policy]
 # require_manifest = false
-# require_signature = false
+# require_signature = false   # true => verify a trusted Ed25519 signature over
+#                             # the .so bytes before dlopen (presence of a
+#                             # signature string is not enough)
+# signature_key_dir = "/etc/geniepod/skill-keys"  # holds <key_id>.pub keys
 # denied_permissions = ["network.raw", "filesystem.write"]
 
 # [core.tool_policy]

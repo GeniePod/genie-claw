@@ -139,7 +139,8 @@ the preferred filename is `myskill.skill.json`.
   "permissions": ["network.http"],
   "capabilities": ["example.lookup"],
   "reviewed_by": "local-operator",
-  "signature": ""
+  "key_id": "geniepod",
+  "signature": "<base64 Ed25519 signature over the .so bytes>"
 }
 ```
 
@@ -150,10 +151,42 @@ Current runtime behavior:
 - Operators can enable `[core.skill_policy].require_manifest` to reject missing or mismatched manifests.
 - Operators can deny requested permission labels through `[core.skill_policy].denied_permissions`.
 - `genie-ctl skill install` copies a detected sidecar manifest.
-- `genie-ctl skill list` shows manifest status, permissions, capabilities, review, and signing presence.
+- `genie-ctl skill list` shows manifest status, permissions, capabilities, review, and whether the skill is cryptographically signed.
 
-`require_signature` currently checks only that signature material exists.
-Cryptographic signature verification is future signed-skill work.
+#### Signing a skill (`require_signature`)
+
+`require_signature` is a **real** authenticity gate, not a presence check. When
+it is enabled the loader verifies, **before `dlopen`**, that the `.so` bytes
+carry a detached **Ed25519** signature produced by a trusted key. A non-empty
+`signature` string alone does **not** count as signed.
+
+- `signature` — base64 of the Ed25519 signature over the exact bytes of the
+  `.so` that will be loaded.
+- `key_id` — the trusted key that produced the signature: the file stem of a
+  `<key_id>.pub` file in `[core.skill_policy].signature_key_dir`
+  (default `/etc/geniepod/skill-keys`). Each `.pub` holds the base64-encoded
+  32-byte Ed25519 public key.
+
+A skill fails to load when `require_signature` is on and the signature is
+missing, malformed, signed by an untrusted key, or no longer matches the `.so`
+bytes (tamper). Verification fails closed: with no trusted keys installed, no
+skill loads.
+
+Generate a key pair and sign a `.so` (raw-byte Ed25519, base64) — e.g. with
+Python's `cryptography`:
+
+```python
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization as s
+import base64, sys
+
+sk = Ed25519PrivateKey.generate()
+pub = sk.public_key().public_bytes(s.Encoding.Raw, s.PublicFormat.Raw)
+print("write to /etc/geniepod/skill-keys/geniepod.pub:", base64.b64encode(pub).decode())
+print('"signature":', base64.b64encode(sk.sign(open(sys.argv[1], "rb").read())).decode())
+```
+
+Set `"key_id": "geniepod"` and the printed `signature` in the sidecar manifest.
 
 ### Step 6: Test
 
@@ -438,8 +471,9 @@ Layer 3: catch_unwind crash containment
 Layer 4: Auto-unload after 3 faults
          → Misbehaving skills are automatically removed
 
-Layer 5: Signature verification (optional)
-         → Unsigned skills trigger taint warning
+Layer 5: Signature verification (optional, enforced before dlopen)
+         → With [core.skill_policy].require_signature = true, only .so bytes
+           verified by a trusted Ed25519 key load; others are rejected
 ```
 
 ### Trust Levels

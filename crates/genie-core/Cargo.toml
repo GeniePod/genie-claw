@@ -47,6 +47,10 @@ toml = { workspace = true }
 genie-skill-sdk = { path = "../genie-skill-sdk" }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+# Detached Ed25519 verification of native skill `.so` bytes before dlopen.
+# Verification only — no RNG/key-generation features pulled into the runtime.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+base64 = "0.22"
 
 [dev-dependencies]
 toml = { workspace = true }

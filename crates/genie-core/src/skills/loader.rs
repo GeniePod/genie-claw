@@ -12,10 +12,14 @@ use genie_skill_sdk::{ABI_VERSION, SkillVTable};
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
 
+use crate::skills::signature::TrustedKeys;
+
 /// Optional sidecar metadata for a native skill.
 ///
 /// A skill named `hello.so` can declare metadata in `hello.skill.json`.
-/// The loader treats this as audit metadata today, not as a signature check.
+/// `signature`/`key_id` are cryptographic material: a detached Ed25519
+/// signature over the `.so` bytes, verified by the loader against a trusted
+/// public key before the library is loaded.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SkillManifest {
@@ -31,8 +35,12 @@ pub struct SkillManifest {
     pub capabilities: Vec<String>,
     /// Reviewer identity or process name.
     pub reviewed_by: String,
-    /// Signature material or signature reference. Presence only is reported.
+    /// Base64-encoded detached Ed25519 signature over the `.so` bytes. Verified
+    /// against the trusted key named by `key_id`; not trusted by presence.
     pub signature: String,
+    /// Id of the trusted public key that produced `signature` (the `.pub`
+    /// file stem in the trusted-key directory).
+    pub key_id: String,
 }
 
 /// Audit view of the manifest state for a loaded skill.
@@ -46,16 +54,34 @@ pub struct SkillManifestAudit {
     pub permissions: Vec<String>,
     pub capabilities: Vec<String>,
     pub reviewed_by: String,
+    /// Id of the trusted key claimed by the manifest (audit only).
+    pub key_id: String,
+    /// True only when a trusted key cryptographically verified the signature
+    /// over the `.so` bytes — never set by mere presence of a string.
     pub signed: bool,
     pub error: String,
 }
 
 /// Runtime load policy for native skills.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SkillLoadPolicy {
     pub require_manifest: bool,
     pub require_signature: bool,
     pub denied_permissions: Vec<String>,
+    /// Directory of trusted Ed25519 public keys used to verify skill
+    /// signatures. Lives outside the (attacker-writable) skills directory.
+    pub signature_key_dir: PathBuf,
+}
+
+impl Default for SkillLoadPolicy {
+    fn default() -> Self {
+        Self {
+            require_manifest: false,
+            require_signature: false,
+            denied_permissions: Vec::new(),
+            signature_key_dir: SkillPolicyConfig::default().signature_key_dir,
+        }
+    }
 }
 
 impl From<&SkillPolicyConfig> for SkillLoadPolicy {
@@ -64,6 +90,7 @@ impl From<&SkillPolicyConfig> for SkillLoadPolicy {
             require_manifest: config.require_manifest,
             require_signature: config.require_signature,
             denied_permissions: config.denied_permissions.clone(),
+            signature_key_dir: config.signature_key_dir.clone(),
         }
     }
 }
@@ -79,6 +106,7 @@ impl SkillManifestAudit {
             permissions: Vec::new(),
             capabilities: Vec::new(),
             reviewed_by: String::new(),
+            key_id: String::new(),
             signed: false,
             error: "no sidecar manifest found".into(),
         }
@@ -94,14 +122,20 @@ impl SkillManifestAudit {
             permissions: Vec::new(),
             capabilities: Vec::new(),
             reviewed_by: String::new(),
+            key_id: String::new(),
             signed: false,
             error,
         }
     }
 
+    /// Build an audit from a parsed manifest. `signed` is the result of
+    /// cryptographic verification performed by the loader against the `.so`
+    /// bytes — it is decided here, never from the presence of the signature
+    /// string.
     fn from_manifest(
         path: PathBuf,
         manifest: SkillManifest,
+        signed: bool,
         loaded_name: &str,
         loaded_version: &str,
     ) -> Self {
@@ -130,7 +164,6 @@ impl SkillManifestAudit {
         } else {
             "mismatch"
         };
-        let signed = !manifest.signature.trim().is_empty();
 
         Self {
             status: status.into(),
@@ -141,6 +174,7 @@ impl SkillManifestAudit {
             permissions: manifest.permissions,
             capabilities: manifest.capabilities,
             reviewed_by: manifest.reviewed_by,
+            key_id: manifest.key_id,
             signed,
             error: problems.join("; "),
         }
@@ -260,13 +294,24 @@ pub fn find_manifest_sidecar(skill_path: &Path) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-fn read_manifest_audit(
-    skill_path: &Path,
-    loaded_name: &str,
-    loaded_version: &str,
-) -> SkillManifestAudit {
+/// Parsed state of a skill's sidecar manifest, before it is matched against
+/// the loaded vtable. Kept separate from [`SkillManifestAudit`] so signature
+/// verification can run on the raw manifest *before* the `.so` is loaded.
+enum ManifestSource {
+    Missing,
+    Invalid {
+        path: PathBuf,
+        error: String,
+    },
+    Present {
+        path: PathBuf,
+        manifest: SkillManifest,
+    },
+}
+
+fn read_manifest_source(skill_path: &Path) -> ManifestSource {
     let Some(path) = find_manifest_sidecar(skill_path) else {
-        return SkillManifestAudit::missing();
+        return ManifestSource::Missing;
     };
 
     match std::fs::read_to_string(&path)
@@ -274,13 +319,49 @@ fn read_manifest_audit(
         .and_then(|content| {
             serde_json::from_str::<SkillManifest>(&content).map_err(|e| e.to_string())
         }) {
-        Ok(manifest) => {
-            SkillManifestAudit::from_manifest(path, manifest, loaded_name, loaded_version)
-        }
-        Err(error) => SkillManifestAudit::invalid(path, error),
+        Ok(manifest) => ManifestSource::Present { path, manifest },
+        Err(error) => ManifestSource::Invalid { path, error },
     }
 }
 
+/// Verify the sidecar's detached signature over the exact bytes of the `.so`
+/// that will be loaded. Returns `true` only when a trusted key validates the
+/// signature over the file contents; fails closed on any read or verification
+/// error. This must be evaluated on the bytes that will actually execute.
+fn verify_skill_signature(
+    skill_path: &Path,
+    manifest: &SkillManifest,
+    trusted_keys: &TrustedKeys,
+) -> bool {
+    match std::fs::read(skill_path) {
+        Ok(bytes) => trusted_keys.verify_detached(&manifest.key_id, &bytes, &manifest.signature),
+        Err(_) => false,
+    }
+}
+
+/// Build the audit view once the vtable's name/version are known. `signed`
+/// carries the verification result computed before load.
+fn build_manifest_audit(
+    source: ManifestSource,
+    signed: bool,
+    loaded_name: &str,
+    loaded_version: &str,
+) -> SkillManifestAudit {
+    match source {
+        ManifestSource::Missing => SkillManifestAudit::missing(),
+        ManifestSource::Invalid { path, error } => SkillManifestAudit::invalid(path, error),
+        ManifestSource::Present { path, manifest } => {
+            SkillManifestAudit::from_manifest(path, manifest, signed, loaded_name, loaded_version)
+        }
+    }
+}
+
+/// Post-load policy checks that depend on the loaded vtable (manifest
+/// name/version match and requested permissions).
+///
+/// The signature gate is enforced *before* `dlopen` in [`SkillLoader::load_skill`]
+/// — never here — because by the time this runs the native code has already
+/// been loaded.
 fn enforce_skill_policy(manifest: &SkillManifestAudit, policy: &SkillLoadPolicy) -> Result<()> {
     if policy.require_manifest && manifest.status != "ok" {
         anyhow::bail!(
@@ -288,10 +369,6 @@ fn enforce_skill_policy(manifest: &SkillManifestAudit, policy: &SkillLoadPolicy)
             manifest.status,
             manifest.error
         );
-    }
-
-    if policy.require_signature && !manifest.signed {
-        anyhow::bail!("skill signature required but manifest is unsigned");
     }
 
     let denied = manifest
@@ -311,6 +388,7 @@ fn enforce_skill_policy(manifest: &SkillManifestAudit, policy: &SkillLoadPolicy)
 pub struct SkillLoader {
     skills_dir: PathBuf,
     policy: SkillLoadPolicy,
+    trusted_keys: TrustedKeys,
     loaded: Vec<LoadedSkill>,
 }
 
@@ -320,9 +398,18 @@ impl SkillLoader {
     }
 
     pub fn new_with_policy(skills_dir: &Path, policy: SkillLoadPolicy) -> Self {
+        let trusted_keys = TrustedKeys::load_from_dir(&policy.signature_key_dir);
+        if policy.require_signature && trusted_keys.is_empty() {
+            tracing::warn!(
+                key_dir = %policy.signature_key_dir.display(),
+                "require_signature is enabled but no trusted skill keys were found; \
+                 every skill will be rejected (fail closed)"
+            );
+        }
         Self {
             skills_dir: skills_dir.to_path_buf(),
             policy,
+            trusted_keys,
             loaded: Vec::new(),
         }
     }
@@ -368,8 +455,32 @@ impl SkillLoader {
 
     /// Load a single skill from a `.so` file.
     pub fn load_skill(&mut self, path: &Path) -> Result<String> {
-        // Safety: loading a .so is inherently unsafe. We trust skills from
-        // the skills directory (like Linux trusts kernel modules from /lib/modules).
+        // Read the sidecar and verify its detached signature over the .so bytes
+        // BEFORE dlopen. Loading a .so executes arbitrary native code in the
+        // genie-core address space, so the authenticity gate must be decided on
+        // the exact bytes about to run — and an unverified skill must never be
+        // loaded at all when a signature is required.
+        let manifest_source = read_manifest_source(path);
+        let signed = match &manifest_source {
+            ManifestSource::Present { manifest, .. } => {
+                verify_skill_signature(path, manifest, &self.trusted_keys)
+            }
+            ManifestSource::Missing | ManifestSource::Invalid { .. } => false,
+        };
+
+        if self.policy.require_signature && !signed {
+            anyhow::bail!(
+                "skill signature required but not cryptographically verified for {} \
+                 (need a trusted key in {} and a matching detached signature)",
+                path.display(),
+                self.policy.signature_key_dir.display()
+            );
+        }
+
+        // Safety: loading a .so is inherently unsafe. With require_signature on,
+        // the bytes have been verified against a trusted key above; otherwise we
+        // trust skills from the skills directory (like Linux trusts kernel
+        // modules from /lib/modules).
         let lib = unsafe { Library::new(path) }
             .map_err(|e| anyhow::anyhow!("dlopen failed for {}: {}", path.display(), e))?;
 
@@ -419,7 +530,7 @@ impl SkillLoader {
             anyhow::bail!("skill '{}' already loaded", name);
         }
 
-        let manifest = read_manifest_audit(path, &name, &version);
+        let manifest = build_manifest_audit(manifest_source, signed, &name, &version);
         if manifest.status != "ok" {
             tracing::warn!(
                 skill = %name,
@@ -633,7 +744,9 @@ mod tests {
         assert_eq!(skill.manifest.status, "ok");
         assert_eq!(skill.manifest.permissions, vec!["speech.output"]);
         assert_eq!(skill.manifest.capabilities, vec!["demo.greeting"]);
-        assert!(skill.manifest.signed);
+        // An arbitrary "signature" string is NOT signed: `signed` is decided by
+        // cryptographic verification, not by the field being non-empty.
+        assert!(!skill.manifest.signed);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -695,6 +808,275 @@ mod tests {
         );
         let err = loader.load_skill(&installed_path).unwrap_err();
         assert!(err.to_string().contains("denied permission"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Signature enforcement (issue #175) -------------------------------
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// Skills dir + a sibling trusted-key dir with one installed key, plus the
+    /// sample `.so` copied in. Returns the directories, the installed `.so`
+    /// path, and the signing key whose public half is trusted under `key_id`.
+    fn signed_skill_dirs(case: &str, key_id: &str) -> (PathBuf, PathBuf, PathBuf, SigningKey) {
+        let dir =
+            std::env::temp_dir().join(format!("geniepod-skills-sig-{case}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let keys_dir = dir.join("keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+
+        let so_path = dir.join("hello.so");
+        std::fs::copy(sample_skill_path(), &so_path).unwrap();
+
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        std::fs::write(
+            keys_dir.join(format!("{key_id}.pub")),
+            BASE64.encode(signing_key.verifying_key().to_bytes()),
+        )
+        .unwrap();
+
+        (dir, keys_dir, so_path, signing_key)
+    }
+
+    /// Detached base64 Ed25519 signature over the current bytes of `so_path`.
+    fn sign_file(key: &SigningKey, so_path: &Path) -> String {
+        let bytes = std::fs::read(so_path).unwrap();
+        BASE64.encode(key.sign(&bytes).to_bytes())
+    }
+
+    fn write_signed_manifest(dir: &Path, signature: &str, key_id: &str) {
+        std::fs::write(
+            dir.join("hello.skill.json"),
+            format!(
+                r#"{{
+                    "name": "hello_world",
+                    "version": "0.1.0",
+                    "description": "Sample hello skill",
+                    "reviewed_by": "test",
+                    "signature": "{signature}",
+                    "key_id": "{key_id}"
+                }}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn require_signature_policy(keys_dir: &Path) -> SkillLoadPolicy {
+        SkillLoadPolicy {
+            require_signature: true,
+            signature_key_dir: keys_dir.to_path_buf(),
+            ..SkillLoadPolicy::default()
+        }
+    }
+
+    /// The reported bug: `require_signature = true` + a junk `"signature"`
+    /// string must NOT load the skill.
+    #[test]
+    fn loader_rejects_required_signature_with_junk_string() {
+        let (dir, keys_dir, so_path, _key) = signed_skill_dirs("junk", "geniepod");
+        write_signed_manifest(&dir, "x", "geniepod");
+
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
+        let err = loader.load_skill(&so_path).unwrap_err();
+        assert!(
+            err.to_string().contains("signature required"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(loader.count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A valid detached signature by a trusted key over the exact `.so` loads
+    /// and is reported as verified.
+    #[test]
+    fn loader_accepts_valid_signature() {
+        let (dir, keys_dir, so_path, key) = signed_skill_dirs("valid", "geniepod");
+        let signature = sign_file(&key, &so_path);
+        write_signed_manifest(&dir, &signature, "geniepod");
+
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
+        let name = loader.load_skill(&so_path).unwrap();
+        assert_eq!(name, "hello_world");
+
+        let skill = loader.loaded().first().unwrap();
+        assert!(skill.manifest.signed);
+        assert_eq!(skill.manifest.status, "ok");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Flipping one byte of the `.so` after signing invalidates the signature:
+    /// tamper detection, load rejected.
+    #[test]
+    fn loader_rejects_tampered_so() {
+        let (dir, keys_dir, so_path, key) = signed_skill_dirs("tamper", "geniepod");
+        let signature = sign_file(&key, &so_path);
+        write_signed_manifest(&dir, &signature, "geniepod");
+
+        // Corrupt one byte after signing.
+        let mut bytes = std::fs::read(&so_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&so_path, &bytes).unwrap();
+
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
+        assert!(loader.load_skill(&so_path).is_err());
+        assert_eq!(loader.count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A correct signature that names a key id we do not trust fails closed.
+    #[test]
+    fn loader_rejects_unknown_key_id() {
+        let (dir, keys_dir, so_path, key) = signed_skill_dirs("unknown", "geniepod");
+        let signature = sign_file(&key, &so_path);
+        // Signature is valid for the trusted key, but the manifest claims a
+        // different (untrusted) key id.
+        write_signed_manifest(&dir, &signature, "attacker");
+
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
+        assert!(loader.load_skill(&so_path).is_err());
+        assert_eq!(loader.count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no trusted keys installed, require_signature fails closed even for
+    /// a present manifest.
+    #[test]
+    fn loader_fails_closed_without_trusted_keys() {
+        let (dir, _keys_dir, so_path, _key) = signed_skill_dirs("nokeys", "geniepod");
+        write_signed_manifest(&dir, "x", "geniepod");
+
+        let empty_keys = dir.join("empty-keys");
+        std::fs::create_dir_all(&empty_keys).unwrap();
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&empty_keys));
+        assert!(loader.load_skill(&so_path).is_err());
+        assert_eq!(loader.count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unsigned native skill — no sidecar manifest at all — must be rejected
+    /// when a signature is required. The rejection is the signature gate, not a
+    /// later manifest/ABI failure.
+    #[test]
+    fn loader_rejects_unsigned_skill_with_no_manifest() {
+        let (dir, keys_dir, so_path, _key) = signed_skill_dirs("nomanifest", "geniepod");
+        // Deliberately write no manifest sidecar.
+
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
+        let err = loader.load_skill(&so_path).unwrap_err();
+        assert!(
+            err.to_string().contains("signature required"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(loader.count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest present but carrying an empty `signature` field is unsigned:
+    /// it must be rejected, never treated as signed by the field's existence.
+    #[test]
+    fn loader_rejects_empty_signature_field() {
+        let (dir, keys_dir, so_path, _key) = signed_skill_dirs("emptysig", "geniepod");
+        write_signed_manifest(&dir, "", "geniepod");
+
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
+        let err = loader.load_skill(&so_path).unwrap_err();
+        assert!(
+            err.to_string().contains("signature required"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(loader.count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The signature gate runs *before* `dlopen`: an unsigned file whose bytes
+    /// are not even a loadable library is rejected with the signature error,
+    /// not a "dlopen failed" error. That proves the native code is never loaded
+    /// when the signature check fails — the whole point of verifying first.
+    #[test]
+    fn loader_rejects_before_dlopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "geniepod-skills-sig-gatefirst-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let keys_dir = dir.join("keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+
+        // Install a trusted key so the gate is genuinely active.
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        std::fs::write(
+            keys_dir.join("geniepod.pub"),
+            BASE64.encode(signing_key.verifying_key().to_bytes()),
+        )
+        .unwrap();
+
+        // A bogus, unsigned ".so" that dlopen would reject outright.
+        let so_path = dir.join("bogus.so");
+        std::fs::write(&so_path, b"this is not a loadable shared library").unwrap();
+
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
+        let err = loader.load_skill(&so_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("signature required"),
+            "expected signature rejection before dlopen, got: {msg}"
+        );
+        assert!(
+            !msg.contains("dlopen"),
+            "dlopen must not be attempted before the signature gate, got: {msg}"
+        );
+        assert_eq!(loader.count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A malformed trusted key file must not produce a trusted posture: when the
+    /// key id the manifest names fails to parse, it never becomes a trust
+    /// anchor, so even a well-formed signature is rejected (fail closed). The
+    /// skill is neither loaded nor reported as signed.
+    #[test]
+    fn loader_malformed_trusted_key_is_not_trusted() {
+        let dir =
+            std::env::temp_dir().join(format!("geniepod-skills-sig-badkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let keys_dir = dir.join("keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+
+        let so_path = dir.join("hello.so");
+        std::fs::copy(sample_skill_path(), &so_path).unwrap();
+
+        // The key the manifest references exists on disk but is garbage, so it
+        // is skipped at load time and never trusted.
+        std::fs::write(keys_dir.join("geniepod.pub"), "not a valid ed25519 key").unwrap();
+
+        // The signature itself is well-formed (real key over the real bytes);
+        // only the trust anchor is broken — which must still fail closed.
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let signature = BASE64.encode(
+            signing_key
+                .sign(&std::fs::read(&so_path).unwrap())
+                .to_bytes(),
+        );
+        write_signed_manifest(&dir, &signature, "geniepod");
+
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
+        let err = loader.load_skill(&so_path).unwrap_err();
+        assert!(
+            err.to_string().contains("signature required"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(loader.count(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
