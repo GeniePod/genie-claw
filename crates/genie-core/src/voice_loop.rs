@@ -20,7 +20,7 @@ static FIRST_REPLY_BANNER_PRINTED: AtomicBool = AtomicBool::new(false);
 
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, LlmRequestHints};
-use crate::memory::Memory;
+use crate::memory::{SharedMemory, with_shared_memory};
 use crate::memory::{extract, inject};
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
@@ -74,7 +74,7 @@ pub async fn run(
     voice_cfg: VoiceConfig,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -208,7 +208,7 @@ async fn run_with_wakeword(
     stt_engine: &stt::SttEngine,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -401,11 +401,13 @@ async fn run_with_wakeword(
                                 continue;
                             }
 
-                            let memory_context = inject::build_memory_context_with_read_context(
-                                memory,
-                                &text,
-                                read_context,
-                            );
+                            let memory_context = with_shared_memory(memory, |memory| {
+                                inject::build_memory_context_with_read_context(
+                                    memory,
+                                    &text,
+                                    read_context,
+                                )
+                            });
                             let full_prompt = format!(
                                 "{}\n\nRelevant household context:\n{}",
                                 system_prompt, memory_context
@@ -454,7 +456,9 @@ async fn run_with_wakeword(
                             }
 
                             // Auto-capture from follow-up.
-                            extract::extract_and_store(memory, &text);
+                            with_shared_memory(memory, |memory| {
+                                extract::extract_and_store(memory, &text);
+                            });
                         } else {
                             let _ = tokio::fs::remove_file(&followup_path).await;
                             eprintln!("[voice] No follow-up speech — returning to wake word.");
@@ -500,7 +504,7 @@ async fn run_push_to_talk(
     stt_engine: &stt::SttEngine,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -846,7 +850,7 @@ async fn voice_cycle(
     stt_engine: &stt::SttEngine,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -945,7 +949,7 @@ pub struct ProcessTranscriptInputs<'a> {
     pub audio_device: &'a str,
     pub llm: &'a LlmClient,
     pub tools: &'a ToolDispatcher,
-    pub memory: &'a Memory,
+    pub memory: &'a SharedMemory,
     pub conversations: &'a ConversationStore,
     pub system_prompt: &'a str,
     pub max_history: usize,
@@ -1058,7 +1062,7 @@ pub async fn process_transcript(
             "[voice] GeniePod: {} (quick tool)",
             format::for_voice(&final_response)
         );
-        let stored = extract::extract_and_store(memory, &text);
+        let stored = with_shared_memory(memory, |memory| extract::extract_and_store(memory, &text));
         if stored > 0 {
             eprintln!(
                 "[voice] (remembered {} fact{})",
@@ -1070,8 +1074,9 @@ pub async fn process_transcript(
     }
 
     // Step 3: Build LLM context with per-query memory injection.
-    let memory_context =
-        inject::build_memory_context_with_read_context(memory, &text, read_context);
+    let memory_context = with_shared_memory(memory, |memory| {
+        inject::build_memory_context_with_read_context(memory, &text, read_context)
+    });
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -1276,7 +1281,7 @@ pub async fn process_transcript(
     }
 
     // Auto-capture facts from user's speech (runs after TTS, non-blocking).
-    let stored = extract::extract_and_store(memory, &text);
+    let stored = with_shared_memory(memory, |memory| extract::extract_and_store(memory, &text));
     if stored > 0 {
         eprintln!(
             "[voice] (remembered {} fact{})",

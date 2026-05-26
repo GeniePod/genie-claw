@@ -49,10 +49,12 @@ async fn main() -> Result<()> {
     let ha = ha::provider_from_config(&config);
 
     let mem_path = config.data_dir.join("memory.db");
-    let mem = memory::Memory::open(&mem_path)?;
-    tracing::info!(memories = mem.count()?, "memory loaded");
+    let memory = Arc::new(std::sync::Mutex::new(memory::Memory::open(&mem_path)?));
+    memory::with_shared_memory(&memory, |mem| {
+        tracing::info!(memories = mem.count()?, "memory loaded");
+        Ok::<(), anyhow::Error>(())
+    })?;
 
-    let mem_arc = Arc::new(std::sync::Mutex::new(memory::Memory::open(&mem_path)?));
     let skill_loader =
         skills::load_all_with_policy(skills::SkillLoadPolicy::from(&config.core.skill_policy));
     let connectivity = Arc::new(connectivity::NullConnectivityController::from_config(
@@ -65,7 +67,7 @@ async fn main() -> Result<()> {
         .with_actuation_safety_config(config.core.actuation_safety.clone())
         .with_actuation_audit_path(config.data_dir.join("safety/actuation-audit.jsonl"))
         .with_tool_audit_path(config.data_dir.join("runtime/tool-audit.jsonl"))
-        .with_memory(Arc::clone(&mem_arc))
+        .with_memory(Arc::clone(&memory))
         .with_skill_loader(skill_loader);
 
     let connectivity_health = connectivity.health().await;
@@ -79,7 +81,9 @@ async fn main() -> Result<()> {
 
     // Load user profile from /opt/geniepod/data/profile/.
     let profile_dir = config.data_dir.join("profile");
-    match genie_core::profile::load_profile(&profile_dir, &mem) {
+    match memory::with_shared_memory(&memory, |mem| {
+        genie_core::profile::load_profile(&profile_dir, mem)
+    }) {
         Ok(report) if report.total() > 0 => {
             tracing::info!(
                 toml = report.toml_facts,
@@ -104,7 +108,9 @@ async fn main() -> Result<()> {
     let model_name = &config.core.llm_model_name;
     let model_family = prompt::ModelFamily::from_model_name(model_name);
     let prompt_builder = prompt::PromptBuilder::from_model_name(model_name);
-    let system_prompt = prompt_builder.build(&tool_dispatcher.tool_defs(), &mem);
+    let system_prompt = memory::with_shared_memory(&memory, |mem| {
+        prompt_builder.build(&tool_dispatcher.tool_defs(), mem)
+    });
     // M1 exit (issue #110): fingerprint the fully-assembled system prompt with a
     // real SHA-256 so silent prompt drift between restarts is observable. The
     // digest is logged here at boot and surfaced via /api/health and
@@ -127,15 +133,17 @@ async fn main() -> Result<()> {
     let conv_list = conversations.list()?;
     tracing::info!(conversations = conv_list.len(), "conversation store loaded");
 
-    let boot_contract = genie_core::server::build_runtime_contract_snapshot(
-        &tool_dispatcher,
-        &mem,
-        &conversations,
-        &system_prompt,
-        config.core.max_history_turns,
-        model_family,
-        &connectivity_health,
-    );
+    let boot_contract = memory::with_shared_memory(&memory, |mem| {
+        genie_core::server::build_runtime_contract_snapshot(
+            &tool_dispatcher,
+            mem,
+            &conversations,
+            &system_prompt,
+            config.core.max_history_turns,
+            model_family,
+            &connectivity_health,
+        )
+    });
     let contract_hash = boot_contract.contract_hash.clone();
     let contract_validation = genie_core::runtime_contract::validate_runtime_contract(
         &contract_hash,
@@ -248,7 +256,7 @@ async fn main() -> Result<()> {
                 voice_cfg,
                 &llm,
                 &tool_dispatcher,
-                &mem,
+                &memory,
                 &conversations,
                 &system_prompt,
                 config.core.max_history_turns,
@@ -266,7 +274,7 @@ async fn main() -> Result<()> {
         genie_core::repl::run(
             &llm,
             &tool_dispatcher,
-            &mem,
+            &memory,
             &conversations,
             &system_prompt,
             config.core.max_history_turns,
@@ -279,7 +287,7 @@ async fn main() -> Result<()> {
             llm,
             tool_dispatcher,
             connectivity,
-            mem,
+            memory,
             conversations,
             system_prompt,
             system_prompt_sha,

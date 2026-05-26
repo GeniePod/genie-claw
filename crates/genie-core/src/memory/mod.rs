@@ -9,6 +9,7 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde::Serialize;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const MAX_QUERY_HASHES: usize = 16;
@@ -38,6 +39,17 @@ pub struct Memory {
     canonical_dir: PathBuf,
     /// Set when schema migration or FTS rebuild failed during [`Memory::open`].
     migration_degraded: bool,
+}
+
+/// Process-wide handle to the single memory store opened at startup.
+pub type SharedMemory = Arc<Mutex<Memory>>;
+
+/// Run a closure against the shared memory store.
+pub fn with_shared_memory<R>(memory: &SharedMemory, f: impl FnOnce(&Memory) -> R) -> R {
+    let guard = memory
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&guard)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

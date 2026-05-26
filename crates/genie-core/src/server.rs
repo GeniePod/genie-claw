@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, LlmRequestHints, Message};
-use crate::memory::Memory;
+use crate::memory::{Memory, SharedMemory, with_shared_memory};
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
 use crate::tools::ToolDispatcher;
@@ -69,7 +69,7 @@ pub struct ChatServer {
     llm: LlmClient,
     tools: ToolDispatcher,
     connectivity: std::sync::Arc<dyn ConnectivityController>,
-    memory: Memory,
+    memory: SharedMemory,
     conversations: ConversationStore,
     current_conv_id: Mutex<String>,
     chat_turn_lock: Mutex<()>,
@@ -95,7 +95,7 @@ impl ChatServer {
         llm: LlmClient,
         tools: ToolDispatcher,
         connectivity: std::sync::Arc<dyn ConnectivityController>,
-        memory: Memory,
+        memory: SharedMemory,
         conversations: ConversationStore,
         system_prompt: String,
         system_prompt_sha: String,
@@ -488,7 +488,7 @@ async fn handle_chat_stream(
     body: Option<&str>,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     current_conv_id: &Mutex<String>,
     system_prompt: &str,
@@ -579,7 +579,9 @@ async fn handle_chat_stream(
             &serde_json::json!({"type":"replace","content": final_response.clone(), "tool": tool_result.tool.clone()}),
         )
         .await?;
-        crate::memory::extract::extract_and_store(memory, user_text);
+        with_shared_memory(memory, |memory| {
+            crate::memory::extract::extract_and_store(memory, user_text);
+        });
         write_stream_event(
             writer,
             &serde_json::json!({
@@ -593,7 +595,9 @@ async fn handle_chat_stream(
         return Ok(());
     }
 
-    let memory_context = crate::memory::inject::build_memory_context(memory, user_text);
+    let memory_context = with_shared_memory(memory, |memory| {
+        crate::memory::inject::build_memory_context(memory, user_text)
+    });
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -743,7 +747,9 @@ async fn handle_chat_stream(
         sanitized
     };
 
-    crate::memory::extract::extract_and_store(memory, user_text);
+    with_shared_memory(memory, |memory| {
+        crate::memory::extract::extract_and_store(memory, user_text);
+    });
 
     write_stream_event(
         writer,
@@ -763,7 +769,7 @@ async fn handle_chat_stream(
 pub async fn process_chat_turn(
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     conv_id: &str,
     user_text: &str,
@@ -790,7 +796,9 @@ pub async fn process_chat_turn(
             )
             .await;
         let final_response = finalize_direct_tool_turn(conversations, conv_id, &call, &tool_result);
-        crate::memory::extract::extract_and_store(memory, user_text);
+        with_shared_memory(memory, |memory| {
+            crate::memory::extract::extract_and_store(memory, user_text);
+        });
         return Ok(ChatTurnResult {
             response: final_response,
             tool: Some(tool_result.tool),
@@ -798,7 +806,9 @@ pub async fn process_chat_turn(
         });
     }
 
-    let memory_context = crate::memory::inject::build_memory_context(memory, user_text);
+    let memory_context = with_shared_memory(memory, |memory| {
+        crate::memory::inject::build_memory_context(memory, user_text)
+    });
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -854,7 +864,9 @@ pub async fn process_chat_turn(
         sanitized
     };
 
-    crate::memory::extract::extract_and_store(memory, user_text);
+    with_shared_memory(memory, |memory| {
+        crate::memory::extract::extract_and_store(memory, user_text);
+    });
 
     Ok(ChatTurnResult {
         response: final_response,
@@ -1030,7 +1042,7 @@ async fn handle_chat(
     body: Option<&str>,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     current_conv_id: &Mutex<String>,
     system_prompt: &str,
@@ -1142,7 +1154,7 @@ async fn handle_health(
     llm: &LlmClient,
     tools: &ToolDispatcher,
     connectivity: &dyn ConnectivityController,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     system_prompt_sha: &str,
@@ -1152,19 +1164,22 @@ async fn handle_health(
 ) -> (u16, &'static str, String) {
     let llm_ok = llm.health().await;
     let connectivity_health = connectivity.health().await;
-    let mem_count = memory.count().unwrap_or(0);
-    let memory_health = memory.health().ok();
+    let (mem_count, memory_health) = with_shared_memory(memory, |memory| {
+        (memory.count().unwrap_or(0), memory.health().ok())
+    });
     let conv_count = conversations.list().map(|l| l.len()).unwrap_or(0);
     let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
-    let runtime_contract = build_runtime_contract_snapshot(
-        tools,
-        memory,
-        conversations,
-        system_prompt,
-        max_history,
-        model_family,
-        &connectivity_health,
-    );
+    let runtime_contract = with_shared_memory(memory, |memory| {
+        build_runtime_contract_snapshot(
+            tools,
+            memory,
+            conversations,
+            system_prompt,
+            max_history,
+            model_family,
+            &connectivity_health,
+        )
+    });
     let runtime_contract =
         runtime_contract_summary_json(&runtime_contract, expected_runtime_contract_hash);
 
@@ -1251,7 +1266,7 @@ fn handle_list_tools(tools: &ToolDispatcher) -> (u16, &'static str, String) {
 async fn handle_runtime_contract(
     tools: &ToolDispatcher,
     connectivity: &dyn ConnectivityController,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -1259,15 +1274,17 @@ async fn handle_runtime_contract(
     expected_runtime_contract_hash: &str,
 ) -> (u16, &'static str, String) {
     let connectivity_health = connectivity.health().await;
-    let contract = build_runtime_contract_snapshot(
-        tools,
-        memory,
-        conversations,
-        system_prompt,
-        max_history,
-        model_family,
-        &connectivity_health,
-    );
+    let contract = with_shared_memory(memory, |memory| {
+        build_runtime_contract_snapshot(
+            tools,
+            memory,
+            conversations,
+            system_prompt,
+            max_history,
+            model_family,
+            &connectivity_health,
+        )
+    });
     let body = runtime_contract_json(&contract, expected_runtime_contract_hash);
     let body = serde_json::to_string(&body).unwrap_or_else(|e| {
         serde_json::json!({ "error": format!("runtime contract serialization failed: {e}") })
@@ -1376,8 +1393,8 @@ fn handle_actuation_actions(tools: &ToolDispatcher) -> (u16, &'static str, Strin
     (200, "application/json", body.to_string())
 }
 
-fn handle_memories_list(memory: &Memory) -> (u16, &'static str, String) {
-    match memory.list_managed(500) {
+fn handle_memories_list(memory: &SharedMemory) -> (u16, &'static str, String) {
+    match with_shared_memory(memory, |memory| memory.list_managed(500)) {
         Ok(entries) => (
             200,
             "application/json",
@@ -1391,7 +1408,10 @@ fn handle_memories_list(memory: &Memory) -> (u16, &'static str, String) {
     }
 }
 
-fn handle_memories_update(body: Option<&str>, memory: &Memory) -> (u16, &'static str, String) {
+fn handle_memories_update(
+    body: Option<&str>,
+    memory: &SharedMemory,
+) -> (u16, &'static str, String) {
     let Some(body) = body else {
         return (
             400,
@@ -1411,7 +1431,9 @@ fn handle_memories_update(body: Option<&str>, memory: &Memory) -> (u16, &'static
         }
     };
 
-    match memory.update_managed(req.id, &req.content, req.kind.as_deref()) {
+    match with_shared_memory(memory, |memory| {
+        memory.update_managed(req.id, &req.content, req.kind.as_deref())
+    }) {
         Ok(true) => (
             200,
             "application/json",
@@ -1430,7 +1452,10 @@ fn handle_memories_update(body: Option<&str>, memory: &Memory) -> (u16, &'static
     }
 }
 
-fn handle_memories_delete(body: Option<&str>, memory: &Memory) -> (u16, &'static str, String) {
+fn handle_memories_delete(
+    body: Option<&str>,
+    memory: &SharedMemory,
+) -> (u16, &'static str, String) {
     let Some(body) = body else {
         return (
             400,
@@ -1450,7 +1475,7 @@ fn handle_memories_delete(body: Option<&str>, memory: &Memory) -> (u16, &'static
         }
     };
 
-    match memory.delete_by_id(req.id) {
+    match with_shared_memory(memory, |memory| memory.delete_by_id(req.id)) {
         Ok(true) => (
             200,
             "application/json",
@@ -1469,7 +1494,10 @@ fn handle_memories_delete(body: Option<&str>, memory: &Memory) -> (u16, &'static
     }
 }
 
-fn handle_memories_reorder(body: Option<&str>, memory: &Memory) -> (u16, &'static str, String) {
+fn handle_memories_reorder(
+    body: Option<&str>,
+    memory: &SharedMemory,
+) -> (u16, &'static str, String) {
     let Some(body) = body else {
         return (
             400,
@@ -1489,7 +1517,7 @@ fn handle_memories_reorder(body: Option<&str>, memory: &Memory) -> (u16, &'stati
         }
     };
 
-    match memory.reorder_managed(&req.ids) {
+    match with_shared_memory(memory, |memory| memory.reorder_managed(&req.ids)) {
         Ok(()) => (
             200,
             "application/json",
@@ -1662,7 +1690,7 @@ async fn handle_openai_chat(
     body: Option<&str>,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     system_prompt: &str,
     max_history: usize,
     model_family: ModelFamily,
@@ -1742,12 +1770,16 @@ async fn handle_openai_chat(
             format!("{} failed: {}", tool_result.tool, tool_result.output)
         };
         let sanitized = crate::security::sandbox::sanitize_output(&response);
-        crate::memory::extract::extract_and_store(memory, &user_text);
+        with_shared_memory(memory, |memory| {
+            crate::memory::extract::extract_and_store(memory, &user_text);
+        });
         return openai_chat_response(model, &sanitized);
     }
 
     // Build context with per-query memory injection.
-    let memory_context = crate::memory::inject::build_memory_context(memory, &user_text);
+    let memory_context = with_shared_memory(memory, |memory| {
+        crate::memory::inject::build_memory_context(memory, &user_text)
+    });
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -1857,7 +1889,9 @@ async fn handle_openai_chat(
     let sanitized = crate::security::sandbox::sanitize_output(&final_response);
 
     // Auto-capture facts from user message.
-    crate::memory::extract::extract_and_store(memory, &user_text);
+    with_shared_memory(memory, |memory| {
+        crate::memory::extract::extract_and_store(memory, &user_text);
+    });
 
     openai_chat_response(model, &sanitized)
 }
@@ -2055,12 +2089,17 @@ mod tests {
     };
     use crate::connectivity::NullConnectivityController;
     use crate::conversation::ConversationStore;
-    use crate::memory::Memory;
+    use crate::memory::{Memory, SharedMemory};
     use crate::prompt::ModelFamily;
     use crate::tools::{RequestOrigin, ToolDispatcher};
     use genie_common::config::ConnectivityConfig;
     use genie_common::config::WebSearchConfig;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    fn shared_memory(path: &std::path::Path) -> SharedMemory {
+        Arc::new(StdMutex::new(Memory::open(path).unwrap()))
+    }
+
     use tokio::sync::Mutex;
     use tracing::subscriber::with_default;
     use tracing::{Event, Subscriber};
@@ -2151,7 +2190,7 @@ mod tests {
             rt.block_on(async {
                 let llm = crate::llm::LlmClient::mock(["ok".to_string()]);
                 let tools = ToolDispatcher::new(None);
-                let memory = Memory::open(&memory_path).unwrap();
+                let memory = shared_memory(&memory_path);
                 let conversations = ConversationStore::open(&conversations_path).unwrap();
                 let conv_id = conversations.create().unwrap();
                 let current_conv_id = Mutex::new(conv_id);
@@ -2275,7 +2314,7 @@ mod tests {
         let llm = crate::llm::LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:1/health");
         let tools = ToolDispatcher::new(None);
         let connectivity = NullConnectivityController::from_config(&ConnectivityConfig::default());
-        let memory = Memory::open(&memory_path).unwrap();
+        let memory = shared_memory(&memory_path);
         let conversations = ConversationStore::open(&conversations_path).unwrap();
 
         let prompt_sha = crate::prompt_sha::sha256_hex("system prompt");
@@ -2357,7 +2396,7 @@ mod tests {
 
         let tools = ToolDispatcher::new(None);
         let connectivity = NullConnectivityController::from_config(&ConnectivityConfig::default());
-        let memory = Memory::open(&memory_path).unwrap();
+        let memory = shared_memory(&memory_path);
         let conversations = ConversationStore::open(&conversations_path).unwrap();
         conversations.create().unwrap();
 
@@ -2487,7 +2526,6 @@ mod tests {
         use crate::connectivity::NullConnectivityController;
         use crate::conversation::ConversationStore;
         use crate::llm::{LlmClient, MockLlmBackend};
-        use crate::memory::Memory;
         use crate::prompt::ModelFamily;
         use crate::tools::ToolDispatcher;
         use genie_common::config::ConnectivityConfig;
@@ -2525,7 +2563,7 @@ mod tests {
             std::sync::Arc::new(NullConnectivityController::from_config(
                 &ConnectivityConfig::default(),
             )),
-            Memory::open(&memory_path).unwrap(),
+            shared_memory(&memory_path),
             ConversationStore::open(&conv_path).unwrap(),
             system_prompt.into(),
             crate::prompt_sha::sha256_hex(system_prompt),
@@ -2627,7 +2665,6 @@ mod tests {
         use crate::connectivity::NullConnectivityController;
         use crate::conversation::ConversationStore;
         use crate::llm::LlmClient;
-        use crate::memory::Memory;
         use crate::tools::ToolDispatcher;
 
         let system_prompt = "You are a helpful assistant.";
@@ -2637,7 +2674,7 @@ mod tests {
             std::sync::Arc::new(NullConnectivityController::from_config(
                 &ConnectivityConfig::default(),
             )),
-            Memory::open(memory_path).unwrap(),
+            shared_memory(memory_path),
             ConversationStore::open(conv_path).unwrap(),
             system_prompt.into(),
             crate::prompt_sha::sha256_hex(system_prompt),
