@@ -287,7 +287,7 @@ async fn send_http_post(url: &str, body: &str) -> Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("timeout"))??;
 
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         path,
@@ -298,7 +298,27 @@ async fn send_http_post(url: &str, body: &str) -> Result<()> {
 
     let mut stream = stream;
     stream.write_all(request.as_bytes()).await?;
-    Ok(())
+
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("read timeout"))??;
+
+    let response = String::from_utf8_lossy(&buf[..n]);
+    if response.starts_with("HTTP/1.") {
+        let status_code: u16 = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if (200..400).contains(&status_code) {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("HTTP {}", status_code))
+        }
+    } else {
+        Err(anyhow::anyhow!("invalid HTTP response"))
+    }
 }
 
 fn now_ms() -> u64 {
@@ -511,5 +531,82 @@ mod tests {
         perms.set_mode(0o644);
         std::fs::set_permissions(&db_path, perms).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn send_http_post_rejects_non_http_tcp_banner() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/api/alert");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(b"SSH-2.0-OpenSSH_9.0\r\n").await;
+            }
+        });
+
+        let error = send_http_post(&url, r#"{"message":"test"}"#)
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(
+            error.to_string().contains("invalid HTTP response"),
+            "expected invalid HTTP error, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_http_post_accepts_valid_http_status_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/api/alert");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        send_http_post(&url, r#"{"message":"test"}"#)
+            .await
+            .expect("alert webhook POST should succeed on HTTP 204");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_http_post_rejects_http_500_status_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/api/alert");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let error = send_http_post(&url, r#"{"message":"test"}"#)
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(
+            error.to_string().contains("HTTP 500"),
+            "expected HTTP 500 error, got: {error}"
+        );
     }
 }
