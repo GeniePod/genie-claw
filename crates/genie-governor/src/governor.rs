@@ -120,7 +120,13 @@ impl Governor {
         if let Some(ref rx) = self.tegra_rx {
             let snap = rx.borrow().clone();
             if snap.timestamp_ms > 0 {
-                let _ = self.store.insert_snapshot(&snap);
+                if let Err(e) = self.store.insert_snapshot(&snap) {
+                    tracing::error!(
+                        ts_ms = snap.timestamp_ms,
+                        error = %e,
+                        "failed to insert tegrastats snapshot"
+                    );
+                }
             }
         }
 
@@ -139,7 +145,9 @@ impl Governor {
         self.prune_counter += 1;
         if self.prune_counter >= 720 {
             self.prune_counter = 0;
-            let _ = self.store.prune();
+            if let Err(e) = self.store.prune() {
+                tracing::error!(error = %e, "failed to prune tegrastats history");
+            }
         }
 
         Ok(())

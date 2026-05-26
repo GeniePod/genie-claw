@@ -99,3 +99,76 @@ pub fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use genie_common::tegrastats::TegraSnapshot;
+
+    fn sample_snapshot(ts_ms: u64) -> TegraSnapshot {
+        TegraSnapshot {
+            timestamp_ms: ts_ms,
+            ram_used_mb: 1000,
+            ram_total_mb: 8000,
+            swap_used_mb: 0,
+            swap_total_mb: 0,
+            gpu_freq_pct: 50,
+            cpu_loads: Vec::new(),
+            gpu_temp_c: Some(45.0),
+            cpu_temp_c: Some(50.0),
+            power_mw: Some(5000),
+        }
+    }
+
+    #[test]
+    fn insert_snapshot_and_prune_on_writable_db() {
+        let dir = std::env::temp_dir().join(format!(
+            "genie-governor-store-writable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("governor.db");
+
+        let store = Store::open(&db_path).unwrap();
+        store.insert_snapshot(&sample_snapshot(1_000)).unwrap();
+        store.insert_snapshot(&sample_snapshot(2_000)).unwrap();
+        assert!(store.prune().is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn insert_snapshot_errors_on_readonly_db_without_panic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "genie-governor-store-readonly-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("governor.db");
+        {
+            let store = Store::open(&db_path).unwrap();
+            store.insert_snapshot(&sample_snapshot(1)).unwrap();
+            drop(store);
+        }
+
+        let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&db_path, perms).unwrap();
+
+        let store = Store::open(&db_path).unwrap();
+        let err = store
+            .insert_snapshot(&sample_snapshot(2))
+            .expect_err("readonly db should reject insert");
+        assert!(!err.to_string().is_empty());
+
+        let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        let _ = std::fs::set_permissions(&db_path, perms);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
