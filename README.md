@@ -57,6 +57,8 @@ genie-ai-runtime   Home Assistant today
 - optional `web_search` tool with DuckDuckGo or SearXNG
 - cache-aware `genie-ai-runtime` requests with `conversation_id` and
   `nvext.agent_hints` for session KV reuse
+- system-prompt SHA exposed in boot logs, `/api/health`, and `genie-ctl status`
+  to prove deterministic prompt assembly across restarts
 - Jetson aarch64 cross-compile CI
 
 Current workspace version: `v1.0.0-alpha.9`.

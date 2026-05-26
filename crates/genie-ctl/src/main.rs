@@ -79,6 +79,7 @@ fn api_probe_addr(config: &Config) -> std::result::Result<String, String> {
         ServiceProbeTarget::UnsupportedScheme { scheme } => Err(scheme),
     }
 }
+
 const SKILL_RESTART_HINT: &str =
     "Restart genie-core to load skill changes, or wait until the next startup.";
 
@@ -852,6 +853,11 @@ async fn cmd_status() -> Result<()> {
                     if enabled { "enabled" } else { "disabled" },
                     provider
                 );
+            }
+            // System-prompt SHA (issue #110): same config + hydrated state must
+            // produce an identical digest across a full-stack restart.
+            if let Some(sha) = data.get("system_prompt_sha").and_then(|v| v.as_str()) {
+                println!("Prompt:    {}", sha);
             }
         }
         Err(_) => println!("Core:      offline"),

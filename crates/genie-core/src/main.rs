@@ -105,10 +105,17 @@ async fn main() -> Result<()> {
     let model_family = prompt::ModelFamily::from_model_name(model_name);
     let prompt_builder = prompt::PromptBuilder::from_model_name(model_name);
     let system_prompt = prompt_builder.build(&tool_dispatcher.tool_defs(), &mem);
+    // M1 exit (issue #110): fingerprint the fully-assembled system prompt with a
+    // real SHA-256 so silent prompt drift between restarts is observable. The
+    // digest is logged here at boot and surfaced via /api/health and
+    // `genie-ctl status`.
+    let system_prompt_sha = genie_core::prompt_sha::sha256_hex(&system_prompt);
     tracing::info!(
         model = model_name,
         family = ?model_family,
-        "system prompt built"
+        prompt_bytes = system_prompt.len(),
+        system_prompt_sha = %system_prompt_sha,
+        "system prompt assembled"
     );
 
     // Check if stdin is a terminal (REPL mode) or pipe/systemd (server-only).
@@ -275,6 +282,7 @@ async fn main() -> Result<()> {
             mem,
             conversations,
             system_prompt,
+            system_prompt_sha,
             config.core.max_history_turns,
             model_family,
             config.core.expected_runtime_contract_hash.clone(),
