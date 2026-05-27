@@ -13,6 +13,7 @@ use crate::connectivity::{ConnectivityController, ConnectivityHealth, Connectivi
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, LlmRequestHints, Message};
 use crate::memory::{Memory, SharedMemory, with_shared_memory};
+use crate::origin_auth::OriginResolver;
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
 use crate::tools::ToolDispatcher;
@@ -92,6 +93,9 @@ pub struct ChatServer {
     expected_runtime_contract_hash: String,
     /// Inbound HTTP-server hardening (read caps, timeout, connection ceiling).
     http_config: HttpServerConfig,
+    /// Trusted resolution of the request origin from the (forgeable) header,
+    /// the peer transport, and any authenticated token (issue #232).
+    origin_resolver: OriginResolver,
 }
 
 pub struct ChatTurnResult {
@@ -131,6 +135,7 @@ impl ChatServer {
             model_family,
             expected_runtime_contract_hash,
             http_config: HttpServerConfig::default(),
+            origin_resolver: OriginResolver::default(),
         })
     }
 
@@ -138,6 +143,15 @@ impl ChatServer {
     /// and connection ceiling). Defaults to [`HttpServerConfig::default`].
     pub fn with_http_config(mut self, http_config: HttpServerConfig) -> Self {
         self.http_config = http_config;
+        self
+    }
+
+    /// Override how the request origin is derived from the wire. Defaults to
+    /// [`OriginResolver::default`], which honors the `X-Genie-Origin` header
+    /// only from loopback peers and downgrades any privileged claim from a
+    /// non-loopback peer to `api` (issue #232).
+    pub fn with_origin_auth(mut self, origin_resolver: OriginResolver) -> Self {
+        self.origin_resolver = origin_resolver;
         self
     }
 
@@ -156,7 +170,9 @@ impl ChatServer {
         if matches!(bind_host, "0.0.0.0" | "::") {
             tracing::warn!(
                 bind_host,
-                "genie-core is exposed beyond localhost; use only behind a trusted gateway or firewall"
+                "genie-core is exposed beyond localhost; use only behind a trusted gateway or firewall. \
+                 Non-loopback peers cannot assume a privileged X-Genie-Origin without a configured \
+                 [core.origin_auth] token (issue #232)"
             );
         }
         let addr = format!("{}:{}", bind_host, port);
@@ -331,14 +347,6 @@ async fn with_chat_turn_lock<T>(lock: &Mutex<()>, fut: impl std::future::Future<
     fut.await
 }
 
-fn normalized_origin(request_origin: RequestOrigin) -> RequestOrigin {
-    if matches!(request_origin, RequestOrigin::Unknown) {
-        RequestOrigin::Api
-    } else {
-        request_origin
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     stream: tokio::net::TcpStream,
@@ -358,6 +366,9 @@ async fn handle_request(
     let max_history = ctx.max_history;
     let model_family = ctx.model_family;
     let expected_runtime_contract_hash = &ctx.expected_runtime_contract_hash;
+    // Capture the peer address before splitting the stream: it is the
+    // transport-level proof used to gate privileged origin claims (issue #232).
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
 
@@ -375,11 +386,6 @@ async fn handle_request(
         }
     };
 
-    let request_origin = request
-        .header("x-genie-origin")
-        .map(RequestOrigin::from_header)
-        .unwrap_or(RequestOrigin::Unknown);
-
     // Cross-origin / DNS-rebinding gate ahead of routing (issue #228). A
     // disallowed Host/Origin is rejected; an allowlisted Origin is reflected in
     // the response (no more wildcard). Mutating/actuating routes additionally
@@ -392,7 +398,8 @@ async fn handle_request(
             return Ok(());
         }
     };
-    if classify_route(&request.method, &request.path).is_mutating() && !guard.token_ok(&request) {
+    let route = classify_route(&request.method, &request.path);
+    if route.is_mutating() && !guard.token_ok(&request) {
         tracing::debug!("mutating request without a valid local API token");
         let _ = write_guard_rejection(
             &mut writer,
@@ -403,12 +410,16 @@ async fn handle_request(
         return Ok(());
     }
 
+    // Derive the trusted origin from the (forgeable) header plus the peer
+    // transport and any authenticated token, rather than trusting the header
+    // outright (issue #232). The result is already normalized to the `api`
+    // floor for unauthenticated/unknown claims.
+    let request_origin = ctx.origin_resolver.resolve(
+        peer_ip,
+        request.header("x-genie-origin"),
+        request.header("x-genie-origin-token"),
+    );
     let body = request.body;
-    let method = request.method;
-    let path = request.path;
-
-    // Route.
-    let route = classify_route(&method, &path);
     if matches!(route, RequestRoute::ChatStream) {
         let _guard = chat_turn_lock.lock().await;
         if let Err(e) = handle_chat_stream(
@@ -422,7 +433,7 @@ async fn handle_request(
             system_prompt,
             max_history,
             model_family,
-            normalized_origin(request_origin),
+            request_origin,
             echo_origin.as_deref(),
         )
         .await
@@ -451,7 +462,7 @@ async fn handle_request(
                     system_prompt,
                     max_history,
                     model_family,
-                    normalized_origin(request_origin),
+                    request_origin,
                 ),
             )
             .await
@@ -509,7 +520,7 @@ async fn handle_request(
                     system_prompt,
                     max_history,
                     model_family,
-                    normalized_origin(request_origin),
+                    request_origin,
                 ),
             )
             .await

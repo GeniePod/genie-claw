@@ -283,6 +283,15 @@ async fn main() -> Result<()> {
         .await
     } else {
         // Daemon mode: run HTTP server.
+        // Trusted origin resolution (issue #232): the `X-Genie-Origin` header is
+        // forgeable, so a privileged origin is only honored from a loopback peer
+        // or with a matching `[core.origin_auth]` token. The in-process Telegram
+        // adapter reaches core over loopback, but we also hand it its configured
+        // token so its `telegram` principal stays unforgeable by other local
+        // processes and keeps working under `require_token`.
+        let origin_resolver =
+            genie_core::origin_auth::OriginResolver::from_config(&config.core.origin_auth);
+
         let chat_server = genie_core::server::ChatServer::new(
             llm,
             tool_dispatcher,
@@ -295,7 +304,8 @@ async fn main() -> Result<()> {
             model_family,
             config.core.expected_runtime_contract_hash.clone(),
         )?
-        .with_http_config(config.http.clone());
+        .with_http_config(config.http.clone())
+        .with_origin_auth(origin_resolver);
 
         tracing::info!(port, "starting HTTP chat API");
         if config.telegram.enabled {
@@ -322,6 +332,9 @@ async fn main() -> Result<()> {
                     );
                 }
 
+                let telegram_origin_token =
+                    config.core.origin_auth.resolved_tokens().remove("telegram");
+
                 let telegram_cfg = genie_core::telegram::TelegramRuntimeConfig {
                     api_base: config.telegram.api_base.clone(),
                     bot_token,
@@ -344,6 +357,7 @@ async fn main() -> Result<()> {
                         piper_model: config.core.piper_model.clone(),
                         max_parallel_voice: config.telegram.voice.max_parallel_voice,
                     },
+                    origin_token: telegram_origin_token,
                 };
 
                 tracing::info!(

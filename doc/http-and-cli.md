@@ -35,6 +35,44 @@ First-party clients should set `X-Genie-Origin` so tool and actuation policy can
 differentiate `dashboard`, `api`, `voice`, `telegram`, and other surfaces.
 Requests without the header are treated as `api`, not `dashboard`.
 
+#### Trusted Origin Resolution (issue #232)
+
+The origin drives per-origin tool ACLs, actuation ACLs, rate limits, audit
+attribution, and NLU confidence thresholds, so the client-supplied
+`X-Genie-Origin` header cannot be trusted on its own — otherwise any caller
+could claim `voice` to clear a higher-trust bar or rotate origins to dodge a
+per-origin rate limit. genie-core only honors an origin more privileged than the
+`api` baseline when the request proves it is entitled to that origin:
+
+- from a **loopback** peer — the documented single-host trust boundary (see
+  [household-security.md](household-security.md)); or
+- with an **`X-Genie-Origin-Token`** that matches the secret configured for the
+  claimed origin under `[core.origin_auth]`.
+
+Anything else — a privileged claim from a non-loopback peer with no valid token,
+or a mismatched token — is downgraded to `api` and logged. This means a LAN peer
+reaching a `bind_host = "0.0.0.0"` deployment **cannot** assume `voice`,
+`dashboard`, or `telegram` from the header alone.
+
+Configuration:
+
+```toml
+[core.origin_auth]
+# Require a token even from loopback peers (hardens multi-process same-host
+# setups). Off by default so the local dashboard, CLI, and in-process adapters
+# work with no setup.
+require_token = false
+# origin -> shared secret presented in the X-Genie-Origin-Token header.
+# Prefer the GENIE_ORIGIN_TOKEN_<ORIGIN> env var and keep config files 0600.
+tokens = { dashboard = "", telegram = "" }
+```
+
+Each origin's token may instead be supplied via the
+`GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable (e.g.
+`GENIE_ORIGIN_TOKEN_TELEGRAM`). The in-process Telegram adapter automatically
+presents its configured token, so its `telegram` principal stays unforgeable by
+other local processes and keeps working when `require_token = true`.
+
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/` | Local chat UI |

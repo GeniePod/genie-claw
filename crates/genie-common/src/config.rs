@@ -191,6 +191,10 @@ pub struct CoreConfig {
     /// Final actuation safety gate for home-control execution.
     #[serde(default)]
     pub actuation_safety: ActuationSafetyConfig,
+
+    /// Authentication for assuming a privileged request origin over HTTP.
+    #[serde(default)]
+    pub origin_auth: OriginAuthConfig,
 }
 
 impl Default for CoreConfig {
@@ -227,6 +231,7 @@ impl Default for CoreConfig {
             skill_policy: SkillPolicyConfig::default(),
             tool_policy: ToolPolicyConfig::default(),
             actuation_safety: ActuationSafetyConfig::default(),
+            origin_auth: OriginAuthConfig::default(),
         }
     }
 }
@@ -481,6 +486,75 @@ impl Default for ActuationSafetyConfig {
             max_actions_per_minute: defaults::actuation_max_actions_per_minute(),
             max_actions_per_minute_by_origin: HashMap::new(),
         }
+    }
+}
+
+/// Authentication for assuming a privileged request origin over HTTP (issue
+/// #232).
+///
+/// The request origin (`voice`, `dashboard`, `telegram`, …) drives per-origin
+/// tool ACLs, actuation ACLs, rate limits, audit attribution, and NLU
+/// confidence thresholds. That origin arrives as the client-supplied
+/// `X-Genie-Origin` header, so on its own it is a *forgeable* security
+/// principal: any client that can reach the port could claim `voice` to clear
+/// a higher-trust bar, or rotate origins to dodge a per-origin rate limit.
+///
+/// `genie-core` therefore only honors an origin more privileged than the
+/// untrusted `api` baseline when the request proves entitlement to it. By
+/// default that proof is the transport itself — a loopback peer is the
+/// documented single-host trust boundary (see `doc/household-security.md`) —
+/// which keeps the local dashboard, CLI, and in-process adapters working with
+/// no configuration. A non-loopback peer (i.e. `bind_host = "0.0.0.0"` reached
+/// across the LAN) cannot assume a privileged origin from the header alone; it
+/// must present a matching shared-secret token.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct OriginAuthConfig {
+    /// Require a valid token for every privileged origin, even from loopback
+    /// peers. Off by default so a single trusted host needs no setup; turn it
+    /// on to also stop one local process from impersonating another's channel.
+    #[serde(default)]
+    pub require_token: bool,
+
+    /// Map of origin name (`voice`, `dashboard`, `telegram`, `repl`) to the
+    /// shared secret a request must present in the `X-Genie-Origin-Token`
+    /// header to assume that origin. Prefer leaving the value empty here and
+    /// supplying it via the `GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable
+    /// (keep config files `0600`). An origin with no resolved token cannot be
+    /// claimed by a non-loopback peer at all.
+    #[serde(default)]
+    pub tokens: HashMap<String, String>,
+}
+
+impl OriginAuthConfig {
+    /// Resolve the effective `origin -> secret` map: the configured value
+    /// first, then the `GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable.
+    /// Blank/whitespace tokens are dropped so an empty entry can never
+    /// authenticate anything.
+    pub fn resolved_tokens(&self) -> HashMap<String, String> {
+        const KNOWN_ORIGINS: [&str; 4] = ["voice", "dashboard", "telegram", "repl"];
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        // Configured origins first, then fill any remaining known origins from
+        // the environment so `GENIE_ORIGIN_TOKEN_TELEGRAM` alone is enough.
+        let names = self.tokens.keys().map(String::as_str).chain(KNOWN_ORIGINS);
+        for name in names {
+            let key = name.trim().to_ascii_lowercase();
+            if key.is_empty() || out.contains_key(&key) {
+                continue;
+            }
+            let configured = self.tokens.get(name).map(|s| s.trim().to_string());
+            let token = match configured {
+                Some(value) if !value.is_empty() => value,
+                _ => std::env::var(format!("GENIE_ORIGIN_TOKEN_{}", key.to_ascii_uppercase()))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            };
+            if !token.is_empty() {
+                out.insert(key, token);
+            }
+        }
+        out
     }
 }
 

@@ -67,6 +67,12 @@ fallback policy, and user-visible review.
 - Keep `genie-core` and `genie-api` on localhost unless a trusted gateway owns
   authentication.
 - Prefer environment variables for tokens.
+- The request origin (`voice`/`dashboard`/`telegram`/…) is a trust input, not a
+  client-asserted label: genie-core only honors a privileged `X-Genie-Origin`
+  from a loopback peer or with a matching `[core.origin_auth]` token, and
+  downgrades everything else to `api`. When binding beyond localhost, configure
+  origin tokens (or set `require_token`) so a network peer cannot forge a
+  higher-trust channel.
 - Keep config files `0600` and data directories `0700`.
 - Do not use Telegram `allow_all_chats` for a real home.
 - Keep tool policy and actuation safety enabled.

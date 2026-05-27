@@ -35,6 +35,11 @@ pub struct TelegramRuntimeConfig {
     pub allowed_chat_ids: Vec<i64>,
     pub allow_all_chats: bool,
     pub voice: TelegramVoiceRuntimeConfig,
+    /// Shared secret presented as `X-Genie-Origin-Token` so genie-core trusts
+    /// the `telegram` origin instead of treating the (forgeable) header as
+    /// proof (issue #232). `None` when no token is configured, in which case
+    /// the loopback `core_base_url` is trusted by transport.
+    pub origin_token: Option<String>,
 }
 
 /// Voice-message ingestion settings for the Telegram channel (issue #42).
@@ -738,10 +743,14 @@ impl TelegramApi {
             conversation_id: Some(format!("telegram-{chat_id}")),
         };
 
-        let response: CoreChatResponse = self
+        let mut builder = self
             .client
             .post(format!("{}/api/chat", self.config.core_base_url))
-            .header("X-Genie-Origin", "telegram")
+            .header("X-Genie-Origin", "telegram");
+        if let Some(token) = &self.config.origin_token {
+            builder = builder.header("X-Genie-Origin-Token", token);
+        }
+        let response: CoreChatResponse = builder
             .json(&request)
             .send()
             .await
@@ -1034,6 +1043,7 @@ mod tests {
                     piper_model: PathBuf::from("/tmp/piper.onnx"),
                     max_parallel_voice,
                 },
+                origin_token: None,
             },
         )
     }

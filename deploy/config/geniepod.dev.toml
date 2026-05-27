@@ -69,6 +69,13 @@ expected_runtime_contract_hash = ""  # Optional: pin after a known-good boot.
 # max_actions_per_minute = 12
 # max_actions_per_minute_by_origin = { telegram = 3, voice = 8 }
 
+# Trusted request-origin auth (issue #232). The X-Genie-Origin header is
+# forgeable, so a privileged origin is only honored from a loopback peer or with
+# a matching token. Localhost-only dev needs nothing here.
+# [core.origin_auth]
+# require_token = false
+# tokens = { dashboard = "", telegram = "" }   # Prefer GENIE_ORIGIN_TOKEN_<ORIGIN>.
+
 [web_search]
 enabled = true
 provider = "duckduckgo"

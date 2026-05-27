@@ -49,6 +49,7 @@ pub mod conversation;
 pub mod ha;
 pub mod llm;
 pub mod memory;
+pub mod origin_auth;
 pub mod ota;
 pub mod profile;
 pub mod prompt;

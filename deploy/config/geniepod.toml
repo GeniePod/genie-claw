@@ -175,6 +175,19 @@ wakeword_script = ""              # Empty = push-to-talk (alpha.5 default).
 # max_actions_per_minute = 12
 # max_actions_per_minute_by_origin = { telegram = 3, voice = 8 }
 
+# Trusted resolution of the request origin (issue #232). The per-origin tool/
+# actuation ACLs, rate limits, audit trail, and confidence thresholds above all
+# key off the X-Genie-Origin header, which is client-supplied and therefore
+# forgeable. genie-core only honors a privileged origin (anything but the `api`
+# baseline) from a loopback peer (the single-host trust boundary) or when the
+# request presents a matching token in the X-Genie-Origin-Token header. No setup
+# is needed for a localhost-only deployment; configure tokens when binding to a
+# LAN address behind a gateway, or set require_token to also stop one local
+# process from impersonating another's channel.
+# [core.origin_auth]
+# require_token = false                         # true => tokens mandatory even on loopback
+# tokens = { dashboard = "", telegram = "" }    # Prefer GENIE_ORIGIN_TOKEN_<ORIGIN> env vars.
+
 [governor]
 poll_interval_ms = 5000
 night_start_hour = 23

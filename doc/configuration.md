@@ -58,6 +58,7 @@ Runtime load path:
 | `skill_policy.*` | Runtime load policy for native skills |
 | `tool_policy.*` | Runtime allow/deny policy for model-callable tools by origin |
 | `actuation_safety.*` | Final home-actuation safety gate settings |
+| `origin_auth.*` | How a request may assume a privileged origin over HTTP |
 
 ### `[core.speaker_identity]`
 
@@ -136,6 +137,27 @@ Behavior notes:
 - `unknown` is not in the default `allowed_origins`; direct tool execution without a channel context cannot actuate the home.
 - Valid origin keys are `voice`, `dashboard`, `api`, `telegram`, `repl`, and `confirmation`.
 - Rate limits apply before physical execution and are tracked per origin over a 60-second window.
+- The origin these policies key off is resolved per `[core.origin_auth]` below, not taken at face value from the header.
+
+### `[core.origin_auth]`
+
+The `X-Genie-Origin` header is client-supplied, so it cannot by itself be a
+trusted security principal for the policies above (issue #232). A request may
+assume an origin more privileged than the `api` baseline only when it proves
+entitlement — by originating from a loopback peer or by presenting a matching
+token. Otherwise it is downgraded to `api`.
+
+| Key | Purpose |
+| --- | --- |
+| `require_token` | Require a valid token even from loopback peers (default `false`) |
+| `tokens` | Map of origin name to the shared secret expected in `X-Genie-Origin-Token` |
+
+Behavior notes:
+
+- Default (`require_token = false`, no tokens): loopback peers are trusted to set any origin; non-loopback peers cannot assume a privileged origin at all.
+- A configured token makes that origin require the token everywhere, including loopback — so one local process cannot impersonate another's channel.
+- Each token may instead be supplied via the `GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable (preferred; keep config files `0600`).
+- The in-process Telegram adapter automatically presents its configured token.
 
 ### Runtime Contract Pinning
 
