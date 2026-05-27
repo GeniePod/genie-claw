@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use super::LlmRequestHints;
@@ -235,6 +235,8 @@ impl RequestProfile {
 const GENIE_RUNTIME_MAX_BODY_BYTES: usize = 4 * 1024;
 const GENIE_RUNTIME_BODY_OVERHEAD_BYTES: usize = 512;
 const GENIE_RUNTIME_CONTEXT_MAX_BYTES: usize = 900;
+/// Cap outbound LLM HTTP bodies so a buggy backend cannot OOM genie-core.
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const GENIE_RUNTIME_COMPACT_SYSTEM: &str =
     "You are GeniePod Home. Answer the user's latest request directly and concisely.";
 const GENIE_RUNTIME_COMPACT_SYSTEM_PREFIX: &str = "You are GeniePod Home. Reply briefly for voice. Use a tool only when required. Tool calls must be ONLY JSON: {\"tool\":\"tool_name\",\"arguments\":{}}. No markdown.";
@@ -489,6 +491,15 @@ impl OpenAiCompatClient {
                     if status != 200 {
                         let mut error_body = String::new();
                         while let Some(line) = lines.next_line().await? {
+                            if error_body.len().saturating_add(line.len())
+                                > DEFAULT_MAX_RESPONSE_BYTES
+                            {
+                                anyhow::bail!(
+                                    "{} streaming error body exceeded {} bytes",
+                                    self.backend_name,
+                                    DEFAULT_MAX_RESPONSE_BYTES
+                                );
+                            }
                             error_body.push_str(&line);
                         }
                         anyhow::bail!(
@@ -515,6 +526,15 @@ impl OpenAiCompatClient {
                         && let Some(content) = &delta.content
                     {
                         on_token(content);
+                        if full_response.len().saturating_add(content.len())
+                            > DEFAULT_MAX_RESPONSE_BYTES
+                        {
+                            anyhow::bail!(
+                                "{} streaming response exceeded {} bytes",
+                                self.backend_name,
+                                DEFAULT_MAX_RESPONSE_BYTES
+                            );
+                        }
                         full_response.push_str(content);
                     }
                     if choice.finish_reason.is_some() {
@@ -559,42 +579,7 @@ impl OpenAiCompatClient {
 
         writer.write_all(request.as_bytes()).await?;
 
-        let mut buf_reader = BufReader::new(reader);
-        let mut response = String::new();
-        let mut headers_done = false;
-        let mut content_length: usize = 0;
-        let mut status = 0;
-
-        // Read headers.
-        loop {
-            let mut line = String::new();
-            buf_reader.read_line(&mut line).await?;
-            if line.starts_with("HTTP/") {
-                status = parse_status_line(&line);
-                continue;
-            }
-            if line.trim().is_empty() {
-                headers_done = true;
-                break;
-            }
-            if let Some(val) = line.to_lowercase().strip_prefix("content-length: ") {
-                content_length = val.trim().parse().unwrap_or(0);
-            }
-        }
-
-        if headers_done && content_length > 0 {
-            let mut buf = vec![0u8; content_length];
-            tokio::io::AsyncReadExt::read_exact(&mut buf_reader, &mut buf).await?;
-            response = String::from_utf8_lossy(&buf).to_string();
-        } else if headers_done {
-            // Chunked or unknown length — read until EOF.
-            tokio::io::AsyncReadExt::read_to_string(&mut buf_reader, &mut response).await?;
-        }
-
-        Ok(HttpResponse {
-            status,
-            body: response,
-        })
+        read_bounded_http_response(reader, DEFAULT_MAX_RESPONSE_BYTES).await
     }
 
     async fn http_get(&self, path: &str) -> Result<HttpResponse> {
@@ -611,25 +596,104 @@ impl OpenAiCompatClient {
         );
         writer.write_all(request.as_bytes()).await?;
 
-        let mut buf_reader = BufReader::new(reader);
-        let mut body = String::new();
-        let mut status = 0;
+        read_bounded_http_response(reader, DEFAULT_MAX_RESPONSE_BYTES).await
+    }
+}
 
-        loop {
-            let mut line = String::new();
-            buf_reader.read_line(&mut line).await?;
-            if line.starts_with("HTTP/") {
-                status = parse_status_line(&line);
-                continue;
-            }
-            if line.trim().is_empty() {
-                break;
-            }
+async fn read_bounded_http_response(
+    reader: tokio::net::tcp::OwnedReadHalf,
+    max_response_bytes: usize,
+) -> Result<HttpResponse> {
+    let mut buf_reader = BufReader::new(reader);
+
+    let mut status_line = String::new();
+    buf_reader.read_line(&mut status_line).await?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or_else(|| parse_status_line(&status_line));
+
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+
+    loop {
+        let mut line = String::new();
+        buf_reader.read_line(&mut line).await?;
+        if line.trim().is_empty() {
+            break;
         }
 
-        tokio::io::AsyncReadExt::read_to_string(&mut buf_reader, &mut body).await?;
-        Ok(HttpResponse { status, body })
+        let lower = line.to_lowercase();
+        if let Some(val) = lower.strip_prefix("content-length:") {
+            content_length = val.trim().parse().ok();
+        }
+        if let Some(val) = lower.strip_prefix("transfer-encoding:")
+            && val.contains("chunked")
+        {
+            chunked = true;
+        }
     }
+
+    let body = if chunked {
+        read_chunked_body(&mut buf_reader, max_response_bytes).await?
+    } else if let Some(content_length) = content_length {
+        if content_length > max_response_bytes {
+            anyhow::bail!(
+                "LLM response Content-Length {} exceeds cap {}",
+                content_length,
+                max_response_bytes
+            );
+        }
+        let mut buf = vec![0u8; content_length];
+        buf_reader.read_exact(&mut buf).await?;
+        String::from_utf8_lossy(&buf).to_string()
+    } else {
+        let cap = max_response_bytes;
+        let mut limited = (&mut buf_reader).take(cap as u64 + 1);
+        let mut body = String::new();
+        limited.read_to_string(&mut body).await?;
+        if body.len() > cap {
+            anyhow::bail!("LLM response without Content-Length exceeded {} bytes", cap);
+        }
+        body
+    };
+
+    Ok(HttpResponse { status, body })
+}
+
+async fn read_chunked_body<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<String> {
+    let mut body = Vec::new();
+
+    loop {
+        let mut size_line = String::new();
+        reader.read_line(&mut size_line).await?;
+        let size_hex = size_line.trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .with_context(|| format!("invalid chunk size: {size_hex}"))?;
+
+        if size == 0 {
+            let mut trailing = String::new();
+            reader.read_line(&mut trailing).await?;
+            break;
+        }
+
+        if body.len().saturating_add(size) > max_bytes {
+            anyhow::bail!("LLM chunked response exceeded {} bytes", max_bytes);
+        }
+
+        let mut chunk = vec![0u8; size];
+        reader.read_exact(&mut chunk).await?;
+        body.extend_from_slice(&chunk);
+
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf).await?;
+    }
+
+    Ok(String::from_utf8_lossy(&body).to_string())
 }
 
 fn build_nvext(hints: &LlmRequestHints) -> Option<NvExt> {
@@ -970,6 +1034,7 @@ fn truncate_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn parse_url() {
@@ -1258,5 +1323,96 @@ mod tests {
             backend_error_message(r#"{"message":"bad request"}"#),
             "bad request"
         );
+    }
+
+    async fn spawn_test_listener<F, Fut>(handler: F) -> std::net::SocketAddr
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((conn, _)) = listener.accept().await {
+                handler(conn).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn rejects_oversize_content_length() {
+        let addr = spawn_test_listener(|mut conn| async move {
+            let mut buf = [0u8; 1024];
+            let _ = conn.read(&mut buf).await;
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n";
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.shutdown().await;
+        })
+        .await;
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (reader, _) = stream.into_split();
+        let err = read_bounded_http_response(reader, 16 * 1024)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("exceeds cap"),
+            "expected cap error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_to_eof_response_is_size_capped() {
+        let addr = spawn_test_listener(|mut conn| async move {
+            let mut buf = [0u8; 1024];
+            let _ = conn.read(&mut buf).await;
+            let header =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+            let _ = conn.write_all(header.as_bytes()).await;
+            let filler = vec![b'x'; 4096];
+            for _ in 0..16 {
+                if conn.write_all(&filler).await.is_err() {
+                    break;
+                }
+            }
+            let _ = conn.shutdown().await;
+        })
+        .await;
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (reader, _) = stream.into_split();
+        let err = read_bounded_http_response(reader, 16 * 1024)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("without Content-Length exceeded"),
+            "expected EOF cap error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_content_length_response() {
+        let addr = spawn_test_listener(|mut conn| async move {
+            let mut buf = [0u8; 1024];
+            let _ = conn.read(&mut buf).await;
+            let body = r#"{"ok":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.shutdown().await;
+        })
+        .await;
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (reader, _) = stream.into_split();
+        let response = read_bounded_http_response(reader, 16 * 1024).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, r#"{"ok":true}"#);
     }
 }
