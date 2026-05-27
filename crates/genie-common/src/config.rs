@@ -737,7 +737,12 @@ pub enum WebSearchProvider {
 /// connections is capped (issue #195). The per-request body cap is fixed per
 /// server (64 KiB for genie-core, 4 KiB for genie-api) and is not part of this
 /// section.
-#[derive(Debug, Deserialize, Clone, Copy)]
+///
+/// It also carries the cross-origin request gate (issue #228): both servers
+/// reflect only allowlisted `Origin`s (never the old wildcard), reject
+/// non-allowlisted `Host`s (DNS-rebinding), and — when `local_api_token` is
+/// set — require that token on mutating/actuating endpoints.
+#[derive(Debug, Deserialize, Clone)]
 pub struct HttpServerConfig {
     /// Max bytes in the request line, newline included.
     #[serde(default = "defaults::http_max_request_line_bytes")]
@@ -763,6 +768,28 @@ pub struct HttpServerConfig {
     /// Ceiling on concurrently handled connections.
     #[serde(default = "defaults::http_max_connections")]
     pub max_connections: usize,
+
+    /// Extra browser `Origin`s to allow cross-origin (exact, scheme-qualified,
+    /// e.g. `http://genie.local:3000`). Loopback origins for the bound port are
+    /// always allowed; add LAN hostnames or alternate UI origins here.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
+    /// Extra `Host` header values to allow (exact `host` or `host:port`, e.g.
+    /// `genie.local:3000`). Loopback hosts for the bound port are always
+    /// allowed; add the LAN hostname/IP the daemon is reached by here. Required
+    /// for any non-loopback access — it closes the DNS-rebinding hole.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+
+    /// Shared local API token for mutating/actuating endpoints (chat, memory
+    /// edits, actuation confirm). When set, both servers require it via
+    /// `X-Genie-Token` or `Authorization: Bearer …`; the on-device UIs receive
+    /// it automatically and genie-api forwards it to genie-core. Blank disables
+    /// token enforcement (the Origin/Host gate still applies). Can also be set
+    /// via the `GENIEPOD_LOCAL_API_TOKEN` env var.
+    #[serde(default)]
+    pub local_api_token: String,
 }
 
 impl Default for HttpServerConfig {
@@ -774,6 +801,9 @@ impl Default for HttpServerConfig {
             max_header_bytes: defaults::http_max_header_bytes(),
             read_timeout_secs: defaults::http_read_timeout_secs(),
             max_connections: defaults::http_max_connections(),
+            allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
+            local_api_token: String::new(),
         }
     }
 }
@@ -1021,9 +1051,23 @@ impl Config {
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("failed to read config {}: {}", path.display(), e))?;
-        let config: Config = toml::from_str(&contents)?;
+        let mut config: Config = toml::from_str(&contents)?;
+        config.resolve_env_overrides();
         config.validate_service_url_drift();
         Ok(config)
+    }
+
+    /// Fold environment-provided secrets into the parsed config so every
+    /// consumer reads them off the struct. Config file wins when set; otherwise
+    /// the env var is used. Currently only the shared local API token
+    /// (`GENIEPOD_LOCAL_API_TOKEN`, issue #228).
+    fn resolve_env_overrides(&mut self) {
+        if self.http.local_api_token.trim().is_empty()
+            && let Ok(token) = std::env::var("GENIEPOD_LOCAL_API_TOKEN")
+            && !token.trim().is_empty()
+        {
+            self.http.local_api_token = token.trim().to_string();
+        }
     }
 
     /// TCP `host:port` for local HTTP clients proxying to genie-core.

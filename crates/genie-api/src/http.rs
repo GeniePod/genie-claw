@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use genie_common::config::Config;
-use genie_common::http::{HttpLimits, read_request};
+use genie_common::http::{
+    GuardRejection, HttpLimits, OriginDecision, RequestGuard, cors_response_headers, read_request,
+};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -43,6 +45,29 @@ pub(crate) async fn serve_listener(listener: TcpListener, config: Config) -> Res
     // Bound concurrently handled connections so a flood cannot exhaust fds.
     let semaphore = Arc::new(Semaphore::new(max_connections));
 
+    // Cross-origin / DNS-rebinding gate (issue #228), built from the actual
+    // bound address so loopback Host/Origin values for the dashboard port are
+    // always accepted; the wildcard ACAO is gone.
+    let local_addr = listener.local_addr().ok();
+    let listen_host = local_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let listen_port = local_addr.map(|addr| addr.port()).unwrap_or(0);
+    let guard = Arc::new(RequestGuard::new(
+        &listen_host,
+        listen_port,
+        &config.http.allowed_origins,
+        &config.http.allowed_hosts,
+        &config.http.local_api_token,
+    ));
+    if guard.enforces_token() {
+        tracing::info!("local API token enforced on mutating dashboard endpoints");
+    } else {
+        tracing::warn!(
+            "no [http].local_api_token set; mutating endpoints rely on the Origin/Host gate only"
+        );
+    }
+
     loop {
         // Reserve a slot before accepting; connections beyond the ceiling stay
         // parked in the OS backlog rather than being spawned unbounded.
@@ -62,11 +87,12 @@ pub(crate) async fn serve_listener(listener: TcpListener, config: Config) -> Res
             }
         };
         let config = config.clone();
+        let guard = Arc::clone(&guard);
 
         tokio::spawn(async move {
             // Hold the permit for the lifetime of the request.
             let _permit = permit;
-            if let Err(e) = handle_connection(stream, &config, &limits).await {
+            if let Err(e) = handle_connection(stream, &config, &limits, &guard).await {
                 tracing::debug!(peer = %peer, error = %e, "connection error");
             }
         });
@@ -79,6 +105,7 @@ async fn handle_connection(
     stream: tokio::net::TcpStream,
     config: &Config,
     limits: &HttpLimits,
+    guard: &RequestGuard,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
@@ -90,19 +117,42 @@ async fn handle_connection(
         Ok(request) => request,
         Err(e) => {
             if let Some(status) = e.status_code() {
-                let _ = write_response(&mut writer, &error_response(status)).await;
+                let _ = write_response(&mut writer, &error_response(status), None).await;
             }
             tracing::debug!(error = %e, "rejected request");
             return Ok(());
         }
     };
 
-    let body = request.body;
-    let method = request.method;
-    let path = request.path;
+    // Cross-origin / DNS-rebinding gate ahead of routing (issue #228).
+    let echo_origin = match guard.check_request(&request) {
+        OriginDecision::Allow(origin) => origin,
+        OriginDecision::Reject(rejection) => {
+            tracing::debug!(reason = rejection.reason(), "request gated out");
+            let _ = write_response(&mut writer, &guard_rejection(rejection), None).await;
+            return Ok(());
+        }
+    };
+
+    let method = request.method.as_str();
+    let path = request.path.as_str();
+
+    // Mutating/actuating endpoints additionally require the shared local token.
+    if is_mutating(method, path) && !guard.token_ok(&request) {
+        tracing::debug!("mutating request without a valid local API token");
+        let response = guard_rejection(GuardRejection::MissingToken);
+        return write_response(&mut writer, &response, echo_origin.as_deref()).await;
+    }
+
+    let body = request.body.as_deref();
 
     // Route the request.
-    let response = match (method.as_str(), path.as_str()) {
+    let response = match (method, path) {
+        ("OPTIONS", _) => Response {
+            status: 204,
+            content_type: "text/plain",
+            body: String::new(),
+        },
         ("GET", "/api/status") => routes::get_status(config).await,
         ("GET", "/api/tegrastats") => routes::get_tegrastats(config).await,
         ("GET", "/api/services") => routes::get_services(config).await,
@@ -111,21 +161,13 @@ async fn handle_connection(
         ("GET", "/api/actuation/pending") => routes::get_actuation_pending(config).await,
         ("GET", "/api/actuation/actions") => routes::get_actuation_actions(config).await,
         ("GET", "/api/actuation/audit") => routes::get_actuation_audit(config).await,
-        ("POST", "/api/actuation/confirm") => {
-            routes::post_actuation_confirm(config, body.as_deref()).await
-        }
+        ("POST", "/api/actuation/confirm") => routes::post_actuation_confirm(config, body).await,
         ("GET", "/api/memories") => routes::get_memories(config).await,
-        ("POST", "/api/memories/update") => {
-            routes::post_memory_update(config, body.as_deref()).await
-        }
-        ("POST", "/api/memories/delete") => {
-            routes::post_memory_delete(config, body.as_deref()).await
-        }
-        ("POST", "/api/memories/reorder") => {
-            routes::post_memory_reorder(config, body.as_deref()).await
-        }
-        ("POST", "/api/mode") => routes::post_mode(body.as_deref()).await,
-        ("GET", "/" | "/index.html") => routes::serve_dashboard(),
+        ("POST", "/api/memories/update") => routes::post_memory_update(config, body).await,
+        ("POST", "/api/memories/delete") => routes::post_memory_delete(config, body).await,
+        ("POST", "/api/memories/reorder") => routes::post_memory_reorder(config, body).await,
+        ("POST", "/api/mode") => routes::post_mode(body).await,
+        ("GET", "/" | "/index.html") => routes::serve_dashboard(&config.http.local_api_token),
         ("GET", "/dashboard.js") => routes::serve_dashboard_js(),
         _ => Response {
             status: 404,
@@ -134,7 +176,30 @@ async fn handle_connection(
         },
     };
 
-    write_response(&mut writer, &response).await
+    write_response(&mut writer, &response, echo_origin.as_deref()).await
+}
+
+/// State-changing / actuating routes that require the shared local API token
+/// when one is configured (issue #228).
+fn is_mutating(method: &str, path: &str) -> bool {
+    method == "POST"
+        && matches!(
+            path,
+            "/api/actuation/confirm"
+                | "/api/memories/update"
+                | "/api/memories/delete"
+                | "/api/memories/reorder"
+                | "/api/mode"
+        )
+}
+
+/// `403` response for a gated-out request, reusing the shared rejection reason.
+fn guard_rejection(rejection: GuardRejection) -> Response {
+    Response {
+        status: rejection.status(),
+        content_type: "application/json",
+        body: format!(r#"{{"error":"{}"}}"#, rejection.reason()),
+    }
 }
 
 pub struct Response {
@@ -153,13 +218,18 @@ fn error_response(status: u16) -> Response {
     }
 }
 
-async fn write_response(writer: &mut OwnedWriteHalf, response: &Response) -> Result<()> {
+async fn write_response(
+    writer: &mut OwnedWriteHalf,
+    response: &Response,
+    reflect_origin: Option<&str>,
+) -> Result<()> {
     let http_response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
         response.status,
         status_text(response.status),
         response.content_type,
         response.body.len(),
+        cors_response_headers(reflect_origin),
     );
 
     writer.write_all(http_response.as_bytes()).await?;
@@ -172,7 +242,9 @@ async fn write_response(writer: &mut OwnedWriteHalf, response: &Response) -> Res
 fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         408 => "Request Timeout",
         413 => "Payload Too Large",
@@ -233,7 +305,7 @@ mod tests {
         // The daemon survives: a well-formed request is still routed.
         let mut stream2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         stream2
-            .write_all(b"GET /does-not-exist HTTP/1.1\r\nHost: x\r\n\r\n")
+            .write_all(b"GET /does-not-exist HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
             .unwrap();
         let resp2 = read_all(stream2, Duration::from_secs(5)).await;
@@ -286,7 +358,7 @@ mod tests {
         // A well-formed request still gets served once stalled peers time out.
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         stream
-            .write_all(b"GET /does-not-exist HTTP/1.1\r\nHost: x\r\n\r\n")
+            .write_all(b"GET /does-not-exist HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
             .unwrap();
         let mut buf = Vec::new();
@@ -301,5 +373,68 @@ mod tests {
         );
 
         drop(stalled);
+    }
+
+    // --- Cross-origin request gate (issue #228) ---------------------------
+
+    async fn roundtrip(port: u16, raw: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        read_all(stream, Duration::from_secs(5)).await
+    }
+
+    #[tokio::test]
+    async fn cross_origin_is_gated_and_wildcard_is_gone() {
+        let config = config_with_http("[http]\nread_timeout_secs = 2\nmax_connections = 8\n");
+        let port = start_server(config).await;
+
+        // Same-origin read: 200 and never a wildcard ACAO.
+        let ok = roundtrip(port, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok:?}");
+        assert!(
+            !ok.contains("Access-Control-Allow-Origin: *"),
+            "wildcard ACAO must be gone: {ok:?}"
+        );
+
+        // Cross-site Origin → 403, not made readable.
+        let evil = roundtrip(
+            port,
+            "GET /api/status HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.example\r\n\r\n",
+        )
+        .await;
+        assert!(evil.starts_with("HTTP/1.1 403"), "{evil:?}");
+        assert!(!evil.contains("Access-Control-Allow-Origin"), "{evil:?}");
+
+        // DNS-rebinding: an attacker Host → 403.
+        let rebind = roundtrip(
+            port,
+            &format!("GET /api/status HTTP/1.1\r\nHost: evil.example:{port}\r\n\r\n"),
+        )
+        .await;
+        assert!(rebind.starts_with("HTTP/1.1 403"), "{rebind:?}");
+    }
+
+    #[tokio::test]
+    async fn mutating_dashboard_endpoint_requires_token_when_configured() {
+        let config = config_with_http(
+            "[http]\nlocal_api_token = \"s3cret\"\nread_timeout_secs = 2\nmax_connections = 8\n",
+        );
+        let port = start_server(config).await;
+
+        // Mutating route without the token → 403 (rejected before any proxy).
+        let no_tok = roundtrip(
+            port,
+            "POST /api/mode HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(no_tok.starts_with("HTTP/1.1 403"), "{no_tok:?}");
+        assert!(no_tok.contains("local API token"), "{no_tok:?}");
+
+        // The served dashboard carries the injected token.
+        let root = roundtrip(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(
+            root.contains(r#"content="s3cret""#),
+            "token must be injected into the dashboard: {root:?}"
+        );
     }
 }

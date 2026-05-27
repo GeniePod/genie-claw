@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use genie_common::config::HttpServerConfig;
-use genie_common::http::{HttpLimits, read_request};
+use genie_common::http::{GuardRejection, HttpLimits, OriginDecision, RequestGuard, read_request};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -24,6 +24,12 @@ const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 /// header phase as the `[http]` `max_header_bytes` default). Issue #195.
 const CORE_MAX_BODY_BYTES: usize = 64 * 1024;
 
+/// Placeholder in the served HTML, replaced at request time with the configured
+/// local API token so the first-party UI can authenticate mutating calls
+/// (issue #228). Safe to embed: the page is only readable same-origin (no
+/// wildcard ACAO) and from an allowlisted Origin.
+const TOKEN_PLACEHOLDER: &str = "__GENIE_LOCAL_TOKEN__";
+
 struct StaticHtml {
     body: &'static str,
 }
@@ -33,8 +39,12 @@ impl StaticHtml {
         Self { body }
     }
 
-    fn response(&self) -> (u16, &'static str, String) {
-        (200, HTML_CONTENT_TYPE, self.body.to_owned())
+    fn response(&self, local_api_token: &str) -> (u16, &'static str, String) {
+        (
+            200,
+            HTML_CONTENT_TYPE,
+            self.body.replace(TOKEN_PLACEHOLDER, local_api_token),
+        )
     }
 }
 
@@ -167,6 +177,30 @@ impl ChatServer {
         // Bound concurrently handled connections so a flood cannot exhaust fds
         // or wedge the single-threaded runtime (issue #195).
         let semaphore = Arc::new(Semaphore::new(max_connections));
+
+        // Cross-origin / DNS-rebinding gate (issue #228). Built from the actual
+        // bound address so loopback Host/Origin values for the right port are
+        // always accepted; the wildcard ACAO is gone.
+        let local_addr = listener.local_addr().ok();
+        let listen_host = local_addr
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let listen_port = local_addr.map(|addr| addr.port()).unwrap_or(0);
+        let guard = Rc::new(RequestGuard::new(
+            &listen_host,
+            listen_port,
+            &self.http_config.allowed_origins,
+            &self.http_config.allowed_hosts,
+            &self.http_config.local_api_token,
+        ));
+        if guard.enforces_token() {
+            tracing::info!("local API token enforced on mutating endpoints");
+        } else {
+            tracing::warn!(
+                "no [http].local_api_token set; mutating endpoints rely on the Origin/Host gate only"
+            );
+        }
+
         let ctx = Rc::new(self);
         let local = tokio::task::LocalSet::new();
         local
@@ -193,11 +227,14 @@ impl ChatServer {
                         }
                     };
                     let request_ctx = Rc::clone(&ctx);
+                    let request_guard = Rc::clone(&guard);
                     tokio::task::spawn_local(async move {
                         // Hold the permit for the lifetime of the request; it
                         // is released when this task ends.
                         let _permit = permit;
-                        if let Err(e) = handle_request(stream, request_ctx.as_ref(), &limits).await
+                        if let Err(e) =
+                            handle_request(stream, request_ctx.as_ref(), &limits, &request_guard)
+                                .await
                         {
                             tracing::debug!(error = %e, "request error");
                         }
@@ -236,6 +273,26 @@ enum RequestRoute<'a> {
     Options,
     Export(&'a str),
     NotFound,
+}
+
+impl RequestRoute<'_> {
+    /// True for state-changing / actuating endpoints, which require the shared
+    /// local API token when one is configured (issue #228). Read-only routes
+    /// are guarded by the Origin/Host gate alone.
+    fn is_mutating(&self) -> bool {
+        matches!(
+            self,
+            RequestRoute::ChatStream
+                | RequestRoute::Chat
+                | RequestRoute::Clear
+                | RequestRoute::WebSearchPost
+                | RequestRoute::ActuationConfirm
+                | RequestRoute::MemoriesUpdate
+                | RequestRoute::MemoriesDelete
+                | RequestRoute::MemoriesReorder
+                | RequestRoute::OpenAiChat
+        )
+    }
 }
 
 fn classify_route<'a>(method: &str, path: &'a str) -> RequestRoute<'a> {
@@ -287,6 +344,7 @@ async fn handle_request(
     stream: tokio::net::TcpStream,
     ctx: &ChatServer,
     limits: &HttpLimits,
+    guard: &RequestGuard,
 ) -> Result<()> {
     let llm = &ctx.llm;
     let tools = &ctx.tools;
@@ -321,6 +379,30 @@ async fn handle_request(
         .header("x-genie-origin")
         .map(RequestOrigin::from_header)
         .unwrap_or(RequestOrigin::Unknown);
+
+    // Cross-origin / DNS-rebinding gate ahead of routing (issue #228). A
+    // disallowed Host/Origin is rejected; an allowlisted Origin is reflected in
+    // the response (no more wildcard). Mutating/actuating routes additionally
+    // require the shared local token when one is configured.
+    let echo_origin = match guard.check_request(&request) {
+        OriginDecision::Allow(origin) => origin,
+        OriginDecision::Reject(rejection) => {
+            tracing::debug!(reason = rejection.reason(), "request gated out");
+            let _ = write_guard_rejection(&mut writer, rejection, None).await;
+            return Ok(());
+        }
+    };
+    if classify_route(&request.method, &request.path).is_mutating() && !guard.token_ok(&request) {
+        tracing::debug!("mutating request without a valid local API token");
+        let _ = write_guard_rejection(
+            &mut writer,
+            GuardRejection::MissingToken,
+            echo_origin.as_deref(),
+        )
+        .await;
+        return Ok(());
+    }
+
     let body = request.body;
     let method = request.method;
     let path = request.path;
@@ -341,6 +423,7 @@ async fn handle_request(
             max_history,
             model_family,
             normalized_origin(request_origin),
+            echo_origin.as_deref(),
         )
         .await
         {
@@ -354,7 +437,7 @@ async fn handle_request(
     }
 
     let (status, content_type, response_body) = match route {
-        RequestRoute::Root => CHAT_UI.response(),
+        RequestRoute::Root => CHAT_UI.response(&ctx.http_config.local_api_token),
         RequestRoute::Chat => {
             with_chat_turn_lock(
                 chat_turn_lock,
@@ -440,15 +523,37 @@ async fn handle_request(
     };
 
     let http = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
         status,
         status_text(status),
         content_type,
         response_body.len(),
+        genie_common::http::cors_response_headers(echo_origin.as_deref()),
     );
 
     writer.write_all(http.as_bytes()).await?;
     writer.write_all(response_body.as_bytes()).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Reject a gated-out request with a `403` JSON body, reflecting an allowlisted
+/// origin when one was present (issue #228).
+async fn write_guard_rejection(
+    writer: &mut OwnedWriteHalf,
+    rejection: GuardRejection,
+    reflect_origin: Option<&str>,
+) -> Result<()> {
+    let body = format!(r#"{{"error":"{}"}}"#, rejection.reason());
+    let http = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+        rejection.status(),
+        status_text(rejection.status()),
+        body.len(),
+        genie_common::http::cors_response_headers(reflect_origin),
+    );
+    writer.write_all(http.as_bytes()).await?;
+    writer.write_all(body.as_bytes()).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -495,9 +600,10 @@ async fn handle_chat_stream(
     max_history: usize,
     model_family: ModelFamily,
     request_origin: RequestOrigin,
+    reflect_origin: Option<&str>,
 ) -> Result<()> {
     let Some(body) = body else {
-        write_stream_headers(writer, 400).await?;
+        write_stream_headers(writer, 400, reflect_origin).await?;
         write_stream_event(
             writer,
             &serde_json::json!({"type":"error","message":"missing body"}),
@@ -509,7 +615,7 @@ async fn handle_chat_stream(
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => {
-            write_stream_headers(writer, 400).await?;
+            write_stream_headers(writer, 400, reflect_origin).await?;
             write_stream_event(
                 writer,
                 &serde_json::json!({"type":"error","message": format!("invalid JSON: {}", e)}),
@@ -521,7 +627,7 @@ async fn handle_chat_stream(
 
     let user_text = parsed.get("message").and_then(|v| v.as_str()).unwrap_or("");
     if user_text.trim().is_empty() {
-        write_stream_headers(writer, 400).await?;
+        write_stream_headers(writer, 400, reflect_origin).await?;
         write_stream_event(
             writer,
             &serde_json::json!({"type":"error","message":"empty message"}),
@@ -556,7 +662,7 @@ async fn handle_chat_stream(
         tools.has_home_automation(),
         tools.has_web_search(),
     ) {
-        write_stream_headers(writer, 200).await?;
+        write_stream_headers(writer, 200, reflect_origin).await?;
         write_stream_event(
             writer,
             &serde_json::json!({"type":"start","conversation_id": conv_id}),
@@ -617,7 +723,7 @@ async fn handle_chat_stream(
         "applied reasoning mode for streamed chat"
     );
 
-    write_stream_headers(writer, 200).await?;
+    write_stream_headers(writer, 200, reflect_origin).await?;
     write_stream_event(
         writer,
         &serde_json::json!({"type":"start","conversation_id": conv_id}),
@@ -951,11 +1057,16 @@ fn is_client_disconnect_error(e: &anyhow::Error) -> bool {
     })
 }
 
-async fn write_stream_headers(writer: &mut OwnedWriteHalf, status: u16) -> Result<()> {
+async fn write_stream_headers(
+    writer: &mut OwnedWriteHalf,
+    status: u16,
+    reflect_origin: Option<&str>,
+) -> Result<()> {
     let http = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\n{}Connection: close\r\n\r\n",
         status,
         status_text(status),
+        genie_common::http::cors_response_headers(reflect_origin),
     );
     writer.write_all(http.as_bytes()).await?;
     writer.flush().await?;
@@ -2018,6 +2129,7 @@ fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         408 => "Request Timeout",
         413 => "Payload Too Large",
@@ -2826,6 +2938,153 @@ mod tests {
                 );
 
                 drop(stalled);
+                let _ = std::fs::remove_file(&memory_path);
+                let _ = std::fs::remove_file(&conv_path);
+            })
+            .await;
+    }
+
+    // --- Cross-origin request gate (issue #228) ---------------------------
+
+    async fn http_roundtrip(port: u16, raw: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        // Half-close so the server sees end-of-request immediately and the read
+        // side observes a clean EOF once the (Connection: close) reply is sent.
+        let _ = stream.shutdown().await;
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("server did not respond within 10s")
+        .expect("read failed");
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_and_rebound_host_are_gated_without_wildcard() {
+        let (memory_path, conv_path) = unique_db_paths("genie-cors");
+        let server = offline_server(
+            &memory_path,
+            &conv_path,
+            genie_common::config::HttpServerConfig::default(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let _ = server.serve_listener(listener).await;
+                });
+
+                // Same-origin read: 200 and never a wildcard ACAO.
+                let ok =
+                    http_roundtrip(port, "GET /api/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        .await;
+                assert!(ok.starts_with("HTTP/1.1 200"), "{ok:?}");
+                assert!(
+                    !ok.contains("Access-Control-Allow-Origin: *"),
+                    "wildcard ACAO must be gone: {ok:?}"
+                );
+
+                // Cross-site Origin: rejected and not made readable.
+                let evil = http_roundtrip(
+                    port,
+                    "GET /api/health HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.example\r\n\r\n",
+                )
+                .await;
+                assert!(evil.starts_with("HTTP/1.1 403"), "{evil:?}");
+                assert!(!evil.contains("Access-Control-Allow-Origin"), "{evil:?}");
+
+                // Allowlisted Origin is reflected verbatim, never '*'.
+                let same = http_roundtrip(
+                    port,
+                    &format!(
+                        "GET /api/health HTTP/1.1\r\nHost: localhost:{port}\r\nOrigin: http://localhost:{port}\r\n\r\n"
+                    ),
+                )
+                .await;
+                assert!(same.starts_with("HTTP/1.1 200"), "{same:?}");
+                assert!(
+                    same.contains(&format!(
+                        "Access-Control-Allow-Origin: http://localhost:{port}"
+                    )),
+                    "{same:?}"
+                );
+
+                // DNS-rebinding: an attacker Host is rejected.
+                let rebind = http_roundtrip(
+                    port,
+                    &format!("GET /api/health HTTP/1.1\r\nHost: evil.example:{port}\r\n\r\n"),
+                )
+                .await;
+                assert!(rebind.starts_with("HTTP/1.1 403"), "{rebind:?}");
+
+                let _ = std::fs::remove_file(&memory_path);
+                let _ = std::fs::remove_file(&conv_path);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_token_gates_mutating_endpoints_and_is_injected_into_ui() {
+        let (memory_path, conv_path) = unique_db_paths("genie-token");
+        let http = genie_common::config::HttpServerConfig {
+            local_api_token: "s3cret".into(),
+            ..genie_common::config::HttpServerConfig::default()
+        };
+        let server = offline_server(&memory_path, &conv_path, http);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let _ = server.serve_listener(listener).await;
+                });
+
+                // Mutating route without the token → 403 (gated before routing,
+                // so no body is required here).
+                let no_tok = http_roundtrip(
+                    port,
+                    "POST /api/memories/reorder HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await;
+                assert!(no_tok.starts_with("HTTP/1.1 403"), "{no_tok:?}");
+                assert!(no_tok.contains("local API token"), "{no_tok:?}");
+
+                // Same route with the token → reaches the handler (200 for an
+                // empty, no-op reorder).
+                let with_tok = http_roundtrip(
+                    port,
+                    "POST /api/memories/reorder HTTP/1.1\r\nHost: localhost\r\nX-Genie-Token: s3cret\r\nContent-Length: 10\r\n\r\n{\"ids\":[]}",
+                )
+                .await;
+                assert!(with_tok.starts_with("HTTP/1.1 200"), "{with_tok:?}");
+
+                // A read route stays open without a token.
+                let read = http_roundtrip(
+                    port,
+                    "GET /api/conversations HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await;
+                assert!(read.starts_with("HTTP/1.1 200"), "{read:?}");
+
+                // The served UI carries the injected token for its own fetches.
+                let root =
+                    http_roundtrip(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+                assert!(
+                    root.contains(r#"content="s3cret""#),
+                    "token must be injected into the served UI: {root:?}"
+                );
+
                 let _ = std::fs::remove_file(&memory_path);
                 let _ = std::fs::remove_file(&conv_path);
             })

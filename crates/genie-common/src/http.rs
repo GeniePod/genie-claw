@@ -311,6 +311,249 @@ where
     }
 }
 
+// --- Cross-origin / DNS-rebinding request gate (issue #228) ---------------
+//
+// The hand-rolled servers in `genie-core` (`:3000`) and `genie-api` (`:3080`)
+// previously answered every request with a wildcard
+// `Access-Control-Allow-Origin: *` and performed no `Origin`/`Host`
+// validation, so any web page the user happened to open could read private
+// conversations/memories and drive home actuation cross-origin. This gate runs
+// ahead of routing in both crates and is the single shared place that decides:
+//   * whether the request's `Host` is an allowlisted value (closing the
+//     DNS-rebinding hole),
+//   * whether a present `Origin` is allowlisted (blocking cross-site reads and
+//     state-changing requests), and reflected back (the wildcard is gone), and
+//   * whether a mutating/actuating endpoint carries the shared local token.
+//
+// Same-origin browser requests and non-browser clients (no `Origin` header)
+// keep working; only an allowlisted `Origin` is ever reflected, always with
+// `Vary: Origin`.
+
+/// Why the request gate rejected a request (always answered with `403`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardRejection {
+    /// `Host` header is present but not allowlisted (possible DNS-rebinding).
+    DisallowedHost,
+    /// `Origin` header is present but not allowlisted (cross-site request).
+    DisallowedOrigin,
+    /// A mutating/actuating endpoint was hit without the configured token.
+    MissingToken,
+}
+
+impl GuardRejection {
+    /// HTTP status to answer a gated-out request with.
+    pub const fn status(self) -> u16 {
+        403
+    }
+
+    /// Short machine-stable reason, surfaced in the JSON error body and logs.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            GuardRejection::DisallowedHost => "host not allowed",
+            GuardRejection::DisallowedOrigin => "origin not allowed",
+            GuardRejection::MissingToken => "missing or invalid local API token",
+        }
+    }
+}
+
+/// Outcome of [`RequestGuard::check_request`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginDecision {
+    /// The request may proceed. The inner value is the `Origin` to reflect in
+    /// `Access-Control-Allow-Origin` (`Some` when an allowlisted `Origin` was
+    /// sent), or `None` for a same-origin / non-browser request.
+    Allow(Option<String>),
+    /// The request must be rejected before routing.
+    Reject(GuardRejection),
+}
+
+/// Cross-origin / DNS-rebinding request gate shared by both HTTP servers.
+///
+/// Build one per server with [`RequestGuard::new`], passing the server's own
+/// bound address (so loopback `Host`/`Origin` values for the right port are
+/// always allowed) plus any operator-configured extras and the shared token.
+#[derive(Debug, Clone)]
+pub struct RequestGuard {
+    allowed_origins: Vec<String>,
+    allowed_hosts: Vec<String>,
+    token: Option<String>,
+}
+
+impl RequestGuard {
+    /// Build the gate for a server bound to `listen_host:listen_port`.
+    ///
+    /// Loopback hosts/origins (`127.0.0.1`, `localhost`, `[::1]`) for the bound
+    /// port are always allowed — that covers the on-device browser UIs and the
+    /// genie-api→genie-core proxy. When the server binds a specific non-wildcard
+    /// address it is added too. LAN access by hostname or a different UI origin
+    /// must be opted into via `extra_origins` / `extra_hosts`. A blank `token`
+    /// disables token enforcement (the Origin/Host gate still applies).
+    pub fn new(
+        listen_host: &str,
+        listen_port: u16,
+        extra_origins: &[String],
+        extra_hosts: &[String],
+        token: &str,
+    ) -> Self {
+        let (mut allowed_hosts, mut allowed_origins) =
+            derive_hosts_and_origins(listen_host, listen_port);
+        for host in extra_hosts {
+            let host = host.trim().to_ascii_lowercase();
+            if !host.is_empty() {
+                push_unique(&mut allowed_hosts, host);
+            }
+        }
+        for origin in extra_origins {
+            let origin = normalize_origin(origin);
+            if !origin.is_empty() {
+                push_unique(&mut allowed_origins, origin);
+            }
+        }
+        let token = token.trim();
+        Self {
+            allowed_origins,
+            allowed_hosts,
+            token: (!token.is_empty()).then(|| token.to_string()),
+        }
+    }
+
+    /// True when a token is configured and will be enforced on mutating routes.
+    pub fn enforces_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    /// Validate `Host` and `Origin` ahead of routing.
+    ///
+    /// A missing `Host` (non-browser client) is allowed; a present-but-unlisted
+    /// `Host` is rejected. A missing `Origin` (same-origin navigation / non-
+    /// browser) is allowed with nothing reflected; a present `Origin` is
+    /// reflected verbatim when allowlisted, else rejected.
+    pub fn check_request(&self, request: &HttpRequest) -> OriginDecision {
+        if let Some(host) = request.header("host") {
+            let host = host.trim().to_ascii_lowercase();
+            if !host.is_empty() && !self.allowed_hosts.iter().any(|h| h == &host) {
+                return OriginDecision::Reject(GuardRejection::DisallowedHost);
+            }
+        }
+
+        match request.header("origin") {
+            None => OriginDecision::Allow(None),
+            Some(origin) => {
+                if self.allowed_origins.contains(&normalize_origin(origin)) {
+                    OriginDecision::Allow(Some(origin.trim().to_string()))
+                } else {
+                    OriginDecision::Reject(GuardRejection::DisallowedOrigin)
+                }
+            }
+        }
+    }
+
+    /// True when the request carries the configured token (via `X-Genie-Token`
+    /// or `Authorization: Bearer <token>`), or when no token is configured.
+    /// Call only for mutating/actuating endpoints.
+    pub fn token_ok(&self, request: &HttpRequest) -> bool {
+        let Some(expected) = self.token.as_deref() else {
+            return true;
+        };
+        let presented = request
+            .header("x-genie-token")
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .or_else(|| bearer_token(request.header("authorization")));
+        presented
+            .map(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
+            .unwrap_or(false)
+    }
+}
+
+/// Build the CORS response header lines (each `\r\n`-terminated) for an
+/// outgoing response, given the `Origin` to reflect (from
+/// [`RequestGuard::check_request`]).
+///
+/// With `Some(origin)` the origin is reflected and the permitted methods and
+/// request headers are advertised; with `None` only `Vary: Origin` is emitted,
+/// so no cross-origin caller may treat the response as world-readable — this is
+/// what replaces the old wildcard `Access-Control-Allow-Origin: *`.
+pub fn cors_response_headers(reflect_origin: Option<&str>) -> String {
+    match reflect_origin {
+        Some(origin) => format!(
+            "Access-Control-Allow-Origin: {origin}\r\n\
+             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+             Access-Control-Allow-Headers: Content-Type, Authorization, X-Genie-Origin, X-Genie-Token\r\n\
+             Vary: Origin\r\n"
+        ),
+        None => "Vary: Origin\r\n".to_string(),
+    }
+}
+
+/// Loopback (+ specific bound address) hosts and origins for `listen_port`.
+fn derive_hosts_and_origins(listen_host: &str, listen_port: u16) -> (Vec<String>, Vec<String>) {
+    let mut bases = vec![
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        "[::1]".to_string(),
+    ];
+    let host = listen_host.trim();
+    if !host.is_empty() && !matches!(host, "0.0.0.0" | "::") {
+        let bracketed = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        if !bases.iter().any(|b| b.eq_ignore_ascii_case(&bracketed)) {
+            bases.push(bracketed);
+        }
+    }
+
+    let mut hosts = Vec::new();
+    let mut origins = Vec::new();
+    for base in &bases {
+        let base = base.to_ascii_lowercase();
+        push_unique(&mut hosts, base.clone());
+        push_unique(&mut hosts, format!("{base}:{listen_port}"));
+        push_unique(&mut origins, format!("http://{base}"));
+        push_unique(&mut origins, format!("http://{base}:{listen_port}"));
+    }
+    (hosts, origins)
+}
+
+/// Normalize an `Origin` value for allowlist comparison: trimmed, lowercased,
+/// and with any trailing slash removed (browsers never send one, but operator
+/// config might).
+fn normalize_origin(origin: &str) -> String {
+    origin.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// Extract the token from an `Authorization: Bearer <token>` header value,
+/// matching the scheme case-insensitively.
+fn bearer_token(value: Option<&str>) -> Option<&str> {
+    let value = value?.trim();
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim())
+        .filter(|t| !t.is_empty())
+}
+
+fn push_unique(values: &mut Vec<String>, candidate: String) {
+    if !values.iter().any(|existing| existing == &candidate) {
+        values.push(candidate);
+    }
+}
+
+/// Length-independent byte comparison for the local API token, so a network
+/// peer cannot learn it byte-by-byte from response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +703,125 @@ mod tests {
         let err = read_request(&mut reader, &test_limits()).await.unwrap_err();
         assert!(matches!(err, HttpReadError::Closed));
         assert_eq!(err.status_code(), None);
+    }
+
+    // --- Cross-origin request gate (issue #228) ---------------------------
+
+    fn req(headers: &[(&str, &str)]) -> HttpRequest {
+        HttpRequest {
+            method: "POST".into(),
+            path: "/api/chat".into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
+                .collect(),
+            content_length: 0,
+            body: None,
+        }
+    }
+
+    fn guard() -> RequestGuard {
+        RequestGuard::new("127.0.0.1", 3000, &[], &[], "")
+    }
+
+    #[test]
+    fn loopback_host_and_origin_for_bound_port_are_allowed() {
+        let g = guard();
+        for host in [
+            "127.0.0.1:3000",
+            "localhost:3000",
+            "[::1]:3000",
+            "localhost",
+        ] {
+            assert_eq!(
+                g.check_request(&req(&[("Host", host)])),
+                OriginDecision::Allow(None),
+                "host {host} should be allowed"
+            );
+        }
+        assert_eq!(
+            g.check_request(&req(&[
+                ("Host", "localhost:3000"),
+                ("Origin", "http://localhost:3000"),
+            ])),
+            OriginDecision::Allow(Some("http://localhost:3000".into())),
+        );
+    }
+
+    #[test]
+    fn missing_host_and_origin_are_allowed_for_non_browser_clients() {
+        assert_eq!(
+            guard().check_request(&req(&[])),
+            OriginDecision::Allow(None)
+        );
+    }
+
+    #[test]
+    fn cross_site_origin_is_rejected_not_reflected() {
+        let g = guard();
+        assert_eq!(
+            g.check_request(&req(&[
+                ("Host", "localhost:3000"),
+                ("Origin", "http://evil.example"),
+            ])),
+            OriginDecision::Reject(GuardRejection::DisallowedOrigin),
+        );
+    }
+
+    #[test]
+    fn rebound_host_is_rejected() {
+        // DNS-rebinding: the page is evil.example resolving to 127.0.0.1, so the
+        // Host carries the attacker name — it must not match the allowlist.
+        let g = guard();
+        assert_eq!(
+            g.check_request(&req(&[("Host", "evil.example:3000")])),
+            OriginDecision::Reject(GuardRejection::DisallowedHost),
+        );
+    }
+
+    #[test]
+    fn configured_extras_are_allowed() {
+        let g = RequestGuard::new(
+            "0.0.0.0",
+            3000,
+            &["http://genie.local:3000/".into()],
+            &["genie.local:3000".into()],
+            "",
+        );
+        assert_eq!(
+            g.check_request(&req(&[
+                ("Host", "genie.local:3000"),
+                ("Origin", "http://genie.local:3000"),
+            ])),
+            OriginDecision::Allow(Some("http://genie.local:3000".into())),
+        );
+    }
+
+    #[test]
+    fn token_required_only_when_configured() {
+        let open = guard();
+        assert!(open.token_ok(&req(&[])), "no token configured => allowed");
+        assert!(!open.enforces_token());
+
+        let g = RequestGuard::new("127.0.0.1", 3000, &[], &[], "s3cret");
+        assert!(g.enforces_token());
+        assert!(!g.token_ok(&req(&[])), "missing token => rejected");
+        assert!(!g.token_ok(&req(&[("X-Genie-Token", "wrong")])));
+        assert!(g.token_ok(&req(&[("X-Genie-Token", "s3cret")])));
+        assert!(g.token_ok(&req(&[("Authorization", "Bearer s3cret")])));
+        assert!(g.token_ok(&req(&[("Authorization", "bearer s3cret")])));
+        assert!(!g.token_ok(&req(&[("Authorization", "Bearer ")])));
+    }
+
+    #[test]
+    fn cors_headers_reflect_only_allowlisted_origin() {
+        let reflected = cors_response_headers(Some("http://localhost:3000"));
+        assert!(reflected.contains("Access-Control-Allow-Origin: http://localhost:3000\r\n"));
+        assert!(reflected.contains("Vary: Origin\r\n"));
+        assert!(!reflected.contains('*'));
+
+        let bare = cors_response_headers(None);
+        assert!(!bare.contains("Access-Control-Allow-Origin"));
+        assert_eq!(bare, "Vary: Origin\r\n");
     }
 }

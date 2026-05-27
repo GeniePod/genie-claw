@@ -607,12 +607,18 @@ async fn query_governor(json_cmd: &str) -> Option<serde_json::Value> {
     line.and_then(|l| serde_json::from_str(&l).ok())
 }
 
-/// GET / — serve the dashboard HTML.
-pub fn serve_dashboard() -> Response {
+/// Placeholder in the dashboard HTML, replaced at request time with the
+/// configured local API token so the same-origin dashboard can authenticate its
+/// mutating calls to genie-api (issue #228).
+const TOKEN_PLACEHOLDER: &str = "__GENIE_LOCAL_TOKEN__";
+
+/// GET / — serve the dashboard HTML with the local API token injected.
+pub fn serve_dashboard(local_api_token: &str) -> Response {
     Response {
         status: 200,
         content_type: "text/html; charset=utf-8",
-        body: include_str!("../../dashboard/index.html").into(),
+        body: include_str!("../../dashboard/index.html")
+            .replace(TOKEN_PLACEHOLDER, local_api_token),
     }
 }
 
@@ -858,16 +864,21 @@ async fn proxy_core_json(
     use tokio::net::TcpStream;
 
     let addr = config.core_http_addr();
-    let host = addr
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(addr.as_str());
     let mut stream = TcpStream::connect(&addr)
         .await
         .map_err(|e| format!("{addr}: {e}"))?;
     let body_str = body.unwrap_or("");
+    // Send the full host:port as Host so it matches genie-core's allowlist, and
+    // forward the shared local token so genie-core's mutating-endpoint gate
+    // accepts the proxied request (issue #228).
+    let token = config.http.local_api_token.trim();
+    let token_header = if token.is_empty() {
+        String::new()
+    } else {
+        format!("X-Genie-Token: {token}\r\n")
+    };
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{token_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         body_str.len(),
         body_str
     );

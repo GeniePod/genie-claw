@@ -287,7 +287,7 @@ async fn main() -> Result<()> {
             model_family,
             config.core.expected_runtime_contract_hash.clone(),
         )?
-        .with_http_config(config.http);
+        .with_http_config(config.http.clone());
 
         tracing::info!(port, "starting HTTP chat API");
         if config.telegram.enabled {
