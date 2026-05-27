@@ -258,10 +258,24 @@ impl Governor {
 
         if mem_avail_mb < pressure.stop_optins_mb {
             if self.should_manage_service("nextcloud") {
-                let _ = ServiceCtl::docker_stop("nextcloud").await;
+                if let Err(e) = ServiceCtl::docker_stop("nextcloud").await {
+                    tracing::error!(
+                        mem_avail_mb,
+                        container = "nextcloud",
+                        error = %e,
+                        "memory-pressure docker stop failed"
+                    );
+                }
             }
             if self.should_manage_service("jellyfin") {
-                let _ = ServiceCtl::docker_stop("jellyfin").await;
+                if let Err(e) = ServiceCtl::docker_stop("jellyfin").await {
+                    tracing::error!(
+                        mem_avail_mb,
+                        container = "jellyfin",
+                        error = %e,
+                        "memory-pressure docker stop failed"
+                    );
+                }
             }
         }
 

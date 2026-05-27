@@ -62,9 +62,11 @@ impl ServiceCtl {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("No such container") {
-                tracing::warn!(container, %stderr, "failed to stop container");
+            if stderr.contains("No such container") {
+                return Ok(());
             }
+            tracing::warn!(container, %stderr, "failed to stop container");
+            anyhow::bail!("docker stop {} failed: {}", container, stderr);
         }
         Ok(())
     }
