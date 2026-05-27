@@ -217,6 +217,7 @@ dependencies = [
  "async-trait",
  "genie-common",
  "genie-skill-sdk",
+ "getrandom 0.3.4",
  "libc",
  "libloading",
  "reqwest",

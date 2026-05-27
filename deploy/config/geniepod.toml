@@ -202,6 +202,26 @@ max_header_bytes = 65536         # Reject when total header bytes exceed this (4
 read_timeout_secs = 15           # Drop a connection that stalls mid-request.
 max_connections = 256            # Ceiling on concurrently handled connections.
 
+# Cross-origin / DNS-rebinding gate (issue #228). Both servers reflect only
+# allowlisted Origins (never a wildcard) and reject non-allowlisted Host
+# headers. Loopback (127.0.0.1 / localhost / [::1]) for each bound port is
+# always allowed, so the on-device UIs and the genie-api->genie-core proxy work
+# out of the box. To reach the daemon over the LAN by hostname/IP, list the
+# Host and Origin the browser uses here (this is what closes the DNS-rebinding
+# hole — do not bind 0.0.0.0 without setting these):
+#   allowed_hosts   = ["genie.local:3000", "192.168.1.50:3000"]
+#   allowed_origins = ["http://genie.local:3000", "http://192.168.1.50:3000"]
+allowed_hosts = []
+allowed_origins = []
+
+# Shared local API token for mutating/actuating endpoints (chat, memory edits,
+# actuation confirm). When set, both servers require it via `X-Genie-Token` or
+# `Authorization: Bearer <token>`; the on-device UIs receive it automatically
+# and genie-api forwards it to genie-core. Leave blank to rely on the
+# Origin/Host gate alone. Can also be set via GENIEPOD_LOCAL_API_TOKEN.
+# Generate one with e.g. `openssl rand -hex 32`.
+local_api_token = ""
+
 # Uncomment to enable Telegram long-poll chat integration:
 # [telegram]
 # enabled = true

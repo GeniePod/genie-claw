@@ -699,9 +699,15 @@ impl ToolDispatcher {
                     action_id: None,
                     undo_of: None,
                 });
+                // The token is a bearer secret: a leaked one is a reusable
+                // door-unlock credential for its full validity window. Keep it
+                // out of LLM tool output (transcripts, voice, logs). The
+                // dashboard fetches it over /api/actuation/pending to drive the
+                // Confirm button; humans confirm there rather than reading the
+                // token back from this string.
                 Ok(format!(
-                    "Confirmation required before I can do that: {}. Pending token: {}. Confirm from the local dashboard or POST /api/actuation/confirm.",
-                    reason, pending.token
+                    "Confirmation required before I can do that: {}. Confirm this pending action from the local dashboard (or POST /api/actuation/confirm with its token from /api/actuation/pending).",
+                    reason
                 ))
             }
             Err(err) => {
@@ -2337,18 +2343,19 @@ mod tests {
         }
     }
 
-    /// Pull the `act-…` confirmation token out of the "Confirmation required"
-    /// message that `home_control` emits when the policy gate returns
-    /// `ConfirmationRequired`.
-    fn extract_confirmation_token(output: &str) -> String {
-        let marker = "Pending token: ";
-        let start = output
-            .find(marker)
-            .unwrap_or_else(|| panic!("no confirmation token in output: {output:?}"))
-            + marker.len();
-        let tail = &output[start..];
-        let end = tail.find('.').unwrap_or(tail.len());
-        tail[..end].trim().to_string()
+    /// Fetch the freshest pending confirmation token from the dispatcher.
+    ///
+    /// The token is deliberately NOT echoed into `home_control`'s tool output
+    /// (it is a bearer secret), so tests read it from the same channel the
+    /// dashboard uses — the pending-confirmations list — rather than scraping
+    /// the LLM-visible string.
+    fn latest_confirmation_token(dispatcher: &ToolDispatcher) -> String {
+        dispatcher
+            .pending_confirmations()
+            .into_iter()
+            .max_by_key(|item| item.created_ms)
+            .map(|item| item.token)
+            .expect("a pending confirmation must exist")
     }
 
     /// Read the actuation audit JSONL written via `with_actuation_audit_path`
@@ -2400,7 +2407,12 @@ mod tests {
             )
             .await;
         assert!(issued.success, "issuing confirmation must succeed");
-        let token = extract_confirmation_token(&issued.output);
+        assert!(
+            !issued.output.contains("act-"),
+            "raw bearer token must not be echoed into tool output: {:?}",
+            issued.output
+        );
+        let token = latest_confirmation_token(&dispatcher);
         let executed_output = dispatcher
             .confirm_pending_home_action(&token)
             .await
@@ -2456,7 +2468,7 @@ mod tests {
             )
             .await;
         assert!(first_issue.success);
-        let first_token = extract_confirmation_token(&first_issue.output);
+        let first_token = latest_confirmation_token(&dispatcher);
 
         // Confirming that first request must succeed: the bucket already paid
         // its single slot on the request, the confirmation must not double-
@@ -2533,7 +2545,7 @@ mod tests {
             )
             .await;
         assert!(first_issue.success);
-        let first_token = extract_confirmation_token(&first_issue.output);
+        let first_token = latest_confirmation_token(&dispatcher);
         dispatcher
             .confirm_pending_home_action(&first_token)
             .await

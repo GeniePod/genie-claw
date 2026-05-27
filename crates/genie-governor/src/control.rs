@@ -8,6 +8,9 @@ use tokio::sync::mpsc;
 use genie_common::mode::Mode;
 
 const SOCKET_PATH: &str = "/run/geniepod/governor.sock";
+/// Owner/group read-write only — genie-core and genie-ctl run as root on device.
+const SOCKET_MODE: u32 = 0o660;
+const RUN_DIR_MODE: u32 = 0o750;
 
 /// Commands that external processes (genie-core, CLI) can send to the governor.
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,13 +40,23 @@ pub async fn spawn_listener() -> Result<mpsc::Receiver<(Command, ResponseSender)
     let _ = tokio::fs::remove_file(SOCKET_PATH).await;
     tokio::fs::create_dir_all("/run/geniepod").await?;
 
-    let listener = UnixListener::bind(SOCKET_PATH)?;
-
-    // Make socket world-writable so genie-core (non-root) can connect.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o666))?;
+        std::fs::set_permissions(
+            "/run/geniepod",
+            std::fs::Permissions::from_mode(RUN_DIR_MODE),
+        )?;
+    }
+
+    let listener = UnixListener::bind(SOCKET_PATH)?;
+
+    // Restrict socket to owner/group — blocks unprivileged local users from
+    // sending mode commands while root-owned services (genie-core, genie-ctl) retain access.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(SOCKET_MODE))?;
     }
 
     let (tx, rx) = mpsc::channel::<(Command, ResponseSender)>(16);

@@ -3,7 +3,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, LlmRequestHints, Message};
-use crate::memory::{self, Memory};
+use crate::memory::{self, SharedMemory, with_shared_memory};
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
 use crate::tools;
@@ -15,7 +15,7 @@ use crate::tools;
 pub async fn run(
     llm: &LlmClient,
     tools_dispatch: &tools::ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -100,7 +100,9 @@ pub async fn run(
             );
             conversations.append_or_log(&conv_id, "assistant", &response, None);
 
-            let stored = memory::extract::extract_and_store(memory, text);
+            let stored = with_shared_memory(memory, |memory| {
+                memory::extract::extract_and_store(memory, text)
+            });
             if stored > 0 {
                 eprintln!(
                     "(remembered {} fact{})",
@@ -112,7 +114,9 @@ pub async fn run(
         }
 
         // Build context with per-query memory injection.
-        let memory_context = memory::inject::build_memory_context(memory, text);
+        let memory_context = with_shared_memory(memory, |memory| {
+            memory::inject::build_memory_context(memory, text)
+        });
         let full_prompt = format!(
             "{}\n\nRelevant household context:\n{}",
             system_prompt, memory_context
@@ -228,7 +232,9 @@ pub async fn run(
         }
 
         // Auto-capture facts.
-        let stored = memory::extract::extract_and_store(memory, text);
+        let stored = with_shared_memory(memory, |memory| {
+            memory::extract::extract_and_store(memory, text)
+        });
         if stored > 0 {
             eprintln!(
                 "(remembered {} fact{})",

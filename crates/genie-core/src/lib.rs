@@ -77,6 +77,6 @@ pub use connectivity::{
 pub use conversation::ConversationStore;
 pub use ha::{HaClient, HomeAssistantProvider, HomeAutomationProvider};
 pub use llm::{LlmClient, Message};
-pub use memory::Memory;
+pub use memory::{Memory, SharedMemory};
 pub use prompt::PromptBuilder;
 pub use tools::{ToolCall, ToolDispatcher, ToolResult};

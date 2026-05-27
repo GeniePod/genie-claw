@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **CORS lockdown + local API token** (#228): the hand-rolled HTTP servers in
+  both `genie-core` (`:3000`) and `genie-api` (`:3080`) previously answered
+  every request with a wildcard `Access-Control-Allow-Origin: *` and did no
+  `Origin`/`Host` validation, so any web page the user opened could read
+  private conversations/memories and drive home actuation cross-origin. A new
+  shared request gate (`genie_common::http::RequestGuard`) now runs ahead of
+  routing in both crates and: (1) reflects only an allowlisted `Origin`
+  (loopback for the bound port is always allowed; LAN hostnames/origins are
+  opt-in via `[http].allowed_origins` / `allowed_hosts`) and never the
+  wildcard; (2) rejects a non-allowlisted `Host` with `403`, closing the
+  DNS-rebinding hole; and (3) when `[http].local_api_token` (or
+  `GENIEPOD_LOCAL_API_TOKEN`) is set, requires that token via `X-Genie-Token`
+  or `Authorization: Bearer …` on every mutating/actuating endpoint
+  (`/api/chat*`, `/api/memories/*`, `/api/actuation/confirm`, `/api/mode`,
+  `/v1/chat/completions`). The on-device chat UI and dashboard receive the
+  token by HTML injection and send it automatically; genie-api forwards it on
+  its proxy hop to genie-core. `HttpServerConfig` loses `Copy` to carry the new
+  fields. Existing loopback-only deployments keep working unchanged (token
+  blank → gate-only); the sample `geniepod.toml` documents the new keys.
 - **System-prompt SHA** (#110): the fully-assembled system prompt (persona,
   tools, and hydrated household memory) is now fingerprinted with a real
   SHA-256 at boot, satisfying the M1 exit criterion that the prompt stays

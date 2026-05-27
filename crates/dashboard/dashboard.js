@@ -230,10 +230,16 @@ async function pollSecurity() {
   setText('security-detail', details);
 }
 
+// Local API token for mutating calls (issue #228). genie-api injects it into
+// the meta tag; left blank when token enforcement is disabled.
+const LOCAL_TOKEN = document.querySelector('meta[name="genie-local-token"]')?.content || '';
+
 async function postJson(url, payload) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (LOCAL_TOKEN) headers['X-Genie-Token'] = LOCAL_TOKEN;
   const r = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(payload),
   });
   return await r.json();

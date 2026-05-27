@@ -330,7 +330,20 @@ async fn tool_gate_confirmable_home_action_requires_token_and_audits() {
         result.output
     );
     assert!(result.output.contains("Confirmation required"));
-    assert!(result.output.contains("Pending token:"));
+    // The confirmation token is a bearer secret and must NOT be echoed into
+    // tool output (transcripts/logs/voice). The user confirms from the local
+    // dashboard, which reads the token from /api/actuation/pending.
+    assert!(
+        !result.output.contains("Pending token:"),
+        "tool output must not echo the raw token: {}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("act-"),
+        "tool output must not contain a raw act- token: {}",
+        result.output
+    );
+    assert!(result.output.contains("local dashboard"));
     assert!(
         executed.lock().unwrap().is_empty(),
         "sensitive action must not execute before confirmation"

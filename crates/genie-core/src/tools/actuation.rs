@@ -1,7 +1,8 @@
+use genie_common::jsonl::{self, DEFAULT_MAX_JSONL_LINE_BYTES};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -110,7 +111,11 @@ impl ConfirmationManager {
         prune_expired(&mut state.pending);
         state.next_id += 1;
         let created_ms = now_ms();
-        let token = format!("act-{:x}-{:x}", created_ms, state.next_id);
+        // The token is a bearer secret: its only entropy is 128 CSPRNG bits.
+        // `created_ms`/`next_id` are display/bookkeeping fields and MUST NOT
+        // feed the token, or it collapses back to the guessable clock+counter
+        // scheme this manager replaced.
+        let token = random_token();
         let pending = PendingConfirmation {
             token: token.clone(),
             entity: entity.to_string(),
@@ -128,7 +133,18 @@ impl ConfirmationManager {
     pub fn confirm(&self, token: &str) -> Option<PendingConfirmation> {
         let mut state = self.inner.lock().expect("confirmation manager lock");
         prune_expired(&mut state.pending);
-        state.pending.remove(token)
+        // Constant-time match: a plain `HashMap::remove(token)` would compare
+        // the supplied token against stored keys with early-exit equality,
+        // leaking how many leading bytes matched as a timing signal. Scan
+        // every pending token, fold the comparisons with `ct_eq`, and never
+        // short-circuit on the first mismatch.
+        let mut matched: Option<String> = None;
+        for key in state.pending.keys() {
+            if ct_eq(key.as_bytes(), token.as_bytes()) {
+                matched = Some(key.clone());
+            }
+        }
+        matched.and_then(|key| state.pending.remove(&key))
     }
 
     pub fn list(&self) -> Vec<PendingConfirmation> {
@@ -327,20 +343,20 @@ impl AuditLogger {
         let Some(path) = &self.path else {
             return Vec::new();
         };
-        let file = match File::open(path) {
-            Ok(file) => file,
+        let scan_limit = limit.saturating_mul(16).max(limit);
+        let lines = match jsonl::tail_lines(path, scan_limit, DEFAULT_MAX_JSONL_LINE_BYTES) {
+            Ok(lines) => lines,
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "audit read failed; returning no recent executed actions"
+                    "audit tail read failed; returning no recent executed actions"
                 );
                 return Vec::new();
             }
         };
-        let mut actions = BufReader::new(file)
-            .lines()
-            .map_while(Result::ok)
+        let mut actions = lines
+            .into_iter()
             .filter_map(|line| match serde_json::from_str::<AuditEvent>(&line) {
                 Ok(event) => audit_event_to_recorded_action(event),
                 Err(e) => {
@@ -387,6 +403,42 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Mint an unguessable confirmation token from 128 bits of CSPRNG entropy,
+/// hex-encoded behind the `act-` prefix the rest of the system expects.
+///
+/// `getrandom` reads the OS CSPRNG (`/dev/urandom`, `getrandom(2)`,
+/// `BCryptGenRandom`, …). It cannot return short reads; the only error is the
+/// source being unavailable, which on a running host means the entropy pool is
+/// broken. Rather than fall back to a weaker, guessable source, we panic — a
+/// confirmation token we cannot generate securely must not be issued at all.
+fn random_token() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable while minting confirmation token");
+    let mut token = String::with_capacity(4 + bytes.len() * 2);
+    token.push_str("act-");
+    for byte in bytes {
+        token.push(HEX[(byte >> 4) as usize] as char);
+        token.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    token
+}
+
+/// Constant-time byte-slice equality. Returns `true` only when both slices have
+/// the same length and identical contents, without leaking the position of the
+/// first differing byte through timing. Used to compare confirmation tokens so
+/// the confirm endpoint is not a partial-match timing oracle.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +459,90 @@ mod tests {
         let confirmed = manager.confirm(&pending.token).unwrap();
         assert_eq!(confirmed.entity, "front door");
         assert!(manager.list().is_empty());
+    }
+
+    /// The token is the entire authorization to execute a sensitive physical
+    /// action, so it must carry real entropy — not be derivable from the clock
+    /// plus a per-process counter. Two tokens issued back-to-back differ in
+    /// their random body, and neither equals what the old `act-{ms:x}-{id:x}`
+    /// scheme would have produced for the same clock/counter inputs.
+    #[test]
+    fn confirmation_tokens_are_unpredictable() {
+        let manager = ConfirmationManager::default();
+        let first = manager.issue("front door", "unlock", None, "r", RequestOrigin::Api);
+        let second = manager.issue("front door", "unlock", None, "r", RequestOrigin::Api);
+
+        assert_ne!(
+            first.token, second.token,
+            "two issued tokens must not collide"
+        );
+
+        // 128 bits of entropy => "act-" + 32 lowercase hex chars.
+        for token in [&first.token, &second.token] {
+            let body = token
+                .strip_prefix("act-")
+                .expect("token keeps the act- prefix");
+            assert_eq!(body.len(), 32, "expected 16 random bytes hex-encoded");
+            assert!(
+                body.bytes().all(|b| b.is_ascii_hexdigit()),
+                "token body must be hex: {token}"
+            );
+        }
+
+        // The old guessable scheme would have produced these from clock +
+        // counter. Knowing both must not let an attacker reconstruct the token.
+        let counter_guess_1 = format!("act-{:x}-{:x}", first.created_ms, 1);
+        let counter_guess_2 = format!("act-{:x}-{:x}", second.created_ms, 2);
+        assert_ne!(first.token, counter_guess_1);
+        assert_ne!(second.token, counter_guess_2);
+    }
+
+    /// A forged or guessed token — including one built from the now-public
+    /// `created_ms` and the low integer counter — must be refused, and must not
+    /// consume or match the genuine pending confirmation.
+    #[test]
+    fn forged_token_is_rejected() {
+        let manager = ConfirmationManager::default();
+        let pending = manager.issue("front door", "unlock", None, "r", RequestOrigin::Api);
+
+        // Reconstruct what the old clock+counter token would have been.
+        let forged_clock_counter = format!("act-{:x}-{:x}", pending.created_ms, 1);
+        assert!(
+            manager.confirm(&forged_clock_counter).is_none(),
+            "clock+counter forgery must not confirm"
+        );
+
+        // Same length/shape as a real token but wrong bytes.
+        let forged_same_shape = format!("act-{}", "0".repeat(32));
+        assert!(
+            manager.confirm(&forged_same_shape).is_none(),
+            "same-shape forgery must not confirm"
+        );
+
+        // A prefix of the real token (timing-oracle probe) must not confirm.
+        let prefix = &pending.token[..pending.token.len() - 1];
+        assert!(
+            manager.confirm(prefix).is_none(),
+            "token prefix must not confirm"
+        );
+
+        // After all the failed attempts, the genuine token still works exactly
+        // once — failed forgeries neither consumed nor unlocked it.
+        assert_eq!(manager.list().len(), 1, "forgeries must not evict pending");
+        assert!(
+            manager.confirm(&pending.token).is_some(),
+            "the genuine token must still confirm"
+        );
+        assert!(manager.confirm(&pending.token).is_none(), "single use only");
+    }
+
+    #[test]
+    fn ct_eq_matches_only_identical_slices() {
+        assert!(ct_eq(b"act-abc", b"act-abc"));
+        assert!(!ct_eq(b"act-abc", b"act-abd"));
+        assert!(!ct_eq(b"act-abc", b"act-ab")); // differing length
+        assert!(!ct_eq(b"", b"x"));
+        assert!(ct_eq(b"", b""));
     }
 
     #[test]
@@ -524,6 +660,43 @@ mod tests {
             None,
         );
         assert_eq!(next.id, 12);
+    }
+
+    #[test]
+    fn audit_logger_reads_recent_executed_actions_from_log_tail() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-actuation-audit-tail-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let logger = AuditLogger::new(&path);
+
+        for idx in 0..500 {
+            logger.append(AuditEvent {
+                ts_ms: idx,
+                status: if idx % 2 == 0 {
+                    AuditStatus::Executed
+                } else {
+                    AuditStatus::ConfirmationIssued
+                },
+                origin: RequestOrigin::Voice,
+                entity: format!("entity-{idx}"),
+                action: "turn_on".into(),
+                value: None,
+                reason: "home action executed".into(),
+                token: None,
+                confidence: None,
+                action_id: if idx % 2 == 0 { Some(idx) } else { None },
+                undo_of: None,
+            });
+        }
+
+        let actions = logger.read_recent_executed_actions(3);
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].entity, "entity-494");
+        assert_eq!(actions[1].entity, "entity-496");
+        assert_eq!(actions[2].entity, "entity-498");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
