@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::openai_compat::{OpenAiCompatClient, RequestProfile};
+use super::openai_compat::{LlmTimeouts, OpenAiCompatClient, RequestProfile};
 use super::{LlmBackendClient, LlmRequestHints, Message, ResponseFormat};
 
 /// Adapter for the `genie-ai-runtime` OpenAI-compatible chat API surface.
@@ -22,11 +22,16 @@ impl GenieAiRuntimeBackend {
     }
 
     pub fn from_url(url: &str) -> Self {
+        Self::from_url_with_timeouts(url, LlmTimeouts::default())
+    }
+
+    pub fn from_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Self {
         Self {
-            inner: OpenAiCompatClient::from_url_with_profile(
+            inner: OpenAiCompatClient::from_url_with_profile_and_timeouts(
                 "genie-ai-runtime",
                 url,
                 RequestProfile::genie_ai_runtime(),
+                timeouts,
             ),
         }
     }

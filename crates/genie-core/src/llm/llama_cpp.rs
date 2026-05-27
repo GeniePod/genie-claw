@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::openai_compat::OpenAiCompatClient;
+use super::openai_compat::{LlmTimeouts, OpenAiCompatClient, RequestProfile};
 use super::{LlmBackendClient, LlmRequestHints, Message, ResponseFormat};
 
 /// llama.cpp `--server` adapter for the OpenAI-compatible chat API.
@@ -17,8 +17,17 @@ impl LlamaCppBackend {
     }
 
     pub fn from_url(url: &str) -> Self {
+        Self::from_url_with_timeouts(url, LlmTimeouts::default())
+    }
+
+    pub fn from_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Self {
         Self {
-            inner: OpenAiCompatClient::from_url("llama.cpp", url),
+            inner: OpenAiCompatClient::from_url_with_profile_and_timeouts(
+                "llama.cpp",
+                url,
+                RequestProfile::generic(),
+                timeouts,
+            ),
         }
     }
 }

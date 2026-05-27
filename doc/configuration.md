@@ -45,6 +45,9 @@ Runtime load path:
 | `piper_pipe_mode` | Keep Piper hot for lower latency |
 | `voice_tts_models` | Optional per-language Piper voices |
 | `max_history_turns` | Max conversation history included per turn |
+| `llm_connect_timeout_secs` | Max wait to open the LLM backend TCP connection (default `10`) |
+| `llm_read_timeout_secs` | Max idle seconds between LLM tokens/bytes before a read is abandoned; bounds every backend read so a hung read can't wedge chat (default `60`) |
+| `llm_request_timeout_secs` | Max seconds for a non-streaming completion's response body (default `120`) |
 | `expected_runtime_contract_hash` | Optional pinned contract hash for runtime drift detection |
 | `audio_device` | ALSA device or `"auto"` |
 | `audio_sample_rate` | Capture sample rate |

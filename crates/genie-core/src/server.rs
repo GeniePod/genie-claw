@@ -1,5 +1,6 @@
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use genie_common::config::HttpServerConfig;
@@ -83,7 +84,7 @@ pub struct ChatServer {
     memory: SharedMemory,
     conversations: ConversationStore,
     current_conv_id: Mutex<String>,
-    chat_turn_lock: Mutex<()>,
+    chat_gate: ChatTurnGate,
     system_prompt: String,
     /// SHA-256 of the boot-assembled system prompt (issue #110). Computed once
     /// at startup and served via /api/health for restart-determinism checks.
@@ -128,7 +129,7 @@ impl ChatServer {
             memory,
             conversations,
             current_conv_id: Mutex::new(conv_id),
-            chat_turn_lock: Mutex::new(()),
+            chat_gate: ChatTurnGate::new(),
             system_prompt,
             system_prompt_sha,
             max_history,
@@ -159,7 +160,7 @@ impl ChatServer {
     ///
     /// Requests are accepted concurrently on one OS thread so health/dashboard
     /// probes stay responsive while a chat turn is waiting on the local LLM.
-    /// Chat turns themselves are still serialized with `chat_turn_lock`.
+    /// Chat turns themselves are still serialized through the chat turn gate.
     pub async fn serve(self, bind_host: &str, port: u16) -> Result<()> {
         let bind_host = bind_host.trim();
         let bind_host = if bind_host.is_empty() {
@@ -342,9 +343,217 @@ fn classify_route<'a>(method: &str, path: &'a str) -> RequestRoute<'a> {
     }
 }
 
-async fn with_chat_turn_lock<T>(lock: &Mutex<()>, fut: impl std::future::Future<Output = T>) -> T {
-    let _guard = lock.lock().await;
-    fut.await
+/// Serializes chat turns and tracks chat-path liveness (issue #181).
+///
+/// The appliance runs a single local model, so concurrent turns are still
+/// serialized behind one lock — but two things changed from the old bare
+/// `Mutex<()>`:
+///
+/// 1. **Acquisition is bounded.** A caller that cannot take the lock within
+///    `busy_wait` gets a "chat busy" response instead of blocking forever. With
+///    client-layer read timeouts now bounding every LLM read, the holder always
+///    releases, so this is a safety valve against pathological pile-up rather
+///    than the common path.
+/// 2. **Liveness is observable.** `snapshot()` exposes the age of the last
+///    completed turn and how long the current turn has held the lock, so
+///    `/api/health` can report `degraded` when a turn is stuck — the wedge used
+///    to be invisible and monitoring stayed green.
+pub(crate) struct ChatTurnGate {
+    lock: Mutex<()>,
+    state: std::sync::Mutex<GateState>,
+    busy_wait: Duration,
+    wedge_after: Duration,
+}
+
+#[derive(Default)]
+struct GateState {
+    waiters: u32,
+    in_flight: bool,
+    holder_since: Option<Instant>,
+    last_completed: Option<Instant>,
+    completed_turns: u64,
+}
+
+/// Point-in-time view of the chat path for health reporting.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ChatLiveness {
+    /// Requests currently waiting to acquire the chat turn lock.
+    pub waiters: u32,
+    /// Whether a chat turn is currently holding the lock.
+    pub in_flight: bool,
+    /// Total chat turns that have completed (acquired then released the lock).
+    pub completed_turns: u64,
+    /// Seconds since the last chat turn completed, if any.
+    pub last_turn_age_secs: Option<u64>,
+    /// Seconds the in-flight turn has held the lock, if any.
+    pub current_turn_age_secs: Option<u64>,
+    /// True when the in-flight turn has held the lock past `wedge_after`,
+    /// i.e. far longer than any bounded turn should take — the chat path looks
+    /// wedged and health should report `degraded`.
+    pub wedged: bool,
+}
+
+impl ChatTurnGate {
+    fn new() -> Self {
+        // A normal turn completes in seconds; `busy_wait` is generous so callers
+        // wait through a legitimately slow turn rather than spuriously bouncing,
+        // while `wedge_after` only trips when a turn has held the lock far past
+        // any bounded read budget — a real stuck turn.
+        Self::with_thresholds(Duration::from_secs(120), Duration::from_secs(240))
+    }
+
+    fn with_thresholds(busy_wait: Duration, wedge_after: Duration) -> Self {
+        Self {
+            lock: Mutex::new(()),
+            state: std::sync::Mutex::new(GateState::default()),
+            busy_wait,
+            wedge_after,
+        }
+    }
+
+    /// Acquire the chat turn lock, bounded by `busy_wait`.
+    ///
+    /// Returns `None` if a turn is already in flight and does not release within
+    /// the budget; the caller should reply "busy" rather than block.
+    ///
+    /// Cancellation-safe: the waiter count is held by a [`WaiterGuard`] whose
+    /// `Drop` decrements it, and the only `.await` is the bounded lock wait. If
+    /// this future is cancelled (dropped) while parked on that wait — exactly what
+    /// happens when the per-connection task is aborted on client disconnect or
+    /// shutdown — the guard still runs, so a dropped request can never leak a
+    /// phantom waiter into the `/api/health` snapshot.
+    async fn try_acquire(&self) -> Option<ChatTurnGuard<'_>> {
+        let waiter = WaiterGuard::new(&self.state);
+        let acquired = tokio::time::timeout(self.busy_wait, self.lock.lock()).await;
+        let guard = match acquired {
+            Ok(guard) => guard,
+            // `waiter` drops here, decrementing the count we registered above.
+            Err(_) => return None,
+        };
+        // Transition from waiter to holder atomically under one lock, then disarm
+        // the guard so its `Drop` does not double-decrement the count.
+        if let Ok(mut s) = self.state.lock() {
+            s.waiters = s.waiters.saturating_sub(1);
+            s.in_flight = true;
+            s.holder_since = Some(Instant::now());
+        }
+        waiter.disarm();
+        Some(ChatTurnGuard {
+            gate: self,
+            _guard: guard,
+        })
+    }
+
+    fn on_turn_complete(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.in_flight = false;
+            s.holder_since = None;
+            s.last_completed = Some(Instant::now());
+            s.completed_turns = s.completed_turns.saturating_add(1);
+        }
+    }
+
+    fn snapshot(&self) -> ChatLiveness {
+        let Ok(s) = self.state.lock() else {
+            return ChatLiveness {
+                waiters: 0,
+                in_flight: false,
+                completed_turns: 0,
+                last_turn_age_secs: None,
+                current_turn_age_secs: None,
+                wedged: false,
+            };
+        };
+        let current = s.holder_since.map(|t| t.elapsed());
+        ChatLiveness {
+            waiters: s.waiters,
+            in_flight: s.in_flight,
+            completed_turns: s.completed_turns,
+            last_turn_age_secs: s.last_completed.map(|t| t.elapsed().as_secs()),
+            current_turn_age_secs: current.map(|d| d.as_secs()),
+            wedged: current.map(|d| d >= self.wedge_after).unwrap_or(false),
+        }
+    }
+}
+
+/// RAII guard for a held chat turn. Dropping it records turn completion and
+/// releases the underlying lock (in that order).
+struct ChatTurnGuard<'a> {
+    gate: &'a ChatTurnGate,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for ChatTurnGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.on_turn_complete();
+    }
+}
+
+/// RAII guard for the gate's waiter count. Incrementing on construction and
+/// decrementing in `Drop` keeps the count correct on every exit path — including
+/// when the future awaiting the gate is cancelled (dropped) mid-`.await`. A manual
+/// decrement placed after the await would be skipped on cancellation and leak the
+/// waiter count, which `/api/health` would then report forever (issue #181 review).
+struct WaiterGuard<'a> {
+    state: &'a std::sync::Mutex<GateState>,
+    armed: bool,
+}
+
+impl<'a> WaiterGuard<'a> {
+    fn new(state: &'a std::sync::Mutex<GateState>) -> Self {
+        if let Ok(mut s) = state.lock() {
+            s.waiters = s.waiters.saturating_add(1);
+        }
+        Self { state, armed: true }
+    }
+
+    /// Mark the wait as resolved so `Drop` becomes a no-op; the caller has already
+    /// decremented the count while transitioning the slot from waiter to holder.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut s) = self.state.lock()
+        {
+            s.waiters = s.waiters.saturating_sub(1);
+        }
+    }
+}
+
+fn chat_busy_response() -> (u16, &'static str, String) {
+    (
+        503,
+        "application/json",
+        r#"{"error":"chat busy: a turn is already in progress, retry shortly"}"#.into(),
+    )
+}
+
+fn openai_busy_response() -> (u16, &'static str, String) {
+    (
+        503,
+        "application/json",
+        r#"{"error":{"message":"chat busy: a turn is already in progress, retry shortly","type":"server_busy"}}"#.into(),
+    )
+}
+
+async fn write_busy_stream(
+    writer: &mut OwnedWriteHalf,
+    reflect_origin: Option<&str>,
+) -> Result<()> {
+    let body = r#"{"error":"chat busy: a turn is already in progress, retry shortly"}"#;
+    let http = format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
+        body.len(),
+        genie_common::http::cors_response_headers(reflect_origin),
+        body,
+    );
+    writer.write_all(http.as_bytes()).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,7 +569,7 @@ async fn handle_request(
     let connectivity = ctx.connectivity.as_ref();
     let conversations = &ctx.conversations;
     let current_conv_id = &ctx.current_conv_id;
-    let chat_turn_lock = &ctx.chat_turn_lock;
+    let chat_gate = &ctx.chat_gate;
     let system_prompt = &ctx.system_prompt;
     let system_prompt_sha = &ctx.system_prompt_sha;
     let max_history = ctx.max_history;
@@ -421,7 +630,13 @@ async fn handle_request(
     );
     let body = request.body;
     if matches!(route, RequestRoute::ChatStream) {
-        let _guard = chat_turn_lock.lock().await;
+        let Some(_guard) = chat_gate.try_acquire().await else {
+            // A turn is already in flight and did not release within the bound;
+            // tell the client we're busy rather than holding the connection open
+            // behind a slow/stuck turn (issue #181).
+            let _ = write_busy_stream(&mut writer, echo_origin.as_deref()).await;
+            return Ok(());
+        };
         if let Err(e) = handle_chat_stream(
             &mut writer,
             body.as_deref(),
@@ -449,9 +664,8 @@ async fn handle_request(
 
     let (status, content_type, response_body) = match route {
         RequestRoute::Root => CHAT_UI.response(&ctx.http_config.local_api_token),
-        RequestRoute::Chat => {
-            with_chat_turn_lock(
-                chat_turn_lock,
+        RequestRoute::Chat => match chat_gate.try_acquire().await {
+            Some(_guard) => {
                 handle_chat(
                     body.as_deref(),
                     llm,
@@ -463,10 +677,11 @@ async fn handle_request(
                     max_history,
                     model_family,
                     request_origin,
-                ),
-            )
-            .await
-        }
+                )
+                .await
+            }
+            None => chat_busy_response(),
+        },
         RequestRoute::History => handle_history(conversations, current_conv_id).await,
         RequestRoute::Clear => handle_clear(conversations, current_conv_id).await,
         RequestRoute::Conversations => handle_list_conversations(conversations),
@@ -498,6 +713,7 @@ async fn handle_request(
                 max_history,
                 model_family,
                 expected_runtime_contract_hash,
+                chat_gate,
             )
             .await
         }
@@ -509,9 +725,8 @@ async fn handle_request(
         RequestRoute::MemoriesUpdate => handle_memories_update(body.as_deref(), memory),
         RequestRoute::MemoriesDelete => handle_memories_delete(body.as_deref(), memory),
         RequestRoute::MemoriesReorder => handle_memories_reorder(body.as_deref(), memory),
-        RequestRoute::OpenAiChat => {
-            with_chat_turn_lock(
-                chat_turn_lock,
+        RequestRoute::OpenAiChat => match chat_gate.try_acquire().await {
+            Some(_guard) => {
                 handle_openai_chat(
                     body.as_deref(),
                     llm,
@@ -521,10 +736,11 @@ async fn handle_request(
                     max_history,
                     model_family,
                     request_origin,
-                ),
-            )
-            .await
-        }
+                )
+                .await
+            }
+            None => openai_busy_response(),
+        },
         RequestRoute::Models => handle_list_models(),
         RequestRoute::Options => (200, "text/plain", String::new()),
         RequestRoute::Export(conv_id) => handle_export(conversations, conv_id),
@@ -1283,6 +1499,7 @@ async fn handle_health(
     max_history: usize,
     model_family: ModelFamily,
     expected_runtime_contract_hash: &str,
+    chat_gate: &ChatTurnGate,
 ) -> (u16, &'static str, String) {
     let llm_ok = llm.health().await;
     let connectivity_health = connectivity.health().await;
@@ -1291,6 +1508,7 @@ async fn handle_health(
     });
     let conv_count = conversations.list().map(|l| l.len()).unwrap_or(0);
     let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
+    let chat = chat_gate.snapshot();
     let runtime_contract = with_shared_memory(memory, |memory| {
         build_runtime_contract_snapshot(
             tools,
@@ -1305,7 +1523,7 @@ async fn handle_health(
     let runtime_contract =
         runtime_contract_summary_json(&runtime_contract, expected_runtime_contract_hash);
 
-    let status = overall_health_status(llm_ok, connectivity_health.state);
+    let status = overall_health_status(llm_ok, connectivity_health.state, chat.wedged);
 
     let resp = serde_json::json!({
         "status": status,
@@ -1326,6 +1544,7 @@ async fn handle_health(
         "conversations": conv_count,
         "mem_available_mb": mem_avail,
         "connectivity": connectivity_health,
+        "chat": chat,
         "web_search": tools.web_search_status(),
         "system_prompt_sha": system_prompt_sha,
         "runtime_contract": runtime_contract,
@@ -1335,8 +1554,13 @@ async fn handle_health(
     (200, "application/json", resp.to_string())
 }
 
-fn overall_health_status(llm_ok: bool, connectivity_state: ConnectivityState) -> &'static str {
+fn overall_health_status(
+    llm_ok: bool,
+    connectivity_state: ConnectivityState,
+    chat_wedged: bool,
+) -> &'static str {
     if llm_ok
+        && !chat_wedged
         && matches!(
             connectivity_state,
             ConnectivityState::Disabled | ConnectivityState::Ready
@@ -2400,20 +2624,33 @@ mod tests {
     #[test]
     fn overall_health_is_ok_when_llm_is_up_and_connectivity_is_disabled() {
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Disabled),
+            overall_health_status(true, ConnectivityState::Disabled, false),
             "ok"
         );
     }
 
     #[test]
     fn overall_health_is_ok_when_llm_is_up_and_connectivity_is_ready() {
-        assert_eq!(overall_health_status(true, ConnectivityState::Ready), "ok");
+        assert_eq!(
+            overall_health_status(true, ConnectivityState::Ready, false),
+            "ok"
+        );
     }
 
     #[test]
     fn overall_health_is_degraded_when_connectivity_is_offline() {
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Offline),
+            overall_health_status(true, ConnectivityState::Offline, false),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn overall_health_is_degraded_when_chat_is_wedged() {
+        // Even with the LLM reachable and connectivity ready, a stuck chat turn
+        // must surface as degraded so monitoring can't stay green (issue #181).
+        assert_eq!(
+            overall_health_status(true, ConnectivityState::Ready, true),
             "degraded"
         );
     }
@@ -2441,6 +2678,7 @@ mod tests {
         let conversations = ConversationStore::open(&conversations_path).unwrap();
 
         let prompt_sha = crate::prompt_sha::sha256_hex("system prompt");
+        let gate = super::ChatTurnGate::new();
         let (status, _, body) = handle_health(
             &llm,
             &tools,
@@ -2452,6 +2690,7 @@ mod tests {
             12,
             ModelFamily::Phi,
             "",
+            &gate,
         )
         .await;
 
@@ -2461,6 +2700,10 @@ mod tests {
         assert_eq!(parsed["llm_backend"], "genie-ai-runtime");
         assert_eq!(parsed["system_prompt_sha"], prompt_sha);
         assert_eq!(parsed["system_prompt_sha"].as_str().unwrap().len(), 64);
+        // Liveness block is present; no turns have run yet on a fresh gate.
+        assert_eq!(parsed["chat"]["in_flight"], false);
+        assert_eq!(parsed["chat"]["completed_turns"], 0);
+        assert_eq!(parsed["chat"]["wedged"], false);
 
         let _ = std::fs::remove_file(&memory_path);
         let _ = std::fs::remove_file(&conversations_path);
@@ -2629,6 +2872,234 @@ mod tests {
         use std::io;
         let e = anyhow::Error::from(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
         assert!(!is_client_disconnect_error(&e));
+    }
+
+    #[tokio::test]
+    async fn chat_gate_tracks_turn_completion_and_liveness() {
+        let gate = super::ChatTurnGate::new();
+
+        let snap = gate.snapshot();
+        assert!(!snap.in_flight);
+        assert_eq!(snap.completed_turns, 0);
+        assert!(snap.last_turn_age_secs.is_none());
+        assert!(snap.current_turn_age_secs.is_none());
+
+        {
+            let _guard = gate.try_acquire().await.expect("first acquire succeeds");
+            let snap = gate.snapshot();
+            assert!(snap.in_flight);
+            assert!(snap.current_turn_age_secs.is_some());
+            assert_eq!(snap.completed_turns, 0);
+        }
+
+        // Dropping the guard records completion and releases the lock.
+        let snap = gate.snapshot();
+        assert!(!snap.in_flight);
+        assert_eq!(snap.completed_turns, 1);
+        assert!(snap.last_turn_age_secs.is_some());
+        assert!(snap.current_turn_age_secs.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_gate_returns_busy_when_lock_held_past_budget() {
+        use std::time::Duration;
+        let gate = super::ChatTurnGate::with_thresholds(
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        );
+
+        let held = gate.try_acquire().await.expect("first acquire succeeds");
+        // A second turn cannot acquire within busy_wait → busy, not a hang.
+        let start = std::time::Instant::now();
+        assert!(
+            gate.try_acquire().await.is_none(),
+            "second acquire must time out as busy while the first is held"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "busy acquire must return promptly"
+        );
+        assert_eq!(gate.snapshot().waiters, 0, "waiter count must be released");
+
+        drop(held);
+        assert!(
+            gate.try_acquire().await.is_some(),
+            "acquire succeeds again once the holder releases"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_gate_marks_wedged_after_threshold() {
+        use std::time::Duration;
+        let gate = super::ChatTurnGate::with_thresholds(
+            Duration::from_secs(60),
+            Duration::from_millis(40),
+        );
+
+        let _held = gate.try_acquire().await.expect("acquire succeeds");
+        assert!(!gate.snapshot().wedged, "not wedged immediately");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snap = gate.snapshot();
+        assert!(snap.in_flight);
+        assert!(
+            snap.wedged,
+            "a turn holding the lock past wedge_after must report wedged"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_gate_cancelled_acquire_does_not_leak_waiter() {
+        use std::time::Duration;
+        // Cancellation-safety regression (issue #181 review): a request that is
+        // dropped while blocked on the gate must not leave a phantom waiter behind.
+        let gate = Arc::new(super::ChatTurnGate::with_thresholds(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        let _held = gate.try_acquire().await.expect("holder acquires the gate");
+
+        // A second turn parks on the held lock, registering as a waiter. It never
+        // acquires (the holder keeps the lock), so it stays inside `try_acquire`'s
+        // await until we abort it; the guard never escapes the task.
+        let blocked = Arc::clone(&gate);
+        let waiting = tokio::spawn(async move {
+            let _ = blocked.try_acquire().await;
+        });
+        for _ in 0..200 {
+            if gate.snapshot().waiters == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            gate.snapshot().waiters,
+            1,
+            "the blocked acquire must be counted as a waiter"
+        );
+
+        // Cancel it mid-`.await` — the same path as a per-connection task aborted
+        // on client disconnect or shutdown.
+        waiting.abort();
+        let _ = waiting.await;
+
+        assert_eq!(
+            gate.snapshot().waiters,
+            0,
+            "a cancelled acquire must not leak its waiter slot (issue #181 review)"
+        );
+        // The gate is still usable once the holder releases.
+        drop(_held);
+        assert!(
+            gate.try_acquire().await.is_some(),
+            "the gate still acquires after a cancelled waiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_gate_concurrent_turn_gets_busy_while_one_is_blocked() {
+        use std::time::Duration;
+        // Concurrent stuck-runtime path (issue #181 review): while one turn is
+        // blocked holding the gate, a concurrent turn must get "busy" within budget
+        // instead of stacking up behind it — then recover once the holder releases.
+        let gate = Arc::new(super::ChatTurnGate::with_thresholds(
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        ));
+
+        // A slow/stuck turn holds the gate longer than the busy budget.
+        let holder_gate = Arc::clone(&gate);
+        let holder = tokio::spawn(async move {
+            let _guard = holder_gate
+                .try_acquire()
+                .await
+                .expect("holder acquires the gate");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        for _ in 0..200 {
+            if gate.snapshot().in_flight {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(gate.snapshot().in_flight, "holder must be in flight");
+
+        // A concurrent turn cannot acquire within busy_wait → busy, and promptly.
+        let start = std::time::Instant::now();
+        assert!(
+            gate.try_acquire().await.is_none(),
+            "a concurrent turn must get busy while another is in flight"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the busy turn must return promptly, not block on the holder"
+        );
+        assert_eq!(
+            gate.snapshot().waiters,
+            0,
+            "the bounced turn must release its waiter slot"
+        );
+
+        // Once the holder finishes, chat recovers and a new turn succeeds.
+        holder.await.expect("holder task completes");
+        assert!(
+            gate.try_acquire().await.is_some(),
+            "a turn succeeds again once the holder releases"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_health_recovers_after_wedged_turn_completes() {
+        use std::time::Duration;
+        // Stuck-runtime recovery path (issue #181 review): a turn held past
+        // wedge_after — as if a backend read stalled — drives overall health to
+        // `degraded`; once it finally releases (the bounded client read now
+        // guarantees it does), the liveness and `degraded` fields recover to `ok`.
+        let gate = super::ChatTurnGate::with_thresholds(
+            Duration::from_secs(60),
+            Duration::from_millis(40),
+        );
+
+        let snap = gate.snapshot();
+        assert!(!snap.wedged);
+        assert_eq!(
+            overall_health_status(true, ConnectivityState::Ready, snap.wedged),
+            "ok",
+            "healthy before any turn"
+        );
+
+        {
+            let _stuck = gate.try_acquire().await.expect("stuck turn acquires");
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let snap = gate.snapshot();
+            assert!(snap.in_flight, "stuck turn is in flight");
+            assert!(snap.wedged, "a turn held past wedge_after reports wedged");
+            assert_eq!(
+                overall_health_status(true, ConnectivityState::Ready, snap.wedged),
+                "degraded",
+                "a wedged chat turn must surface as degraded even with the LLM reachable"
+            );
+            // `_stuck` drops here: the bounded read timed out, the turn aborted and
+            // released the gate.
+        }
+
+        let snap = gate.snapshot();
+        assert!(
+            !snap.in_flight,
+            "no turn in flight after the stuck turn released"
+        );
+        assert!(!snap.wedged, "wedged clears once the stuck turn releases");
+        assert!(snap.current_turn_age_secs.is_none());
+        assert!(
+            snap.last_turn_age_secs.is_some(),
+            "the completed turn was recorded"
+        );
+        assert_eq!(snap.completed_turns, 1);
+        assert_eq!(
+            overall_health_status(true, ConnectivityState::Ready, snap.wedged),
+            "ok",
+            "overall health recovers to ok once the wedged turn completes"
+        );
     }
 
     /// Smoke test for issue #124: dropping a real TCP connection mid-stream

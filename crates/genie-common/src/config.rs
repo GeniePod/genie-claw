@@ -84,6 +84,26 @@ pub struct CoreConfig {
     #[serde(default = "defaults::max_history_turns")]
     pub max_history_turns: usize,
 
+    /// Seconds to wait for the LLM backend TCP connection to establish before
+    /// giving up. Bounds the streaming `connect` that previously had no timeout
+    /// (issue #181).
+    #[serde(default = "defaults::llm_connect_timeout_secs")]
+    pub llm_connect_timeout_secs: u64,
+
+    /// Maximum idle seconds between bytes/tokens from the LLM backend before a
+    /// read is abandoned. This bounds every client read (streaming SSE lines and
+    /// HTTP headers) so a single hung backend read can no longer hold the chat
+    /// turn lock forever and wedge all chat (issue #181). Generous by default so
+    /// a cold model swap's first-token latency is not mistaken for a hang.
+    #[serde(default = "defaults::llm_read_timeout_secs")]
+    pub llm_read_timeout_secs: u64,
+
+    /// Maximum seconds for a non-streaming LLM completion (the single response
+    /// body read, which spans the whole generation). Backstops the idle read
+    /// timeout for the blocking `/v1/chat/completions` path (issue #181).
+    #[serde(default = "defaults::llm_request_timeout_secs")]
+    pub llm_request_timeout_secs: u64,
+
     /// Optional pinned runtime contract hash for drift detection.
     #[serde(default)]
     pub expected_runtime_contract_hash: String,
@@ -209,6 +229,9 @@ impl Default for CoreConfig {
             piper_model: defaults::piper_model(),
             piper_pipe_mode: defaults::piper_pipe_mode(),
             max_history_turns: defaults::max_history_turns(),
+            llm_connect_timeout_secs: defaults::llm_connect_timeout_secs(),
+            llm_read_timeout_secs: defaults::llm_read_timeout_secs(),
+            llm_request_timeout_secs: defaults::llm_request_timeout_secs(),
             expected_runtime_contract_hash: String::new(),
             whisper_cli_path: defaults::whisper_cli_path(),
             piper_path: defaults::piper_path(),
@@ -2542,6 +2565,15 @@ mod defaults {
     }
     pub fn max_history_turns() -> usize {
         20
+    }
+    pub fn llm_connect_timeout_secs() -> u64 {
+        10
+    }
+    pub fn llm_read_timeout_secs() -> u64 {
+        60
+    }
+    pub fn llm_request_timeout_secs() -> u64 {
+        120
     }
     pub fn whisper_cli_path() -> PathBuf {
         PathBuf::from("/opt/geniepod/bin/whisper-cli")

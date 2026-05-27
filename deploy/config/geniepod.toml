@@ -62,6 +62,10 @@ piper_model = "/opt/geniepod/voices/en_US-amy-medium.onnx"
 piper_path = "/opt/geniepod/piper/piper"
 piper_pipe_mode = false           # true = long-running subprocess (lower latency).
 max_history_turns = 20
+llm_connect_timeout_secs = 10     # Max wait to open the TCP connection to the LLM backend.
+llm_read_timeout_secs = 60        # Max idle seconds between tokens/bytes before a read is abandoned.
+                                  #   Bounds every backend read so one hung read can't wedge all chat.
+llm_request_timeout_secs = 120    # Max seconds for a non-streaming completion (whole generation).
 expected_runtime_contract_hash = ""  # Optional: pin after a known-good boot to detect prompt/tool/policy drift.
 audio_device = "auto"             # CAPTURE/microphone device.
                                   # Auto-detect: prefers Tegra APE (LyraT/I2S2) if routed,

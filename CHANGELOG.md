@@ -33,6 +33,36 @@
   identical SHA, plus asserts that a prompt-assembly or hydration change
   shifts the digest — so silent prompt drift between runs becomes a visible
   hash mismatch instead of an undetected behavior change.
+- **Bounded LLM reads + observable chat liveness** (#181): a single hung
+  backend read could take down chat across every channel — unrecoverable
+  without a daemon restart — while `/api/health` stayed green. Two layers were
+  unbounded together. (1) `OpenAiCompatClient` only timed out on the
+  *non-streaming connect*; the streaming `TcpStream::connect` and **every** read
+  (`read_line`/`read_exact`/`read_to_string`/`next_line`) had no timeout, so a
+  backend that accepted a connection then stalled (e.g. mid governor model swap)
+  hung forever. Now every connect, read, and write is bounded by configurable
+  timeouts (`core.llm_connect_timeout_secs` / `llm_read_timeout_secs` /
+  `llm_request_timeout_secs`), threaded through `LlmClient::from_service_config`
+  so all call sites (web, OpenAI bridge, voice, REPL, Telegram) inherit the
+  bound. (2) The server held the process-wide `chat_turn_lock` across that
+  unbounded read, serializing the whole appliance behind one stuck turn. The
+  bare `Mutex<()>` is replaced by a `ChatTurnGate` with **bounded acquisition**
+  (a turn that can't get the lock within budget gets a `503 chat busy` instead
+  of blocking forever) and **liveness tracking**: `/api/health` now reports a
+  `chat` block (`in_flight`, `last_turn_age_secs`, `current_turn_age_secs`,
+  `waiters`, `wedged`) and flips overall status to `degraded` when a turn is
+  wedged, so monitoring can no longer show green while chat is stuck. The gate's
+  waiter count is held by an RAII guard that decrements on every exit path, so a
+  request cancelled (dropped) while parked on the gate — e.g. a client disconnect
+  or shutdown aborting the per-connection task — cannot leak a phantom waiter into
+  the health snapshot. Tests cover the stuck-runtime recovery path: a concurrent
+  turn gets `503 chat busy` while one is blocked, the `wedged`/`degraded` fields
+  recover to `ok` once the stuck turn releases, and a cancelled waiter leaves the
+  count at zero. The dead,
+  never-wired `RetryLlmClient` module (the only place a timeout previously lived,
+  reachable solely via `#[allow(unused_imports)]`) is removed; its timeout
+  semantics now live at the client read layer where every call site inherits
+  them.
 - **Crash fix: non-ASCII backend error bodies** (#147): `truncate_body`
   in `llm/openai_compat.rs` sliced the response body at a fixed 240-byte
   offset (`&trimmed[..240]`). When that offset landed inside a multi-byte

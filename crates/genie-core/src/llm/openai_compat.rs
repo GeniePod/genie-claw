@@ -1,9 +1,54 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use super::LlmRequestHints;
+
+/// Network timeouts applied to every backend read, write, and connect.
+///
+/// Before issue #181 the only bound was a `connect` timeout on the
+/// non-streaming path; the streaming `connect` and *all* reads were unbounded,
+/// so a backend that accepted a connection and then stalled mid-response held
+/// the caller (and the server's chat turn lock) forever. These timeouts bound
+/// each I/O step so a hung backend fails the turn instead of wedging the daemon.
+#[derive(Debug, Clone, Copy)]
+pub struct LlmTimeouts {
+    /// Maximum time to establish the TCP connection.
+    pub connect: Duration,
+    /// Maximum idle time for an incremental read (an SSE token line or an HTTP
+    /// header line) or a write before it is abandoned.
+    pub read: Duration,
+    /// Maximum time for a non-streaming completion's single response-body read,
+    /// which spans the whole generation. Streaming relies on `read` (idle)
+    /// instead, so a long but live stream is never cut off.
+    pub request: Duration,
+}
+
+impl Default for LlmTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            read: Duration::from_secs(60),
+            request: Duration::from_secs(120),
+        }
+    }
+}
+
+impl LlmTimeouts {
+    /// Build from whole-second config values, clamping zeros to a 1s floor so a
+    /// misconfigured `0` can never disable the bound (which would reintroduce
+    /// the issue #181 hang).
+    pub fn from_secs(connect: u64, read: u64, request: u64) -> Self {
+        Self {
+            connect: Duration::from_secs(connect.max(1)),
+            read: Duration::from_secs(read.max(1)),
+            request: Duration::from_secs(request.max(1)),
+        }
+    }
+}
 
 /// Raw HTTP client for local OpenAI-compatible chat completion backends.
 ///
@@ -14,6 +59,7 @@ pub struct OpenAiCompatClient {
     host: String,
     port: u16,
     request_profile: RequestProfile,
+    timeouts: LlmTimeouts,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,7 +184,7 @@ struct HttpResponse {
 }
 
 impl RequestProfile {
-    fn generic() -> Self {
+    pub(crate) fn generic() -> Self {
         Self::Generic
     }
 
@@ -264,11 +310,28 @@ impl OpenAiCompatClient {
         port: u16,
         request_profile: RequestProfile,
     ) -> Self {
+        Self::new_with_profile_and_timeouts(
+            backend_name,
+            host,
+            port,
+            request_profile,
+            LlmTimeouts::default(),
+        )
+    }
+
+    pub(crate) fn new_with_profile_and_timeouts(
+        backend_name: &'static str,
+        host: &str,
+        port: u16,
+        request_profile: RequestProfile,
+        timeouts: LlmTimeouts,
+    ) -> Self {
         Self {
             backend_name,
             host: host.to_string(),
             port,
             request_profile,
+            timeouts,
         }
     }
 
@@ -281,6 +344,20 @@ impl OpenAiCompatClient {
         url: &str,
         request_profile: RequestProfile,
     ) -> Self {
+        Self::from_url_with_profile_and_timeouts(
+            backend_name,
+            url,
+            request_profile,
+            LlmTimeouts::default(),
+        )
+    }
+
+    pub(crate) fn from_url_with_profile_and_timeouts(
+        backend_name: &'static str,
+        url: &str,
+        request_profile: RequestProfile,
+        timeouts: LlmTimeouts,
+    ) -> Self {
         let stripped = url.strip_prefix("http://").unwrap_or(url);
         let (host_port, _) = stripped.split_once('/').unwrap_or((stripped, ""));
         let (host, port_str) = host_port.split_once(':').unwrap_or((host_port, "8080"));
@@ -290,11 +367,66 @@ impl OpenAiCompatClient {
             host: host.to_string(),
             port,
             request_profile,
+            timeouts,
         }
     }
 
     pub fn backend_name(&self) -> &str {
         self.backend_name
+    }
+
+    /// Connect to the backend, bounded by the configured connect timeout.
+    ///
+    /// The streaming path previously called `TcpStream::connect` with no
+    /// timeout (issue #181); routing every connect through here guarantees a
+    /// bound on all paths.
+    async fn connect(&self, addr: &str) -> Result<TcpStream> {
+        match tokio::time::timeout(self.timeouts.connect, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => Err(anyhow::anyhow!(
+                "{} connect failed ({addr}): {e}",
+                self.backend_name
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "{} connect timed out after {}s ({addr})",
+                self.backend_name,
+                self.timeouts.connect.as_secs()
+            )),
+        }
+    }
+
+    /// Run a single read/write future under a timeout, mapping both the I/O
+    /// error and the elapsed-timeout into a descriptive `anyhow` error.
+    ///
+    /// `op` labels the step in the resulting error (e.g. "stream read") so a
+    /// wedged backend is diagnosable from logs.
+    async fn timed<F, T>(&self, budget: Duration, op: &'static str, fut: F) -> Result<T>
+    where
+        F: std::future::Future<Output = std::io::Result<T>>,
+    {
+        match tokio::time::timeout(budget, fut).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => Err(anyhow::anyhow!("{} {op} failed: {e}", self.backend_name)),
+            Err(_) => Err(anyhow::anyhow!(
+                "{} {op} timed out after {}s",
+                self.backend_name,
+                budget.as_secs()
+            )),
+        }
+    }
+
+    async fn timed_result<F, T>(&self, budget: Duration, op: &'static str, fut: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        match tokio::time::timeout(budget, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "{} {op} timed out after {}s",
+                self.backend_name,
+                budget.as_secs()
+            )),
+        }
     }
 
     /// Send a chat completion request, return the full response.
@@ -474,7 +606,7 @@ impl OpenAiCompatClient {
         }
 
         let addr = format!("{}:{}", self.host, self.port);
-        let stream = TcpStream::connect(&addr).await?;
+        let stream = self.connect(&addr).await?;
         let (reader, mut writer) = stream.into_split();
 
         let http_req = format!(
@@ -484,14 +616,25 @@ impl OpenAiCompatClient {
             prepared.body,
         );
 
-        writer.write_all(http_req.as_bytes()).await?;
+        self.timed(
+            self.timeouts.read,
+            "stream request write",
+            writer.write_all(http_req.as_bytes()),
+        )
+        .await?;
 
         let mut lines = BufReader::new(reader).lines();
         let mut full_response = String::new();
         let mut status = 0;
         let mut headers_done = false;
 
-        while let Some(line) = lines.next_line().await? {
+        // Each `next_line()` is bounded by the idle (`read`) timeout: if the
+        // backend stalls between SSE chunks, the read fails instead of hanging
+        // forever and holding the chat turn lock (issue #181).
+        while let Some(line) = self
+            .timed(self.timeouts.read, "stream read", lines.next_line())
+            .await?
+        {
             // Skip HTTP headers.
             if !headers_done {
                 if line.starts_with("HTTP/") {
@@ -502,7 +645,10 @@ impl OpenAiCompatClient {
                     headers_done = true;
                     if status != 200 {
                         let mut error_body = String::new();
-                        while let Some(line) = lines.next_line().await? {
+                        while let Some(line) = self
+                            .timed(self.timeouts.read, "stream error read", lines.next_line())
+                            .await?
+                        {
                             if error_body.len().saturating_add(line.len())
                                 > DEFAULT_MAX_RESPONSE_BYTES
                             {
@@ -573,11 +719,7 @@ impl OpenAiCompatClient {
 
     async fn http_post(&self, path: &str, body: &str) -> Result<HttpResponse> {
         let addr = format!("{}:{}", self.host, self.port);
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            TcpStream::connect(&addr),
-        )
-        .await??;
+        let stream = self.connect(&addr).await?;
 
         let (reader, mut writer) = stream.into_split();
 
@@ -589,16 +731,24 @@ impl OpenAiCompatClient {
             body
         );
 
-        writer.write_all(request.as_bytes()).await?;
+        self.timed(
+            self.timeouts.read,
+            "request write",
+            writer.write_all(request.as_bytes()),
+        )
+        .await?;
 
-        read_bounded_http_response(reader, DEFAULT_MAX_RESPONSE_BYTES).await
+        self.timed_result(
+            self.timeouts.request,
+            "response read",
+            read_bounded_http_response(reader, DEFAULT_MAX_RESPONSE_BYTES),
+        )
+        .await
     }
 
     async fn http_get(&self, path: &str) -> Result<HttpResponse> {
         let addr = format!("{}:{}", self.host, self.port);
-        let stream =
-            tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))
-                .await??;
+        let stream = self.connect(&addr).await?;
 
         let (reader, mut writer) = stream.into_split();
 
@@ -606,9 +756,19 @@ impl OpenAiCompatClient {
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
             path, addr
         );
-        writer.write_all(request.as_bytes()).await?;
+        self.timed(
+            self.timeouts.read,
+            "health request write",
+            writer.write_all(request.as_bytes()),
+        )
+        .await?;
 
-        read_bounded_http_response(reader, DEFAULT_MAX_RESPONSE_BYTES).await
+        self.timed_result(
+            self.timeouts.read,
+            "health response read",
+            read_bounded_http_response(reader, DEFAULT_MAX_RESPONSE_BYTES),
+        )
+        .await
     }
 }
 
@@ -1548,5 +1708,136 @@ mod tests {
         let response = read_bounded_http_response(reader, 16 * 1024).await.unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn default_timeouts_are_bounded() {
+        let t = LlmTimeouts::default();
+        assert!(t.connect.as_secs() > 0);
+        assert!(t.read.as_secs() > 0);
+        assert!(t.request.as_secs() > 0);
+    }
+
+    #[test]
+    fn from_secs_clamps_zero_to_keep_a_bound() {
+        // A misconfigured 0 must never disable the bound (issue #181 regression).
+        let t = LlmTimeouts::from_secs(0, 0, 0);
+        assert_eq!(t.connect, Duration::from_secs(1));
+        assert_eq!(t.read, Duration::from_secs(1));
+        assert_eq!(t.request, Duration::from_secs(1));
+    }
+
+    /// A backend that accepts the connection, sends 200 headers promising a
+    /// body, then never sends it must make a *non-streaming* completion fail
+    /// fast on the body read timeout instead of hanging forever (issue #181).
+    #[tokio::test]
+    async fn non_streaming_body_read_times_out_on_stalled_backend() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                    .await;
+                // Promise 100 body bytes that never arrive.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let client = OpenAiCompatClient::from_url_with_profile_and_timeouts(
+            "test-backend",
+            &format!("http://{addr}"),
+            RequestProfile::generic(),
+            LlmTimeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_millis(200),
+                request: Duration::from_millis(200),
+            },
+        );
+
+        let start = std::time::Instant::now();
+        let result = client
+            .chat(
+                &[Message {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                Some(8),
+            )
+            .await;
+        let elapsed = start.elapsed();
+        server.abort();
+
+        let err = result.expect_err("stalled body read must error, not hang");
+        assert!(
+            err.to_string().contains("timed out"),
+            "error should mention timeout: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must fail fast on read timeout, not hang: took {elapsed:?}"
+        );
+    }
+
+    /// A backend that completes the SSE headers then stalls mid-stream must make
+    /// a *streaming* completion fail on the idle read timeout (issue #181).
+    #[tokio::test]
+    async fn streaming_read_times_out_on_stalled_backend() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                    .await;
+                // Headers done, but no `data:` lines ever follow.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let client = OpenAiCompatClient::from_url_with_profile_and_timeouts(
+            "test-backend",
+            &format!("http://{addr}"),
+            RequestProfile::generic(),
+            LlmTimeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_millis(200),
+                request: Duration::from_secs(2),
+            },
+        );
+
+        let start = std::time::Instant::now();
+        let mut tokens = String::new();
+        let result = client
+            .chat_stream(
+                &[Message {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                Some(8),
+                &mut |t| tokens.push_str(t),
+            )
+            .await;
+        let elapsed = start.elapsed();
+        server.abort();
+
+        let err = result.expect_err("stalled stream read must error, not hang");
+        assert!(
+            err.to_string().contains("timed out"),
+            "error should mention timeout: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must fail fast on idle read timeout, not hang: took {elapsed:?}"
+        );
+        assert!(tokens.is_empty(), "no tokens should have been produced");
     }
 }

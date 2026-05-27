@@ -1105,6 +1105,32 @@ async fn cmd_health() -> Result<()> {
             Some(_) => println!("  [DOWN] {}", label),
             None => println!("  [DOWN] {}", label),
         }
+
+        // Chat-path liveness (issue #181): a wedged turn must be visible here
+        // rather than hidden behind an overall "ok" status.
+        if let Some(chat) = health.get("chat") {
+            let in_flight = chat
+                .get("in_flight")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let wedged = chat
+                .get("wedged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if wedged {
+                let age = chat
+                    .get("current_turn_age_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                println!(
+                    "  [WEDGED] chat turn stuck for {age}s — restart genie-core if it persists"
+                );
+            } else if in_flight {
+                println!("  [BUSY] chat turn in progress");
+            } else {
+                println!("  [OK]   chat path idle");
+            }
+        }
     }
 
     // Check each remaining HTTP/TLS service, honoring [services.*] in geniepod.toml.
