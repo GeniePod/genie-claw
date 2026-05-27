@@ -74,6 +74,12 @@ pub(crate) struct CacheControl {
     #[serde(rename = "type")]
     pub(crate) cache_type: &'static str,
     pub(crate) ttl: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scope: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prefix_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,7 +195,7 @@ impl RequestProfile {
             conversation_id,
             think: self.think_override(),
             response_format,
-            nvext: self.nvext(hints),
+            nvext: self.nvext(messages, hints),
         };
         Ok(serde_json::to_string(&request)?)
     }
@@ -224,10 +230,10 @@ impl RequestProfile {
         }
     }
 
-    fn nvext(&self, hints: Option<&LlmRequestHints>) -> Option<NvExt> {
+    fn nvext(&self, messages: &[Message], hints: Option<&LlmRequestHints>) -> Option<NvExt> {
         match self {
             Self::Generic => None,
-            Self::GenieAiRuntime => hints.and_then(build_nvext),
+            Self::GenieAiRuntime => build_nvext(messages, hints),
         }
     }
 }
@@ -240,6 +246,12 @@ const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const GENIE_RUNTIME_COMPACT_SYSTEM: &str =
     "You are GeniePod Home. Answer the user's latest request directly and concisely.";
 const GENIE_RUNTIME_COMPACT_SYSTEM_PREFIX: &str = "You are GeniePod Home. Reply briefly for voice. Use a tool only when required. Tool calls must be ONLY JSON: {\"tool\":\"tool_name\",\"arguments\":{}}. No markdown.";
+const SYSTEM_PROMPT_PREFIX_CACHE_SCOPE: &str = "system_prompt_prefix";
+const SYSTEM_PROMPT_PREFIX_CACHE_KEY_PREFIX: &str = "system-prompt-prefix:";
+const SYSTEM_PROMPT_PREFIX_CACHE_MARKERS: [&str; 2] = [
+    "\n\nRelevant household context:\n",
+    "\n\nHousehold context:\n",
+];
 
 impl OpenAiCompatClient {
     pub fn new(backend_name: &'static str, host: &str, port: u16) -> Self {
@@ -696,30 +708,30 @@ async fn read_chunked_body<R: AsyncBufReadExt + Unpin>(
     Ok(String::from_utf8_lossy(&body).to_string())
 }
 
-fn build_nvext(hints: &LlmRequestHints) -> Option<NvExt> {
+fn build_nvext(messages: &[Message], hints: Option<&LlmRequestHints>) -> Option<NvExt> {
     let session_id = hints
-        .session_id
-        .as_deref()
+        .and_then(|h| h.session_id.as_deref())
         .and_then(normalize_runtime_session_id);
-    let agent_hints = if session_id.is_some()
-        || hints.priority.is_some()
-        || hints.output_sequence_length.is_some()
-        || hints.speculative_prefill
-    {
-        Some(AgentHints {
-            session_id,
-            priority: hints.priority,
-            osl: hints.output_sequence_length,
-            speculative_prefill: hints.speculative_prefill.then_some(true),
-        })
-    } else {
-        None
-    };
-
-    let cache_control = hints.cache_ttl_secs.map(|ttl| CacheControl {
-        cache_type: "ephemeral",
-        ttl: format_ttl(ttl),
+    let agent_hints = hints.and_then(|hints| {
+        if session_id.is_some()
+            || hints.priority.is_some()
+            || hints.output_sequence_length.is_some()
+            || hints.speculative_prefill
+        {
+            Some(AgentHints {
+                session_id: session_id.clone(),
+                priority: hints.priority,
+                osl: hints.output_sequence_length,
+                speculative_prefill: hints.speculative_prefill.then_some(true),
+            })
+        } else {
+            None
+        }
     });
+
+    let cache_control = hints
+        .and_then(|h| h.cache_ttl_secs)
+        .map(|ttl| cache_control(ttl, system_prompt_prefix_cache(messages)));
 
     if agent_hints.is_some() || cache_control.is_some() {
         Some(NvExt {
@@ -729,6 +741,50 @@ fn build_nvext(hints: &LlmRequestHints) -> Option<NvExt> {
     } else {
         None
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SystemPromptPrefixCache {
+    cache_key: String,
+    prefix_bytes: usize,
+}
+
+fn cache_control(ttl_secs: u32, prefix_cache: Option<SystemPromptPrefixCache>) -> CacheControl {
+    CacheControl {
+        cache_type: "ephemeral",
+        ttl: format_ttl(ttl_secs),
+        scope: prefix_cache
+            .as_ref()
+            .map(|_| SYSTEM_PROMPT_PREFIX_CACHE_SCOPE),
+        cache_key: prefix_cache.as_ref().map(|cache| cache.cache_key.clone()),
+        prefix_bytes: prefix_cache.map(|cache| cache.prefix_bytes),
+    }
+}
+
+fn system_prompt_prefix_cache(messages: &[Message]) -> Option<SystemPromptPrefixCache> {
+    let system = messages
+        .iter()
+        .find(|message| message.role == "system")?
+        .content
+        .as_str();
+
+    let prefix_end = SYSTEM_PROMPT_PREFIX_CACHE_MARKERS
+        .iter()
+        .filter_map(|marker| system.find(marker).map(|pos| pos + marker.len()))
+        .min()?;
+    let prefix = system.get(..prefix_end)?;
+    if prefix.trim().is_empty() {
+        return None;
+    }
+
+    Some(SystemPromptPrefixCache {
+        cache_key: format!(
+            "{}{}",
+            SYSTEM_PROMPT_PREFIX_CACHE_KEY_PREFIX,
+            crate::prompt_sha::sha256_hex(prefix)
+        ),
+        prefix_bytes: prefix.len(),
+    })
 }
 
 fn normalize_runtime_session_id(raw: &str) -> Option<String> {
@@ -1110,6 +1166,84 @@ mod tests {
         assert_eq!(json["nvext"]["agent_hints"]["osl"], 512);
         assert_eq!(json["nvext"]["cache_control"]["type"], "ephemeral");
         assert_eq!(json["nvext"]["cache_control"]["ttl"], "15m");
+        assert!(json["nvext"]["cache_control"].get("scope").is_none());
+        assert!(json["nvext"]["cache_control"].get("cache_key").is_none());
+        assert!(json["nvext"]["cache_control"].get("prefix_bytes").is_none());
+    }
+
+    #[test]
+    fn genie_runtime_profile_serializes_system_prompt_prefix_cache_hint() {
+        let profile = RequestProfile::genie_ai_runtime();
+        let hints = LlmRequestHints::agent_turn("conv-abc", 512);
+        let static_prompt = "You are GeniePod Home.\nUse tools safely.";
+        let marker = "\n\nRelevant household context:\n";
+        let full_prompt = format!("{static_prompt}{marker}Jared lives here.");
+        let prepared = profile
+            .prepare_body(
+                &[
+                    Message {
+                        role: "system".into(),
+                        content: full_prompt.clone(),
+                    },
+                    Message {
+                        role: "user".into(),
+                        content: "hello".into(),
+                    },
+                ],
+                Some(512),
+                false,
+                None,
+                Some(&hints),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
+        let cache = &json["nvext"]["cache_control"];
+        let expected_prefix = format!("{static_prompt}{marker}");
+
+        assert_eq!(cache["type"], "ephemeral");
+        assert_eq!(cache["ttl"], "15m");
+        assert_eq!(cache["scope"], SYSTEM_PROMPT_PREFIX_CACHE_SCOPE);
+        assert_eq!(cache["prefix_bytes"], expected_prefix.len());
+        assert_eq!(
+            cache["cache_key"],
+            format!(
+                "{}{}",
+                SYSTEM_PROMPT_PREFIX_CACHE_KEY_PREFIX,
+                crate::prompt_sha::sha256_hex(&expected_prefix)
+            )
+        );
+    }
+
+    #[test]
+    fn system_prompt_prefix_cache_key_ignores_dynamic_household_context() {
+        let marker = "\n\nRelevant household context:\n";
+        let first = system_prompt_prefix_cache(&[Message {
+            role: "system".into(),
+            content: format!("stable prompt{marker}Jared likes tea."),
+        }])
+        .unwrap();
+        let second = system_prompt_prefix_cache(&[Message {
+            role: "system".into(),
+            content: format!("stable prompt{marker}Maya likes oat milk."),
+        }])
+        .unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn compacted_system_prompt_prefix_cache_uses_household_context_boundary() {
+        let marker = "\n\nHousehold context:\n";
+        let cache = system_prompt_prefix_cache(&[Message {
+            role: "system".into(),
+            content: format!("stable compacted prompt{marker}Jared lives here."),
+        }])
+        .unwrap();
+
+        assert_eq!(
+            cache.prefix_bytes,
+            format!("stable compacted prompt{marker}").len()
+        );
     }
 
     #[test]

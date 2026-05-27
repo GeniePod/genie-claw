@@ -55,8 +55,8 @@ genie-ai-runtime   Home Assistant today
 - Home Assistant adapter with confirmations, rate limits, and audit logging
 - local HTTP API, dashboard, CLI, health service, and governor service
 - optional `web_search` tool with DuckDuckGo or SearXNG
-- cache-aware `genie-ai-runtime` requests with `conversation_id` and
-  `nvext.agent_hints` for session KV reuse
+- cache-aware `genie-ai-runtime` requests with `conversation_id`,
+  `nvext.agent_hints`, and system-prompt prefix cache metadata for KV reuse
 - system-prompt SHA exposed in boot logs, `/api/health`, and `genie-ctl status`
   to prove deterministic prompt assembly across restarts
 - Jetson aarch64 cross-compile CI
@@ -82,8 +82,8 @@ The repo now has explicit code-level contract surfaces for the new direction:
   response reserve, and optional provider context against the Jetson 4096-token
   baseline.
 - `genie_core::llm::LlmRequestHints` carries session id, expected output
-  length, priority, and short-lived cache TTL to runtimes that understand the
-  `nvext` extension.
+  length, priority, short-lived cache TTL, and stable system-prompt prefix
+  cache metadata to runtimes that understand the `nvext` extension.
 - `[agent]` in `geniepod.toml` selects the runtime profile:
   `jetson`, `raspberry_pi`, `portable_sbc`, `laptop`, or `mac`.
 - `[optional_ai_provider]` is disabled by default. API-key providers must keep
