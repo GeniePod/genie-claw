@@ -20,7 +20,7 @@ static FIRST_REPLY_BANNER_PRINTED: AtomicBool = AtomicBool::new(false);
 
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, LlmRequestHints};
-use crate::memory::Memory;
+use crate::memory::{SharedMemory, with_shared_memory};
 use crate::memory::{extract, inject};
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
@@ -74,7 +74,7 @@ pub async fn run(
     voice_cfg: VoiceConfig,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -208,7 +208,7 @@ async fn run_with_wakeword(
     stt_engine: &stt::SttEngine,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -348,6 +348,11 @@ async fn run_with_wakeword(
                     if let Ok(transcript) = stt_engine.transcribe_file(&followup_path).await {
                         let text = transcript.text.trim().to_string();
                         if !text.is_empty() {
+                            // Security: scan for prompt injection (issue #196).
+                            crate::security::injection::scan_and_warn(
+                                &text,
+                                crate::security::injection::source::VOICE_FOLLOWUP,
+                            );
                             let response_language = transcript.language.clone().or_else(|| {
                                 crate::voice::language::detect_language_from_text(&text)
                             });
@@ -378,7 +383,7 @@ async fn run_with_wakeword(
 
                             // Build context and process — reuse voice_cycle but skip recording
                             // (we already have the text).
-                            let _ = conversations.append(conv_id, "user", &text, None);
+                            conversations.append_or_log(conv_id, "user", &text, None);
 
                             if handle_quick_tool_for_voice(
                                 tools,
@@ -396,11 +401,13 @@ async fn run_with_wakeword(
                                 continue;
                             }
 
-                            let memory_context = inject::build_memory_context_with_read_context(
-                                memory,
-                                &text,
-                                read_context,
-                            );
+                            let memory_context = with_shared_memory(memory, |memory| {
+                                inject::build_memory_context_with_read_context(
+                                    memory,
+                                    &text,
+                                    read_context,
+                                )
+                            });
                             let full_prompt = format!(
                                 "{}\n\nRelevant household context:\n{}",
                                 system_prompt, memory_context
@@ -431,8 +438,12 @@ async fn run_with_wakeword(
                             .await
                             {
                                 Ok(response) => {
-                                    let _ =
-                                        conversations.append(conv_id, "assistant", &response, None);
+                                    conversations.append_or_log(
+                                        conv_id,
+                                        "assistant",
+                                        &response,
+                                        None,
+                                    );
                                     eprintln!("[voice] GeniePod: {}", format::for_voice(&response));
                                 }
                                 Err(e) => {
@@ -445,7 +456,9 @@ async fn run_with_wakeword(
                             }
 
                             // Auto-capture from follow-up.
-                            extract::extract_and_store(memory, &text);
+                            with_shared_memory(memory, |memory| {
+                                extract::extract_and_store(memory, &text);
+                            });
                         } else {
                             let _ = tokio::fs::remove_file(&followup_path).await;
                             eprintln!("[voice] No follow-up speech — returning to wake word.");
@@ -491,7 +504,7 @@ async fn run_push_to_talk(
     stt_engine: &stt::SttEngine,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -727,9 +740,9 @@ async fn handle_quick_tool_for_voice(
         })
         .to_string();
 
-        let _ = conversations.append(conv_id, "assistant", &tool_json, Some("web_search"));
-        let _ = conversations.append(conv_id, "system", &format!("Tool: {}", response), None);
-        let _ = conversations.append(conv_id, "assistant", &response, None);
+        conversations.append_or_log(conv_id, "assistant", &tool_json, Some("web_search"));
+        conversations.append_or_log(conv_id, "system", &format!("Tool: {}", response), None);
+        conversations.append_or_log(conv_id, "assistant", &response, None);
 
         let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
         let voice_text = format::for_voice(&voice_response);
@@ -762,14 +775,14 @@ async fn handle_quick_tool_for_voice(
     })
     .to_string();
 
-    let _ = conversations.append(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
-    let _ = conversations.append(
+    conversations.append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+    conversations.append_or_log(
         conv_id,
         "system",
         &format!("Tool: {}", tool_result.output),
         None,
     );
-    let _ = conversations.append(conv_id, "assistant", &response, None);
+    conversations.append_or_log(conv_id, "assistant", &response, None);
 
     let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
     let voice_text = format::for_voice(&response);
@@ -837,7 +850,7 @@ async fn voice_cycle(
     stt_engine: &stt::SttEngine,
     llm: &LlmClient,
     tools: &ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -936,7 +949,7 @@ pub struct ProcessTranscriptInputs<'a> {
     pub audio_device: &'a str,
     pub llm: &'a LlmClient,
     pub tools: &'a ToolDispatcher,
-    pub memory: &'a Memory,
+    pub memory: &'a SharedMemory,
     pub conversations: &'a ConversationStore,
     pub system_prompt: &'a str,
     pub max_history: usize,
@@ -996,6 +1009,8 @@ pub async fn process_transcript(
         eprintln!("[voice] No speech detected.");
         return true;
     }
+    // Security: scan for prompt injection (issue #196).
+    crate::security::injection::scan_and_warn(&text, crate::security::injection::source::VOICE);
     if let VoiceIntentDecision::Reject(reason) = intent::assess_transcript(&text) {
         if let Some(path) = wav_path {
             let _ = tokio::fs::remove_file(path).await;
@@ -1029,7 +1044,7 @@ pub async fn process_transcript(
         "[voice] You said: \"{}\" (STT: {} ms)",
         text, transcript.duration_ms
     );
-    let _ = conversations.append(conv_id, "user", &text, None);
+    conversations.append_or_log(conv_id, "user", &text, None);
 
     if let Some(final_response) = handle_quick_tool_for_voice(
         tools,
@@ -1047,7 +1062,7 @@ pub async fn process_transcript(
             "[voice] GeniePod: {} (quick tool)",
             format::for_voice(&final_response)
         );
-        let stored = extract::extract_and_store(memory, &text);
+        let stored = with_shared_memory(memory, |memory| extract::extract_and_store(memory, &text));
         if stored > 0 {
             eprintln!(
                 "[voice] (remembered {} fact{})",
@@ -1059,8 +1074,9 @@ pub async fn process_transcript(
     }
 
     // Step 3: Build LLM context with per-query memory injection.
-    let memory_context =
-        inject::build_memory_context_with_read_context(memory, &text, read_context);
+    let memory_context = with_shared_memory(memory, |memory| {
+        inject::build_memory_context_with_read_context(memory, &text, read_context)
+    });
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -1149,8 +1165,8 @@ pub async fn process_transcript(
             "[voice] Tool: {} → {}",
             tool_result.tool, tool_result.output
         );
-        let _ = conversations.append(conv_id, "assistant", &response, Some(&tool_result.tool));
-        let _ = conversations.append(
+        conversations.append_or_log(conv_id, "assistant", &response, Some(&tool_result.tool));
+        conversations.append_or_log(
             conv_id,
             "system",
             &format!("Tool: {}", tool_result.output),
@@ -1209,10 +1225,10 @@ pub async fn process_transcript(
             }
         };
 
-        let _ = conversations.append(conv_id, "assistant", &summary, None);
+        conversations.append_or_log(conv_id, "assistant", &summary, None);
         (summary, Some(tool_result.tool))
     } else {
-        let _ = conversations.append(conv_id, "assistant", &response, None);
+        conversations.append_or_log(conv_id, "assistant", &response, None);
         (response, None)
     };
 
@@ -1265,7 +1281,7 @@ pub async fn process_transcript(
     }
 
     // Auto-capture facts from user's speech (runs after TTS, non-blocking).
-    let stored = extract::extract_and_store(memory, &text);
+    let stored = with_shared_memory(memory, |memory| extract::extract_and_store(memory, &text));
     if stored > 0 {
         eprintln!(
             "[voice] (remembered {} fact{})",

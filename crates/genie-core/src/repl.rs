@@ -3,7 +3,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, LlmRequestHints, Message};
-use crate::memory::{self, Memory};
+use crate::memory::{self, SharedMemory, with_shared_memory};
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
 use crate::tools;
@@ -15,7 +15,7 @@ use crate::tools;
 pub async fn run(
     llm: &LlmClient,
     tools_dispatch: &tools::ToolDispatcher,
-    memory: &Memory,
+    memory: &SharedMemory,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -58,8 +58,11 @@ pub async fn run(
             continue;
         }
 
+        // Security: scan for prompt injection (issue #196).
+        crate::security::injection::scan_and_warn(text, crate::security::injection::source::REPL);
+
         // Persist user message.
-        let _ = conversations.append(&conv_id, "user", text, None);
+        conversations.append_or_log(&conv_id, "user", text, None);
 
         if let Some(call) = tools::quick::route_for_available_tools(
             text,
@@ -88,17 +91,18 @@ pub async fn run(
             .to_string();
 
             eprintln!("\nGeniePod: {}", response);
-            let _ =
-                conversations.append(&conv_id, "assistant", &tool_json, Some(&tool_result.tool));
-            let _ = conversations.append(
+            conversations.append_or_log(&conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+            conversations.append_or_log(
                 &conv_id,
                 "system",
                 &format!("Tool: {}", tool_result.output),
                 None,
             );
-            let _ = conversations.append(&conv_id, "assistant", &response, None);
+            conversations.append_or_log(&conv_id, "assistant", &response, None);
 
-            let stored = memory::extract::extract_and_store(memory, text);
+            let stored = with_shared_memory(memory, |memory| {
+                memory::extract::extract_and_store(memory, text)
+            });
             if stored > 0 {
                 eprintln!(
                     "(remembered {} fact{})",
@@ -110,7 +114,9 @@ pub async fn run(
         }
 
         // Build context with per-query memory injection.
-        let memory_context = memory::inject::build_memory_context(memory, text);
+        let memory_context = with_shared_memory(memory, |memory| {
+            memory::inject::build_memory_context(memory, text)
+        });
         let full_prompt = format!(
             "{}\n\nRelevant household context:\n{}",
             system_prompt, memory_context
@@ -156,13 +162,13 @@ pub async fn run(
                 .await
                 {
                     eprintln!("[TOOL: {}] {}", tool_result.tool, tool_result.output);
-                    let _ = conversations.append(
+                    conversations.append_or_log(
                         &conv_id,
                         "assistant",
                         &response,
                         Some(&tool_result.tool),
                     );
-                    let _ = conversations.append(
+                    conversations.append_or_log(
                         &conv_id,
                         "system",
                         &format!("Tool: {}", tool_result.output),
@@ -180,8 +186,12 @@ pub async fn run(
                     );
 
                     if preserve_raw {
-                        let _ =
-                            conversations.append(&conv_id, "assistant", &tool_result.output, None);
+                        conversations.append_or_log(
+                            &conv_id,
+                            "assistant",
+                            &tool_result.output,
+                            None,
+                        );
                     } else {
                         // Get follow-up summary.
                         let recent = conversations.get_recent(&conv_id, 6).unwrap_or_default();
@@ -207,13 +217,13 @@ pub async fn run(
                         {
                             Ok(summary) => {
                                 eprintln!();
-                                let _ = conversations.append(&conv_id, "assistant", &summary, None);
+                                conversations.append_or_log(&conv_id, "assistant", &summary, None);
                             }
                             Err(_) => eprintln!(),
                         }
                     }
                 } else {
-                    let _ = conversations.append(&conv_id, "assistant", &response, None);
+                    conversations.append_or_log(&conv_id, "assistant", &response, None);
                 }
             }
             Err(e) => {
@@ -222,7 +232,9 @@ pub async fn run(
         }
 
         // Auto-capture facts.
-        let stored = memory::extract::extract_and_store(memory, text);
+        let stored = with_shared_memory(memory, |memory| {
+            memory::extract::extract_and_store(memory, text)
+        });
         if stored > 0 {
             eprintln!(
                 "(remembered {} fact{})",

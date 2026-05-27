@@ -45,7 +45,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use genie_core::conversation::ConversationStore;
 use genie_core::llm::{LlmClient, Message};
-use genie_core::memory::Memory;
+use genie_core::memory::{Memory, SharedMemory};
 use genie_core::prompt::ModelFamily;
 use genie_core::tools::{ToolDispatcher, ToolExecutionContext, try_tool_call_with_context};
 use genie_core::voice::identity::SpeakerIdentityProvider;
@@ -53,6 +53,7 @@ use genie_core::voice::streaming::stream_and_speak;
 use genie_core::voice::stt::{MockTranscript, SttEngine, Transcript};
 use genie_core::voice::tts::TtsEngine;
 use genie_core::voice_loop::{ProcessTranscriptInputs, VoiceConfig, process_transcript};
+use std::sync::{Arc, Mutex};
 
 /// Each test gets its own parent dir so SQLite WAL/SHM sidecars and
 /// audit-log JSONLs cannot collide and ConversationStore::open's
@@ -375,7 +376,7 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
     // store, AND audit logs — the three observables #21 AC-B lists.
 
     let dir = unique_dir("process-transcript");
-    let memory = Memory::open(&dir.join("memory.db")).unwrap();
+    let memory: SharedMemory = Arc::new(Mutex::new(Memory::open(&dir.join("memory.db")).unwrap()));
     let conversations = ConversationStore::open(&dir.join("conversations.db")).unwrap();
     let conv_id = "voice-it-process";
     conversations
@@ -468,7 +469,7 @@ async fn process_transcript_ignores_empty_transcript() {
     // Empty / whitespace transcripts must short-circuit cleanly without
     // touching the LLM, the conversation store, or the audit log.
     let dir = unique_dir("process-empty");
-    let memory = Memory::open(&dir.join("memory.db")).unwrap();
+    let memory: SharedMemory = Arc::new(Mutex::new(Memory::open(&dir.join("memory.db")).unwrap()));
     let conversations = ConversationStore::open(&dir.join("conversations.db")).unwrap();
     let conv_id = "voice-it-empty";
     conversations.ensure(conv_id, "empty transcript").unwrap();

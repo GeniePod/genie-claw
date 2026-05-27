@@ -606,9 +606,14 @@ impl ToolDispatcher {
             });
             anyhow::bail!("Home action blocked by channel policy: {}", reason);
         }
-        if let Err(err) = self
-            .actuation_rate_limiter
-            .check_and_record(&self.actuation_safety, exec_ctx.request_origin)
+        // Skip the rate-limit recharge for pre-confirmed actions. The
+        // origin's bucket already paid one slot on the original request that
+        // returned `ConfirmationRequired`; counting the confirmation re-entry
+        // as a second hit would double-charge the same logical action.
+        if !exec_ctx.confirmed
+            && let Err(err) = self
+                .actuation_rate_limiter
+                .check_and_record(&self.actuation_safety, exec_ctx.request_origin)
         {
             let reason = err.to_string();
             self.audit_logger.append(AuditEvent {
@@ -694,9 +699,15 @@ impl ToolDispatcher {
                     action_id: None,
                     undo_of: None,
                 });
+                // The token is a bearer secret: a leaked one is a reusable
+                // door-unlock credential for its full validity window. Keep it
+                // out of LLM tool output (transcripts, voice, logs). The
+                // dashboard fetches it over /api/actuation/pending to drive the
+                // Confirm button; humans confirm there rather than reading the
+                // token back from this string.
                 Ok(format!(
-                    "Confirmation required before I can do that: {}. Pending token: {}. Confirm from the local dashboard or POST /api/actuation/confirm.",
-                    reason, pending.token
+                    "Confirmation required before I can do that: {}. Confirm this pending action from the local dashboard (or POST /api/actuation/confirm with its token from /api/actuation/pending).",
+                    reason
                 ))
             }
             Err(err) => {
@@ -796,11 +807,21 @@ impl ToolDispatcher {
                 "value": pending.value,
             }),
         };
+        // Re-enter with the channel that ORIGINALLY requested the action, not a
+        // synthetic `Confirmation` origin. The `confirmed: true` flag is what
+        // tells the policy gate the action is pre-approved; overriding origin
+        // would (a) hide the originating channel in `AuditEvent.origin`,
+        // (b) bypass `max_actions_per_minute_by_origin` for the requesting
+        // channel by charging the `Confirmation` bucket instead, and
+        // (c) break ACL setups whose `allowed_origins` exclude
+        // `"confirmation"`. The original-bucket already paid one slot when
+        // the request returned `ConfirmationRequired`, so the limiter skips
+        // re-charging here (see `confirmed`-guard in `exec_home_control_inner`).
         let result = self
             .execute_with_context(
                 &call,
                 ToolExecutionContext {
-                    request_origin: RequestOrigin::Confirmation,
+                    request_origin: pending.requested_by,
                     confirmed: true,
                     ..ToolExecutionContext::default()
                 },
@@ -900,18 +921,24 @@ impl ToolDispatcher {
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
         let health = mem.health()?;
         let promoted = mem.promoted_count()?;
-        let state = if health.quick_check_ok && health.fts_consistent {
+        let state = if health.quick_check_ok && health.fts_consistent && !health.migration_degraded
+        {
             "ok"
         } else {
             "degraded"
         };
 
         Ok(format!(
-            "Memory status: {}. Rows: {}. FTS rows: {}. FTS consistent: {}. Promoted memories: {}. Canonical root: {}. Namespace notes: {}. Daily notes: {}. Event logs: {}. Person-scoped memories: {}. Private memories: {}. Restricted memories: {}.",
+            "Memory status: {}. Rows: {}. FTS rows: {}. FTS consistent: {}. Migration degraded: {}. Promoted memories: {}. Canonical root: {}. Namespace notes: {}. Daily notes: {}. Event logs: {}. Person-scoped memories: {}. Private memories: {}. Restricted memories: {}.",
             state,
             health.memory_rows,
             health.fts_rows,
             if health.fts_consistent { "yes" } else { "no" },
+            if health.migration_degraded {
+                "yes"
+            } else {
+                "no"
+            },
             promoted,
             if health.canonical_root_exists {
                 "present"
@@ -2236,11 +2263,310 @@ mod tests {
         assert!(output.contains("Memory status: ok"));
         assert!(output.contains("Rows: 1"));
         assert!(output.contains("FTS consistent: yes"));
+        assert!(output.contains("Migration degraded: no"));
         assert!(output.contains("Canonical root:"));
         assert!(output.contains("Daily notes: 1"));
         assert!(output.contains("Event logs: 1"));
         assert!(output.contains("Person-scoped memories: 0"));
         assert!(output.contains("Private memories: 0"));
         assert!(output.contains("Restricted memories: 0"));
+    }
+
+    /// `HomeAutomationProvider` that resolves every target as a sensitive
+    /// lock (`voice_safe = false`, domain = "lock"). Used by the confirmation
+    /// regression tests below — any action against this provider trips the
+    /// confirmation policy gate, which is what we need to exercise the
+    /// `confirm_pending_home_action` re-entry path.
+    struct SensitiveHomeProvider {
+        executed: Arc<std::sync::Mutex<Vec<HomeActionKind>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HomeAutomationProvider for SensitiveHomeProvider {
+        async fn health(&self) -> IntegrationHealth {
+            IntegrationHealth {
+                connected: true,
+                cached_graph: true,
+                message: "ok".into(),
+            }
+        }
+
+        async fn sync_structure(&self) -> Result<HomeGraph> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn resolve_target(
+            &self,
+            query: &str,
+            _action_hint: Option<HomeActionKind>,
+        ) -> Result<HomeTarget> {
+            Ok(HomeTarget {
+                kind: HomeTargetKind::Entity,
+                query: query.into(),
+                display_name: query.into(),
+                entity_ids: vec!["lock.front_door".into()],
+                domain: Some("lock".into()),
+                area: Some("Entry".into()),
+                confidence: 0.96,
+                voice_safe: false,
+            })
+        }
+
+        async fn get_state(&self, target: &HomeTarget) -> Result<HomeState> {
+            Ok(HomeState {
+                target_name: target.display_name.clone(),
+                domain: target.domain.clone(),
+                area: target.area.clone(),
+                entities: Vec::new(),
+                available: true,
+                spoken_summary: format!("{} is available", target.display_name),
+            })
+        }
+
+        async fn execute(&self, action: HomeAction) -> Result<ActionResult> {
+            self.executed.lock().unwrap().push(action.kind);
+            Ok(ActionResult {
+                success: true,
+                spoken_summary: format!("Executed {:?}", action.kind),
+                affected_targets: vec![action.target.display_name],
+                state_snapshot: None,
+                confidence: Some(action.target.confidence),
+            })
+        }
+
+        async fn list_scenes(&self, _room: Option<&str>) -> Result<Vec<SceneRef>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_devices(&self, _room: Option<&str>) -> Result<Vec<DeviceRef>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Fetch the freshest pending confirmation token from the dispatcher.
+    ///
+    /// The token is deliberately NOT echoed into `home_control`'s tool output
+    /// (it is a bearer secret), so tests read it from the same channel the
+    /// dashboard uses — the pending-confirmations list — rather than scraping
+    /// the LLM-visible string.
+    fn latest_confirmation_token(dispatcher: &ToolDispatcher) -> String {
+        dispatcher
+            .pending_confirmations()
+            .into_iter()
+            .max_by_key(|item| item.created_ms)
+            .map(|item| item.token)
+            .expect("a pending confirmation must exist")
+    }
+
+    /// Read the actuation audit JSONL written via `with_actuation_audit_path`
+    /// and return every event for which the predicate returns true.
+    fn audit_events_matching<P>(path: &Path, mut predicate: P) -> Vec<serde_json::Value>
+    where
+        P: FnMut(&serde_json::Value) -> bool,
+    {
+        let content = std::fs::read_to_string(path).expect("read audit log");
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| predicate(event))
+            .collect()
+    }
+
+    /// Regression for the bug fixed in `confirm_pending_home_action`:
+    /// after confirmation, the executed `AuditEvent` must carry the channel
+    /// that ORIGINALLY requested the action, not a synthetic `Confirmation`
+    /// origin. Otherwise "who unlocked the door?" can never be answered from
+    /// the audit log.
+    #[tokio::test]
+    async fn confirm_preserves_original_origin_in_audit_log() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let audit_path = std::env::temp_dir().join(format!(
+            "geniepod-dispatch-confirm-origin-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&audit_path);
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(SensitiveHomeProvider {
+            executed: executed.clone(),
+        })))
+        .with_actuation_audit_path(audit_path.clone());
+
+        let lock_call = ToolCall {
+            name: "home_control".into(),
+            arguments: serde_json::json!({
+                "entity": "front door",
+                "action": "lock"
+            }),
+        };
+        let issued = dispatcher
+            .execute_with_context(
+                &lock_call,
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Telegram,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+        assert!(issued.success, "issuing confirmation must succeed");
+        assert!(
+            !issued.output.contains("act-"),
+            "raw bearer token must not be echoed into tool output: {:?}",
+            issued.output
+        );
+        let token = latest_confirmation_token(&dispatcher);
+        let executed_output = dispatcher
+            .confirm_pending_home_action(&token)
+            .await
+            .expect("confirm should succeed");
+        assert!(executed_output.contains("Executed"));
+        assert_eq!(executed.lock().unwrap().len(), 1, "exactly one HA execute");
+
+        let executed_rows = audit_events_matching(&audit_path, |event| {
+            event["status"].as_str() == Some("executed")
+        });
+        assert_eq!(executed_rows.len(), 1, "exactly one executed audit row");
+        assert_eq!(
+            executed_rows[0]["origin"].as_str(),
+            Some("telegram"),
+            "executed audit row must keep the original origin, not 'confirmation'"
+        );
+    }
+
+    /// Regression: per-origin rate limit must not be bypassed by funnelling
+    /// sensitive actions through the confirmation flow. If an operator sets
+    /// `max_actions_per_minute_by_origin = { telegram = 1 }`, the second
+    /// Telegram-initiated sensitive request — even routed through
+    /// `confirm_pending_home_action` — must be rejected.
+    #[tokio::test]
+    async fn confirm_does_not_bypass_per_origin_rate_limit() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut safety = ActuationSafetyConfig::default();
+        safety
+            .max_actions_per_minute_by_origin
+            .insert("telegram".into(), 1);
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(SensitiveHomeProvider {
+            executed: executed.clone(),
+        })))
+        .with_actuation_safety_config(safety);
+
+        let lock_call = ToolCall {
+            name: "home_control".into(),
+            arguments: serde_json::json!({
+                "entity": "front door",
+                "action": "lock"
+            }),
+        };
+
+        // First Telegram request → returns ConfirmationRequired and charges
+        // the telegram bucket once.
+        let first_issue = dispatcher
+            .execute_with_context(
+                &lock_call,
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Telegram,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+        assert!(first_issue.success);
+        let first_token = latest_confirmation_token(&dispatcher);
+
+        // Confirming that first request must succeed: the bucket already paid
+        // its single slot on the request, the confirmation must not double-
+        // charge, so the configured `telegram = 1` lets exactly this through.
+        let first_confirm = dispatcher.confirm_pending_home_action(&first_token).await;
+        assert!(
+            first_confirm.is_ok(),
+            "first confirmed action under telegram=1 must succeed (got {:?})",
+            first_confirm.err()
+        );
+
+        // A second Telegram-initiated sensitive request inside the same window
+        // must now be rate-limited at the issue step, instead of getting
+        // through by routing through the confirmation bucket.
+        let second_issue = dispatcher
+            .execute_with_context(
+                &lock_call,
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Telegram,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+        assert!(
+            !second_issue.success,
+            "second telegram-initiated sensitive request must be rate-limited"
+        );
+        assert!(
+            second_issue.output.to_lowercase().contains("rate limit"),
+            "expected a rate-limit message, got: {:?}",
+            second_issue.output
+        );
+        assert_eq!(
+            executed.lock().unwrap().len(),
+            1,
+            "only the confirmed first action may reach the HA provider"
+        );
+    }
+
+    /// Regression: when the original request already pushed one slot into
+    /// the origin's rate-limit bucket (on the `ConfirmationRequired` path),
+    /// the confirmation re-entry must not push a second slot for the same
+    /// logical action.
+    #[tokio::test]
+    async fn confirm_does_not_double_charge_when_already_paid() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut safety = ActuationSafetyConfig::default();
+        // Capacity for exactly two telegram actions in the window. If the
+        // confirmation re-entry double-charges, the third issue below would
+        // hit the limit. If it does NOT, the third issue still has budget.
+        safety
+            .max_actions_per_minute_by_origin
+            .insert("telegram".into(), 2);
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(SensitiveHomeProvider {
+            executed: executed.clone(),
+        })))
+        .with_actuation_safety_config(safety);
+
+        let lock_call = ToolCall {
+            name: "home_control".into(),
+            arguments: serde_json::json!({
+                "entity": "front door",
+                "action": "lock"
+            }),
+        };
+
+        let first_issue = dispatcher
+            .execute_with_context(
+                &lock_call,
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Telegram,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+        assert!(first_issue.success);
+        let first_token = latest_confirmation_token(&dispatcher);
+        dispatcher
+            .confirm_pending_home_action(&first_token)
+            .await
+            .expect("confirm should succeed");
+
+        // Second telegram-initiated sensitive request. Telegram bucket usage
+        // so far: 1 (request) + 0 (confirm doesn't recharge) = 1. With limit
+        // = 2, this issue must still be accepted (returns
+        // ConfirmationRequired again, charging slot #2).
+        let second_issue = dispatcher
+            .execute_with_context(
+                &lock_call,
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Telegram,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+        assert!(
+            second_issue.success,
+            "second issue must succeed: confirm of #1 must not double-charge the telegram bucket"
+        );
     }
 }

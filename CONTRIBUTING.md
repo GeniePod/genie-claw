@@ -23,7 +23,7 @@ What we are slower to land:
 
 Every PR body must include a **"Real Behavior Proof"** section that demonstrates you have actually run the code you are changing. This is **enforced by CI** — a PR with no proof section will fail the `Contribution checklist` job and cannot be merged.
 
-The bar is **truth, not theatre**: tell us what you ran, where you ran it, and what happened. Real validation > performative completeness.
+The bar is **truth, not theatre**: tell us what you ran, where you ran it, what hardware or runtime profile it represents, and what happened. Real validation > performative completeness.
 
 ### Minimum content
 
@@ -33,11 +33,22 @@ Copy the section from the PR template and fill it in honestly:
 ## Real Behavior Proof
 
 - [ ] I have built and run the affected code locally (or noted why I could not).
-- [ ] I have verified the change end-to-end on Jetson hardware **OR** explained the equivalent verification path I used.
+- [ ] I have verified the change end-to-end on Jetson hardware.
+- [ ] I have NOT verified on Jetson hardware, and I explain the equivalent verification path or validation gap below.
+
+Tested profile / hardware (check all that apply):
+
+- [ ] `jetson`
+- [ ] `raspberry_pi`
+- [ ] `portable_sbc`
+- [ ] `laptop`
+- [ ] `mac`
+- [ ] CI-only / docs-only
+- [ ] Not run locally
 
 ### What I ran
 
-<commands you executed, with output if useful>
+<commands you executed, with environment/profile details and output if useful>
 
 ### What I observed
 
@@ -49,8 +60,9 @@ Copy the section from the PR template and fill it in honestly:
 In rough order of preference:
 
 1. **You ran it on a real Jetson** (Orin Nano, Orin AGX, or Xavier — any L4T target the repo supports). Include the device, the model loaded, and the output of the affected subsystem (chat reply, voice loop banner, `journalctl -u genie-core`, `genie-ctl status`, dashboard screenshot, etc.).
-2. **The `aarch64-unknown-linux-gnu release build` CI job built your branch cleanly**, AND the code path you changed is exercised by an existing unit / integration test you can show passing under `cargo test`. Document the test names you ran.
-3. **You cannot run on Jetson** (no hardware, no cross-compile toolchain on your dev machine, etc.) — say so explicitly under "What I ran". Explain what verification you did do (`cargo fmt --check`, `cargo clippy -- -D warnings`, targeted unit tests, manual code reading). The reviewer will then decide whether a maintainer needs to run your branch on Jetson before merge.
+2. **You ran the affected path on another declared profile** (`raspberry_pi`, `portable_sbc`, `laptop`, or `mac`). Include the board or machine, OS, config profile, and why that is an equivalent path for the change.
+3. **The `aarch64-unknown-linux-gnu release build` CI job built your branch cleanly**, AND the code path you changed is exercised by an existing unit / integration test you can show passing under `cargo test`. Document the test names you ran.
+4. **You cannot run on Jetson** (no hardware, no cross-compile toolchain on your dev machine, etc.) — tick the "NOT verified on Jetson hardware" checkbox and say so explicitly under "What I ran". Explain what verification you did do (`cargo fmt --check`, `cargo clippy -- -D warnings`, targeted unit tests, manual code reading). The reviewer will then decide whether a maintainer needs to run your branch on Jetson before merge.
 
 ### What does NOT count
 

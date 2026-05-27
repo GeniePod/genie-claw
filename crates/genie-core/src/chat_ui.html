@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Local API token injected by genie-core; authenticates mutating calls (issue #228). -->
+<meta name="genie-local-token" content="__GENIE_LOCAL_TOKEN__">
 <title>GeniePod</title>
 <style>
 :root {
@@ -163,6 +165,17 @@ const sendBtn = document.getElementById('send-btn');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 
+// Local API token for mutating calls (issue #228). genie-core injects it into
+// the meta tag; left blank when token enforcement is disabled.
+const LOCAL_TOKEN = document.querySelector('meta[name="genie-local-token"]')?.content || '';
+
+// Build request headers, adding the local token only when one was injected.
+function apiHeaders(extra) {
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, extra || {});
+  if (LOCAL_TOKEN) headers['X-Genie-Token'] = LOCAL_TOKEN;
+  return headers;
+}
+
 let sending = false;
 
 function applyHealthStatus(data) {
@@ -251,7 +264,7 @@ async function sendMessage() {
   try {
     const r = await fetch('/api/chat/stream', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Genie-Origin': 'dashboard' },
+      headers: apiHeaders({ 'X-Genie-Origin': 'dashboard' }),
       body: JSON.stringify({ message: text }),
     });
 
@@ -265,7 +278,7 @@ async function sendMessage() {
     if (!r.body) {
       const fallback = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Genie-Origin': 'dashboard' },
+        headers: apiHeaders({ 'X-Genie-Origin': 'dashboard' }),
         body: JSON.stringify({ message: text }),
       });
       const data = await fallback.json();
@@ -351,7 +364,7 @@ async function sendMessage() {
 
 async function clearChat() {
   try {
-    await fetch('/api/chat/clear', { method: 'POST' });
+    await fetch('/api/chat/clear', { method: 'POST', headers: apiHeaders() });
     messagesEl.innerHTML = '';
     addMessage('system', 'Conversation cleared.');
   } catch (e) {

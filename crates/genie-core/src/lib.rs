@@ -52,6 +52,7 @@ pub mod memory;
 pub mod ota;
 pub mod profile;
 pub mod prompt;
+pub mod prompt_sha;
 pub mod reasoning;
 pub mod repl;
 pub mod runtime_boundary;
@@ -76,6 +77,6 @@ pub use connectivity::{
 pub use conversation::ConversationStore;
 pub use ha::{HaClient, HomeAssistantProvider, HomeAutomationProvider};
 pub use llm::{LlmClient, Message};
-pub use memory::Memory;
+pub use memory::{Memory, SharedMemory};
 pub use prompt::PromptBuilder;
 pub use tools::{ToolCall, ToolDispatcher, ToolResult};

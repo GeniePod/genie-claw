@@ -1,8 +1,27 @@
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+/// TCP-connect cap. Same value the file had hard-coded since scaffolding;
+/// surfaced as a named constant so tests can assert against it.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Full-request cap covering write + status-line + headers + body. Without
+/// this, a Home Assistant that pauses mid-response (Python GC, integration
+/// reload, Supervisor self-update, stalled add-on) leaves the dispatching
+/// chat / voice / dashboard task hung forever — there was no timeout at all
+/// on the read side before this constant existed.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Hard upper bound on a single response body. Prevents the read-to-EOF
+/// fallback (no `Content-Length`, no `Transfer-Encoding: chunked`) from
+/// accumulating unbounded bytes in RSS, and caps the cumulative payload of
+/// a malformed chunked stream. 8 MiB comfortably fits the largest realistic
+/// `/api/states` dump for a household.
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Home Assistant REST API client.
 ///
@@ -15,6 +34,9 @@ pub struct HaClient {
     host: String,
     port: u16,
     token: String,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    max_response_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +69,9 @@ impl HaClient {
             host: host.to_string(),
             port,
             token: token.to_string(),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
 
@@ -55,6 +80,23 @@ impl HaClient {
     pub fn from_url(url: &str, token: &str) -> Result<Self> {
         let (host, port) = parse_http_url(url)?;
         Ok(Self::new(&host, port, token))
+    }
+
+    /// Override the default timeouts and the max response size. Intended for
+    /// `mod tests`, which need to assert that a hung server is surfaced as
+    /// an `Err` in millisecond-scale rather than waiting for the production
+    /// 30 s deadline. Production callers should leave the defaults alone.
+    #[cfg(test)]
+    pub(crate) fn with_test_limits(
+        mut self,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        max_response_bytes: usize,
+    ) -> Self {
+        self.connect_timeout = connect_timeout;
+        self.request_timeout = request_timeout;
+        self.max_response_bytes = max_response_bytes;
+        self
     }
 
     pub fn host(&self) -> &str {
@@ -136,9 +178,25 @@ impl HaClient {
         body: Option<&str>,
     ) -> Result<HttpResponse> {
         let addr = format!("{}:{}", self.host, self.port);
-        let stream =
-            tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))
-                .await??;
+        let connect_timeout = self.connect_timeout;
+        let request_timeout = self.request_timeout;
+        let max_response_bytes = self.max_response_bytes;
+
+        let stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(&addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                return Err(e)
+                    .with_context(|| format!("Home Assistant connect {} {} failed", method, path));
+            }
+            Err(_) => {
+                anyhow::bail!(
+                    "Home Assistant connect {} {} timed out after {:?}",
+                    method,
+                    path,
+                    connect_timeout
+                );
+            }
+        };
 
         let (reader, mut writer) = stream.into_split();
 
@@ -163,8 +221,25 @@ impl HaClient {
             )
         };
 
-        writer.write_all(request.as_bytes()).await?;
-        let response = read_http_response(reader).await?;
+        // Enforce a single deadline that covers write + status-line + headers
+        // + body. Pre-fix only the `connect` step had a timeout; a hung HA
+        // (Python GC pause, integration reload, Supervisor self-update,
+        // stalled add-on) blocked the calling task indefinitely.
+        let response = match tokio::time::timeout(request_timeout, async {
+            writer.write_all(request.as_bytes()).await?;
+            read_http_response(reader, max_response_bytes).await
+        })
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!(
+                "Home Assistant {} {} timed out after {:?}",
+                method,
+                path,
+                request_timeout
+            ),
+        };
 
         if !(200..300).contains(&response.status_code) {
             let body = response.body.trim().replace('\n', " ");
@@ -185,7 +260,10 @@ impl HaClient {
     }
 }
 
-async fn read_http_response(reader: tokio::net::tcp::OwnedReadHalf) -> Result<HttpResponse> {
+async fn read_http_response(
+    reader: tokio::net::tcp::OwnedReadHalf,
+    max_response_bytes: usize,
+) -> Result<HttpResponse> {
     let mut buf_reader = BufReader::new(reader);
 
     let mut status_line = String::new();
@@ -218,21 +296,42 @@ async fn read_http_response(reader: tokio::net::tcp::OwnedReadHalf) -> Result<Ht
     }
 
     let body = if chunked {
-        read_chunked_body(&mut buf_reader).await?
+        read_chunked_body(&mut buf_reader, max_response_bytes).await?
     } else if let Some(content_length) = content_length {
+        if content_length > max_response_bytes {
+            anyhow::bail!(
+                "Home Assistant response Content-Length {} exceeds cap {}",
+                content_length,
+                max_response_bytes
+            );
+        }
         let mut buf = vec![0u8; content_length];
         buf_reader.read_exact(&mut buf).await?;
         String::from_utf8_lossy(&buf).to_string()
     } else {
+        // No `Content-Length` and no `Transfer-Encoding: chunked`: cap the
+        // read at `max_response_bytes + 1` so we can distinguish "fits in
+        // the cap" from "ran over the cap" without ever allocating more.
+        let cap = max_response_bytes;
+        let mut limited = (&mut buf_reader).take(cap as u64 + 1);
         let mut body = String::new();
-        buf_reader.read_to_string(&mut body).await?;
+        limited.read_to_string(&mut body).await?;
+        if body.len() > cap {
+            anyhow::bail!(
+                "Home Assistant response without Content-Length exceeded {} bytes",
+                cap
+            );
+        }
         body
     };
 
     Ok(HttpResponse { status_code, body })
 }
 
-async fn read_chunked_body<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<String> {
+async fn read_chunked_body<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<String> {
     let mut body = Vec::new();
 
     loop {
@@ -246,6 +345,13 @@ async fn read_chunked_body<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result
             let mut trailing = String::new();
             reader.read_line(&mut trailing).await?;
             break;
+        }
+
+        if body.len().saturating_add(size) > max_bytes {
+            anyhow::bail!(
+                "Home Assistant chunked response exceeded {} bytes",
+                max_bytes
+            );
         }
 
         let mut chunk = vec![0u8; size];
@@ -318,5 +424,178 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("only http:// is supported"));
+    }
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    /// Spawn a `TcpListener` on a free local port, run `handler` on each
+    /// accepted connection. Returns the bound address.
+    async fn spawn_listener<F, Fut>(handler: F) -> std::net::SocketAddr
+    where
+        F: Fn(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                tokio::spawn(handler(conn));
+            }
+        });
+        addr
+    }
+
+    fn test_client(addr: std::net::SocketAddr) -> HaClient {
+        HaClient::new(&addr.ip().to_string(), addr.port(), "test-token").with_test_limits(
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+            16 * 1024,
+        )
+    }
+
+    /// Server that accepts the connection and then never writes a response —
+    /// mimics Home Assistant after a `kill -STOP`, mid-GC pause, or stalled
+    /// integration. Pre-fix, the calling task hangs forever; with the fix
+    /// it surfaces as a clean `Err("…timed out…")` within the request budget.
+    #[tokio::test]
+    async fn hung_server_after_connect_times_out_cleanly() {
+        let addr = spawn_listener(|mut conn| async move {
+            // Drain the request so the client's `write_all` doesn't stall on
+            // a full receive buffer, but never write a response.
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut conn, &mut buf).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        })
+        .await;
+
+        let client = test_client(addr);
+        let start = std::time::Instant::now();
+        let err = client.test_connection().await.unwrap_err().to_string();
+        let elapsed = start.elapsed();
+
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must surface inside the request budget, elapsed {elapsed:?}"
+        );
+    }
+
+    /// Server that accepts, waits briefly (< budget), then sends a valid
+    /// minimal HTTP/1.1 200. Confirms healthy HA still works after the fix.
+    #[tokio::test]
+    async fn slow_server_within_budget_succeeds() {
+        let addr = spawn_listener(|mut conn| async move {
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut conn, &mut buf).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let body = "[]";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.shutdown().await;
+        })
+        .await;
+
+        let client = test_client(addr);
+        let entities = client.get_states().await.unwrap();
+        assert!(entities.is_empty());
+    }
+
+    /// Server that advertises `Content-Length` larger than `max_response_bytes`.
+    /// Pre-fix the client would allocate that much memory; with the fix it
+    /// rejects up front with a clear "exceeds cap" error.
+    #[tokio::test]
+    async fn oversize_content_length_is_rejected() {
+        let addr = spawn_listener(|mut conn| async move {
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut conn, &mut buf).await;
+            // Advertise 1 MiB but the test cap is 16 KiB.
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n";
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.shutdown().await;
+        })
+        .await;
+
+        let client = test_client(addr);
+        let err = client.get_states().await.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds cap") || err.contains("exceeded"),
+            "expected size-cap error, got: {err}"
+        );
+    }
+
+    /// Server that streams data without `Content-Length` and without chunked
+    /// encoding (the read-to-EOF fallback path) until the client closes.
+    /// Pre-fix this read unbounded into RSS; with the fix it stops at the
+    /// `max_response_bytes` cap and surfaces a clean error.
+    #[tokio::test]
+    async fn read_to_eof_response_is_size_capped() {
+        let addr = spawn_listener(|mut conn| async move {
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut conn, &mut buf).await;
+            // No Content-Length, no chunked. Stream lots of bytes.
+            let header =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+            let _ = conn.write_all(header.as_bytes()).await;
+            let filler = vec![b'x'; 4096];
+            for _ in 0..16 {
+                if conn.write_all(&filler).await.is_err() {
+                    break;
+                }
+            }
+            let _ = conn.shutdown().await;
+        })
+        .await;
+
+        let client = test_client(addr);
+        let err = client.get_states().await.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeded") || err.contains("without Content-Length"),
+            "expected size-cap error, got: {err}"
+        );
+    }
+
+    /// Server that uses `Transfer-Encoding: chunked` and emits more aggregate
+    /// payload than `max_response_bytes`. The chunked decoder must bail before
+    /// allocating it all.
+    #[tokio::test]
+    async fn chunked_body_aggregate_size_is_capped() {
+        let addr = spawn_listener(|mut conn| async move {
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut conn, &mut buf).await;
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            let _ = conn.write_all(header.as_bytes()).await;
+            // 8 chunks of 4 KiB = 32 KiB, exceeds the 16 KiB test cap.
+            let chunk_payload = vec![b'y'; 4096];
+            for _ in 0..8 {
+                let chunk_header = format!("{:x}\r\n", chunk_payload.len());
+                if conn.write_all(chunk_header.as_bytes()).await.is_err() {
+                    break;
+                }
+                if conn.write_all(&chunk_payload).await.is_err() {
+                    break;
+                }
+                if conn.write_all(b"\r\n").await.is_err() {
+                    break;
+                }
+            }
+            let _ = conn.write_all(b"0\r\n\r\n").await;
+            let _ = conn.shutdown().await;
+        })
+        .await;
+
+        let client = test_client(addr);
+        let err = client.get_states().await.unwrap_err().to_string();
+        assert!(
+            err.contains("chunked response exceeded") || err.contains("exceeded"),
+            "expected chunked-cap error, got: {err}"
+        );
     }
 }

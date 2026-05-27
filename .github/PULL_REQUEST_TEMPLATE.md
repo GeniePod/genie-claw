@@ -25,17 +25,29 @@ contributor. CI enforces this.
 REQUIRED. CI will fail if this section is missing or empty.
 See CONTRIBUTING.md "Required: Real Behavior Proof" for the rules.
 
-The bar is: tell us what you ran, where you ran it, and what happened.
+The bar is: tell us what you ran, where you ran it, which runtime profile or
+hardware it represents, and what happened.
 A green CI run is NOT sufficient by itself — it doesn't exercise voice,
 audio, Home Assistant, or the dashboard.
 -->
 
 - [ ] I have built and run the affected code locally (or noted why I could not).
-- [ ] I have verified the change end-to-end on Jetson hardware **OR** explained the equivalent verification path I used.
+- [ ] I have verified the change end-to-end on Jetson hardware.
+- [ ] I have NOT verified on Jetson hardware, and I explain the equivalent verification path or validation gap below.
+
+Tested profile / hardware (check all that apply):
+
+- [ ] `jetson`
+- [ ] `raspberry_pi`
+- [ ] `portable_sbc`
+- [ ] `laptop`
+- [ ] `mac`
+- [ ] CI-only / docs-only
+- [ ] Not run locally
 
 ### What I ran
 
-<!-- Commands you executed, with environment details (Jetson model + L4T version, or "no Jetson available"). -->
+<!-- Commands you executed, with environment/profile details: Jetson model + L4T version, Raspberry Pi / SBC model + OS, laptop/mac OS, CI-only/docs-only, or "not run locally". -->
 
 ### What I observed
 

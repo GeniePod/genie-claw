@@ -35,9 +35,11 @@ impl ServiceCtl {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Don't fail on "not loaded" — service may not be enabled.
-            if !stderr.contains("not loaded") {
-                tracing::warn!(unit, %stderr, "failed to stop service");
+            if stderr.contains("not loaded") {
+                return Ok(());
             }
+            tracing::warn!(unit, %stderr, "failed to stop service");
+            anyhow::bail!("systemctl stop {} failed: {}", unit, stderr);
         }
         Ok(())
     }

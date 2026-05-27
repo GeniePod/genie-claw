@@ -51,6 +51,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 # Verification only — no RNG/key-generation features pulled into the runtime.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 base64 = "0.22"
+# CSPRNG for actuation confirmation tokens (see crates/genie-core/src/tools/actuation.rs).
+# Already in the resolved graph via rustls/quinn, so this adds no new third-party crate.
+getrandom = "0.3"
 
 [dev-dependencies]
 toml = { workspace = true }

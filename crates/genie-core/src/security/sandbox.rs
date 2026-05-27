@@ -124,9 +124,12 @@ pub fn validate_inference_route(url: &str) -> Result<(), String> {
 pub fn sanitize_output(text: &str) -> String {
     let mut result = text.to_string();
 
-    // Redact common secret patterns.
+    // Redact common secret patterns. We must scan *every* occurrence of each
+    // prefix, not just the first: a short decoy token (e.g. `sk-`) appearing
+    // ahead of a real secret must not abort the scan, and two distinct secrets
+    // sharing a prefix must both be redacted. See issue #177.
     for pattern in SECRET_PATTERNS {
-        if let Some(re_match) = find_secret_pattern(&result, pattern) {
+        for re_match in find_secret_matches(&result, pattern) {
             let redacted = format!("[REDACTED:{}]", pattern.name);
             result = result.replace(&re_match, &redacted);
             tracing::warn!(
@@ -193,20 +196,34 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
     },
 ];
 
-fn find_secret_pattern(text: &str, pattern: &SecretPattern) -> Option<String> {
-    if let Some(pos) = text.find(pattern.prefix) {
-        // Extract the token-like string after the prefix.
-        let start = pos;
+/// Find every secret-like token matching `pattern` in `text`.
+///
+/// Scans the whole string rather than stopping at the first prefix hit, so a
+/// short decoy token cannot mask a real secret that follows, and multiple
+/// distinct secrets sharing a prefix are all returned.
+fn find_secret_matches(text: &str, pattern: &SecretPattern) -> Vec<String> {
+    let mut matches = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(rel_pos) = text[search_start..].find(pattern.prefix) {
+        let pos = search_start + rel_pos;
         let rest = &text[pos..];
+        // Extract the token-like string after the prefix.
         let end = rest
             .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == '}')
             .unwrap_or(rest.len());
 
         if end >= pattern.min_len {
-            return Some(rest[..end].to_string());
+            matches.push(rest[..end].to_string());
         }
+
+        // Advance past this token so the next iteration cannot rematch it.
+        // `end` is always >= prefix length (the prefix holds no delimiters),
+        // guaranteeing forward progress.
+        search_start = pos + end;
     }
-    None
+
+    matches
 }
 
 fn extract_host(url: &str) -> String {
@@ -266,6 +283,34 @@ mod tests {
         let text = "AWS key: AKIAIOSFODNN7EXAMPLE";
         let sanitized = sanitize_output(text);
         assert!(sanitized.contains("[REDACTED:aws_key]"));
+    }
+
+    #[test]
+    fn sanitize_redacts_second_secret_with_same_prefix() {
+        // Two distinct GitHub tokens — both must be redacted (issue #177).
+        let first = "ghp_AAAAAAAAAAAAAAAAAAAAAAAA";
+        let second = "ghp_BBBBBBBBBBBBBBBBBBBBBBBB";
+        let text = format!("first {first} and second {second} end");
+        let sanitized = sanitize_output(&text);
+        assert!(
+            !sanitized.contains(first),
+            "first token leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains(second),
+            "second token leaked: {sanitized}"
+        );
+        assert_eq!(sanitized.matches("[REDACTED:github_token]").count(), 2);
+    }
+
+    #[test]
+    fn sanitize_redacts_secret_after_short_decoy() {
+        // A short decoy sharing the prefix must not abort the scan (issue #177).
+        let real = "sk-proj-1234567890abcdefghijklmnop";
+        let text = format!("decoy sk- then real {real} here");
+        let sanitized = sanitize_output(&text);
+        assert!(!sanitized.contains(real), "real secret leaked: {sanitized}");
+        assert!(sanitized.contains("[REDACTED:api_key]"));
     }
 
     #[test]

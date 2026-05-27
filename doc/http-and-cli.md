@@ -12,6 +12,23 @@ Set `[core].bind_host = "0.0.0.0"` only when `genie-core` is behind a trusted
 LAN, firewall, or first-party gateway. The API includes chat, memory, tool, and
 physical-actuation surfaces, so localhost is the safe default.
 
+### Request Limits And Hardening
+
+Both `genie-core` (`:3000`) and `genie-api` (`:3080`) read inbound requests
+through the shared, bounded reader in `genie-common::http`, configured by the
+`[http]` section (see `deploy/config/geniepod.toml`). This protects the
+always-on daemon from an unauthenticated peer on the LAN:
+
+- An oversized request line or header is rejected with `431` (the request body
+  is capped per server — 64 KiB for `genie-core`, 4 KiB for `genie-api` — and an
+  over-cap `Content-Length` is rejected with `413`).
+- A connection that opens and then stalls mid-request is dropped after
+  `[http].read_timeout_secs`, so half-open connections cannot wedge the
+  listener.
+- Concurrent connections are capped at `[http].max_connections`; transient
+  `accept()` errors (e.g. `EMFILE`) are logged and the accept loop continues
+  rather than terminating the process.
+
 ### UI And Chat Endpoints
 
 First-party clients should set `X-Genie-Origin` so tool and actuation policy can

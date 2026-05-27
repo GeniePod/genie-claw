@@ -33,6 +33,14 @@ fn collect_endpoints(config: &Config) -> Vec<(String, String)> {
         ("llm".into(), config.services.llm.url.clone()),
     ];
 
+    match config.api_status_url() {
+        Ok(url) => endpoints.push(("api".into(), url)),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "skipping genie-api health probe; check [services.api].url"
+        ),
+    }
+
     if let Some(ref ha) = config.services.homeassistant {
         endpoints.push(("homeassistant".into(), ha.url.clone()));
     }
@@ -111,17 +119,7 @@ impl HealthMonitor {
         for (name, url) in &services {
             let status = check_http(name, url).await;
 
-            // Log to SQLite.
-            let _ = self.db.execute(
-                "INSERT INTO health_log (ts_ms, service, healthy, response_ms, error) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    ts_ms,
-                    status.name,
-                    status.healthy as i32,
-                    status.response_ms,
-                    status.error,
-                ],
-            );
+            insert_health_log(&self.db, ts_ms, &status);
 
             if status.healthy {
                 if self.failure_counts.remove(name).is_some() {
@@ -147,9 +145,7 @@ impl HealthMonitor {
 
         // Prune logs older than 24h every ~120 checks (~1 hour at 30s interval).
         let cutoff = ts_ms.saturating_sub(24 * 3600 * 1000);
-        let _ = self
-            .db
-            .execute("DELETE FROM health_log WHERE ts_ms < ?1", [cutoff]);
+        prune_health_log(&self.db, cutoff);
     }
 
     async fn send_alert(&self, status: &ServiceStatus) {
@@ -178,6 +174,35 @@ impl HealthMonitor {
         if let Err(e) = send_http_post(&url, &payload.to_string()).await {
             tracing::warn!(error = %e, "failed to send alert to local webhook");
         }
+    }
+}
+
+fn insert_health_log(db: &Connection, ts_ms: u64, status: &ServiceStatus) {
+    if let Err(e) = db.execute(
+        "INSERT INTO health_log (ts_ms, service, healthy, response_ms, error) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            ts_ms,
+            status.name,
+            status.healthy as i32,
+            status.response_ms,
+            status.error,
+        ],
+    ) {
+        tracing::error!(
+            service = %status.name,
+            error = %e,
+            "failed to insert health_log row"
+        );
+    }
+}
+
+fn prune_health_log(db: &Connection, cutoff_ts_ms: u64) {
+    if let Err(e) = db.execute("DELETE FROM health_log WHERE ts_ms < ?1", [cutoff_ts_ms]) {
+        tracing::error!(
+            cutoff_ts_ms,
+            error = %e,
+            "failed to prune health_log rows"
+        );
     }
 }
 
@@ -262,7 +287,7 @@ async fn send_http_post(url: &str, body: &str) -> Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("timeout"))??;
 
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         path,
@@ -273,7 +298,27 @@ async fn send_http_post(url: &str, body: &str) -> Result<()> {
 
     let mut stream = stream;
     stream.write_all(request.as_bytes()).await?;
-    Ok(())
+
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("read timeout"))??;
+
+    let response = String::from_utf8_lossy(&buf[..n]);
+    if response.starts_with("HTTP/1.") {
+        let status_code: u16 = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if (200..400).contains(&status_code) {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("HTTP {}", status_code))
+        }
+    } else {
+        Err(anyhow::anyhow!("invalid HTTP response"))
+    }
 }
 
 fn now_ms() -> u64 {
@@ -324,6 +369,7 @@ mod tests {
             telegram: TelegramConfig::default(),
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
+            http: Default::default(),
         }
     }
 
@@ -334,6 +380,7 @@ mod tests {
 
         assert!(names.contains(&"core"));
         assert!(names.contains(&"llm"));
+        assert!(names.contains(&"api"));
         assert!(!names.contains(&"homeassistant"));
     }
 
@@ -366,5 +413,200 @@ mod tests {
             .expect("llm endpoint should always be present");
 
         assert_eq!(llm_url, "http://127.0.0.1:9999/v1/health");
+    }
+
+    #[test]
+    fn api_endpoint_url_uses_derived_status_url() {
+        let mut config = test_config();
+        config.services.api.url = "127.0.0.1:4080/api/status".into();
+
+        let endpoints = collect_endpoints(&config);
+        let api_url = endpoints
+            .iter()
+            .find(|(name, _)| name == "api")
+            .map(|(_, url)| url.as_str())
+            .expect("api endpoint should always be present when api_status_url parses");
+
+        assert_eq!(api_url, "http://127.0.0.1:4080/api/status");
+    }
+
+    #[test]
+    fn api_endpoint_omitted_when_status_url_unsupported() {
+        let mut config = test_config();
+        config.services.api.url = "https://api.example/api/status".into();
+
+        let endpoints = collect_endpoints(&config);
+        assert!(
+            !endpoints.iter().any(|(name, _)| name == "api"),
+            "https api url cannot be probed by plain HTTP client"
+        );
+    }
+
+    fn open_test_db(dir: &std::path::Path) -> Connection {
+        let db_path = dir.join("health.db");
+        let db = Connection::open(&db_path).unwrap();
+        db.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS health_log (
+                ts_ms       INTEGER NOT NULL,
+                service     TEXT NOT NULL,
+                healthy     INTEGER NOT NULL,
+                response_ms INTEGER NOT NULL,
+                error       TEXT
+            );
+            ",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn health_log_insert_and_prune_on_writable_db() {
+        let dir =
+            std::env::temp_dir().join(format!("genie-health-writable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let db = open_test_db(&dir);
+        let status = ServiceStatus {
+            name: "core".into(),
+            url: "http://127.0.0.1:3000/api/health".into(),
+            healthy: true,
+            response_ms: 12,
+            error: None,
+        };
+
+        insert_health_log(&db, 1_000, &status);
+        insert_health_log(&db, 2_000, &status);
+
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM health_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        prune_health_log(&db, 1_500);
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM health_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn health_log_write_errors_do_not_panic_on_readonly_db() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("genie-health-readonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let db_path = dir.join("health.db");
+        {
+            let db = open_test_db(&dir);
+            drop(db);
+        }
+
+        let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&db_path, perms).unwrap();
+
+        let db = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+
+        let status = ServiceStatus {
+            name: "core".into(),
+            url: "http://127.0.0.1:3000/api/health".into(),
+            healthy: false,
+            response_ms: 0,
+            error: Some("timeout".into()),
+        };
+
+        insert_health_log(&db, 9_000, &status);
+        prune_health_log(&db, 0);
+
+        let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&db_path, perms).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn send_http_post_rejects_non_http_tcp_banner() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/api/alert");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(b"SSH-2.0-OpenSSH_9.0\r\n").await;
+            }
+        });
+
+        let error = send_http_post(&url, r#"{"message":"test"}"#)
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(
+            error.to_string().contains("invalid HTTP response"),
+            "expected invalid HTTP error, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_http_post_accepts_valid_http_status_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/api/alert");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        send_http_post(&url, r#"{"message":"test"}"#)
+            .await
+            .expect("alert webhook POST should succeed on HTTP 204");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_http_post_rejects_http_500_status_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/api/alert");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let error = send_http_post(&url, r#"{"message":"test"}"#)
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(
+            error.to_string().contains("HTTP 500"),
+            "expected HTTP 500 error, got: {error}"
+        );
     }
 }

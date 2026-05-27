@@ -1,4 +1,5 @@
 use genie_common::config::Config;
+use genie_common::jsonl::{self, DEFAULT_MAX_JSONL_LINE_BYTES};
 use genie_common::tegrastats;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -237,7 +238,7 @@ fn dashboard_service_targets(config: &Config) -> Vec<ServiceTarget> {
         ServiceTarget {
             service: "api".into(),
             unit: config.services.api.systemd_unit.clone(),
-            latency_url: Some(config.services.api.url.clone()),
+            latency_url: config.api_status_url().ok(),
             disabled_reason: None,
         },
         ServiceTarget {
@@ -607,12 +608,18 @@ async fn query_governor(json_cmd: &str) -> Option<serde_json::Value> {
     line.and_then(|l| serde_json::from_str(&l).ok())
 }
 
-/// GET / — serve the dashboard HTML.
-pub fn serve_dashboard() -> Response {
+/// Placeholder in the dashboard HTML, replaced at request time with the
+/// configured local API token so the same-origin dashboard can authenticate its
+/// mutating calls to genie-api (issue #228).
+const TOKEN_PLACEHOLDER: &str = "__GENIE_LOCAL_TOKEN__";
+
+/// GET / — serve the dashboard HTML with the local API token injected.
+pub fn serve_dashboard(local_api_token: &str) -> Response {
     Response {
         status: 200,
         content_type: "text/html; charset=utf-8",
-        body: include_str!("../../dashboard/index.html").into(),
+        body: include_str!("../../dashboard/index.html")
+            .replace(TOKEN_PLACEHOLDER, local_api_token),
     }
 }
 
@@ -678,15 +685,11 @@ pub async fn get_actuation_actions(config: &Config) -> Response {
 pub async fn get_actuation_audit(config: &Config) -> Response {
     let path = config.data_dir.join("safety/actuation-audit.jsonl");
     let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        if !path.exists() {
-            return Ok("[]".into());
-        }
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let items = text
-            .lines()
-            .rev()
-            .take(50)
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        let lines = jsonl::tail_lines(&path, 50, DEFAULT_MAX_JSONL_LINE_BYTES)
+            .map_err(|e| e.to_string())?;
+        let items = lines
+            .into_iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
             .collect::<Vec<_>>();
         serde_json::to_string(&items).map_err(|e| e.to_string())
     })
@@ -858,16 +861,21 @@ async fn proxy_core_json(
     use tokio::net::TcpStream;
 
     let addr = config.core_http_addr();
-    let host = addr
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(addr.as_str());
     let mut stream = TcpStream::connect(&addr)
         .await
         .map_err(|e| format!("{addr}: {e}"))?;
     let body_str = body.unwrap_or("");
+    // Send the full host:port as Host so it matches genie-core's allowlist, and
+    // forward the shared local token so genie-core's mutating-endpoint gate
+    // accepts the proxied request (issue #228).
+    let token = config.http.local_api_token.trim();
+    let token_header = if token.is_empty() {
+        String::new()
+    } else {
+        format!("X-Genie-Token: {token}\r\n")
+    };
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{token_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         body_str.len(),
         body_str
     );
@@ -917,6 +925,7 @@ mod tests {
             telegram: TelegramConfig::default(),
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
+            http: Default::default(),
         }
     }
 
@@ -942,6 +951,23 @@ mod tests {
         assert_eq!(
             core_target.latency_url.as_deref(),
             Some("http://127.0.0.1:3001/api/health"),
+        );
+    }
+
+    #[test]
+    fn dashboard_api_target_uses_derived_status_url() {
+        let mut config = test_config();
+        config.services.api.url = "127.0.0.1:4080/api/status".into();
+
+        let targets = dashboard_service_targets(&config);
+        let api_target = targets
+            .iter()
+            .find(|target| target.service == "api")
+            .expect("api target should always be present");
+
+        assert_eq!(
+            api_target.latency_url.as_deref(),
+            Some("http://127.0.0.1:4080/api/status"),
         );
     }
 

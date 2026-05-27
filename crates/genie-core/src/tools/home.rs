@@ -323,6 +323,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_confirmation_origin_executes_sensitive_action_when_confirmed() {
+        // Regression for #138 / #162: `confirm_pending_home_action` re-dispatches
+        // with `RequestOrigin::Confirmation` and `confirmed: true` — the policy
+        // gate must not mint another ConfirmationRequired token.
+        let home = StubHome {
+            domain: "lock",
+            voice_safe: false,
+        };
+
+        let result = control(
+            &home,
+            "Front door",
+            "unlock",
+            None,
+            &ActuationSafetyConfig::default(),
+            RequestOrigin::Confirmation,
+            true,
+        )
+        .await
+        .unwrap();
+
+        match result {
+            ControlOutcome::Executed(output, _) => assert!(output.contains("Unlock")),
+            ControlOutcome::ConfirmationRequired { .. } => {
+                panic!("Confirmation origin with confirmed=true must execute, not re-prompt")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn control_confirmation_origin_still_requires_confirm_when_unconfirmed() {
+        let home = StubHome {
+            domain: "lock",
+            voice_safe: false,
+        };
+
+        let result = control(
+            &home,
+            "Front door",
+            "unlock",
+            None,
+            &ActuationSafetyConfig::default(),
+            RequestOrigin::Confirmation,
+            false,
+        )
+        .await
+        .unwrap();
+
+        match result {
+            ControlOutcome::ConfirmationRequired { .. } => {}
+            ControlOutcome::Executed(_, _) => {
+                panic!("unconfirmed sensitive action must not execute at policy gate")
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn control_blocks_low_confidence_runtime_target() {
         struct LowConfidenceHome;
 

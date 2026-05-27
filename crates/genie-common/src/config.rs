@@ -37,6 +37,9 @@ pub struct Config {
 
     #[serde(default)]
     pub connectivity: ConnectivityConfig,
+
+    #[serde(default)]
+    pub http: HttpServerConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -745,6 +748,86 @@ pub enum WebSearchProvider {
     Searxng,
 }
 
+/// Inbound HTTP-server hardening shared by `genie-core` (`:3000`) and
+/// `genie-api` (`:3080`).
+///
+/// These bounds protect the always-on daemon from an unauthenticated peer on
+/// the LAN: oversized request lines/headers are rejected, a stalled connection
+/// is dropped after `read_timeout_secs`, and the number of concurrent
+/// connections is capped (issue #195). The per-request body cap is fixed per
+/// server (64 KiB for genie-core, 4 KiB for genie-api) and is not part of this
+/// section.
+///
+/// It also carries the cross-origin request gate (issue #228): both servers
+/// reflect only allowlisted `Origin`s (never the old wildcard), reject
+/// non-allowlisted `Host`s (DNS-rebinding), and — when `local_api_token` is
+/// set — require that token on mutating/actuating endpoints.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HttpServerConfig {
+    /// Max bytes in the request line, newline included.
+    #[serde(default = "defaults::http_max_request_line_bytes")]
+    pub max_request_line_bytes: usize,
+
+    /// Max bytes in any single header line, newline included.
+    #[serde(default = "defaults::http_max_header_line_bytes")]
+    pub max_header_line_bytes: usize,
+
+    /// Max number of header lines per request.
+    #[serde(default = "defaults::http_max_header_count")]
+    pub max_header_count: usize,
+
+    /// Max total bytes across all header lines (the header-phase ceiling).
+    /// Mirrors the existing body cap upward into the header phase.
+    #[serde(default = "defaults::http_max_header_bytes")]
+    pub max_header_bytes: usize,
+
+    /// Deadline for reading one whole request (line + headers + body).
+    #[serde(default = "defaults::http_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+
+    /// Ceiling on concurrently handled connections.
+    #[serde(default = "defaults::http_max_connections")]
+    pub max_connections: usize,
+
+    /// Extra browser `Origin`s to allow cross-origin (exact, scheme-qualified,
+    /// e.g. `http://genie.local:3000`). Loopback origins for the bound port are
+    /// always allowed; add LAN hostnames or alternate UI origins here.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
+    /// Extra `Host` header values to allow (exact `host` or `host:port`, e.g.
+    /// `genie.local:3000`). Loopback hosts for the bound port are always
+    /// allowed; add the LAN hostname/IP the daemon is reached by here. Required
+    /// for any non-loopback access — it closes the DNS-rebinding hole.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+
+    /// Shared local API token for mutating/actuating endpoints (chat, memory
+    /// edits, actuation confirm). When set, both servers require it via
+    /// `X-Genie-Token` or `Authorization: Bearer …`; the on-device UIs receive
+    /// it automatically and genie-api forwards it to genie-core. Blank disables
+    /// token enforcement (the Origin/Host gate still applies). Can also be set
+    /// via the `GENIEPOD_LOCAL_API_TOKEN` env var.
+    #[serde(default)]
+    pub local_api_token: String,
+}
+
+impl Default for HttpServerConfig {
+    fn default() -> Self {
+        Self {
+            max_request_line_bytes: defaults::http_max_request_line_bytes(),
+            max_header_line_bytes: defaults::http_max_header_line_bytes(),
+            max_header_count: defaults::http_max_header_count(),
+            max_header_bytes: defaults::http_max_header_bytes(),
+            read_timeout_secs: defaults::http_read_timeout_secs(),
+            max_connections: defaults::http_max_connections(),
+            allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
+            local_api_token: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ConnectivityConfig {
     /// Enable the external connectivity coprocessor path.
@@ -878,6 +961,33 @@ pub fn parse_service_probe_target(url: &str) -> ServiceProbeTarget {
     ServiceProbeTarget::Http { addr, path }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceUrlDrift {
+    service: &'static str,
+    configured_url: String,
+    services_url_addr: String,
+    listen_addr: String,
+}
+
+fn record_http_url_drift(
+    drifts: &mut Vec<ServiceUrlDrift>,
+    service: &'static str,
+    configured_url: &str,
+    listen_addr: &str,
+) {
+    match parse_service_probe_target(configured_url) {
+        ServiceProbeTarget::Http { addr, .. } if addr != listen_addr => {
+            drifts.push(ServiceUrlDrift {
+                service,
+                configured_url: configured_url.to_string(),
+                services_url_addr: addr,
+                listen_addr: listen_addr.to_string(),
+            });
+        }
+        ServiceProbeTarget::Http { .. } | ServiceProbeTarget::UnsupportedScheme { .. } => {}
+    }
+}
+
 /// Split a URL into `(lowercased_scheme, rest_after_://)` when it starts
 /// with a `scheme://` prefix; otherwise `None`.
 fn split_scheme(url: &str) -> Option<(&'static str, &str)> {
@@ -975,8 +1085,23 @@ impl Config {
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("failed to read config {}: {}", path.display(), e))?;
-        let config: Config = toml::from_str(&contents)?;
+        let mut config: Config = toml::from_str(&contents)?;
+        config.resolve_env_overrides();
+        config.validate_service_url_drift();
         Ok(config)
+    }
+
+    /// Fold environment-provided secrets into the parsed config so every
+    /// consumer reads them off the struct. Config file wins when set; otherwise
+    /// the env var is used. Currently only the shared local API token
+    /// (`GENIEPOD_LOCAL_API_TOKEN`, issue #228).
+    fn resolve_env_overrides(&mut self) {
+        if self.http.local_api_token.trim().is_empty()
+            && let Ok(token) = std::env::var("GENIEPOD_LOCAL_API_TOKEN")
+            && !token.trim().is_empty()
+        {
+            self.http.local_api_token = token.trim().to_string();
+        }
     }
 
     /// TCP `host:port` for local HTTP clients proxying to genie-core.
@@ -1016,6 +1141,45 @@ impl Config {
                  \"{scheme}\" (use http://)"
             ),
         }
+    }
+
+    /// Status-probe URL for genie-api, derived from `[services.api].url` host:port.
+    ///
+    /// Normalizes bare authorities (e.g. `127.0.0.1:4080/api/status`) to a full
+    /// `http://…/api/status` URL for dashboard latency probes.
+    pub fn api_status_url(&self) -> anyhow::Result<String> {
+        Ok(format!("http://{}/api/status", self.api_http_addr()?))
+    }
+
+    /// Compare configured service URLs against derived listen addresses and log
+    /// warnings when they disagree. Does not fail startup.
+    pub fn validate_service_url_drift(&self) {
+        for drift in self.service_url_drifts() {
+            tracing::warn!(
+                service = drift.service,
+                configured_url = %drift.configured_url,
+                services_url_addr = %drift.services_url_addr,
+                listen_addr = %drift.listen_addr,
+                "service URL host:port disagrees with listen address"
+            );
+        }
+    }
+
+    fn service_url_drifts(&self) -> Vec<ServiceUrlDrift> {
+        let mut drifts = Vec::new();
+
+        record_http_url_drift(
+            &mut drifts,
+            "core",
+            &self.services.core.url,
+            &self.core_http_addr(),
+        );
+
+        if let Ok(listen_addr) = self.api_http_addr() {
+            record_http_url_drift(&mut drifts, "api", &self.services.api.url, &listen_addr);
+        }
+
+        drifts
     }
 
     /// Resolve the configured Home Assistant endpoint, if this deployment uses one.
@@ -1347,6 +1511,7 @@ mod tests {
             telegram: TelegramConfig::default(),
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
+            http: HttpServerConfig::default(),
         }
     }
 
@@ -1647,6 +1812,51 @@ systemd_unit = "genie-ai-runtime.service"
     }
 
     #[test]
+    fn validate_service_url_drift_empty_on_aligned_defaults() {
+        let config = test_config();
+        assert!(config.service_url_drifts().is_empty());
+    }
+
+    #[test]
+    fn validate_service_url_drift_detects_stale_core_port() {
+        let mut config = test_config();
+        config.core.port = 3001;
+        config.services.core.url = "http://127.0.0.1:3000/api/health".into();
+
+        let drifts = config.service_url_drifts();
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].service, "core");
+        assert_eq!(drifts[0].services_url_addr, "127.0.0.1:3000");
+        assert_eq!(drifts[0].listen_addr, "127.0.0.1:3001");
+    }
+
+    #[test]
+    fn validate_service_url_drift_detects_core_host_mismatch() {
+        let mut config = test_config();
+        config.core.bind_host = "10.0.0.5".into();
+        config.core.port = 4000;
+        config.services.core.url = "http://127.0.0.1:3000/api/health".into();
+
+        let drifts = config.service_url_drifts();
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].service, "core");
+        assert_eq!(drifts[0].services_url_addr, "127.0.0.1:3000");
+        assert_eq!(drifts[0].listen_addr, "10.0.0.5:4000");
+    }
+
+    #[test]
+    fn validate_service_url_drift_skips_unsupported_api_scheme() {
+        let mut config = test_config();
+        config.services.api.url = "https://api.example/api/status".into();
+        assert!(config.service_url_drifts().is_empty());
+    }
+
+    #[test]
+    fn validate_service_url_drift_no_panic_on_defaults() {
+        test_config().validate_service_url_drift();
+    }
+
+    #[test]
     fn api_http_addr_defaults_to_documented_port() {
         let config = test_config();
         assert_eq!(config.api_http_addr().unwrap(), "127.0.0.1:3080");
@@ -1667,6 +1877,25 @@ systemd_unit = "genie-ai-runtime.service"
         assert!(
             err.to_string().contains("unsupported scheme"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn api_status_url_defaults_to_documented_endpoint() {
+        let config = test_config();
+        assert_eq!(
+            config.api_status_url().unwrap(),
+            "http://127.0.0.1:3080/api/status"
+        );
+    }
+
+    #[test]
+    fn api_status_url_normalizes_bare_authority() {
+        let mut config = test_config();
+        config.services.api.url = "127.0.0.1:4080/api/status".into();
+        assert_eq!(
+            config.api_status_url().unwrap(),
+            "http://127.0.0.1:4080/api/status"
         );
     }
 
@@ -2079,6 +2308,60 @@ expected_runtime_contract_hash = "abc123"
     }
 
     #[test]
+    fn http_server_config_defaults_are_bounded() {
+        let config = test_config();
+        assert_eq!(config.http.max_request_line_bytes, 8 * 1024);
+        assert_eq!(config.http.max_header_line_bytes, 8 * 1024);
+        assert_eq!(config.http.max_header_count, 100);
+        assert_eq!(config.http.max_header_bytes, 64 * 1024);
+        assert_eq!(config.http.read_timeout_secs, 15);
+        assert_eq!(config.http.max_connections, 256);
+    }
+
+    #[test]
+    fn http_server_config_falls_back_when_section_absent() {
+        // Existing deployments have no [http] section yet — the whole config
+        // must still parse and use the hardened defaults.
+        let config: Config = toml::from_str(
+            r#"
+[services.core]
+url = "http://127.0.0.1:3000/api/health"
+systemd_unit = "genie-core.service"
+
+[services.llm]
+url = "http://127.0.0.1:8080/health"
+systemd_unit = "genie-ai-runtime.service"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.http.max_header_bytes, 64 * 1024);
+        assert_eq!(config.http.max_connections, 256);
+    }
+
+    #[test]
+    fn http_server_config_parses_overrides() {
+        let config: HttpServerConfig = toml::from_str(
+            r#"
+max_request_line_bytes = 2048
+max_header_line_bytes = 2048
+max_header_count = 32
+max_header_bytes = 16384
+read_timeout_secs = 5
+max_connections = 16
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_request_line_bytes, 2048);
+        assert_eq!(config.max_header_line_bytes, 2048);
+        assert_eq!(config.max_header_count, 32);
+        assert_eq!(config.max_header_bytes, 16384);
+        assert_eq!(config.read_timeout_secs, 5);
+        assert_eq!(config.max_connections, 16);
+    }
+
+    #[test]
     fn legacy_spi_connectivity_config_still_parses() {
         let config: ConnectivityConfig = toml::from_str(
             r#"
@@ -2322,6 +2605,29 @@ mod defaults {
     }
     pub fn connectivity_device() -> String {
         "esp32c6".into()
+    }
+    pub fn http_max_request_line_bytes() -> usize {
+        8 * 1024
+    }
+    pub fn http_max_header_line_bytes() -> usize {
+        8 * 1024
+    }
+    pub fn http_max_header_count() -> usize {
+        100
+    }
+    pub fn http_max_header_bytes() -> usize {
+        // Mirror the genie-core 64 KiB body cap upward into the header phase.
+        64 * 1024
+    }
+    pub fn http_read_timeout_secs() -> u64 {
+        15
+    }
+    pub fn http_max_connections() -> usize {
+        // Generous headroom over the handful of real clients (dashboard polls
+        // every 5 s, plus voice/Telegram/local apps) while still bounding fan-out
+        // so a connection flood cannot exhaust fds or wedge the single-threaded
+        // genie-core runtime.
+        256
     }
     pub fn esp32c6_uart_device() -> String {
         "/dev/ttyTHS1".into()
