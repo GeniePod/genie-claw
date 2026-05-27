@@ -1,4 +1,5 @@
 use genie_common::config::Config;
+use genie_common::jsonl::{self, DEFAULT_MAX_JSONL_LINE_BYTES};
 use genie_common::tegrastats;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -678,15 +679,11 @@ pub async fn get_actuation_actions(config: &Config) -> Response {
 pub async fn get_actuation_audit(config: &Config) -> Response {
     let path = config.data_dir.join("safety/actuation-audit.jsonl");
     let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        if !path.exists() {
-            return Ok("[]".into());
-        }
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let items = text
-            .lines()
-            .rev()
-            .take(50)
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        let lines = jsonl::tail_lines(&path, 50, DEFAULT_MAX_JSONL_LINE_BYTES)
+            .map_err(|e| e.to_string())?;
+        let items = lines
+            .into_iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
             .collect::<Vec<_>>();
         serde_json::to_string(&items).map_err(|e| e.to_string())
     })

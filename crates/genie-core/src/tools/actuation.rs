@@ -1,7 +1,8 @@
+use genie_common::jsonl::{self, DEFAULT_MAX_JSONL_LINE_BYTES};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -327,20 +328,20 @@ impl AuditLogger {
         let Some(path) = &self.path else {
             return Vec::new();
         };
-        let file = match File::open(path) {
-            Ok(file) => file,
+        let scan_limit = limit.saturating_mul(16).max(limit);
+        let lines = match jsonl::tail_lines(path, scan_limit, DEFAULT_MAX_JSONL_LINE_BYTES) {
+            Ok(lines) => lines,
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "audit read failed; returning no recent executed actions"
+                    "audit tail read failed; returning no recent executed actions"
                 );
                 return Vec::new();
             }
         };
-        let mut actions = BufReader::new(file)
-            .lines()
-            .map_while(Result::ok)
+        let mut actions = lines
+            .into_iter()
             .filter_map(|line| match serde_json::from_str::<AuditEvent>(&line) {
                 Ok(event) => audit_event_to_recorded_action(event),
                 Err(e) => {
@@ -524,6 +525,43 @@ mod tests {
             None,
         );
         assert_eq!(next.id, 12);
+    }
+
+    #[test]
+    fn audit_logger_reads_recent_executed_actions_from_log_tail() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-actuation-audit-tail-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let logger = AuditLogger::new(&path);
+
+        for idx in 0..500 {
+            logger.append(AuditEvent {
+                ts_ms: idx,
+                status: if idx % 2 == 0 {
+                    AuditStatus::Executed
+                } else {
+                    AuditStatus::ConfirmationIssued
+                },
+                origin: RequestOrigin::Voice,
+                entity: format!("entity-{idx}"),
+                action: "turn_on".into(),
+                value: None,
+                reason: "home action executed".into(),
+                token: None,
+                confidence: None,
+                action_id: if idx % 2 == 0 { Some(idx) } else { None },
+                undo_of: None,
+            });
+        }
+
+        let actions = logger.read_recent_executed_actions(3);
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].entity, "entity-494");
+        assert_eq!(actions[1].entity, "entity-496");
+        assert_eq!(actions[2].entity, "entity-498");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
