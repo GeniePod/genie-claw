@@ -199,8 +199,21 @@ Each service block has:
 
 | Key | Purpose |
 | --- | --- |
-| `url` | Health or base URL |
+| `url` | Health or base URL (`http://` or `https://`) |
 | `systemd_unit` | Associated systemd unit name |
+
+### HTTPS probe trust (status / health / dashboard latency)
+
+`genie-ctl status`, `genie-health`, and the dashboard latency rows probe
+configured `https://` service URLs using the shared helper in
+`genie-common::probe`.
+
+| Behavior | Detail |
+| --- | --- |
+| **Trust roots** | Mozilla CA bundle from the `webpki-roots` crate — **not** the host OS trust store |
+| **Self-signed LAN certs** | Rejected (common for local Home Assistant HTTPS). Use `http://` on the LAN, terminate TLS at a reverse proxy with a public CA, or wait for a future opt-in `tls_ca_file` / pin policy |
+| **Keep-alive responses** | Probes parse the status line (and `Content-Length` / chunked body when present) and return without waiting for EOF, so healthy keep-alive servers do not time out |
+| **Listen addresses** | `[services.api].url` / `api_http_addr` still require `http://` — HTTPS is probe-only, not a listen scheme |
 
 ## `[telegram]`
 
