@@ -210,41 +210,10 @@ impl Governor {
             ServiceCtl::stop(&unit).await?;
         }
 
-        // Handle LLM model swap.
-        match (from, target) {
-            (_, Mode::Media) => {
-                let unit = self.llm_service_unit();
-                ServiceCtl::stop(&unit).await?;
-            }
-            (Mode::Media, _) => {
-                if let Some(model) = target.llm_model() {
-                    let path = format!("/opt/geniepod/models/{}", model);
-                    let unit = self.llm_service_unit();
-                    if let Err(e) = ServiceCtl::swap_llm_model(&unit, &path).await {
-                        tracing::error!(error = %e, unit = %unit, model = %path, "LLM model swap failed");
-                    }
-                }
-                let _ = tokio::fs::remove_file("/run/geniepod/media_mode").await;
-            }
-            (Mode::Day | Mode::NightA, Mode::NightB) => {
-                if let Some(model) = Mode::NightB.llm_model() {
-                    let path = format!("/opt/geniepod/models/{}", model);
-                    let unit = self.llm_service_unit();
-                    if let Err(e) = ServiceCtl::swap_llm_model(&unit, &path).await {
-                        tracing::error!(error = %e, unit = %unit, model = %path, "LLM model swap failed");
-                    }
-                }
-            }
-            (Mode::NightB, Mode::Day) => {
-                if let Some(model) = Mode::Day.llm_model() {
-                    let path = format!("/opt/geniepod/models/{}", model);
-                    let unit = self.llm_service_unit();
-                    if let Err(e) = ServiceCtl::swap_llm_model(&unit, &path).await {
-                        tracing::error!(error = %e, unit = %unit, model = %path, "LLM model swap failed");
-                    }
-                }
-            }
-            _ => {}
+        // Handle LLM model swap — failure aborts the transition (issue #241).
+        self.apply_llm_swaps(from, target).await?;
+        if matches!((from, target), (Mode::Media, _)) {
+            let _ = tokio::fs::remove_file("/run/geniepod/media_mode").await;
         }
 
         // Start services required by target mode.
@@ -296,6 +265,35 @@ impl Governor {
         self.config
             .service_unit_for_alias("llm")
             .unwrap_or_else(|| "genie-ai-runtime.service".into())
+    }
+
+    async fn apply_llm_swaps(&self, from: Mode, target: Mode) -> Result<()> {
+        match (from, target) {
+            (_, Mode::Media) => {
+                let unit = self.llm_service_unit();
+                ServiceCtl::stop(&unit).await?;
+            }
+            (Mode::Media, _)
+            | (Mode::Day | Mode::NightA, Mode::NightB)
+            | (Mode::NightB, Mode::Day) => {
+                if let Some(model) = llm_model_for_transition(from, target) {
+                    let path = format!("/opt/geniepod/models/{}", model);
+                    let unit = self.llm_service_unit();
+                    ServiceCtl::swap_llm_model(&unit, &path).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn llm_model_for_transition(from: Mode, target: Mode) -> Option<&'static str> {
+    match (from, target) {
+        (Mode::Media, _) => target.llm_model(),
+        (Mode::Day | Mode::NightA, Mode::NightB) => Mode::NightB.llm_model(),
+        (Mode::NightB, Mode::Day) => Mode::Day.llm_model(),
+        _ => None,
     }
 }
 
@@ -495,5 +493,22 @@ mod tests {
             Some("genie-ai-runtime.service")
         );
         assert_eq!(gov.llm_service_unit(), "genie-ai-runtime.service");
+    }
+
+    #[test]
+    fn llm_model_for_transition_selects_target_mode_weights() {
+        assert_eq!(
+            llm_model_for_transition(Mode::Day, Mode::NightB),
+            Mode::NightB.llm_model()
+        );
+        assert_eq!(
+            llm_model_for_transition(Mode::NightB, Mode::Day),
+            Mode::Day.llm_model()
+        );
+        assert_eq!(
+            llm_model_for_transition(Mode::Media, Mode::Day),
+            Mode::Day.llm_model()
+        );
+        assert!(llm_model_for_transition(Mode::Day, Mode::NightA).is_none());
     }
 }
