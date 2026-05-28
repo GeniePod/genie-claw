@@ -491,6 +491,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_http_rejects_non_http_tcp_banner() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/health");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(b"SSH-2.0-OpenSSH_9.0\r\n").await;
+            }
+        });
+
+        let status = check_http("llm", &url).await;
+        server.abort();
+
+        assert!(
+            !status.healthy,
+            "non-HTTP TCP banner should be reported unhealthy"
+        );
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("invalid HTTP response")),
+            "expected invalid HTTP error, got: {:?}",
+            status.error
+        );
+    }
+
+    #[tokio::test]
     async fn send_http_post_rejects_non_http_tcp_banner() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
