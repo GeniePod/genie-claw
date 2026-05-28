@@ -150,7 +150,8 @@ impl ServiceCtl {
         let output = Command::new("sh").args(["-c", script]).output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!(%stderr, "zram setup may have partially failed");
+            tracing::error!(%stderr, "zram setup failed");
+            anyhow::bail!("zram setup failed: {}", stderr.trim());
         }
         Ok(())
     }
@@ -187,5 +188,17 @@ mod tests {
             llm_override_dir_for_unit("genie-ai-runtime.service"),
             "/etc/systemd/system/genie-ai-runtime.service.d"
         );
+    }
+
+    #[tokio::test]
+    async fn enable_zram_returns_err_with_message_when_setup_fails() {
+        let result = ServiceCtl::enable_zram().await;
+        if let Err(err) = result {
+            let message = err.to_string();
+            assert!(
+                message.contains("zram setup failed"),
+                "expected propagated failure message, got: {message}"
+            );
+        }
     }
 }
