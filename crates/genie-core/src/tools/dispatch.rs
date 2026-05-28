@@ -1083,16 +1083,28 @@ impl ToolDispatcher {
             .any(|category| category == "shopping")
         {
             let count = mem.shopping_list_pending_count().unwrap_or(0);
+            let removed = stored.iter().any(|content| {
+                content
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("shopping list removed:")
+            });
             let added = stored
                 .iter()
                 .map(|content| {
                     content
                         .trim_start_matches("shopping list pending:")
+                        .trim_start_matches("shopping list removed:")
                         .trim()
                         .to_string()
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            if removed {
+                return Ok(format!(
+                    "Removed {added} from the shopping list. You have {count} item(s) total."
+                ));
+            }
             return Ok(format!(
                 "Added {added} to the shopping list. You have {count} item(s) total."
             ));
@@ -2446,8 +2458,22 @@ mod tests {
         assert!(result.contains("Added milk, eggs"));
         assert!(result.contains("2 item"));
 
+        {
+            let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+            assert_eq!(mem.shopping_list_pending_count().unwrap(), 2);
+        }
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "shopping list removed: milk",
+                "category": "shopping"
+            }))
+            .unwrap();
+        assert!(result.contains("Removed milk"));
+        assert!(result.contains("1 item"));
+
         let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
-        assert_eq!(mem.shopping_list_pending_count().unwrap(), 2);
+        assert_eq!(mem.shopping_list_pending_count().unwrap(), 1);
     }
 
     #[test]

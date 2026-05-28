@@ -80,11 +80,12 @@ GenieClaw keeps these decisions separate:
   dad?", and safe device-alias memories feed exact Home Assistant target
   resolution before fuzzy matching; safe profile attributes and household rules
   answer low-latency questions about age, allergies, homework, and screen-time
-  constraints before FTS fallback; safe calendar, access, chore/task-log, and
-  schedule memories answer local exact-match questions before fuzzy fallback;
-  safe household notes, reminders, manuals, warranties, utility notes, first-aid
-  notes, story/media notes, and watch notes are indexed in a typed local FTS
-  table for direct note recall
+  constraints before FTS fallback; safe calendar, access, chore/task-log,
+  schedule, and event-log memories answer local exact-match questions before
+  fuzzy fallback; safe household notes, reminders, manuals, warranties, utility
+  notes, first-aid notes, story/media notes, inventory notes, meal history,
+  commute notes, pantry notes, location notes, shopping notes, and watch notes
+  are indexed in a typed local FTS table for direct note recall
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
   class such as household, person, sensitive, private, or restricted
@@ -123,9 +124,9 @@ treated as ordinary recall.
 - Keep fuzzy household recall local-first: embedded-memory rows are metadata in
   the local SQLite store, not a remote vector service dependency.
 - Keep household indexes typed and inspectable. Calendar events, shopping-list
-  items, access permissions, chore/task logs, household schedules, device
-  aliases, and media targets are local SQLite rows derived from safe memory
-  records, not remote profile data.
+  items, access permissions, chore/task logs, household schedules, event logs,
+  device aliases, and media targets are local SQLite rows derived from safe
+  memory records, not remote profile data.
 - Store playlists as provider targets instead of secrets. Credential and access
   code memories should remain app-only references and are not spoken in
   shared-room chat.

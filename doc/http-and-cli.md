@@ -432,28 +432,38 @@ Memory tools are policy-aware:
 - safe chore/task-log and household schedule memories maintain local typed
   indexes for questions such as "did Leo feed the dog today?", "what time does
   the school bus arrive?", "when is the electricity bill due?", and "is it
-  recycling week?"
+  recycling week?", plus school calendar items such as parent-teacher
+  conferences
+- safe household event-log memories maintain a local typed index for audit-style
+  questions such as "who turned off the security system?" without repeating
+  keypad/code details in the spoken answer
 - safe profile attributes and household rules maintain local indexes for exact
   age, preference, allergy, homework, and screen-time recall
 - safe notes, reminders, manuals, pet health, maintenance, storage, gift,
   troubleshooting, recipe, warranty, school, utility, recycling, photo,
-  story, first-aid, visitor, and watch notes maintain a typed local FTS index for
-  direct questions such as "find my note about...", "what did the vet say...",
-  "what color did we paint...", or "where are..."
+  story, first-aid, visitor, inventory, meal-history, shopping-list, beverage,
+  social, commute, pantry, comfort, location, and watch notes maintain a typed
+  local FTS index for direct questions such as "find my note about...", "what
+  did the vet say...", "what color did we paint...", "how do I clean...", or
+  "where are..."
 - password/code questions can resolve to app-only secret references without
   exposing the value in shared-room chat
 - selected safe preferences, notes, shopping, activity, troubleshooting, recipe,
   media, maintenance, routine, wellness, education, first-aid, story, travel,
-  diet, visitor, music-profile, and manual memories also maintain local
+  diet, visitor, music-profile, beverage, social, commute, pantry, comfort,
+  location, pizza, arrival, and manual memories also maintain local
   embeddings for fuzzy household recall such as comfort, lunchbox, bored-child,
   printer, car-noise, recipe, date-night, movie, science-fair, headache,
-  zoo-trip, diet-meal, washing-machine, visitor, watch-history, and focus-music
+  zoo-trip, diet-meal, washing-machine, visitor, watch-history, focus-music,
+  scary-movie, hydration, brightness, loneliness, commute, tacos, humidity,
+  first-aid, key-location, outdoor-sound, pizza, remote-start, and arrival
   questions when exact words are missing
 - live answers still require live tools: garage/lock/thermostat state comes from
   Home Assistant, weather comes from the weather tool, media playback comes from
   the local media path, and sensors such as baby monitors, cameras, face
-  recognition, smart-fridge inventories, purchase carts, or location history are
-  not simulated by memory recall
+  recognition, smart-fridge inventories, purchase carts, car remote start,
+  traffic, Bluetooth trackers, microphones, or location history are not
+  simulated by memory recall
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 
