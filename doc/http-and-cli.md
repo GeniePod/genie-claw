@@ -427,6 +427,8 @@ Memory tools are policy-aware:
   age, preference, allergy, homework, and screen-time recall
 - safe notes, reminders, manuals, and watch notes maintain a typed local FTS
   index for direct questions such as "find my note about..." or "where are..."
+- password/code questions can resolve to app-only secret references without
+  exposing the value in shared-room chat
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 

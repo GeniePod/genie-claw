@@ -2468,6 +2468,34 @@ mod tests {
     }
 
     #[test]
+    fn memory_recall_answers_app_only_secret_reference_without_value() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-secret-ref-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "credential_reference",
+                "Guest Wi-Fi password is stored in credential:guest_wifi",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "what is our wifi password for guests"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("app-only reference"));
+        assert!(!output.contains("credential:guest_wifi"));
+    }
+
+    #[test]
     fn memory_recall_hides_person_memory_in_shared_room_context() {
         let db = std::env::temp_dir().join(format!(
             "memory-recall-shared-room-test-{}.db",

@@ -150,6 +150,10 @@ fn memory_recall_query(text: &str) -> Option<String> {
         return Some(text.to_string());
     }
 
+    if is_app_only_secret_question(text) {
+        return Some(text.to_string());
+    }
+
     if is_household_note_question(text) {
         return Some(text.to_string());
     }
@@ -212,6 +216,24 @@ fn is_household_note_question(text: &str) -> bool {
         || text.starts_with("what did i watch about ")
         || text.starts_with("what movie ")
         || text.starts_with("what was that movie ")
+}
+
+fn is_app_only_secret_question(text: &str) -> bool {
+    (text.contains("password")
+        || text.contains("passcode")
+        || text.contains("gate code")
+        || text.contains("door code")
+        || text.contains("lock code")
+        || text.contains("alarm code")
+        || text.contains("security code")
+        || text.contains("combination")
+        || text.contains("combo"))
+        && (text.contains("what")
+            || text.contains("show")
+            || text.contains("find")
+            || text.contains("where")
+            || text.contains("wifi")
+            || text.contains("wi fi"))
 }
 
 fn scene_or_routine_activation_request(text: &str) -> Option<String> {
@@ -762,6 +784,20 @@ mod tests {
             call.arguments["query"],
             "where are the extra batteries kept"
         );
+    }
+
+    #[test]
+    fn routes_app_only_secret_questions_to_memory_recall() {
+        let call = route("What is our Wi-Fi password for guests?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(
+            call.arguments["query"],
+            "what is our wi fi password for guests"
+        );
+
+        let call = route("Where is the gate code?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "where is the gate code");
     }
 
     #[test]

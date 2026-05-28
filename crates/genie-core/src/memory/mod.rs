@@ -148,6 +148,14 @@ pub struct HouseholdNote {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppOnlySecretReference {
+    pub source_memory_id: i64,
+    pub secret_type: String,
+    pub label: String,
+    pub location_hint: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MemoryEvent {
     ts_ms: u64,
@@ -291,6 +299,18 @@ impl Memory {
                 VALUES (new.source_memory_id, new.title, new.content, new.note_type);
             END;
 
+            CREATE TABLE IF NOT EXISTS app_only_secret_references (
+                source_memory_id INTEGER PRIMARY KEY,
+                secret_type      TEXT NOT NULL,
+                label            TEXT NOT NULL,
+                normalized_label TEXT NOT NULL,
+                location_hint    TEXT NOT NULL,
+                updated_ms       INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_app_only_secret_references_lookup
+                ON app_only_secret_references(secret_type, normalized_label, updated_ms DESC);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content,
                 content='memories',
@@ -405,6 +425,7 @@ impl Memory {
         rebuild_household_profile_attributes(&conn)?;
         rebuild_household_rules(&conn)?;
         rebuild_household_notes(&conn)?;
+        rebuild_app_only_secret_references(&conn)?;
 
         // Older databases may predate the FTS update trigger or may have been
         // edited by a recovery tool. Rebuild once at open so recall and forget
@@ -1019,6 +1040,37 @@ impl Memory {
         Ok(entries)
     }
 
+    pub fn app_only_secret_references(&self, query: &str) -> Result<Vec<AppOnlySecretReference>> {
+        let Some((secret_type, label_query)) = secret_reference_query(query) else {
+            return Ok(Vec::new());
+        };
+        let normalized_label = normalize_alias_key(&label_query);
+        let label_like = format!("%{}%", normalized_label);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT source_memory_id, secret_type, label, location_hint
+             FROM app_only_secret_references
+             WHERE secret_type = ?1
+               AND (?2 = '' OR normalized_label LIKE ?3 OR ?2 LIKE '%' || normalized_label || '%')
+             ORDER BY updated_ms DESC, source_memory_id DESC",
+        )?;
+        let entries = stmt
+            .query_map(
+                rusqlite::params![secret_type, normalized_label, label_like],
+                |row| {
+                    Ok(AppOnlySecretReference {
+                        source_memory_id: row.get(0)?,
+                        secret_type: row.get(1)?,
+                        label: row.get(2)?,
+                        location_hint: row.get(3)?,
+                    })
+                },
+            )?
+            .filter_map(|row| row.ok())
+            .collect();
+        Ok(entries)
+    }
+
     pub fn structured_household_answer(&self, query: &str) -> Result<Option<String>> {
         if let Some((name, attribute)) = profile_attribute_query(query) {
             let attrs = self.profile_attributes(&name, attribute)?;
@@ -1060,6 +1112,13 @@ impl Memory {
             let notes = self.household_notes_search(&note_query, 3)?;
             if let Some(note) = notes.first() {
                 return Ok(Some(format_household_note_answer(note)));
+            }
+        }
+
+        if secret_reference_query(query).is_some() {
+            let refs = self.app_only_secret_references(query)?;
+            if let Some(secret_ref) = refs.first() {
+                return Ok(Some(format_app_only_secret_reference_answer(secret_ref)));
             }
         }
 
@@ -1164,6 +1223,14 @@ impl Memory {
             )?;
             upsert_household_rules_from_memory(&self.conn, id, &content, metadata, now_ms())?;
             upsert_household_note_from_memory(
+                &self.conn,
+                id,
+                &next_kind,
+                &content,
+                metadata,
+                now_ms(),
+            )?;
+            upsert_app_only_secret_reference_from_memory(
                 &self.conn,
                 id,
                 &next_kind,
@@ -1417,6 +1484,7 @@ impl Memory {
         upsert_household_profile_attributes_from_memory(&self.conn, id, content, metadata, now)?;
         upsert_household_rules_from_memory(&self.conn, id, content, metadata, now)?;
         upsert_household_note_from_memory(&self.conn, id, kind, content, metadata, now)?;
+        upsert_app_only_secret_reference_from_memory(&self.conn, id, kind, content, metadata, now)?;
         Ok(id)
     }
 
@@ -1775,6 +1843,16 @@ fn rebuild_household_notes(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn rebuild_app_only_secret_references(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM app_only_secret_references", [])?;
+    let rows = shared_safe_memory_rows_with_kind(conn)?;
+    let now = now_ms();
+    for (id, kind, content, metadata) in rows {
+        upsert_app_only_secret_reference_from_memory(conn, id, &kind, &content, metadata, now)?;
+    }
+    Ok(())
+}
+
 fn shared_safe_memory_rows(
     conn: &Connection,
 ) -> Result<Vec<(i64, String, policy::MemoryPolicyMetadata)>> {
@@ -1966,6 +2044,39 @@ fn upsert_household_note_from_memory(
     Ok(())
 }
 
+fn upsert_app_only_secret_reference_from_memory(
+    conn: &Connection,
+    source_memory_id: i64,
+    kind: &str,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+    updated_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM app_only_secret_references WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+
+    let Some(secret_ref) = app_only_secret_reference_from_memory(kind, content, metadata) else {
+        return Ok(());
+    };
+
+    conn.execute(
+        "INSERT INTO app_only_secret_references (
+            source_memory_id, secret_type, label, normalized_label, location_hint, updated_ms
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            source_memory_id,
+            secret_ref.secret_type,
+            secret_ref.label,
+            normalize_alias_key(&secret_ref.label),
+            secret_ref.location_hint,
+            updated_ms
+        ],
+    )?;
+    Ok(())
+}
+
 fn delete_structured_household_rows(conn: &Connection, source_memory_id: i64) -> Result<()> {
     conn.execute(
         "DELETE FROM household_profile_attributes WHERE source_memory_id = ?1",
@@ -1977,6 +2088,10 @@ fn delete_structured_household_rows(conn: &Connection, source_memory_id: i64) ->
     )?;
     conn.execute(
         "DELETE FROM household_notes WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+    conn.execute(
+        "DELETE FROM app_only_secret_references WHERE source_memory_id = ?1",
         [source_memory_id],
     )?;
     Ok(())
@@ -2328,6 +2443,104 @@ fn household_note_title(content: &str) -> String {
     }
 }
 
+fn app_only_secret_reference_from_memory(
+    _kind: &str,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+) -> Option<AppOnlySecretReference> {
+    let lower = content.to_ascii_lowercase();
+    let secret_type = secret_type_from_text(&lower)?;
+
+    let shared_allowed =
+        policy::assess_memory_read(metadata, policy::MemoryReadContext::shared_room_voice())
+            .allowed;
+    let explicitly_app_only = matches!(
+        metadata.spoken_policy,
+        policy::SpokenMemoryPolicy::AppOnly | policy::SpokenMemoryPolicy::Deny
+    ) || lower.contains("credential:")
+        || lower.contains("credentials vault")
+        || lower.contains("local vault")
+        || lower.contains("app-only")
+        || lower.contains("app only");
+
+    if shared_allowed && !explicitly_app_only {
+        return None;
+    }
+
+    let label = secret_label_from_text(content, &lower, secret_type);
+    Some(AppOnlySecretReference {
+        source_memory_id: 0,
+        secret_type: secret_type.into(),
+        label,
+        location_hint: secret_location_hint(content, &lower),
+    })
+}
+
+fn secret_type_from_text(lower: &str) -> Option<&'static str> {
+    if lower.contains("wi-fi")
+        || lower.contains("wifi")
+        || lower.contains("wi fi")
+        || lower.contains("network password")
+    {
+        Some("wifi_password")
+    } else if lower.contains("password") {
+        Some("password")
+    } else if lower.contains("gate code") {
+        Some("gate_code")
+    } else if lower.contains("door code") || lower.contains("lock code") {
+        Some("lock_code")
+    } else if lower.contains("alarm code") || lower.contains("security code") {
+        Some("security_code")
+    } else if lower.contains("combination") || lower.contains("combo") {
+        Some("combination")
+    } else {
+        None
+    }
+}
+
+fn secret_label_from_text(content: &str, lower: &str, secret_type: &str) -> String {
+    if lower.contains("guest") && matches!(secret_type, "wifi_password" | "password") {
+        return "guest wifi".into();
+    }
+    if lower.contains("wi-fi") || lower.contains("wifi") || lower.contains("wi fi") {
+        return "wifi".into();
+    }
+    let before_marker = [" is ", " stored ", " saved ", " lives "]
+        .iter()
+        .filter_map(|marker| lower.find(marker).map(|pos| content[..pos].trim()))
+        .next()
+        .unwrap_or(content)
+        .trim_start_matches("the ")
+        .trim_start_matches("our ")
+        .trim_start_matches("my ");
+    let label = clean_sentence_value(before_marker);
+    if label.is_empty() {
+        secret_type.replace('_', " ")
+    } else {
+        label
+    }
+}
+
+fn secret_location_hint(content: &str, lower: &str) -> String {
+    for marker in [
+        "credential:",
+        "credentials vault",
+        "local vault",
+        "vault",
+        "dashboard",
+    ] {
+        if let Some(pos) = lower.find(marker) {
+            let hint = content[pos..]
+                .trim()
+                .trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | '!' | '?'));
+            if !hint.is_empty() {
+                return hint.to_string();
+            }
+        }
+    }
+    "app-only credential storage".into()
+}
+
 fn parse_allergy_rule(content: &str, lower: &str) -> Option<(String, String)> {
     if let Some((person, rest)) = split_once_case_insensitive(content, lower, " is allergic to ") {
         return Some((clean_person_name(person), normalize_rule_subject(rest)));
@@ -2619,6 +2832,30 @@ fn household_note_query(query: &str) -> Option<String> {
     None
 }
 
+fn secret_reference_query(query: &str) -> Option<(&'static str, String)> {
+    let lower = query.to_ascii_lowercase();
+    let secret_type = secret_type_from_text(&lower)?;
+    if !(lower.contains("what")
+        || lower.contains("show")
+        || lower.contains("find")
+        || lower.contains("where")
+        || lower.contains("password")
+        || lower.contains("code")
+        || lower.contains("combo"))
+    {
+        return None;
+    }
+
+    let label = if lower.contains("guest") && secret_type == "wifi_password" {
+        "guest wifi".into()
+    } else if lower.contains("wifi") || lower.contains("wi-fi") || lower.contains("wi fi") {
+        "wifi".into()
+    } else {
+        search_tokens(query).join(" ")
+    };
+    Some((secret_type, label))
+}
+
 fn format_profile_attribute_answer(attr: &HouseholdProfileAttribute) -> String {
     match attr.attribute.as_str() {
         "age" => format!("{} is {} years old.", attr.name, attr.value),
@@ -2663,6 +2900,13 @@ fn format_household_note_answer(note: &HouseholdNote) -> String {
         "media" => format!("I found this watch note: {}", note.content),
         _ => format!("I found this note: {}", note.content),
     }
+}
+
+fn format_app_only_secret_reference_answer(secret_ref: &AppOnlySecretReference) -> String {
+    format!(
+        "I have an app-only reference for {}. Open the local dashboard or credential store to view it; I won't speak the value in shared-room chat.",
+        secret_ref.label
+    )
 }
 
 fn possessive_named_profile(content: &str, lower: &str) -> Option<(&'static str, String)> {
@@ -3429,6 +3673,43 @@ mod tests {
 
         assert!(
             mem.household_notes_search("safe code", 3)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn app_only_secret_reference_indexes_without_revealing_value() {
+        let mem = temp_memory();
+        mem.store(
+            "credential_reference",
+            "Guest Wi-Fi password is stored in credential:guest_wifi",
+        )
+        .unwrap();
+
+        let refs = mem
+            .app_only_secret_references("What is our Wi-Fi password for guests?")
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].secret_type, "wifi_password");
+        assert_eq!(refs[0].label, "guest wifi");
+
+        let answer = mem
+            .structured_household_answer("What is our Wi-Fi password for guests?")
+            .unwrap()
+            .unwrap();
+        assert!(answer.contains("app-only reference"));
+        assert!(!answer.contains("credential:guest_wifi"));
+    }
+
+    #[test]
+    fn normal_password_memory_is_not_indexed_as_shared_note() {
+        let mem = temp_memory();
+        mem.store("fact", "Guest Wi-Fi password is pizza-party-2024")
+            .unwrap();
+
+        assert!(
+            mem.household_notes_search("wifi password", 3)
                 .unwrap()
                 .is_empty()
         );

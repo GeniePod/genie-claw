@@ -59,6 +59,9 @@ memory as product data with visibility rules:
   not valid shared-room memory
 - dashboard memory management should show editable saved memories, not raw
   database rows or config files
+- password/code memories may be represented as app-only references, but the
+  shared-room assistant should point users to the local dashboard or credential
+  store instead of speaking values
 
 Speaker recognition improves routing; it is not a hard security boundary unless
 the deployment explicitly adds biometric enrollment, local profile storage,
