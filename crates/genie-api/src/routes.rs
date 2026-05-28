@@ -369,11 +369,18 @@ fn merge_service_rows(
             let endpoint_healthy = health_row
                 .map(|row| row.healthy)
                 .or_else(|| live_row.map(|row| row.healthy))
-                .unwrap_or(true);
+                .unwrap_or_else(|| target.latency_url.is_none());
             let healthy = !missing && systemd_active && endpoint_healthy;
             let endpoint_error = health_row
                 .and_then(|row| row.error.clone())
-                .or_else(|| live_row.and_then(|row| row.error.clone()));
+                .or_else(|| live_row.and_then(|row| row.error.clone()))
+                .or_else(|| {
+                    if target.latency_url.is_some() && health_row.is_none() && live_row.is_none() {
+                        Some("endpoint probe unavailable".into())
+                    } else {
+                        None
+                    }
+                });
             let systemd_error = systemd_row
                 .error
                 .clone()
@@ -1117,5 +1124,35 @@ mod tests {
         );
         assert_eq!(wakeword.source, "config");
         assert_eq!(wakeword.sub_state, "disabled");
+    }
+
+    #[test]
+    fn url_backed_service_unhealthy_when_probe_data_missing() {
+        let targets = vec![ServiceTarget {
+            service: "core".into(),
+            unit: "genie-core.service".into(),
+            latency_url: Some("http://127.0.0.1:3000/api/health".into()),
+            disabled_reason: None,
+        }];
+        let systemd = BTreeMap::from([(
+            "genie-core.service".into(),
+            SystemdRow {
+                load_state: "loaded".into(),
+                active_state: "active".into(),
+                sub_state: "running".into(),
+                unit_file_state: "enabled".into(),
+                result: "success".into(),
+                error: None,
+            },
+        )]);
+
+        let rows = merge_service_rows(&targets, &BTreeMap::new(), &BTreeMap::new(), &systemd);
+        let core = rows.first().unwrap();
+
+        assert!(
+            !core.healthy,
+            "URL-backed service must not default healthy without probe data"
+        );
+        assert_eq!(core.error.as_deref(), Some("endpoint probe unavailable"));
     }
 }
