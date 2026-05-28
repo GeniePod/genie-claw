@@ -422,6 +422,8 @@ Memory tools are policy-aware:
   role recall before FTS fallback
 - safe device-alias memories maintain a local alias index for exact
   Home Assistant target resolution before fuzzy matching
+- safe profile attributes and household rules maintain local indexes for exact
+  age, preference, allergy, homework, and screen-time recall
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 

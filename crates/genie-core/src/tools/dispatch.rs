@@ -925,6 +925,10 @@ impl ToolDispatcher {
             .memory_read_context
             .unwrap_or_else(|| memory_read_context(args));
 
+        if let Some(answer) = mem.structured_household_answer(query)? {
+            return Ok(answer);
+        }
+
         if let Some(role) = household_role_query(query) {
             let profiles = mem.household_profiles_by_role(role)?;
             if !profiles.is_empty() {
@@ -2412,6 +2416,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "Jared is the dad.");
+    }
+
+    #[test]
+    fn memory_recall_answers_structured_household_rule() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-structured-rule-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("fact", "Leo is not allowed to play video games after 8 PM")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "is Leo allowed to play video games after 8 PM"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.starts_with("No."));
+        assert!(output.contains("Leo is not allowed"));
     }
 
     #[test]

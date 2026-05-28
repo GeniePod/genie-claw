@@ -75,7 +75,9 @@ GenieClaw keeps these decisions separate:
   retrieval can find candidate memories; safe relationship memories also feed a
   local household-profile index for exact role questions such as "who is the
   dad?", and safe device-alias memories feed exact Home Assistant target
-  resolution before fuzzy matching
+  resolution before fuzzy matching; safe profile attributes and household rules
+  answer low-latency questions about age, allergies, homework, and screen-time
+  constraints before FTS fallback
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
   class such as household, person, sensitive, private, or restricted

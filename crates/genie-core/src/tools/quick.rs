@@ -139,6 +139,10 @@ fn memory_recall_query(text: &str) -> Option<String> {
         return Some(role.into());
     }
 
+    if is_structured_household_question(text) {
+        return Some(text.to_string());
+    }
+
     for prefix in [
         "what do you remember about ",
         "what do you know about ",
@@ -168,6 +172,15 @@ fn memory_recall_query(text: &str) -> Option<String> {
     }
 
     None
+}
+
+fn is_structured_household_question(text: &str) -> bool {
+    (text.starts_with("how old is ") || text.starts_with("what age is "))
+        || (text.starts_with("what does ") && text.contains(" like"))
+        || (text.starts_with("is ") && text.contains(" allowed"))
+        || (text.contains("allergic") || text.contains("allergy"))
+        || text.contains("homework rule")
+        || text.contains("homework rules")
 }
 
 fn household_role_query(text: &str) -> Option<&'static str> {
@@ -655,6 +668,23 @@ mod tests {
         let call = route("Who are the children in our house?").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "child");
+    }
+
+    #[test]
+    fn routes_structured_household_questions_to_memory_recall() {
+        let call = route("How old is Leo?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "how old is leo");
+
+        let call = route("Is Leo allowed to play video games after 8 PM?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(
+            call.arguments["query"],
+            "is leo allowed to play video games after 8 pm"
+        );
+
+        let call = route("Is anyone allergic to peanuts?").unwrap();
+        assert_eq!(call.name, "memory_recall");
     }
 
     #[test]

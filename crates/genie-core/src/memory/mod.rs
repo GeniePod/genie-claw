@@ -121,6 +121,25 @@ pub struct DeviceAlias {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HouseholdProfileAttribute {
+    pub source_memory_id: i64,
+    pub name: String,
+    pub attribute: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HouseholdRule {
+    pub source_memory_id: i64,
+    pub person: Option<String>,
+    pub rule_type: String,
+    pub subject: String,
+    pub value: Option<String>,
+    pub allowed: bool,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MemoryEvent {
     ts_ms: u64,
@@ -198,6 +217,35 @@ impl Memory {
 
             CREATE INDEX IF NOT EXISTS idx_device_aliases_normalized_alias
                 ON device_aliases(normalized_alias, updated_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS household_profile_attributes (
+                id               INTEGER PRIMARY KEY,
+                source_memory_id INTEGER NOT NULL,
+                name             TEXT NOT NULL,
+                normalized_name  TEXT NOT NULL,
+                attribute        TEXT NOT NULL,
+                value            TEXT NOT NULL,
+                updated_ms       INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_household_profile_attributes_lookup
+                ON household_profile_attributes(normalized_name, attribute, updated_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS household_rules (
+                id                INTEGER PRIMARY KEY,
+                source_memory_id  INTEGER NOT NULL,
+                person            TEXT,
+                normalized_person TEXT,
+                rule_type         TEXT NOT NULL,
+                subject           TEXT NOT NULL,
+                value             TEXT,
+                allowed           INTEGER NOT NULL,
+                description       TEXT NOT NULL,
+                updated_ms        INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_household_rules_lookup
+                ON household_rules(rule_type, subject, normalized_person, updated_ms DESC);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content,
@@ -310,6 +358,8 @@ impl Memory {
         backfill_policy_columns(&conn)?;
         rebuild_household_profiles(&conn)?;
         rebuild_device_aliases(&conn)?;
+        rebuild_household_profile_attributes(&conn)?;
+        rebuild_household_rules(&conn)?;
 
         // Older databases may predate the FTS update trigger or may have been
         // edited by a recovery tool. Rebuild once at open so recall and forget
@@ -789,6 +839,114 @@ impl Memory {
         }))
     }
 
+    pub fn profile_attributes(
+        &self,
+        name: &str,
+        attribute: &str,
+    ) -> Result<Vec<HouseholdProfileAttribute>> {
+        let normalized_name = normalize_name_key(name);
+        if normalized_name.is_empty() || attribute.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT source_memory_id, name, attribute, value
+             FROM household_profile_attributes
+             WHERE normalized_name = ?1 AND attribute = ?2
+             ORDER BY updated_ms DESC, source_memory_id DESC",
+        )?;
+        let entries = stmt
+            .query_map(rusqlite::params![normalized_name, attribute], |row| {
+                Ok(HouseholdProfileAttribute {
+                    source_memory_id: row.get(0)?,
+                    name: row.get(1)?,
+                    attribute: row.get(2)?,
+                    value: row.get(3)?,
+                })
+            })?
+            .filter_map(|row| row.ok())
+            .collect();
+
+        Ok(entries)
+    }
+
+    pub fn household_rules(
+        &self,
+        person: Option<&str>,
+        rule_type: &str,
+        subject: Option<&str>,
+    ) -> Result<Vec<HouseholdRule>> {
+        let normalized_person = person.map(normalize_name_key);
+        let subject = subject.map(normalize_rule_subject);
+        let mut stmt = self.conn.prepare(
+            "SELECT source_memory_id, person, rule_type, subject, value, allowed, description
+             FROM household_rules
+             WHERE rule_type = ?1
+               AND (?2 IS NULL OR normalized_person = ?2)
+               AND (?3 IS NULL OR subject = ?3)
+             ORDER BY updated_ms DESC, source_memory_id DESC",
+        )?;
+        let entries = stmt
+            .query_map(
+                rusqlite::params![rule_type, normalized_person.as_deref(), subject.as_deref()],
+                |row| {
+                    Ok(HouseholdRule {
+                        source_memory_id: row.get(0)?,
+                        person: row.get(1)?,
+                        rule_type: row.get(2)?,
+                        subject: row.get(3)?,
+                        value: row.get(4)?,
+                        allowed: row.get::<_, i64>(5)? != 0,
+                        description: row.get(6)?,
+                    })
+                },
+            )?
+            .filter_map(|row| row.ok())
+            .collect();
+
+        Ok(entries)
+    }
+
+    pub fn structured_household_answer(&self, query: &str) -> Result<Option<String>> {
+        if let Some((name, attribute)) = profile_attribute_query(query) {
+            let attrs = self.profile_attributes(&name, attribute)?;
+            if let Some(attr) = attrs.first() {
+                return Ok(Some(format_profile_attribute_answer(attr)));
+            }
+        }
+
+        if let Some(subject) = allergy_query_subject(query) {
+            let rules = self.household_rules(None, "allergy", subject.as_deref())?;
+            if !rules.is_empty() {
+                return Ok(Some(format_allergy_answer(&rules)));
+            }
+        }
+
+        if let Some((person, subject, value)) = allowed_rule_query(query) {
+            let rules = self.household_rules(Some(&person), "screen_time", Some(&subject))?;
+            if let Some(rule) = rules
+                .iter()
+                .find(|rule| {
+                    value
+                        .as_deref()
+                        .is_none_or(|v| rule.value.as_deref() == Some(v))
+                })
+                .or_else(|| rules.first())
+            {
+                return Ok(Some(format_allowed_rule_answer(rule)));
+            }
+        }
+
+        if let Some(person) = homework_rule_query(query) {
+            let rules = self.household_rules(Some(&person), "homework", Some("homework"))?;
+            if !rules.is_empty() {
+                return Ok(Some(format_rule_list_answer(&rules)));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Delete a memory by ID.
     pub fn delete_by_id(&self, id: i64) -> Result<bool> {
         let existing = self.get_by_id(id)?;
@@ -806,6 +964,7 @@ impl Memory {
                 "DELETE FROM device_aliases WHERE source_memory_id = ?1",
                 [id],
             )?;
+            delete_structured_household_rows(&self.conn, id)?;
             if entry.promoted {
                 self.rebuild_root_memory_file()?;
             }
@@ -877,6 +1036,14 @@ impl Memory {
                 now_ms(),
             )?;
             upsert_device_alias_from_memory(&self.conn, id, &content, metadata, now_ms())?;
+            upsert_household_profile_attributes_from_memory(
+                &self.conn,
+                id,
+                &content,
+                metadata,
+                now_ms(),
+            )?;
+            upsert_household_rules_from_memory(&self.conn, id, &content, metadata, now_ms())?;
             if existing.promoted {
                 self.rebuild_root_memory_file()?;
             }
@@ -1120,6 +1287,8 @@ impl Memory {
         let id = self.conn.last_insert_rowid();
         upsert_household_profile_from_memory(&self.conn, id, kind, content, metadata, now)?;
         upsert_device_alias_from_memory(&self.conn, id, content, metadata, now)?;
+        upsert_household_profile_attributes_from_memory(&self.conn, id, content, metadata, now)?;
+        upsert_household_rules_from_memory(&self.conn, id, content, metadata, now)?;
         Ok(id)
     }
 
@@ -1439,6 +1608,53 @@ fn rebuild_device_aliases(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn rebuild_household_profile_attributes(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM household_profile_attributes", [])?;
+    let rows = shared_safe_memory_rows(conn)?;
+    let now = now_ms();
+    for (id, content, metadata) in rows {
+        upsert_household_profile_attributes_from_memory(conn, id, &content, metadata, now)?;
+    }
+    Ok(())
+}
+
+fn rebuild_household_rules(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM household_rules", [])?;
+    let rows = shared_safe_memory_rows(conn)?;
+    let now = now_ms();
+    for (id, content, metadata) in rows {
+        upsert_household_rules_from_memory(conn, id, &content, metadata, now)?;
+    }
+    Ok(())
+}
+
+fn shared_safe_memory_rows(
+    conn: &Connection,
+) -> Result<Vec<(i64, String, policy::MemoryPolicyMetadata)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, content, scope, sensitivity, spoken_policy
+         FROM memories
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                policy::MemoryPolicyMetadata {
+                    scope: policy::MemoryScope::from_storage(&row.get::<_, String>(2)?),
+                    sensitivity: policy::MemorySensitivity::from_storage(&row.get::<_, String>(3)?),
+                    spoken_policy: policy::SpokenMemoryPolicy::from_storage(
+                        &row.get::<_, String>(4)?,
+                    ),
+                },
+            ))
+        })?
+        .filter_map(|row| row.ok())
+        .collect();
+    Ok(rows)
+}
+
 fn upsert_household_profile_from_memory(
     conn: &Connection,
     source_memory_id: i64,
@@ -1465,6 +1681,94 @@ fn upsert_household_profile_from_memory(
         "INSERT INTO household_profiles (source_memory_id, name, role, updated_ms)
          VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![source_memory_id, name, role, updated_ms],
+    )?;
+    Ok(())
+}
+
+fn upsert_household_profile_attributes_from_memory(
+    conn: &Connection,
+    source_memory_id: i64,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+    updated_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM household_profile_attributes WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+
+    if !policy::assess_memory_read(metadata, policy::MemoryReadContext::shared_room_voice()).allowed
+    {
+        return Ok(());
+    }
+
+    for attr in household_profile_attributes_from_memory(content) {
+        let normalized_name = normalize_name_key(&attr.name);
+        conn.execute(
+            "INSERT INTO household_profile_attributes (
+                source_memory_id, name, normalized_name, attribute, value, updated_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                source_memory_id,
+                attr.name,
+                normalized_name,
+                attr.attribute,
+                attr.value,
+                updated_ms
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn upsert_household_rules_from_memory(
+    conn: &Connection,
+    source_memory_id: i64,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+    updated_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM household_rules WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+
+    if !policy::assess_memory_read(metadata, policy::MemoryReadContext::shared_room_voice()).allowed
+    {
+        return Ok(());
+    }
+
+    for rule in household_rules_from_memory(content) {
+        let normalized_person = rule.person.as_deref().map(normalize_name_key);
+        conn.execute(
+            "INSERT INTO household_rules (
+                source_memory_id, person, normalized_person, rule_type, subject,
+                value, allowed, description, updated_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                source_memory_id,
+                rule.person,
+                normalized_person,
+                rule.rule_type,
+                rule.subject,
+                rule.value,
+                if rule.allowed { 1 } else { 0 },
+                rule.description,
+                updated_ms
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn delete_structured_household_rows(conn: &Connection, source_memory_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM household_profile_attributes WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+    conn.execute(
+        "DELETE FROM household_rules WHERE source_memory_id = ?1",
+        [source_memory_id],
     )?;
     Ok(())
 }
@@ -1632,6 +1936,392 @@ fn device_alias_kind(target_id: &str) -> String {
         .split_once('.')
         .map(|(domain, _)| domain.to_string())
         .unwrap_or_else(|| "entity".into())
+}
+
+fn household_profile_attributes_from_memory(content: &str) -> Vec<HouseholdProfileAttribute> {
+    let trimmed = content
+        .trim()
+        .trim_matches(|ch| matches!(ch, '.' | '!' | '?'));
+    let lower = trimmed.to_ascii_lowercase();
+    let mut attrs = Vec::new();
+
+    if let Some((name, rest)) = split_once_case_insensitive(trimmed, &lower, " is ") {
+        let rest_lower = rest.to_ascii_lowercase();
+        if let Some(age) = leading_age(&rest_lower) {
+            attrs.push(profile_attr(name, "age", &age.to_string()));
+        }
+    }
+
+    for marker in [" likes ", " prefers ", " enjoys "] {
+        if let Some((name, value)) = split_once_case_insensitive(trimmed, &lower, marker) {
+            let value = clean_sentence_value(value);
+            if !value.is_empty() {
+                attrs.push(profile_attr(name, "likes", &value));
+            }
+        }
+    }
+
+    if let Some((left, value)) = split_once_case_insensitive(trimmed, &lower, " is ")
+        && left.to_ascii_lowercase().contains("favorite ")
+    {
+        let name = left
+            .split_once("'s ")
+            .map(|(name, _)| name)
+            .unwrap_or("household");
+        let attribute = left
+            .to_ascii_lowercase()
+            .split("favorite ")
+            .nth(1)
+            .map(|subject| format!("favorite_{}", normalize_rule_subject(subject)))
+            .unwrap_or_else(|| "favorite".into());
+        let value = clean_sentence_value(value);
+        if !value.is_empty() {
+            attrs.push(profile_attr(name, &attribute, &value));
+        }
+    }
+
+    attrs
+}
+
+fn household_rules_from_memory(content: &str) -> Vec<HouseholdRule> {
+    let trimmed = content
+        .trim()
+        .trim_matches(|ch| matches!(ch, '.' | '!' | '?'));
+    let lower = trimmed.to_ascii_lowercase();
+    let mut rules = Vec::new();
+
+    if lower.contains("allerg")
+        && let Some((person, subject)) = parse_allergy_rule(trimmed, &lower)
+    {
+        rules.push(HouseholdRule {
+            source_memory_id: 0,
+            person: Some(person),
+            rule_type: "allergy".into(),
+            subject,
+            value: None,
+            allowed: false,
+            description: trimmed.to_string(),
+        });
+    }
+
+    if (lower.contains("screen time") || lower.contains("gaming") || lower.contains("video game"))
+        && (lower.contains("after ") || lower.contains("ends at "))
+        && let Some((person, subject, value)) = parse_screen_time_rule(trimmed, &lower)
+    {
+        rules.push(HouseholdRule {
+            source_memory_id: 0,
+            person: Some(person),
+            rule_type: "screen_time".into(),
+            subject,
+            value: Some(value),
+            allowed: false,
+            description: trimmed.to_string(),
+        });
+    }
+
+    if lower.contains("homework")
+        && let Some(person) = leading_person_name(trimmed)
+    {
+        rules.push(HouseholdRule {
+            source_memory_id: 0,
+            person: Some(person),
+            rule_type: "homework".into(),
+            subject: "homework".into(),
+            value: if lower.contains("before screen") {
+                Some("before_screen_time".into())
+            } else {
+                None
+            },
+            allowed: true,
+            description: trimmed.to_string(),
+        });
+    }
+
+    rules
+}
+
+fn parse_allergy_rule(content: &str, lower: &str) -> Option<(String, String)> {
+    if let Some((person, rest)) = split_once_case_insensitive(content, lower, " is allergic to ") {
+        return Some((clean_person_name(person), normalize_rule_subject(rest)));
+    }
+
+    if let Some((person, rest)) = split_once_case_insensitive(content, lower, " has ") {
+        let rest_lower = rest.to_ascii_lowercase();
+        if let Some(pos) = rest_lower.find(" allergy") {
+            let subject = rest[..pos]
+                .split_whitespace()
+                .rfind(|word| {
+                    !matches!(
+                        word.to_ascii_lowercase().as_str(),
+                        "a" | "an" | "mild" | "severe" | "recent"
+                    )
+                })
+                .unwrap_or("");
+            if !subject.is_empty() {
+                return Some((clean_person_name(person), normalize_rule_subject(subject)));
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_screen_time_rule(content: &str, lower: &str) -> Option<(String, String, String)> {
+    let person = if let Some((person, _)) =
+        split_once_case_insensitive(content, lower, " is not allowed ")
+    {
+        clean_person_name(person)
+    } else if let Some((person, _)) = split_once_case_insensitive(content, lower, "'s screen time")
+    {
+        clean_person_name(person)
+    } else {
+        leading_person_name(content)?
+    };
+
+    let subject = if lower.contains("video game") || lower.contains("gaming") {
+        "video_games"
+    } else {
+        "screen_time"
+    };
+    let value = time_after_marker(content, lower, " after ")
+        .or_else(|| time_after_marker(content, lower, " ends at "))?;
+    Some((person, subject.into(), value))
+}
+
+fn profile_attr(name: &str, attribute: &str, value: &str) -> HouseholdProfileAttribute {
+    HouseholdProfileAttribute {
+        source_memory_id: 0,
+        name: clean_person_name(name),
+        attribute: attribute.into(),
+        value: clean_sentence_value(value),
+    }
+}
+
+fn split_once_case_insensitive<'a>(
+    original: &'a str,
+    lower: &str,
+    marker: &str,
+) -> Option<(&'a str, &'a str)> {
+    let pos = lower.find(marker)?;
+    Some((&original[..pos], &original[pos + marker.len()..]))
+}
+
+fn leading_age(value: &str) -> Option<u8> {
+    let digits = value
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits
+        .parse::<u8>()
+        .ok()
+        .filter(|age| (1..=120).contains(age))
+}
+
+fn leading_person_name(value: &str) -> Option<String> {
+    let name = value.split_whitespace().next()?;
+    let name = clean_person_name(name);
+    if name.is_empty() { None } else { Some(name) }
+}
+
+fn clean_person_name(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("for ")
+        .trim_start_matches("that ")
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '.' | ',' | ':' | ';' | '?' | '!'))
+        .split_whitespace()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn clean_sentence_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '.' | ',' | ':' | ';' | '?' | '!'))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_name_key(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_rule_subject(value: &str) -> String {
+    let singular = value
+        .trim()
+        .trim_start_matches("the ")
+        .trim_start_matches("a ")
+        .trim_start_matches("an ")
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '.' | ',' | ':' | ';' | '?' | '!'))
+        .to_ascii_lowercase();
+    match singular.as_str() {
+        "peanuts" => "peanut".into(),
+        "video_games" | "video games" | "video game" | "gaming" => "video_games".into(),
+        "screen_time" | "screen time" => "screen_time".into(),
+        "homework" => "homework".into(),
+        other => other
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_")
+            .trim_end_matches('s')
+            .to_string(),
+    }
+}
+
+fn time_after_marker(content: &str, lower: &str, marker: &str) -> Option<String> {
+    let pos = lower.find(marker)?;
+    let rest = content[pos + marker.len()..].trim();
+    let mut parts = Vec::new();
+    for word in rest.split_whitespace().take(3) {
+        let clean = word.trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | '!' | '?'));
+        if clean.eq_ignore_ascii_case("for") || clean.eq_ignore_ascii_case("because") {
+            break;
+        }
+        parts.push(clean);
+        if clean.eq_ignore_ascii_case("am") || clean.eq_ignore_ascii_case("pm") {
+            break;
+        }
+    }
+    let raw = parts.join(" ");
+    normalize_time_value(&raw)
+}
+
+fn normalize_time_value(value: &str) -> Option<String> {
+    let cleaned = value.trim().to_ascii_lowercase().replace(' ', "");
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn profile_attribute_query(query: &str) -> Option<(String, &'static str)> {
+    let query = query.trim();
+    let lower = query.to_ascii_lowercase();
+
+    for prefix in ["how old is ", "what age is "] {
+        if let Some(name) = lower.strip_prefix(prefix) {
+            return Some((clean_person_name(name), "age"));
+        }
+    }
+
+    if lower.starts_with("what does ") && lower.contains(" like") {
+        let rest = query.get("what does ".len()..)?;
+        let lower_rest = rest.to_ascii_lowercase();
+        let pos = lower_rest.find(" like")?;
+        return Some((clean_person_name(&rest[..pos]), "likes"));
+    }
+
+    None
+}
+
+fn allergy_query_subject(query: &str) -> Option<Option<String>> {
+    let lower = query.to_ascii_lowercase();
+    if !(lower.contains("allergic") || lower.contains("allergy")) {
+        return None;
+    }
+
+    if let Some((_, subject)) = split_once_case_insensitive(query, &lower, " allergic to ") {
+        return Some(Some(normalize_rule_subject(subject)));
+    }
+    if lower.contains("peanut") {
+        return Some(Some("peanut".into()));
+    }
+
+    Some(None)
+}
+
+fn allowed_rule_query(query: &str) -> Option<(String, String, Option<String>)> {
+    let lower = query.to_ascii_lowercase();
+    if !(lower.starts_with("is ") && lower.contains(" allowed")) {
+        return None;
+    }
+    let rest = query.get("is ".len()..)?;
+    let lower_rest = rest.to_ascii_lowercase();
+    let allowed_pos = lower_rest.find(" allowed")?;
+    let person = clean_person_name(&rest[..allowed_pos]);
+    if person.is_empty() {
+        return None;
+    }
+
+    let subject = if lower.contains("video game") || lower.contains("gaming") {
+        "video_games"
+    } else if lower.contains("screen time") {
+        "screen_time"
+    } else {
+        return None;
+    };
+    let value = time_after_marker(query, &lower, " after ");
+    Some((person, subject.into(), value))
+}
+
+fn homework_rule_query(query: &str) -> Option<String> {
+    let lower = query.to_ascii_lowercase();
+    if !lower.contains("homework") {
+        return None;
+    }
+
+    for marker in ["show me ", "what are ", "what is "] {
+        if let Some(rest) = lower.strip_prefix(marker) {
+            let name = rest
+                .split("'s")
+                .next()
+                .or_else(|| rest.split_whitespace().next())
+                .map(clean_person_name)?;
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+
+    leading_person_name(query)
+}
+
+fn format_profile_attribute_answer(attr: &HouseholdProfileAttribute) -> String {
+    match attr.attribute.as_str() {
+        "age" => format!("{} is {} years old.", attr.name, attr.value),
+        "likes" => format!("{} likes {}.", attr.name, attr.value),
+        attribute if attribute.starts_with("favorite_") => {
+            let subject = attribute.trim_start_matches("favorite_").replace('_', " ");
+            format!("{}'s favorite {} is {}.", attr.name, subject, attr.value)
+        }
+        _ => format!("{}: {}.", attr.name, attr.value),
+    }
+}
+
+fn format_allergy_answer(rules: &[HouseholdRule]) -> String {
+    let items = rules
+        .iter()
+        .map(|rule| rule.description.as_str())
+        .collect::<Vec<_>>();
+    format!("Yes. {}", items.join(" "))
+}
+
+fn format_allowed_rule_answer(rule: &HouseholdRule) -> String {
+    if rule.allowed {
+        format!("Yes. {}", rule.description)
+    } else {
+        format!("No. {}", rule.description)
+    }
+}
+
+fn format_rule_list_answer(rules: &[HouseholdRule]) -> String {
+    let items = rules
+        .iter()
+        .map(|rule| rule.description.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("I found this rule: {items}")
 }
 
 fn possessive_named_profile(content: &str, lower: &str) -> Option<(&'static str, String)> {
@@ -2274,6 +2964,57 @@ mod tests {
         .unwrap();
 
         assert!(mem.device_alias("bedroom camera").unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_attribute_memory_indexes_age_and_preferences() {
+        let mem = temp_memory();
+        mem.store("fact", "Leo is 8 years old").unwrap();
+        mem.store("preference", "Leo likes granola bars").unwrap();
+
+        let age = mem.profile_attributes("leo", "age").unwrap();
+        assert_eq!(age[0].name, "Leo");
+        assert_eq!(age[0].value, "8");
+
+        let answer = mem
+            .structured_household_answer("How old is Leo?")
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer, "Leo is 8 years old.");
+    }
+
+    #[test]
+    fn household_rules_answer_allergy_and_screen_time() {
+        let mem = temp_memory();
+        mem.store("fact", "Leo has a mild peanut allergy").unwrap();
+        mem.store("fact", "Leo is not allowed to play video games after 8 PM")
+            .unwrap();
+
+        let allergy = mem
+            .structured_household_answer("Is anyone allergic to peanuts?")
+            .unwrap()
+            .unwrap();
+        assert!(allergy.contains("Leo has a mild peanut allergy"));
+
+        let allowed = mem
+            .structured_household_answer("Is Leo allowed to play video games after 8 PM?")
+            .unwrap()
+            .unwrap();
+        assert!(allowed.starts_with("No."));
+        assert!(allowed.contains("not allowed"));
+    }
+
+    #[test]
+    fn household_rules_answer_homework_rules() {
+        let mem = temp_memory();
+        mem.store("fact", "Mia must finish homework before screen time")
+            .unwrap();
+
+        let answer = mem
+            .structured_household_answer("Show me Mia's homework rules")
+            .unwrap()
+            .unwrap();
+        assert!(answer.contains("Mia must finish homework before screen time"));
     }
 
     #[test]
