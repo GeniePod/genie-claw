@@ -45,6 +45,16 @@ pub enum MemoryDisclosure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryDisclosureClass {
+    Public,
+    Household,
+    Person,
+    Sensitive,
+    Private,
+    Restricted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryPolicyMetadata {
     pub scope: MemoryScope,
     pub sensitivity: MemorySensitivity,
@@ -63,6 +73,7 @@ pub struct MemoryReadContext {
 pub struct MemoryPolicyDecision {
     pub allowed: bool,
     pub disclosure: MemoryDisclosure,
+    pub class: MemoryDisclosureClass,
     pub reason: &'static str,
 }
 
@@ -124,6 +135,19 @@ impl SpokenMemoryPolicy {
     }
 }
 
+impl MemoryDisclosureClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Household => "household",
+            Self::Person => "person",
+            Self::Sensitive => "sensitive",
+            Self::Private => "private",
+            Self::Restricted => "restricted",
+        }
+    }
+}
+
 impl MemoryReadContext {
     pub fn shared_room_voice() -> Self {
         Self {
@@ -132,6 +156,53 @@ impl MemoryReadContext {
             explicit_private_intent: false,
             shared_space_voice: true,
         }
+    }
+}
+
+pub fn classify_memory(metadata: MemoryPolicyMetadata) -> MemoryDisclosureClass {
+    if metadata.sensitivity == MemorySensitivity::Restricted
+        || metadata.spoken_policy == SpokenMemoryPolicy::Deny
+    {
+        return MemoryDisclosureClass::Restricted;
+    }
+
+    if metadata.scope == MemoryScope::Private {
+        return MemoryDisclosureClass::Private;
+    }
+
+    if metadata.sensitivity == MemorySensitivity::Cautious
+        || metadata.spoken_policy == SpokenMemoryPolicy::Confirm
+    {
+        return MemoryDisclosureClass::Sensitive;
+    }
+
+    match metadata.scope {
+        MemoryScope::Session | MemoryScope::Household => MemoryDisclosureClass::Household,
+        MemoryScope::Person => MemoryDisclosureClass::Person,
+        MemoryScope::Private => MemoryDisclosureClass::Private,
+    }
+}
+
+fn decision_for_metadata(
+    metadata: MemoryPolicyMetadata,
+    allowed: bool,
+    disclosure: MemoryDisclosure,
+    reason: &'static str,
+) -> MemoryPolicyDecision {
+    MemoryPolicyDecision {
+        allowed,
+        disclosure,
+        class: classify_memory(metadata),
+        reason,
+    }
+}
+
+fn restricted_decision(reason: &'static str) -> MemoryPolicyDecision {
+    MemoryPolicyDecision {
+        allowed: false,
+        disclosure: MemoryDisclosure::Deny,
+        class: MemoryDisclosureClass::Restricted,
+        reason,
     }
 }
 
@@ -185,27 +256,25 @@ pub fn infer_metadata(kind: &str, content: &str) -> MemoryPolicyMetadata {
 pub fn assess_memory_write(kind: &str, content: &str) -> MemoryPolicyDecision {
     let lower = content.to_lowercase();
     if let Some(reason) = restricted_secret_reason(&lower) {
-        return MemoryPolicyDecision {
-            allowed: false,
-            disclosure: MemoryDisclosure::Deny,
-            reason,
-        };
+        return restricted_decision(reason);
     }
 
     let metadata = infer_metadata(kind, content);
     if metadata.scope == MemoryScope::Private {
-        return MemoryPolicyDecision {
-            allowed: false,
-            disclosure: MemoryDisclosure::AppOnly,
-            reason: "Private personal memory requires an explicit app-backed flow in V1.",
-        };
+        return decision_for_metadata(
+            metadata,
+            false,
+            MemoryDisclosure::AppOnly,
+            "Private personal memory requires an explicit app-backed flow in V1.",
+        );
     }
 
-    MemoryPolicyDecision {
-        allowed: true,
-        disclosure: MemoryDisclosure::Speak,
-        reason: "Memory is safe for household-shared storage.",
-    }
+    decision_for_metadata(
+        metadata,
+        true,
+        MemoryDisclosure::Speak,
+        "Memory is safe for household-shared storage.",
+    )
 }
 
 /// Decide whether a memory is safe to use in the current response context.
@@ -216,66 +285,75 @@ pub fn assess_memory_read(
     if metadata.spoken_policy == SpokenMemoryPolicy::Deny
         || metadata.sensitivity == MemorySensitivity::Restricted
     {
-        return MemoryPolicyDecision {
-            allowed: false,
-            disclosure: MemoryDisclosure::Deny,
-            reason: "Memory is restricted and must not be spoken.",
-        };
+        return decision_for_metadata(
+            metadata,
+            false,
+            MemoryDisclosure::Deny,
+            "Memory is restricted and must not be spoken.",
+        );
     }
 
     match metadata.scope {
         MemoryScope::Session | MemoryScope::Household => match metadata.spoken_policy {
-            SpokenMemoryPolicy::Allow => MemoryPolicyDecision {
-                allowed: true,
-                disclosure: MemoryDisclosure::Speak,
-                reason: "Household memory is safe for shared-space use.",
-            },
-            SpokenMemoryPolicy::Confirm => MemoryPolicyDecision {
-                allowed: false,
-                disclosure: MemoryDisclosure::Confirm,
-                reason: "Cautious household memory requires confirmation before speaking.",
-            },
-            SpokenMemoryPolicy::AppOnly => MemoryPolicyDecision {
-                allowed: false,
-                disclosure: MemoryDisclosure::AppOnly,
-                reason: "Memory should be shown in the app instead of spoken.",
-            },
-            SpokenMemoryPolicy::Deny => MemoryPolicyDecision {
-                allowed: false,
-                disclosure: MemoryDisclosure::Deny,
-                reason: "Memory policy denies spoken disclosure.",
-            },
+            SpokenMemoryPolicy::Allow => decision_for_metadata(
+                metadata,
+                true,
+                MemoryDisclosure::Speak,
+                "Household memory is safe for shared-space use.",
+            ),
+            SpokenMemoryPolicy::Confirm => decision_for_metadata(
+                metadata,
+                false,
+                MemoryDisclosure::Confirm,
+                "Cautious household memory requires confirmation before speaking.",
+            ),
+            SpokenMemoryPolicy::AppOnly => decision_for_metadata(
+                metadata,
+                false,
+                MemoryDisclosure::AppOnly,
+                "Memory should be shown in the app instead of spoken.",
+            ),
+            SpokenMemoryPolicy::Deny => decision_for_metadata(
+                metadata,
+                false,
+                MemoryDisclosure::Deny,
+                "Memory policy denies spoken disclosure.",
+            ),
         },
         MemoryScope::Person => {
             if context.explicit_named_person
                 || context.identity_confidence >= IdentityConfidence::Medium
             {
-                MemoryPolicyDecision {
-                    allowed: true,
-                    disclosure: MemoryDisclosure::Speak,
-                    reason: "Person-linked household memory is eligible in this context.",
-                }
+                decision_for_metadata(
+                    metadata,
+                    true,
+                    MemoryDisclosure::Speak,
+                    "Person-linked household memory is eligible in this context.",
+                )
             } else {
-                MemoryPolicyDecision {
-                    allowed: false,
-                    disclosure: MemoryDisclosure::Confirm,
-                    reason: "Person-linked memory needs explicit naming or stronger identity confidence.",
-                }
+                decision_for_metadata(
+                    metadata,
+                    false,
+                    MemoryDisclosure::Confirm,
+                    "Person-linked memory needs explicit naming or stronger identity confidence.",
+                )
             }
         }
         MemoryScope::Private => {
             if context.explicit_private_intent && !context.shared_space_voice {
-                MemoryPolicyDecision {
-                    allowed: false,
-                    disclosure: MemoryDisclosure::AppOnly,
-                    reason: "Private memory should be presented through a personal interface.",
-                }
+                decision_for_metadata(
+                    metadata,
+                    false,
+                    MemoryDisclosure::AppOnly,
+                    "Private memory should be presented through a personal interface.",
+                )
             } else {
-                MemoryPolicyDecision {
-                    allowed: false,
-                    disclosure: MemoryDisclosure::Deny,
-                    reason: "Private memory is not spoken in shared-room voice.",
-                }
+                decision_for_metadata(
+                    metadata,
+                    false,
+                    MemoryDisclosure::Deny,
+                    "Private memory is not spoken in shared-room voice.",
+                )
             }
         }
     }
@@ -466,6 +544,8 @@ mod tests {
 
         assert!(decision.allowed);
         assert_eq!(decision.disclosure, MemoryDisclosure::Speak);
+        assert_eq!(decision.class, MemoryDisclosureClass::Household);
+        assert_eq!(decision.class.as_str(), "household");
     }
 
     #[test]
@@ -474,6 +554,7 @@ mod tests {
 
         assert!(!decision.allowed);
         assert_eq!(decision.disclosure, MemoryDisclosure::Deny);
+        assert_eq!(decision.class, MemoryDisclosureClass::Restricted);
         assert!(decision.reason.contains("passwords"));
     }
 
@@ -483,6 +564,7 @@ mod tests {
 
         assert!(!decision.allowed);
         assert_eq!(decision.disclosure, MemoryDisclosure::Deny);
+        assert_eq!(decision.class, MemoryDisclosureClass::Restricted);
         assert!(decision.reason.contains("access codes"));
     }
 
@@ -492,7 +574,18 @@ mod tests {
 
         assert!(!decision.allowed);
         assert_eq!(decision.disclosure, MemoryDisclosure::Deny);
+        assert_eq!(decision.class, MemoryDisclosureClass::Restricted);
         assert!(decision.reason.contains("sensitive document"));
+    }
+
+    #[test]
+    fn cautious_memory_is_classified_sensitive() {
+        let metadata = infer_metadata("fact", "User has a recent medical diagnosis of mild asthma");
+        let decision = assess_memory_read(metadata, MemoryReadContext::shared_room_voice());
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.disclosure, MemoryDisclosure::Confirm);
+        assert_eq!(decision.class, MemoryDisclosureClass::Sensitive);
     }
 
     #[test]
@@ -507,6 +600,7 @@ mod tests {
 
         assert!(!decision.allowed);
         assert_eq!(decision.disclosure, MemoryDisclosure::Deny);
+        assert_eq!(decision.class, MemoryDisclosureClass::Private);
     }
 
     #[test]
@@ -519,6 +613,7 @@ mod tests {
 
         let low = assess_memory_read(metadata, MemoryReadContext::shared_room_voice());
         assert!(!low.allowed);
+        assert_eq!(low.class, MemoryDisclosureClass::Person);
 
         let medium = assess_memory_read(
             metadata,
@@ -530,6 +625,7 @@ mod tests {
             },
         );
         assert!(medium.allowed);
+        assert_eq!(medium.class, MemoryDisclosureClass::Person);
     }
 
     #[test]

@@ -74,7 +74,8 @@ GenieClaw keeps these decisions separate:
 - recall layer: structured records, SQLite `FTS5`, and optional semantic
   retrieval can find candidate memories
 - classification layer: each memory is scoped and tagged by sensitivity before
-  it is injected, spoken, or shown
+  it is injected, spoken, or shown; policy decisions expose a stable disclosure
+  class such as household, person, sensitive, private, or restricted
 - policy layer: the current origin, room context, speaker confidence, and
   memory metadata decide whether disclosure is allowed, confirm-required,
   app-only, or denied
