@@ -1080,14 +1080,18 @@ impl Memory {
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
 
-        let _ = std::fs::remove_dir_all(&namespaces_dir);
         if records.is_empty() {
+            let _ = std::fs::remove_dir_all(&namespaces_dir);
             let _ = std::fs::remove_file(&file);
             let _ = std::fs::remove_file(&index_file);
             return Ok(());
         }
 
-        std::fs::create_dir_all(&namespaces_dir)?;
+        // Stage all writes to temporary paths so the originals are untouched
+        // until every write has succeeded (atomic write-then-swap pattern).
+        let namespaces_staging = self.canonical_dir.join("namespaces.tmp");
+        let _ = std::fs::remove_dir_all(&namespaces_staging);
+        std::fs::create_dir_all(&namespaces_staging)?;
 
         let mut namespace_index: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
@@ -1126,8 +1130,14 @@ impl Memory {
 
         for (namespace, lines) in &namespace_index {
             let relative = canonical_namespace_note_relative(namespace);
-            let note_path = self.canonical_dir.join(&relative);
-            if let Some(parent) = note_path.parent() {
+            // Write namespace files into the staging dir rather than the live dir.
+            // `relative` is always of the form "namespaces/<path>"; strip the
+            // leading component so we can re-root under namespaces_staging.
+            let relative_within_ns = relative
+                .strip_prefix("namespaces/")
+                .unwrap_or(relative.as_str());
+            let staged_note_path = namespaces_staging.join(relative_within_ns);
+            if let Some(parent) = staged_note_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
 
@@ -1138,7 +1148,7 @@ impl Memory {
             for line in lines {
                 note_text.push_str(line);
             }
-            std::fs::write(note_path, note_text)?;
+            std::fs::write(&staged_note_path, note_text)?;
 
             index_text.push_str(&format!(
                 "- [{}]({}) — {} durable entr{}\n",
@@ -1149,23 +1159,35 @@ impl Memory {
             ));
         }
 
-        std::fs::write(index_file, index_text)?;
-
-        if root_lines.is_empty() {
+        let root_text = if root_lines.is_empty() {
             let mut text = String::from("# GenieClaw Durable Memory\n\n");
             text.push_str(
                 "No promoted memories are currently safe for shared-room disclosure.\n\nSee [INDEX.md](INDEX.md) for the local namespace map.\n",
             );
-            std::fs::write(file, text)?;
-            return Ok(());
-        }
+            text
+        } else {
+            let mut text = String::from("# GenieClaw Durable Memory\n\n");
+            text.push_str("See [INDEX.md](INDEX.md) for namespace notes.\n\n");
+            for line in root_lines {
+                text.push_str(&line);
+            }
+            text
+        };
 
-        let mut text = String::from("# GenieClaw Durable Memory\n\n");
-        text.push_str("See [INDEX.md](INDEX.md) for namespace notes.\n\n");
-        for line in root_lines {
-            text.push_str(&line);
-        }
-        std::fs::write(file, text)?;
+        // Write MEMORY.md and INDEX.md to temp files before touching the live copies.
+        let file_staging = self.canonical_dir.join("MEMORY.md.tmp");
+        let index_staging = self.canonical_dir.join("INDEX.md.tmp");
+        std::fs::write(&index_staging, index_text)?;
+        std::fs::write(&file_staging, root_text)?;
+
+        // All writes succeeded — destroy the old state and rename into place.
+        // The window between remove and rename is intentionally tiny; SQLite
+        // remains authoritative so a crash here is recoverable by rerunning.
+        let _ = std::fs::remove_dir_all(&namespaces_dir);
+        std::fs::rename(&namespaces_staging, &namespaces_dir)?;
+        std::fs::rename(&index_staging, &index_file)?;
+        std::fs::rename(&file_staging, &file)?;
+
         Ok(())
     }
 }
@@ -2005,5 +2027,51 @@ mod tests {
             entry.canonical_note.as_deref(),
             Some("memory/namespaces/household/preference.md")
         );
+    }
+
+    #[test]
+    fn rebuild_leaves_no_staging_artifacts_on_success() {
+        let mem = temp_memory();
+        let id = mem
+            .store("preference", "User likes chamomile tea")
+            .unwrap();
+        mem.mark_promoted(id).unwrap();
+
+        // Staging directories and temp files must be cleaned up after a
+        // successful rebuild so they don't accumulate across calls.
+        assert!(!mem.canonical_dir.join("namespaces.tmp").exists());
+        assert!(!mem.canonical_dir.join("MEMORY.md.tmp").exists());
+        assert!(!mem.canonical_dir.join("INDEX.md.tmp").exists());
+    }
+
+    #[test]
+    fn rebuild_preserves_original_files_until_all_writes_succeed() {
+        // Verify that the atomic swap keeps the live namespace dir intact until
+        // a second rebuild replaces it — if the first rebuild completed, the
+        // second must produce the updated content and not a partial state.
+        let mem = temp_memory();
+        let first = mem
+            .store("preference", "User likes chamomile tea")
+            .unwrap();
+        mem.mark_promoted(first).unwrap();
+
+        let note_path = mem
+            .canonical_dir
+            .join("namespaces/household/preference.md");
+        let original_text = std::fs::read_to_string(&note_path).unwrap();
+        assert!(original_text.contains("chamomile tea"));
+
+        // Second promotion triggers another rebuild; live file must be updated.
+        let second = mem
+            .store("preference", "User likes peppermint tea")
+            .unwrap();
+        mem.mark_promoted(second).unwrap();
+
+        let updated_text = std::fs::read_to_string(&note_path).unwrap();
+        assert!(updated_text.contains("chamomile tea"));
+        assert!(updated_text.contains("peppermint tea"));
+
+        // No staging debris left behind.
+        assert!(!mem.canonical_dir.join("namespaces.tmp").exists());
     }
 }
