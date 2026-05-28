@@ -81,7 +81,9 @@ GenieClaw keeps these decisions separate:
   app-only, or denied
 - action layer: device control, media, purchases, security, network, and other
   side effects pass through tool policy and actuation safety even if memory
-  retrieval found the right target
+  retrieval found the right target; tool results and audit events carry an
+  action class such as `read_only`, `memory_write`, `home_actuation`, network, media,
+  timer, or diagnostic
 - audit layer: tool execution records the tool name, origin, success state, and
   argument keys without logging secret values
 

@@ -80,4 +80,4 @@ pub use ha::{HaClient, HomeAssistantProvider, HomeAutomationProvider};
 pub use llm::{LlmClient, Message};
 pub use memory::{Memory, SharedMemory};
 pub use prompt::PromptBuilder;
-pub use tools::{ToolCall, ToolDispatcher, ToolResult};
+pub use tools::{ToolActionClass, ToolCall, ToolDispatcher, ToolResult};

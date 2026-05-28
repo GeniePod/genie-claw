@@ -412,6 +412,8 @@ Home-control execution now has three separate safety layers:
 - first-pass local action policy
 - final runtime actuation gate plus append-only audit logging
 - recent action ledger for "what did you do?" and bounded undo
+- tool audit events include an `action_class` such as `read_only`,
+  `memory_write`, `home_actuation`, `network`, `media`, or `diagnostic`
 
 Memory tools are policy-aware:
 

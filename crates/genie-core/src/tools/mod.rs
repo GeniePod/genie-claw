@@ -10,5 +10,5 @@ mod weather;
 pub(crate) mod web_search;
 
 pub use actuation::{PendingConfirmation, RequestOrigin};
-pub use dispatch::{ToolCall, ToolDispatcher, ToolExecutionContext, ToolResult};
+pub use dispatch::{ToolActionClass, ToolCall, ToolDispatcher, ToolExecutionContext, ToolResult};
 pub use parser::{try_tool_call, try_tool_call_with_context};

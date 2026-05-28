@@ -36,8 +36,39 @@ pub struct ToolDef {
 #[derive(Debug, Serialize)]
 pub struct ToolResult {
     pub tool: String,
+    pub action_class: ToolActionClass,
     pub success: bool,
     pub output: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActionClass {
+    ReadOnly,
+    Diagnostic,
+    MemoryRead,
+    MemoryWrite,
+    HomeActuation,
+    Media,
+    Network,
+    Timer,
+    Skill,
+}
+
+impl ToolActionClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Diagnostic => "diagnostic",
+            Self::MemoryRead => "memory_read",
+            Self::MemoryWrite => "memory_write",
+            Self::HomeActuation => "home_actuation",
+            Self::Media => "media",
+            Self::Network => "network",
+            Self::Timer => "timer",
+            Self::Skill => "skill",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -82,6 +113,7 @@ struct ActuationRateLimiter {
 struct ToolAuditEvent {
     ts_ms: u64,
     tool: String,
+    action_class: ToolActionClass,
     origin: RequestOrigin,
     success: bool,
     duration_ms: u64,
@@ -495,11 +527,13 @@ impl ToolDispatcher {
         exec_ctx: ToolExecutionContext,
     ) -> ToolResult {
         let started = Instant::now();
+        let action_class = tool_action_class(&call.name);
         if let Err(err) =
             tool_origin_allowed(&self.tool_policy, exec_ctx.request_origin, &call.name)
         {
             let tool_result = ToolResult {
                 tool: call.name.clone(),
+                action_class,
                 success: false,
                 output: format!("Tool blocked by origin policy: {err}"),
             };
@@ -529,11 +563,13 @@ impl ToolDispatcher {
         let tool_result = match result {
             Ok(output) => ToolResult {
                 tool: call.name.clone(),
+                action_class,
                 success: true,
                 output,
             },
             Err(e) => ToolResult {
                 tool: call.name.clone(),
+                action_class,
                 success: false,
                 output: e.to_string(),
             },
@@ -554,6 +590,7 @@ impl ToolDispatcher {
         self.tool_audit_logger.append(ToolAuditEvent {
             ts_ms: now_ms(),
             tool: call.name.clone(),
+            action_class: result.action_class,
             origin: exec_ctx.request_origin,
             success: result.success,
             duration_ms: started.elapsed().as_millis() as u64,
@@ -1114,6 +1151,20 @@ impl ToolDispatcher {
                 ))
             }
         }
+    }
+}
+
+pub fn tool_action_class(name: &str) -> ToolActionClass {
+    match name {
+        "home_control" | "home_undo" => ToolActionClass::HomeActuation,
+        "play_media" => ToolActionClass::Media,
+        "memory_recall" => ToolActionClass::MemoryRead,
+        "memory_forget" | "memory_store" => ToolActionClass::MemoryWrite,
+        "memory_status" | "system_info" | "action_history" => ToolActionClass::Diagnostic,
+        "web_search" | "get_weather" => ToolActionClass::Network,
+        "set_timer" => ToolActionClass::Timer,
+        "home_status" | "get_time" | "calculate" => ToolActionClass::ReadOnly,
+        _ => ToolActionClass::Skill,
     }
 }
 
@@ -1746,7 +1797,27 @@ mod tests {
         };
         let result = dispatcher.execute(&call).await;
         assert!(result.success);
+        assert_eq!(result.action_class, ToolActionClass::ReadOnly);
         assert!(!result.output.is_empty());
+    }
+
+    #[test]
+    fn tool_action_class_maps_side_effecting_tools() {
+        assert_eq!(
+            tool_action_class("home_control"),
+            ToolActionClass::HomeActuation
+        );
+        assert_eq!(
+            tool_action_class("memory_store"),
+            ToolActionClass::MemoryWrite
+        );
+        assert_eq!(
+            tool_action_class("memory_recall"),
+            ToolActionClass::MemoryRead
+        );
+        assert_eq!(tool_action_class("web_search"), ToolActionClass::Network);
+        assert_eq!(tool_action_class("custom_skill"), ToolActionClass::Skill);
+        assert_eq!(ToolActionClass::HomeActuation.as_str(), "home_actuation");
     }
 
     #[tokio::test]
@@ -1775,6 +1846,7 @@ mod tests {
         let line = std::fs::read_to_string(&path).unwrap();
         let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(event["tool"], "calculate");
+        assert_eq!(event["action_class"], "read_only");
         assert_eq!(event["origin"], "api");
         assert_eq!(event["success"], false);
         assert_eq!(event["argument_keys"], serde_json::json!(["expression"]));
