@@ -79,24 +79,27 @@ GenieClaw keeps these decisions separate:
   local household-profile index for exact role questions such as "who is the
   dad?", and safe device-alias memories feed exact Home Assistant target
   resolution before fuzzy matching; safe profile attributes and household rules
-  answer low-latency questions about age, allergies, homework, and screen-time
-  constraints before FTS fallback; safe calendar, access, chore/task-log,
-  schedule, and event-log memories answer local exact-match questions before
-  fuzzy fallback; safe household notes, reminders, manuals, warranties, utility
-  notes, first-aid notes, story/media notes, inventory notes, meal history,
-  commute notes, pantry notes, location notes, shopping notes, and watch notes
-  are indexed in a typed local FTS table for direct note recall
+  answer low-latency questions about age, shoe sizes, allergies, homework, and
+  screen-time constraints before FTS fallback; safe calendar, access,
+  chore/task-log, schedule, finance/event-log, and security-event memories
+  answer local exact-match questions before fuzzy fallback; safe household
+  notes, reminders, manuals, warranties, receipts, utility notes, first-aid
+  notes, education notes, dictionary notes, story/media notes, inventory notes,
+  storage notes, meal history, commute notes, pantry notes, location notes,
+  shopping notes, and watch notes are indexed in a typed local FTS table for
+  direct note recall
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
   class such as household, person, sensitive, private, or restricted
 - policy layer: the current origin, room context, speaker confidence, and
   memory metadata decide whether disclosure is allowed, confirm-required,
   app-only, or denied
-- action layer: device control, media, purchases, security, network, and other
-  side effects pass through tool policy and actuation safety even if memory
-  retrieval found the right target; tool results and audit events carry an
-  action class such as `read_only`, `memory_write`, `home_actuation`,
-  `network`, `media`, `timer`, or `diagnostic`
+- action layer: device control, media, purchases, security, network, phone
+  finder, sprinklers, locks/gates, freezer telemetry, and other side effects
+  pass through tool policy and actuation safety even if memory retrieval found
+  the right target; tool results and audit events carry an action class such as
+  `read_only`, `memory_write`, `home_actuation`, `network`, `media`, `timer`,
+  or `diagnostic`
 - audit layer: tool execution records the tool name, origin, success state, and
   argument keys without logging secret values
 
@@ -125,8 +128,8 @@ treated as ordinary recall.
   the local SQLite store, not a remote vector service dependency.
 - Keep household indexes typed and inspectable. Calendar events, shopping-list
   items, access permissions, chore/task logs, household schedules, event logs,
-  device aliases, and media targets are local SQLite rows derived from safe
-  memory records, not remote profile data.
+  finance/allowance logs, device aliases, and media targets are local SQLite
+  rows derived from safe memory records, not remote profile data.
 - Store playlists as provider targets instead of secrets. Credential and access
   code memories should remain app-only references and are not spoken in
   shared-room chat.
