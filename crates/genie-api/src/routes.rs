@@ -88,10 +88,15 @@ pub async fn get_tegrastats(config: &Config) -> Response {
             content_type: "application/json",
             body: json,
         },
-        _ => Response {
-            status: 200,
+        Ok(Err(e)) => Response {
+            status: 500,
             content_type: "application/json",
-            body: "[]".into(),
+            body: serde_json::json!({ "error": e }).to_string(),
+        },
+        Err(e) => Response {
+            status: 500,
+            content_type: "application/json",
+            body: serde_json::json!({ "error": e.to_string() }).to_string(),
         },
     }
 }
@@ -1117,5 +1122,22 @@ mod tests {
         );
         assert_eq!(wakeword.source, "config");
         assert_eq!(wakeword.sub_state, "disabled");
+    }
+
+    #[tokio::test]
+    async fn get_tegrastats_returns_error_when_db_missing() {
+        let mut config = test_config();
+        config.data_dir = std::env::temp_dir().join(format!(
+            "genie-api-tegrastats-missing-{}",
+            std::process::id()
+        ));
+
+        let response = get_tegrastats(&config).await;
+        assert_eq!(response.status, 500);
+        assert!(
+            response.body.contains("error"),
+            "expected JSON error body, got: {}",
+            response.body
+        );
     }
 }
