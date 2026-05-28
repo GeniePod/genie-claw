@@ -371,6 +371,7 @@ async fn main() -> Result<()> {
                         max_parallel_voice: config.telegram.voice.max_parallel_voice,
                     },
                     origin_token: telegram_origin_token,
+                    max_parallel_updates: config.telegram.max_parallel_updates,
                 };
 
                 tracing::info!(
@@ -379,6 +380,7 @@ async fn main() -> Result<()> {
                     allow_all_chats = telegram_cfg.allow_all_chats,
                     voice_enabled = telegram_cfg.voice.enabled,
                     max_parallel_voice = telegram_cfg.voice.max_parallel_voice,
+                    max_parallel_updates = telegram_cfg.max_parallel_updates,
                     "starting Telegram adapter"
                 );
 
