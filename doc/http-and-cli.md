@@ -418,6 +418,8 @@ Home-control execution now has three separate safety layers:
 Memory tools are policy-aware:
 
 - memory recall defaults to shared-room-safe disclosure
+- safe relationship memories maintain a local household-profile index for exact
+  role recall before FTS fallback
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 

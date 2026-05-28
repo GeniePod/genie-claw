@@ -908,6 +908,13 @@ impl ToolDispatcher {
             .memory_read_context
             .unwrap_or_else(|| memory_read_context(args));
 
+        if let Some(role) = household_role_query(query) {
+            let profiles = mem.household_profiles_by_role(role)?;
+            if !profiles.is_empty() {
+                return Ok(format_household_role_answer(role, &profiles));
+            }
+        }
+
         let results = crate::memory::recall::recall_with_context(&mem, query, 10, read_context)?;
         if results.is_empty() {
             return Ok(match query {
@@ -1233,6 +1240,75 @@ fn memory_query(args: &serde_json::Value) -> &str {
     } else {
         raw
     }
+}
+
+fn household_role_query(query: &str) -> Option<&'static str> {
+    let normalized = query
+        .trim()
+        .to_ascii_lowercase()
+        .replace(
+            |ch: char| !ch.is_ascii_alphanumeric() && !ch.is_whitespace(),
+            " ",
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let role = tokens
+        .iter()
+        .find_map(|token| normalize_household_role_query_token(token))?;
+
+    let is_role_question = normalized.starts_with("who is ")
+        || normalized.starts_with("who are ")
+        || normalized.starts_with("whos ")
+        || normalized.starts_with("who s ")
+        || normalized.contains(" in this house")
+        || normalized.contains(" in our house")
+        || normalized.contains(" household");
+    let is_direct_role_topic = tokens.len() == 1
+        || (tokens.len() == 2
+            && normalize_household_role_query_token(tokens[0]).is_some()
+            && matches!(tokens[1], "name" | "names"));
+
+    if is_role_question || is_direct_role_topic {
+        Some(role)
+    } else {
+        None
+    }
+}
+
+fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
+    match token {
+        "dad" | "father" => Some("dad"),
+        "mom" | "mother" | "mum" => Some("mom"),
+        "son" | "sons" => Some("son"),
+        "daughter" | "daughters" => Some("daughter"),
+        "child" | "children" | "kid" | "kids" => Some("child"),
+        "wife" => Some("wife"),
+        "husband" => Some("husband"),
+        "partner" => Some("partner"),
+        "dog" | "dogs" => Some("dog"),
+        "cat" | "cats" => Some("cat"),
+        "pet" | "pets" => Some("pet"),
+        _ => None,
+    }
+}
+
+fn format_household_role_answer(
+    role: &str,
+    profiles: &[crate::memory::HouseholdProfile],
+) -> String {
+    if profiles.len() == 1 {
+        return format!("{} is the {}.", profiles[0].name, role);
+    }
+
+    let names = profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{names} are the {role}s.")
 }
 
 fn memory_read_context(args: &serde_json::Value) -> crate::memory::policy::MemoryReadContext {
@@ -1820,6 +1896,13 @@ mod tests {
         assert_eq!(ToolActionClass::HomeActuation.as_str(), "home_actuation");
     }
 
+    #[test]
+    fn household_role_query_ignores_non_role_topics() {
+        assert_eq!(household_role_query("who is the dad"), Some("dad"));
+        assert_eq!(household_role_query("dog name"), Some("dog"));
+        assert_eq!(household_role_query("hot dog recipe"), None);
+    }
+
     #[tokio::test]
     async fn tool_audit_records_origin_and_argument_keys_without_values() {
         let path = std::env::temp_dir().join(format!(
@@ -2246,6 +2329,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "Your name is Jared");
+    }
+
+    #[test]
+    fn memory_recall_answers_household_role_from_structured_profile() {
+        let db =
+            std::env::temp_dir().join(format!("memory-recall-role-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("relationship", "Jared is the dad").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "who is the father in this house"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert_eq!(output, "Jared is the dad.");
     }
 
     #[test]

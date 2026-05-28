@@ -72,7 +72,9 @@ not answer "may this fact be revealed?" or "may this action execute?"
 GenieClaw keeps these decisions separate:
 
 - recall layer: structured records, SQLite `FTS5`, and optional semantic
-  retrieval can find candidate memories
+  retrieval can find candidate memories; safe relationship memories also feed a
+  local household-profile index for exact role questions such as "who is the
+  dad?"
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
   class such as household, person, sensitive, private, or restricted
@@ -82,8 +84,8 @@ GenieClaw keeps these decisions separate:
 - action layer: device control, media, purchases, security, network, and other
   side effects pass through tool policy and actuation safety even if memory
   retrieval found the right target; tool results and audit events carry an
-  action class such as `read_only`, `memory_write`, `home_actuation`, network, media,
-  timer, or diagnostic
+  action class such as `read_only`, `memory_write`, `home_actuation`,
+  `network`, `media`, `timer`, or `diagnostic`
 - audit layer: tool execution records the tool name, origin, success state, and
   argument keys without logging secret values
 

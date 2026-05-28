@@ -106,6 +106,13 @@ pub struct ManagedMemoryEntry {
     pub display_order: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HouseholdProfile {
+    pub source_memory_id: i64,
+    pub name: String,
+    pub role: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MemoryEvent {
     ts_ms: u64,
@@ -161,6 +168,16 @@ impl Memory {
                 spoken_policy TEXT NOT NULL DEFAULT 'allow',
                 display_order INTEGER NOT NULL DEFAULT 2147483647
             );
+
+            CREATE TABLE IF NOT EXISTS household_profiles (
+                source_memory_id INTEGER PRIMARY KEY,
+                name             TEXT NOT NULL,
+                role             TEXT NOT NULL,
+                updated_ms       INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_household_profiles_role
+                ON household_profiles(role, updated_ms DESC);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content,
@@ -271,6 +288,7 @@ impl Memory {
         );
 
         backfill_policy_columns(&conn)?;
+        rebuild_household_profiles(&conn)?;
 
         // Older databases may predate the FTS update trigger or may have been
         // edited by a recovery tool. Rebuild once at open so recall and forget
@@ -699,6 +717,31 @@ impl Memory {
         Ok(entries)
     }
 
+    pub fn household_profiles_by_role(&self, role: &str) -> Result<Vec<HouseholdProfile>> {
+        let Some(role) = normalize_household_role(role) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT source_memory_id, name, role
+             FROM household_profiles
+             WHERE role = ?1
+             ORDER BY updated_ms DESC, source_memory_id DESC",
+        )?;
+
+        let profiles = stmt
+            .query_map([role], |row| {
+                Ok(HouseholdProfile {
+                    source_memory_id: row.get(0)?,
+                    name: row.get(1)?,
+                    role: row.get(2)?,
+                })
+            })?
+            .filter_map(|row| row.ok())
+            .collect();
+
+        Ok(profiles)
+    }
+
     /// Delete a memory by ID.
     pub fn delete_by_id(&self, id: i64) -> Result<bool> {
         let existing = self.get_by_id(id)?;
@@ -708,6 +751,10 @@ impl Memory {
         if deleted > 0
             && let Some(entry) = existing
         {
+            self.conn.execute(
+                "DELETE FROM household_profiles WHERE source_memory_id = ?1",
+                [id],
+            )?;
             if entry.promoted {
                 self.rebuild_root_memory_file()?;
             }
@@ -770,6 +817,14 @@ impl Memory {
         )?;
 
         if updated > 0 {
+            upsert_household_profile_from_memory(
+                &self.conn,
+                id,
+                &next_kind,
+                &content,
+                metadata,
+                now_ms(),
+            )?;
             if existing.promoted {
                 self.rebuild_root_memory_file()?;
             }
@@ -1010,7 +1065,9 @@ impl Memory {
                 metadata.spoken_policy.as_str(),
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        upsert_household_profile_from_memory(&self.conn, id, kind, content, metadata, now)?;
+        Ok(id)
     }
 
     fn record_canonical_event(&self, event: MemoryEvent) -> Result<()> {
@@ -1258,6 +1315,172 @@ fn backfill_policy_columns(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn rebuild_household_profiles(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM household_profiles", [])?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, content, scope, sensitivity, spoken_policy
+         FROM memories
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                policy::MemoryPolicyMetadata {
+                    scope: policy::MemoryScope::from_storage(&row.get::<_, String>(3)?),
+                    sensitivity: policy::MemorySensitivity::from_storage(&row.get::<_, String>(4)?),
+                    spoken_policy: policy::SpokenMemoryPolicy::from_storage(
+                        &row.get::<_, String>(5)?,
+                    ),
+                },
+            ))
+        })?
+        .filter_map(|row| row.ok())
+        .collect::<Vec<_>>();
+    drop(stmt);
+
+    let now = now_ms();
+    for (id, kind, content, metadata) in rows {
+        upsert_household_profile_from_memory(conn, id, &kind, &content, metadata, now)?;
+    }
+
+    Ok(())
+}
+
+fn upsert_household_profile_from_memory(
+    conn: &Connection,
+    source_memory_id: i64,
+    kind: &str,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+    updated_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM household_profiles WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+
+    if !policy::assess_memory_read(metadata, policy::MemoryReadContext::shared_room_voice()).allowed
+    {
+        return Ok(());
+    }
+
+    let Some((name, role)) = household_profile_from_memory(kind, content) else {
+        return Ok(());
+    };
+
+    conn.execute(
+        "INSERT INTO household_profiles (source_memory_id, name, role, updated_ms)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![source_memory_id, name, role, updated_ms],
+    )?;
+    Ok(())
+}
+
+fn household_profile_from_memory(_kind: &str, content: &str) -> Option<(String, &'static str)> {
+    let lower = content.to_ascii_lowercase();
+
+    if let Some((role, name)) = possessive_named_profile(content, &lower) {
+        return Some((name, role));
+    }
+
+    if let Some((role, name)) = definite_role_profile(content, &lower) {
+        return Some((name, role));
+    }
+
+    if let Some((name, role)) = subject_role_profile(content, &lower) {
+        return Some((name, role));
+    }
+
+    None
+}
+
+fn possessive_named_profile(content: &str, lower: &str) -> Option<(&'static str, String)> {
+    let marker = " is named ";
+    let marker_pos = lower.find(marker)?;
+    let left = lower[..marker_pos].trim();
+    let role_phrase = left
+        .strip_prefix("user's ")
+        .or_else(|| left.strip_prefix("my "))
+        .or_else(|| left.strip_prefix("our "))?;
+    let role = normalize_household_role(role_phrase)?;
+    let name = clean_profile_name(&content[marker_pos + marker.len()..]);
+    if name.is_empty() {
+        None
+    } else {
+        Some((role, name))
+    }
+}
+
+fn definite_role_profile(content: &str, lower: &str) -> Option<(&'static str, String)> {
+    let marker = " is ";
+    let marker_pos = lower.find(marker)?;
+    let left = lower[..marker_pos].trim();
+    let role_phrase = left.strip_prefix("the ")?;
+    let role = normalize_household_role(role_phrase)?;
+    let name = clean_profile_name(&content[marker_pos + marker.len()..]);
+    if name.is_empty() {
+        None
+    } else {
+        Some((role, name))
+    }
+}
+
+fn subject_role_profile(content: &str, lower: &str) -> Option<(String, &'static str)> {
+    for marker in [" is the ", " is our ", " is my "] {
+        if let Some(marker_pos) = lower.find(marker) {
+            let name = clean_profile_name(&content[..marker_pos]);
+            let role_phrase = lower[marker_pos + marker.len()..].trim();
+            let role = normalize_household_role(role_phrase)?;
+            if !name.is_empty() {
+                return Some((name, role));
+            }
+        }
+    }
+    None
+}
+
+fn clean_profile_name(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("named ")
+        .trim_matches(|ch: char| matches!(ch, '.' | ',' | '!' | '?' | '"' | '\''))
+        .split_whitespace()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_household_role(value: &str) -> Option<&'static str> {
+    let normalized = value
+        .trim()
+        .trim_start_matches("the ")
+        .trim_start_matches("a ")
+        .trim_start_matches("an ")
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|ch: char| matches!(ch, '.' | ',' | '!' | '?' | ':' | ';'));
+
+    match normalized {
+        "dad" | "father" => Some("dad"),
+        "mom" | "mother" | "mum" => Some("mom"),
+        "son" | "sons" => Some("son"),
+        "daughter" | "daughters" => Some("daughter"),
+        "child" | "children" | "kid" | "kids" => Some("child"),
+        "wife" => Some("wife"),
+        "husband" => Some("husband"),
+        "partner" => Some("partner"),
+        "dog" | "dogs" => Some("dog"),
+        "cat" | "cats" => Some("cat"),
+        "pet" | "pets" => Some("pet"),
+        _ => None,
+    }
 }
 
 fn canonical_date(ts_ms: u64) -> String {
@@ -1705,6 +1928,66 @@ mod tests {
         let preferences = mem.get_by_kind("preference", 10).unwrap();
         assert_eq!(preferences.len(), 1);
         assert_eq!(preferences[0].content, "User's favorite color is green");
+    }
+
+    #[test]
+    fn relationship_memory_indexes_household_profile_role() {
+        let mem = temp_memory();
+        mem.store("relationship", "Jared is the dad").unwrap();
+
+        let profiles = mem.household_profiles_by_role("father").unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "Jared");
+        assert_eq!(profiles[0].role, "dad");
+    }
+
+    #[test]
+    fn household_profiles_rebuild_on_reopen() {
+        let path = temp_memory_path("profiles-reopen");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store("relationship", "User's son is named Leo")
+                .unwrap();
+        }
+
+        let mem = Memory::open(&path).unwrap();
+        let profiles = mem.household_profiles_by_role("son").unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "Leo");
+    }
+
+    #[test]
+    fn managed_update_refreshes_household_profile_role() {
+        let mem = temp_memory();
+        let id = mem.store("relationship", "Jared is the dad").unwrap();
+
+        assert!(
+            mem.update_managed(id, "Sarah is the mom", Some("relationship"))
+                .unwrap()
+        );
+
+        assert!(mem.household_profiles_by_role("dad").unwrap().is_empty());
+        let profiles = mem.household_profiles_by_role("mom").unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "Sarah");
+    }
+
+    #[test]
+    fn private_relationship_memory_is_not_indexed_as_household_profile() {
+        let mem = temp_memory();
+        mem.store_with_metadata(
+            "private_relationship",
+            "Jared is the dad",
+            policy::MemoryPolicyMetadata {
+                scope: policy::MemoryScope::Private,
+                sensitivity: policy::MemorySensitivity::Cautious,
+                spoken_policy: policy::SpokenMemoryPolicy::AppOnly,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(mem.household_profiles_by_role("dad").unwrap().is_empty());
     }
 
     #[test]

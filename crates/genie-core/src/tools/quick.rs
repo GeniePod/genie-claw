@@ -135,6 +135,10 @@ fn memory_recall_query(text: &str) -> Option<String> {
         return Some("name".into());
     }
 
+    if let Some(role) = household_role_query(text) {
+        return Some(role.into());
+    }
+
     for prefix in [
         "what do you remember about ",
         "what do you know about ",
@@ -164,6 +168,43 @@ fn memory_recall_query(text: &str) -> Option<String> {
     }
 
     None
+}
+
+fn household_role_query(text: &str) -> Option<&'static str> {
+    if !(text.starts_with("who is ")
+        || text.starts_with("who are ")
+        || text.starts_with("whos ")
+        || text.starts_with("who s ")
+        || text.contains(" in this house")
+        || text.contains(" in our house")
+        || text.contains(" household"))
+    {
+        return None;
+    }
+
+    for token in text.split_whitespace() {
+        if let Some(role) = normalize_household_role_query_token(token) {
+            return Some(role);
+        }
+    }
+    None
+}
+
+fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
+    match token.trim_matches(|ch: char| matches!(ch, '.' | ',' | '?' | '!' | ':' | ';')) {
+        "dad" | "father" => Some("dad"),
+        "mom" | "mother" | "mum" => Some("mom"),
+        "son" | "sons" => Some("son"),
+        "daughter" | "daughters" => Some("daughter"),
+        "child" | "children" | "kid" | "kids" => Some("child"),
+        "wife" => Some("wife"),
+        "husband" => Some("husband"),
+        "partner" => Some("partner"),
+        "dog" | "dogs" => Some("dog"),
+        "cat" | "cats" => Some("cat"),
+        "pet" | "pets" => Some("pet"),
+        _ => None,
+    }
 }
 
 fn asks_home_undo(text: &str) -> bool {
@@ -603,6 +644,17 @@ mod tests {
         let call = route("do you remember my name").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "name");
+    }
+
+    #[test]
+    fn routes_household_role_questions_to_memory_recall() {
+        let call = route("Who is the dad in this house?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "dad");
+
+        let call = route("Who are the children in our house?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "child");
     }
 
     #[test]
