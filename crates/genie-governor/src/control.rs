@@ -175,6 +175,23 @@ async fn handle_connection(stream: UnixStream, tx: mpsc::Sender<(Command, Respon
     }
 }
 
+/// CLI helper: send a command to the governor and print the response.
+/// Usage: `echo '{"cmd":"status"}' | socat - UNIX-CONNECT:/run/geniepod/governor.sock`
+/// Or from Rust: `control::send_command(&cmd).await`
+#[allow(dead_code)]
+pub async fn send_command(cmd: &Command) -> Result<String> {
+    let stream = UnixStream::connect(SOCKET_PATH).await?;
+    let (reader, mut writer) = stream.into_split();
+
+    let json = serde_json::to_string(cmd)?;
+    writer.write_all(json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+
+    let mut lines = BufReader::new(reader).lines();
+    let response = lines.next_line().await?.unwrap_or_else(|| "{}".to_string());
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,21 +222,4 @@ mod tests {
             "expected cap error, got: {error}"
         );
     }
-}
-
-/// CLI helper: send a command to the governor and print the response.
-/// Usage: `echo '{"cmd":"status"}' | socat - UNIX-CONNECT:/run/geniepod/governor.sock`
-/// Or from Rust: `control::send_command(&cmd).await`
-#[allow(dead_code)]
-pub async fn send_command(cmd: &Command) -> Result<String> {
-    let stream = UnixStream::connect(SOCKET_PATH).await?;
-    let (reader, mut writer) = stream.into_split();
-
-    let json = serde_json::to_string(cmd)?;
-    writer.write_all(json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-
-    let mut lines = BufReader::new(reader).lines();
-    let response = lines.next_line().await?.unwrap_or_else(|| "{}".to_string());
-    Ok(response)
 }
