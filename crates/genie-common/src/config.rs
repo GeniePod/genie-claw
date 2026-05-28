@@ -470,6 +470,13 @@ pub struct SkillPolicyConfig {
     /// Reject skills requesting any of these permission labels.
     #[serde(default)]
     pub denied_permissions: Vec<String>,
+
+    /// Deadline for a single native skill invocation, in milliseconds. The C
+    /// ABI call runs on a blocking thread; if it does not return within this
+    /// budget the call is abandoned and a timeout error is returned to the
+    /// caller, so a hung skill cannot freeze the async executor.
+    #[serde(default = "defaults::skill_execution_timeout_ms")]
+    pub skill_execution_timeout_ms: u64,
 }
 
 impl Default for SkillPolicyConfig {
@@ -479,6 +486,7 @@ impl Default for SkillPolicyConfig {
             require_signature: false,
             signature_key_dir: defaults::skill_signature_key_dir(),
             denied_permissions: Vec::new(),
+            skill_execution_timeout_ms: defaults::skill_execution_timeout_ms(),
         }
     }
 }
@@ -1521,7 +1529,8 @@ impl Config {
                 "skill_signature_required": self.core.skill_policy.require_signature,
                 "skill_signature_scheme": "ed25519_detached_over_so_bytes",
                 "skill_signature_key_dir": self.core.skill_policy.signature_key_dir.display().to_string(),
-                "skill_signature_trusted_keys_present": has_trusted_skill_keys(&self.core.skill_policy.signature_key_dir)
+                "skill_signature_trusted_keys_present": has_trusted_skill_keys(&self.core.skill_policy.signature_key_dir),
+                "skill_execution_timeout_ms": self.core.skill_policy.skill_execution_timeout_ms
             },
             "secret_presence": {
                 "homeassistant_token_configured": self.homeassistant_token().is_some(),
@@ -2297,6 +2306,9 @@ local_min_score = 0.91
         assert!(!config.core.skill_policy.require_manifest);
         assert!(!config.core.skill_policy.require_signature);
         assert!(config.core.skill_policy.denied_permissions.is_empty());
+        // A bounded execution deadline is always in effect, even in audit-only
+        // mode, so a hung skill can never freeze the executor by default.
+        assert_eq!(config.core.skill_policy.skill_execution_timeout_ms, 30_000);
     }
 
     #[test]
@@ -2321,6 +2333,19 @@ denied_permissions = ["network.raw", "filesystem.write"]
             config.signature_key_dir,
             PathBuf::from("/etc/geniepod/skill-keys")
         );
+        // Omitting the key keeps the documented default deadline.
+        assert_eq!(config.skill_execution_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn skill_execution_timeout_overridable() {
+        let config: SkillPolicyConfig = toml::from_str(
+            r#"
+skill_execution_timeout_ms = 1500
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.skill_execution_timeout_ms, 1500);
     }
 
     #[test]
@@ -2723,6 +2748,9 @@ mod defaults {
     }
     pub fn skill_signature_key_dir() -> PathBuf {
         PathBuf::from("/etc/geniepod/skill-keys")
+    }
+    pub fn skill_execution_timeout_ms() -> u64 {
+        30_000
     }
     pub fn tool_policy_enabled() -> bool {
         true

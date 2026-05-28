@@ -523,7 +523,7 @@ impl ToolDispatcher {
             "memory_status" => self.exec_memory_status(),
             "memory_forget" => self.exec_memory_forget(&call.arguments),
             "memory_store" => self.exec_memory_store(&call.arguments),
-            other => self.exec_skill(other, &call.arguments),
+            other => self.exec_skill(other, &call.arguments).await,
         };
 
         let tool_result = match result {
@@ -1052,32 +1052,56 @@ impl ToolDispatcher {
         )
     }
 
-    fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
+    async fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
         let skills = self
             .skills
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
-        let mut loader = skills
-            .lock()
-            .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
 
         let args_json = serde_json::to_string(args)?;
-        let (success, output) = {
+
+        // Build a Send invocation handle under a short lock, then drop the lock
+        // BEFORE awaiting the (possibly blocking) C call. The invocation owns an
+        // Arc to the skill's library, so the native code stays mapped for the
+        // whole call even though the loader lock is released. Holding a
+        // std::sync::Mutex guard across the await would both serialize every
+        // other skill access and trip clippy's `await_holding_lock`.
+        let invocation = {
+            let loader = skills
+                .lock()
+                .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
             let skill = loader
-                .get_mut(name)
+                .loaded()
+                .iter()
+                .find(|s| s.name == name)
                 .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
-            skill.execute_parsed(&args_json)
+            skill.prepare(&args_json)
         };
 
-        let pruned = loader.prune_faulted();
-        if pruned.iter().any(|skill_name| skill_name == name) {
-            tracing::warn!(skill = name, "skill auto-unloaded after repeated faults");
+        let outcome = invocation.run().await;
+
+        // Re-acquire the lock to record the fault and reap a skill that has
+        // exceeded its fault budget. The skill may have been unloaded meanwhile;
+        // that is fine — the Arc kept its library alive for the call above.
+        {
+            let mut loader = skills
+                .lock()
+                .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
+            if outcome.faulted
+                && let Some(skill) = loader.get_mut(name)
+            {
+                skill.fault_count += 1;
+            }
+            let pruned = loader.prune_faulted();
+            if pruned.iter().any(|skill_name| skill_name == name) {
+                tracing::warn!(skill = name, "skill auto-unloaded after repeated faults");
+            }
         }
 
-        if success {
-            Ok(output)
+        if outcome.success {
+            Ok(outcome.output)
         } else {
-            Err(anyhow::anyhow!("{}", output))
+            Err(anyhow::anyhow!("{}", outcome.output))
         }
     }
 
