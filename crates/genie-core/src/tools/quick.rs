@@ -60,6 +60,10 @@ pub fn route(text: &str) -> Option<ToolCall> {
         ));
     }
 
+    if let Some(query) = play_media_request(&normalized) {
+        return Some(tool("play_media", serde_json::json!({ "query": query })));
+    }
+
     if let Some(expression) = calculation_request(&normalized) {
         return Some(tool(
             "calculate",
@@ -273,6 +277,17 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
         }
     }
 
+    None
+}
+
+fn play_media_request(text: &str) -> Option<String> {
+    for prefix in ["please play ", "play ", "start ", "put on "] {
+        if let Some(rest) = text.strip_prefix(prefix).map(str::trim)
+            && rest.contains("playlist")
+        {
+            return Some(rest.to_string());
+        }
+    }
     None
 }
 
@@ -839,6 +854,13 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "bedtime reading");
         assert_eq!(call.arguments["action"], "activate");
+    }
+
+    #[test]
+    fn routes_playlist_requests_to_media() {
+        let call = route("Play my Morning Boost playlist").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "my morning boost playlist");
     }
 
     #[test]

@@ -1148,7 +1148,14 @@ impl ToolDispatcher {
 
     async fn exec_play_media(&self, args: &serde_json::Value) -> Result<String> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        tracing::info!(query, "triggering media mode via governor control socket");
+        let resolved = self.resolve_media_query(query);
+        tracing::info!(
+            query,
+            resolved_query = resolved.query.as_str(),
+            provider = resolved.provider.as_deref().unwrap_or("unknown"),
+            "triggering media mode via governor control socket"
+        );
+        write_media_request(&resolved).await;
 
         // Send media_start command to the governor via its Unix control socket.
         let response = governor_command(r#"{"cmd":"media_start"}"#).await;
@@ -1159,7 +1166,7 @@ impl ToolDispatcher {
                 if ok {
                     Ok(format!(
                         "Playing: {}. Switched to media mode — LLM unloaded, HDMI ready.",
-                        query
+                        resolved.display()
                     ))
                 } else {
                     let err = resp
@@ -1175,9 +1182,61 @@ impl ToolDispatcher {
                 tokio::fs::write("/run/geniepod/media_mode", b"1").await?;
                 Ok(format!(
                     "Playing: {}. Media mode triggered (file fallback).",
-                    query
+                    resolved.display()
                 ))
             }
+        }
+    }
+
+    fn resolve_media_query(&self, query: &str) -> ResolvedMediaQuery {
+        let Some(memory) = &self.memory else {
+            return ResolvedMediaQuery::unresolved(query);
+        };
+        let Ok(memory) = memory.lock() else {
+            return ResolvedMediaQuery::unresolved(query);
+        };
+        match memory.media_playlist_for_query(query).ok().flatten() {
+            Some(item) => ResolvedMediaQuery {
+                query: item.name,
+                provider: item.provider,
+                target: Some(item.target),
+                source: "memory".into(),
+            },
+            None => ResolvedMediaQuery::unresolved(query),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ResolvedMediaQuery {
+    query: String,
+    provider: Option<String>,
+    target: Option<String>,
+    source: String,
+}
+
+impl ResolvedMediaQuery {
+    fn unresolved(query: &str) -> Self {
+        Self {
+            query: query.trim().to_string(),
+            provider: None,
+            target: None,
+            source: "query".into(),
+        }
+    }
+
+    fn display(&self) -> String {
+        match (&self.provider, &self.target) {
+            (Some(provider), Some(target))
+                if target
+                    .to_ascii_lowercase()
+                    .starts_with(&format!("{provider}:")) =>
+            {
+                format!("{} ({target})", self.query)
+            }
+            (Some(provider), Some(target)) => format!("{} ({provider}: {target})", self.query),
+            (_, Some(target)) => format!("{} ({target})", self.query),
+            _ => self.query.clone(),
         }
     }
 }
@@ -1580,6 +1639,19 @@ async fn governor_command(json_cmd: &str) -> Option<serde_json::Value> {
         .ok()?;
 
     line.and_then(|l| serde_json::from_str(&l).ok())
+}
+
+async fn write_media_request(request: &ResolvedMediaQuery) {
+    let result: Result<()> = async {
+        tokio::fs::create_dir_all("/run/geniepod").await?;
+        let json = serde_json::to_vec(request)?;
+        tokio::fs::write("/run/geniepod/media_request.json", json).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::debug!(error = %error, "media request sidecar write skipped");
+    }
 }
 
 #[cfg(test)]
@@ -2576,6 +2648,37 @@ mod tests {
             .unwrap();
 
         assert!(output.contains("Iron Giant"));
+    }
+
+    #[test]
+    fn play_media_resolves_playlist_from_memory() {
+        let db = std::env::temp_dir().join(format!(
+            "media-profile-dispatch-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "media_profile",
+                "Jared's Morning Boost playlist is spotify:playlist:morning_boost",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let resolved = dispatcher.resolve_media_query("play my Morning Boost playlist");
+
+        assert_eq!(resolved.query, "Morning Boost");
+        assert_eq!(resolved.provider.as_deref(), Some("spotify"));
+        assert_eq!(
+            resolved.target.as_deref(),
+            Some("spotify:playlist:morning_boost")
+        );
+        assert_eq!(
+            resolved.display(),
+            "Morning Boost (spotify:playlist:morning_boost)"
+        );
     }
 
     #[test]

@@ -119,6 +119,9 @@ treated as ordinary recall.
 - Use separate hosts or OS users for people who should not share authority.
 - Keep fuzzy household recall local-first: embedded-memory rows are metadata in
   the local SQLite store, not a remote vector service dependency.
+- Store playlists as provider targets instead of secrets. Credential and access
+  code memories should remain app-only references and are not spoken in
+  shared-room chat.
 
 ## Runtime Contract
 

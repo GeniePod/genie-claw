@@ -158,6 +158,16 @@ pub struct AppOnlySecretReference {
     pub location_hint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaProfileItem {
+    pub source_memory_id: i64,
+    pub owner: Option<String>,
+    pub item_type: String,
+    pub name: String,
+    pub provider: Option<String>,
+    pub target: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SemanticMemoryHit {
     pub entry: MemoryEntry,
@@ -320,6 +330,21 @@ impl Memory {
             CREATE INDEX IF NOT EXISTS idx_app_only_secret_references_lookup
                 ON app_only_secret_references(secret_type, normalized_label, updated_ms DESC);
 
+            CREATE TABLE IF NOT EXISTS media_profile_items (
+                source_memory_id INTEGER PRIMARY KEY,
+                owner            TEXT,
+                normalized_owner TEXT,
+                item_type        TEXT NOT NULL,
+                name             TEXT NOT NULL,
+                normalized_name  TEXT NOT NULL,
+                provider         TEXT,
+                target           TEXT NOT NULL,
+                updated_ms       INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_media_profile_items_lookup
+                ON media_profile_items(item_type, normalized_name, normalized_owner, updated_ms DESC);
+
             CREATE TABLE IF NOT EXISTS embedded_memories (
                 source_memory_id INTEGER PRIMARY KEY,
                 memory_type      TEXT NOT NULL,
@@ -447,6 +472,7 @@ impl Memory {
         rebuild_household_rules(&conn)?;
         rebuild_household_notes(&conn)?;
         rebuild_app_only_secret_references(&conn)?;
+        rebuild_media_profile_items(&conn)?;
         rebuild_embedded_memories(&conn)?;
 
         // Older databases may predate the FTS update trigger or may have been
@@ -720,7 +746,7 @@ impl Memory {
              LIMIT ?1",
         )?;
 
-        let entries = stmt
+        let entries: Vec<MemoryEntry> = stmt
             .query_map([limit], read_entry)?
             .filter_map(|r| r.ok())
             .collect();
@@ -781,7 +807,7 @@ impl Memory {
              LIMIT ?3",
         )?;
 
-        let entries = stmt
+        let entries: Vec<MemoryEntry> = stmt
             .query_map(
                 rusqlite::params![min_recall_count, min_score, limit],
                 read_entry,
@@ -868,7 +894,7 @@ impl Memory {
              LIMIT ?2",
         )?;
 
-        let entries = stmt
+        let entries: Vec<MemoryEntry> = stmt
             .query_map(rusqlite::params![kind, limit], read_entry)?
             .filter_map(|r| r.ok())
             .collect();
@@ -974,7 +1000,7 @@ impl Memory {
                AND (?3 IS NULL OR subject = ?3)
              ORDER BY updated_ms DESC, source_memory_id DESC",
         )?;
-        let entries = stmt
+        let entries: Vec<HouseholdRule> = stmt
             .query_map(
                 rusqlite::params![rule_type, normalized_person.as_deref(), subject.as_deref()],
                 |row| {
@@ -1011,7 +1037,7 @@ impl Memory {
              LIMIT ?2",
         )?;
 
-        let entries = stmt
+        let entries: Vec<HouseholdNote> = stmt
             .query_map(rusqlite::params![fts_query, limit], read_household_note)?
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
@@ -1076,7 +1102,7 @@ impl Memory {
                AND (?2 = '' OR normalized_label LIKE ?3 OR ?2 LIKE '%' || normalized_label || '%')
              ORDER BY updated_ms DESC, source_memory_id DESC",
         )?;
-        let entries = stmt
+        let entries: Vec<AppOnlySecretReference> = stmt
             .query_map(
                 rusqlite::params![secret_type, normalized_label, label_like],
                 |row| {
@@ -1090,7 +1116,88 @@ impl Memory {
             )?
             .filter_map(|row| row.ok())
             .collect();
-        Ok(entries)
+        if entries.is_empty() {
+            self.app_only_secret_reference_fallback(secret_type, query)
+        } else {
+            Ok(entries)
+        }
+    }
+
+    fn app_only_secret_reference_fallback(
+        &self,
+        secret_type: &str,
+        query: &str,
+    ) -> Result<Vec<AppOnlySecretReference>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_memory_id, secret_type, label, location_hint
+             FROM app_only_secret_references
+             WHERE secret_type = ?1
+             ORDER BY updated_ms DESC, source_memory_id DESC",
+        )?;
+        let mut entries = stmt
+            .query_map([secret_type], |row| {
+                Ok(AppOnlySecretReference {
+                    source_memory_id: row.get(0)?,
+                    secret_type: row.get(1)?,
+                    label: row.get(2)?,
+                    location_hint: row.get(3)?,
+                })
+            })?
+            .filter_map(|row| row.ok())
+            .map(|entry| {
+                let score = lexical_overlap_score(query, &entry.label);
+                (entry, score)
+            })
+            .filter(|(_, score)| *score > 0.0)
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.source_memory_id.cmp(&a.0.source_memory_id))
+        });
+        Ok(entries.into_iter().map(|(entry, _)| entry).collect())
+    }
+
+    pub fn media_playlist_for_query(&self, query: &str) -> Result<Option<MediaProfileItem>> {
+        let Some((owner, name)) = media_playlist_query(query) else {
+            return Ok(None);
+        };
+        self.media_playlist(owner.as_deref(), &name)
+    }
+
+    pub fn media_playlist(
+        &self,
+        owner: Option<&str>,
+        name: &str,
+    ) -> Result<Option<MediaProfileItem>> {
+        let normalized_name = normalize_alias_key(name);
+        if normalized_name.is_empty() {
+            return Ok(None);
+        }
+        let normalized_owner = owner.map(normalize_name_key).unwrap_or_default();
+        let mut stmt = self.conn.prepare(
+            "SELECT source_memory_id, owner, item_type, name, provider, target
+             FROM media_profile_items
+             WHERE item_type = 'playlist'
+               AND normalized_name = ?1
+               AND (?2 = '' OR normalized_owner = ?2 OR normalized_owner = '')
+             ORDER BY CASE WHEN normalized_owner = ?2 THEN 0 ELSE 1 END,
+                      updated_ms DESC,
+                      source_memory_id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![normalized_name, normalized_owner])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(MediaProfileItem {
+            source_memory_id: row.get(0)?,
+            owner: row.get(1)?,
+            item_type: row.get(2)?,
+            name: row.get(3)?,
+            provider: row.get(4)?,
+            target: row.get(5)?,
+        }))
     }
 
     pub fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<SemanticMemoryHit>> {
@@ -1318,6 +1425,14 @@ impl Memory {
                 now_ms(),
             )?;
             upsert_app_only_secret_reference_from_memory(
+                &self.conn,
+                id,
+                &next_kind,
+                &content,
+                metadata,
+                now_ms(),
+            )?;
+            upsert_media_profile_item_from_memory(
                 &self.conn,
                 id,
                 &next_kind,
@@ -1580,6 +1695,7 @@ impl Memory {
         upsert_household_rules_from_memory(&self.conn, id, content, metadata, now)?;
         upsert_household_note_from_memory(&self.conn, id, kind, content, metadata, now)?;
         upsert_app_only_secret_reference_from_memory(&self.conn, id, kind, content, metadata, now)?;
+        upsert_media_profile_item_from_memory(&self.conn, id, kind, content, metadata, now)?;
         upsert_embedded_memory_from_memory(&self.conn, id, kind, content, metadata, now)?;
         Ok(id)
     }
@@ -1949,6 +2065,16 @@ fn rebuild_app_only_secret_references(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn rebuild_media_profile_items(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM media_profile_items", [])?;
+    let rows = shared_safe_memory_rows_with_kind(conn)?;
+    let now = now_ms();
+    for (id, kind, content, metadata) in rows {
+        upsert_media_profile_item_from_memory(conn, id, &kind, &content, metadata, now)?;
+    }
+    Ok(())
+}
+
 fn rebuild_embedded_memories(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM embedded_memories", [])?;
     let rows = shared_safe_memory_rows_with_kind(conn)?;
@@ -2183,6 +2309,54 @@ fn upsert_app_only_secret_reference_from_memory(
     Ok(())
 }
 
+fn upsert_media_profile_item_from_memory(
+    conn: &Connection,
+    source_memory_id: i64,
+    _kind: &str,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+    updated_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM media_profile_items WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+
+    if !policy::assess_memory_read(metadata, policy::MemoryReadContext::shared_room_voice()).allowed
+    {
+        return Ok(());
+    }
+
+    let Some(item) = media_profile_item_from_memory(content) else {
+        return Ok(());
+    };
+    let normalized_owner = item
+        .owner
+        .as_deref()
+        .map(normalize_name_key)
+        .unwrap_or_default();
+    let normalized_name = normalize_alias_key(&item.name);
+
+    conn.execute(
+        "INSERT INTO media_profile_items (
+            source_memory_id, owner, normalized_owner, item_type, name,
+            normalized_name, provider, target, updated_ms
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            source_memory_id,
+            item.owner,
+            normalized_owner,
+            item.item_type,
+            item.name,
+            normalized_name,
+            item.provider,
+            item.target,
+            updated_ms
+        ],
+    )?;
+    Ok(())
+}
+
 fn upsert_embedded_memory_from_memory(
     conn: &Connection,
     source_memory_id: i64,
@@ -2236,6 +2410,10 @@ fn delete_structured_household_rows(conn: &Connection, source_memory_id: i64) ->
     )?;
     conn.execute(
         "DELETE FROM app_only_secret_references WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+    conn.execute(
+        "DELETE FROM media_profile_items WHERE source_memory_id = ?1",
         [source_memory_id],
     )?;
     conn.execute(
@@ -2648,6 +2826,138 @@ fn parse_embedding(value: &str, dimensions: usize) -> Option<Vec<f32>> {
     }
 }
 
+fn media_profile_item_from_memory(content: &str) -> Option<MediaProfileItem> {
+    let trimmed = content
+        .trim()
+        .trim_matches(|ch| matches!(ch, '.' | '!' | '?'));
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.contains("playlist") {
+        return None;
+    }
+
+    let (statement, target) = split_media_target(trimmed, &lower)?;
+    let statement_lower = statement.to_ascii_lowercase();
+    let (owner, name) = playlist_owner_and_name(statement, &statement_lower)?;
+    let name = clean_sentence_value(&name);
+    let target = clean_sentence_value(target);
+    if name.is_empty() || target.is_empty() {
+        return None;
+    }
+
+    Some(MediaProfileItem {
+        source_memory_id: 0,
+        owner,
+        item_type: "playlist".into(),
+        name,
+        provider: media_provider_from_target(&target, &lower),
+        target,
+    })
+}
+
+fn split_media_target<'a>(content: &'a str, lower: &str) -> Option<(&'a str, &'a str)> {
+    for marker in [
+        " maps to ",
+        " is ",
+        " uri is ",
+        " url is ",
+        " opens ",
+        " plays ",
+    ] {
+        if let Some(pos) = lower.rfind(marker) {
+            let left = content[..pos].trim();
+            let right = content[pos + marker.len()..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                return Some((left, right));
+            }
+        }
+    }
+    None
+}
+
+fn playlist_owner_and_name(statement: &str, lower: &str) -> Option<(Option<String>, String)> {
+    if let Some(pos) = lower.find("'s playlist named ") {
+        let owner = clean_person_name(&statement[..pos]);
+        let name = statement[pos + "'s playlist named ".len()..].trim();
+        return Some((Some(owner), name.to_string()));
+    }
+    if let Some(pos) = lower.find("'s playlist ") {
+        let owner = clean_person_name(&statement[..pos]);
+        let name = statement[pos + "'s playlist ".len()..].trim();
+        return Some((Some(owner), name.to_string()));
+    }
+    if let Some(pos) = lower.find("'s ")
+        && let Some(playlist_pos) = lower[pos + 3..].find(" playlist")
+    {
+        let owner = clean_person_name(&statement[..pos]);
+        let start = pos + 3;
+        let end = start + playlist_pos;
+        let name = statement[start..end].trim();
+        return Some((Some(owner), name.to_string()));
+    }
+    if let Some(pos) = lower.find("playlist named ") {
+        let name = statement[pos + "playlist named ".len()..].trim();
+        return Some((None, name.to_string()));
+    }
+    if let Some(pos) = lower.find(" playlist") {
+        let name = statement[..pos]
+            .trim()
+            .trim_start_matches("the ")
+            .trim_start_matches("my ")
+            .trim_start_matches("our ");
+        return Some((None, name.to_string()));
+    }
+    None
+}
+
+fn media_provider_from_target(target: &str, lower: &str) -> Option<String> {
+    let target_lower = target.to_ascii_lowercase();
+    if target_lower.starts_with("spotify:") || lower.contains("spotify") {
+        Some("spotify".into())
+    } else if target_lower.contains("youtube") || lower.contains("youtube") {
+        Some("youtube".into())
+    } else if target_lower.contains("plex") || lower.contains("plex") {
+        Some("plex".into())
+    } else {
+        None
+    }
+}
+
+fn media_playlist_query(query: &str) -> Option<(Option<String>, String)> {
+    let normalized = normalize_alias_key(query);
+    if !normalized.contains("playlist") {
+        return None;
+    }
+    let mut text = normalized.as_str();
+    for prefix in ["please play ", "play ", "start ", "put on "] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest.trim();
+            break;
+        }
+    }
+    let text = text
+        .trim_end_matches(" on spotify")
+        .trim_end_matches(" playlist")
+        .trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let (owner, name_tokens) = if tokens.len() >= 3 && tokens[1] == "s" {
+        (Some(clean_person_name(tokens[0])), &tokens[2..])
+    } else if matches!(tokens.first(), Some(&"my" | &"our" | &"the")) {
+        (None, &tokens[1..])
+    } else {
+        (None, tokens.as_slice())
+    };
+    let name = name_tokens.join(" ");
+    if name.is_empty() {
+        None
+    } else {
+        Some((owner, name))
+    }
+}
+
 fn app_only_secret_reference_from_memory(
     _kind: &str,
     content: &str,
@@ -2692,7 +3002,10 @@ fn secret_type_from_text(lower: &str) -> Option<&'static str> {
         Some("password")
     } else if lower.contains("gate code") {
         Some("gate_code")
-    } else if lower.contains("door code") || lower.contains("lock code") {
+    } else if lower.contains("door code")
+        || lower.contains("lock code")
+        || (lower.contains("lock") && (lower.contains("combination") || lower.contains("combo")))
+    {
         Some("lock_code")
     } else if lower.contains("alarm code") || lower.contains("security code") {
         Some("security_code")
@@ -3918,6 +4231,69 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn app_only_secret_reference_matches_lock_combo_query_without_value() {
+        let mem = temp_memory();
+        mem.store(
+            "credential_reference",
+            "Bike lock combo is stored in credential:bike_lock",
+        )
+        .unwrap();
+
+        let refs = mem
+            .app_only_secret_references("Find my note about the bicycle lock code")
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].secret_type, "lock_code");
+        assert_eq!(refs[0].label, "Bike lock combo");
+
+        let answer = mem
+            .structured_household_answer("Find my note about the bicycle lock code")
+            .unwrap()
+            .unwrap();
+        assert!(answer.contains("app-only reference"));
+        assert!(!answer.contains("credential:bike_lock"));
+    }
+
+    #[test]
+    fn media_profile_indexes_and_resolves_playlist() {
+        let mem = temp_memory();
+        mem.store(
+            "media_profile",
+            "Jared's Morning Boost playlist is spotify:playlist:morning_boost",
+        )
+        .unwrap();
+
+        let playlist = mem
+            .media_playlist_for_query("play my Morning Boost playlist")
+            .unwrap()
+            .unwrap();
+        assert_eq!(playlist.owner.as_deref(), Some("Jared"));
+        assert_eq!(playlist.name, "Morning Boost");
+        assert_eq!(playlist.provider.as_deref(), Some("spotify"));
+        assert_eq!(playlist.target, "spotify:playlist:morning_boost");
+    }
+
+    #[test]
+    fn media_profile_rebuilds_on_reopen() {
+        let path = temp_memory_path("media-profile-reopen");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store(
+                "media_profile",
+                "Jared's playlist Morning Boost is spotify:playlist:morning_boost",
+            )
+            .unwrap();
+        }
+
+        let reopened = Memory::open(&path).unwrap();
+        let playlist = reopened
+            .media_playlist_for_query("play Jared's Morning Boost playlist")
+            .unwrap()
+            .unwrap();
+        assert_eq!(playlist.target, "spotify:playlist:morning_boost");
     }
 
     #[test]

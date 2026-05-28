@@ -423,6 +423,9 @@ Memory tools are policy-aware:
   role recall before FTS fallback
 - safe device-alias memories maintain a local alias index for exact
   Home Assistant target resolution before fuzzy matching
+- safe media-profile memories maintain a local playlist index, so requests like
+  "play my Morning Boost playlist" resolve a remembered provider target before
+  media mode starts
 - safe profile attributes and household rules maintain local indexes for exact
   age, preference, allergy, homework, and screen-time recall
 - safe notes, reminders, manuals, and watch notes maintain a typed local FTS
