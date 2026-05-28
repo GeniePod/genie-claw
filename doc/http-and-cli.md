@@ -429,22 +429,31 @@ Memory tools are policy-aware:
 - safe calendar, shopping-list, and access-permission memories maintain local
   typed indexes for questions such as "does Mia have piano today?", "what is on
   the shopping list?", and "can Leo unlock the front door?"
+- safe chore/task-log and household schedule memories maintain local typed
+  indexes for questions such as "did Leo feed the dog today?", "what time does
+  the school bus arrive?", "when is the electricity bill due?", and "is it
+  recycling week?"
 - safe profile attributes and household rules maintain local indexes for exact
   age, preference, allergy, homework, and screen-time recall
 - safe notes, reminders, manuals, pet health, maintenance, storage, gift,
-  troubleshooting, recipe, and watch notes maintain a typed local FTS index for
+  troubleshooting, recipe, warranty, school, utility, recycling, photo,
+  story, first-aid, visitor, and watch notes maintain a typed local FTS index for
   direct questions such as "find my note about...", "what did the vet say...",
   "what color did we paint...", or "where are..."
 - password/code questions can resolve to app-only secret references without
   exposing the value in shared-room chat
 - selected safe preferences, notes, shopping, activity, troubleshooting, recipe,
-  media, maintenance, routine, and manual memories also maintain local
+  media, maintenance, routine, wellness, education, first-aid, story, travel,
+  diet, visitor, music-profile, and manual memories also maintain local
   embeddings for fuzzy household recall such as comfort, lunchbox, bored-child,
-  printer, car-noise, recipe, date-night, and movie questions when exact words
-  are missing
+  printer, car-noise, recipe, date-night, movie, science-fair, headache,
+  zoo-trip, diet-meal, washing-machine, visitor, watch-history, and focus-music
+  questions when exact words are missing
 - live answers still require live tools: garage/lock/thermostat state comes from
-  Home Assistant, weather comes from the weather tool, and sensors such as baby
-  monitors or location history are not simulated by memory recall
+  Home Assistant, weather comes from the weather tool, media playback comes from
+  the local media path, and sensors such as baby monitors, cameras, face
+  recognition, smart-fridge inventories, purchase carts, or location history are
+  not simulated by memory recall
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 

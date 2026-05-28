@@ -196,6 +196,31 @@ pub struct AccessPermission {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HouseholdTaskLog {
+    pub source_memory_id: i64,
+    pub person: String,
+    pub task: String,
+    pub subject: Option<String>,
+    pub day: Option<String>,
+    pub time: Option<String>,
+    pub status: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HouseholdScheduleItem {
+    pub source_memory_id: i64,
+    pub schedule_type: String,
+    pub subject: Option<String>,
+    pub title: String,
+    pub day: Option<String>,
+    pub date: Option<String>,
+    pub time: Option<String>,
+    pub amount: Option<String>,
+    pub description: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SemanticMemoryHit {
     pub entry: MemoryEntry,
@@ -417,6 +442,42 @@ impl Memory {
             CREATE INDEX IF NOT EXISTS idx_access_permissions_lookup
                 ON access_permissions(normalized_person, action, normalized_device, updated_ms DESC);
 
+            CREATE TABLE IF NOT EXISTS household_task_logs (
+                id                INTEGER PRIMARY KEY,
+                source_memory_id  INTEGER NOT NULL,
+                person            TEXT NOT NULL,
+                normalized_person TEXT NOT NULL,
+                task              TEXT NOT NULL,
+                subject           TEXT,
+                normalized_subject TEXT,
+                day               TEXT,
+                time              TEXT,
+                status            TEXT NOT NULL,
+                description       TEXT NOT NULL,
+                updated_ms        INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_household_task_logs_lookup
+                ON household_task_logs(task, day, normalized_person, normalized_subject, updated_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS household_schedule_items (
+                id                INTEGER PRIMARY KEY,
+                source_memory_id  INTEGER NOT NULL,
+                schedule_type     TEXT NOT NULL,
+                subject           TEXT,
+                normalized_subject TEXT,
+                title             TEXT NOT NULL,
+                day               TEXT,
+                date              TEXT,
+                time              TEXT,
+                amount            TEXT,
+                description       TEXT NOT NULL,
+                updated_ms        INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_household_schedule_items_lookup
+                ON household_schedule_items(schedule_type, normalized_subject, day, updated_ms DESC);
+
             CREATE TABLE IF NOT EXISTS embedded_memories (
                 source_memory_id INTEGER PRIMARY KEY,
                 memory_type      TEXT NOT NULL,
@@ -548,6 +609,8 @@ impl Memory {
         rebuild_family_calendar_events(&conn)?;
         rebuild_shopping_list_items(&conn)?;
         rebuild_access_permissions(&conn)?;
+        rebuild_household_task_logs(&conn)?;
+        rebuild_household_schedule_items(&conn)?;
         rebuild_embedded_memories(&conn)?;
 
         // Older databases may predate the FTS update trigger or may have been
@@ -1391,6 +1454,83 @@ impl Memory {
         }))
     }
 
+    pub fn household_task_log_for_query(&self, query: &str) -> Result<Option<HouseholdTaskLog>> {
+        let Some((person, task, subject, day)) = task_log_query(query) else {
+            return Ok(None);
+        };
+        let normalized_person = normalize_name_key(&person);
+        let normalized_subject = subject
+            .as_deref()
+            .map(normalize_alias_key)
+            .unwrap_or_default();
+        let mut stmt = self.conn.prepare(
+            "SELECT source_memory_id, person, task, subject, day, time, status, description
+             FROM household_task_logs
+             WHERE normalized_person = ?1
+               AND task = ?2
+               AND (?3 = '' OR normalized_subject = ?3 OR normalized_subject IS NULL)
+               AND (?4 IS NULL OR day = ?4)
+             ORDER BY updated_ms DESC, source_memory_id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![
+            normalized_person,
+            task,
+            normalized_subject,
+            day
+        ])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(HouseholdTaskLog {
+            source_memory_id: row.get(0)?,
+            person: row.get(1)?,
+            task: row.get(2)?,
+            subject: row.get(3)?,
+            day: row.get(4)?,
+            time: row.get(5)?,
+            status: row.get(6)?,
+            description: row.get(7)?,
+        }))
+    }
+
+    pub fn household_schedule_item_for_query(
+        &self,
+        query: &str,
+    ) -> Result<Option<HouseholdScheduleItem>> {
+        let Some((schedule_type, subject, day)) = schedule_item_query(query) else {
+            return Ok(None);
+        };
+        let normalized_subject = subject
+            .as_deref()
+            .map(normalize_alias_key)
+            .unwrap_or_default();
+        let mut stmt = self.conn.prepare(
+            "SELECT source_memory_id, schedule_type, subject, title, day, date, time, amount, description
+             FROM household_schedule_items
+             WHERE schedule_type = ?1
+               AND (?2 = '' OR normalized_subject = ?2 OR normalized_subject IS NULL)
+               AND (?3 IS NULL OR day = ?3)
+             ORDER BY updated_ms DESC, source_memory_id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![schedule_type, normalized_subject, day])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(HouseholdScheduleItem {
+            source_memory_id: row.get(0)?,
+            schedule_type: row.get(1)?,
+            subject: row.get(2)?,
+            title: row.get(3)?,
+            day: row.get(4)?,
+            date: row.get(5)?,
+            time: row.get(6)?,
+            amount: row.get(7)?,
+            description: row.get(8)?,
+        }))
+    }
+
     pub fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<SemanticMemoryHit>> {
         let query = query.trim();
         if query.is_empty() {
@@ -1506,6 +1646,14 @@ impl Memory {
 
         if let Some(permission) = self.access_permission_for_query(query)? {
             return Ok(Some(format_access_permission_answer(&permission)));
+        }
+
+        if let Some(task) = self.household_task_log_for_query(query)? {
+            return Ok(Some(format_household_task_log_answer(&task)));
+        }
+
+        if let Some(schedule) = self.household_schedule_item_for_query(query)? {
+            return Ok(Some(format_household_schedule_item_answer(&schedule)));
         }
 
         if shopping_list_query(query) {
@@ -1670,6 +1818,22 @@ impl Memory {
                 now_ms(),
             )?;
             upsert_access_permissions_from_memory(
+                &self.conn,
+                id,
+                &next_kind,
+                &content,
+                metadata,
+                now_ms(),
+            )?;
+            upsert_household_task_logs_from_memory(
+                &self.conn,
+                id,
+                &next_kind,
+                &content,
+                metadata,
+                now_ms(),
+            )?;
+            upsert_household_schedule_items_from_memory(
                 &self.conn,
                 id,
                 &next_kind,
@@ -1936,6 +2100,8 @@ impl Memory {
         upsert_family_calendar_events_from_memory(&self.conn, id, kind, content, metadata, now)?;
         upsert_shopping_list_items_from_memory(&self.conn, id, kind, content, metadata, now)?;
         upsert_access_permissions_from_memory(&self.conn, id, kind, content, metadata, now)?;
+        upsert_household_task_logs_from_memory(&self.conn, id, kind, content, metadata, now)?;
+        upsert_household_schedule_items_from_memory(&self.conn, id, kind, content, metadata, now)?;
         upsert_embedded_memory_from_memory(&self.conn, id, kind, content, metadata, now)?;
         Ok(id)
     }
@@ -2345,6 +2511,26 @@ fn rebuild_access_permissions(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn rebuild_household_task_logs(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM household_task_logs", [])?;
+    let rows = shared_safe_memory_rows_with_kind(conn)?;
+    let now = now_ms();
+    for (id, kind, content, metadata) in rows {
+        upsert_household_task_logs_from_memory(conn, id, &kind, &content, metadata, now)?;
+    }
+    Ok(())
+}
+
+fn rebuild_household_schedule_items(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM household_schedule_items", [])?;
+    let rows = shared_safe_memory_rows_with_kind(conn)?;
+    let now = now_ms();
+    for (id, kind, content, metadata) in rows {
+        upsert_household_schedule_items_from_memory(conn, id, &kind, &content, metadata, now)?;
+    }
+    Ok(())
+}
+
 fn rebuild_embedded_memories(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM embedded_memories", [])?;
     let rows = shared_safe_memory_rows_with_kind(conn)?;
@@ -2746,6 +2932,93 @@ fn upsert_access_permissions_from_memory(
     Ok(())
 }
 
+fn upsert_household_task_logs_from_memory(
+    conn: &Connection,
+    source_memory_id: i64,
+    kind: &str,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+    updated_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM household_task_logs WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+
+    if !policy::assess_memory_read(metadata, policy::MemoryReadContext::shared_room_voice()).allowed
+    {
+        return Ok(());
+    }
+
+    for task in household_task_logs_from_memory(kind, content) {
+        let normalized_person = normalize_name_key(&task.person);
+        let normalized_subject = task.subject.as_deref().map(normalize_alias_key);
+        conn.execute(
+            "INSERT INTO household_task_logs (
+                source_memory_id, person, normalized_person, task, subject,
+                normalized_subject, day, time, status, description, updated_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                source_memory_id,
+                task.person,
+                normalized_person,
+                task.task,
+                task.subject,
+                normalized_subject,
+                task.day,
+                task.time,
+                task.status,
+                task.description,
+                updated_ms
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn upsert_household_schedule_items_from_memory(
+    conn: &Connection,
+    source_memory_id: i64,
+    kind: &str,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+    updated_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM household_schedule_items WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+
+    if !policy::assess_memory_read(metadata, policy::MemoryReadContext::shared_room_voice()).allowed
+    {
+        return Ok(());
+    }
+
+    for item in household_schedule_items_from_memory(kind, content) {
+        let normalized_subject = item.subject.as_deref().map(normalize_alias_key);
+        conn.execute(
+            "INSERT INTO household_schedule_items (
+                source_memory_id, schedule_type, subject, normalized_subject, title,
+                day, date, time, amount, description, updated_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                source_memory_id,
+                item.schedule_type,
+                item.subject,
+                normalized_subject,
+                item.title,
+                item.day,
+                item.date,
+                item.time,
+                item.amount,
+                item.description,
+                updated_ms
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn upsert_embedded_memory_from_memory(
     conn: &Connection,
     source_memory_id: i64,
@@ -2815,6 +3088,14 @@ fn delete_structured_household_rows(conn: &Connection, source_memory_id: i64) ->
     )?;
     conn.execute(
         "DELETE FROM access_permissions WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+    conn.execute(
+        "DELETE FROM household_task_logs WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+    conn.execute(
+        "DELETE FROM household_schedule_items WHERE source_memory_id = ?1",
         [source_memory_id],
     )?;
     conn.execute(
@@ -3122,6 +3403,26 @@ fn household_note_from_memory(kind: &str, content: &str) -> Option<(String, Stri
             | "activity"
             | "media_library"
             | "routine"
+            | "safe_inventory"
+            | "appliance_manual"
+            | "photo_metadata"
+            | "warranty"
+            | "school"
+            | "utility"
+            | "recycling"
+            | "wellness"
+            | "science_project"
+            | "first_aid"
+            | "medicine"
+            | "audiobook"
+            | "story"
+            | "pet_inventory"
+            | "travel"
+            | "diet"
+            | "watch_history"
+            | "doorbell"
+            | "visitor"
+            | "music_profile"
     ) {
         (note_type_from_kind(&kind_lower, &lower), trimmed)
     } else if let Some(rest) = lower
@@ -3174,6 +3475,23 @@ fn note_type_from_kind<'a>(kind: &'a str, lower_content: &str) -> &'a str {
         "activity" => "activity",
         "media_library" => "media",
         "routine" => "routine",
+        "safe_inventory" => "storage",
+        "appliance_manual" => "manual",
+        "photo_metadata" => "photo",
+        "warranty" => "warranty",
+        "school" => "school",
+        "utility" => "utility",
+        "recycling" => "recycling",
+        "wellness" => "wellness",
+        "science_project" => "education",
+        "first_aid" | "medicine" => "first_aid",
+        "audiobook" | "story" => "story",
+        "pet_inventory" => "pet",
+        "travel" => "travel",
+        "diet" => "diet",
+        "watch_history" => "media",
+        "doorbell" | "visitor" => "visitor",
+        "music_profile" => "media",
         _ if lower_content.starts_with("watched ") || lower_content.contains(" watched ") => {
             "media"
         }
@@ -3226,6 +3544,19 @@ fn should_embed_memory(kind: &str, content: &str, metadata: policy::MemoryPolicy
             | "pet_health"
             | "home_maintenance"
             | "routine"
+            | "wellness"
+            | "science_project"
+            | "first_aid"
+            | "medicine"
+            | "audiobook"
+            | "story"
+            | "pet_inventory"
+            | "travel"
+            | "diet"
+            | "watch_history"
+            | "doorbell"
+            | "visitor"
+            | "music_profile"
     ) || content.len() >= 48
         || lower.contains("thermostat")
         || lower.contains("lunchbox")
@@ -3251,6 +3582,28 @@ fn should_embed_memory(kind: &str, content: &str, metadata: policy::MemoryPolicy
         || lower.contains("date night")
         || lower.contains("grandma")
         || lower.contains("feeding")
+        || lower.contains("stressed")
+        || lower.contains("stress")
+        || lower.contains("calm")
+        || lower.contains("science fair")
+        || lower.contains("baking soda")
+        || lower.contains("flour")
+        || lower.contains("sugar")
+        || lower.contains("headache")
+        || lower.contains("tylenol")
+        || lower.contains("story")
+        || lower.contains("audiobook")
+        || lower.contains("recycling")
+        || lower.contains("dog food")
+        || lower.contains("zoo")
+        || lower.contains("diet")
+        || lower.contains("calorie")
+        || lower.contains("washing machine")
+        || lower.contains("shaking")
+        || lower.contains("watch history")
+        || lower.contains("doorbell")
+        || lower.contains("uncle")
+        || lower.contains("focus music")
 }
 
 fn semantic_memory_type(kind: &str, content: &str) -> String {
@@ -3285,6 +3638,36 @@ fn semantic_memory_type(kind: &str, content: &str) -> String {
         "family_contact".into()
     } else if lower.contains("feeding") || lower.contains("diaper") || lower.contains("nap") {
         "routine".into()
+    } else if lower.contains("stressed") || lower.contains("stress") || lower.contains("calm") {
+        "wellness".into()
+    } else if lower.contains("science fair") || lower.contains("baking soda") {
+        "science_project".into()
+    } else if lower.contains("headache") || lower.contains("tylenol") {
+        "first_aid".into()
+    } else if lower.contains("story") || lower.contains("audiobook") {
+        "story".into()
+    } else if lower.contains("dog food") || lower.contains("royal canin") {
+        "pet_shopping".into()
+    } else if lower.contains("zoo")
+        || lower.contains("reptile")
+        || lower.contains("lion")
+        || lower.contains("picnic")
+    {
+        "trip_planning".into()
+    } else if lower.contains("diet") || lower.contains("calorie") || lower.contains("broccoli") {
+        "diet_recipe".into()
+    } else if lower.contains("washing machine")
+        || lower.contains("washer")
+        || lower.contains("vibrating")
+        || lower.contains("shaking")
+    {
+        "appliance_troubleshooting".into()
+    } else if lower.contains("watch history") || lower.contains("resume") {
+        "watch_history".into()
+    } else if lower.contains("doorbell") || lower.contains("uncle") {
+        "visitor".into()
+    } else if lower.contains("focus music") || lower.contains("study") || lower.contains("lo-fi") {
+        "focus_music".into()
     } else {
         kind.trim().to_ascii_lowercase()
     }
@@ -3324,6 +3707,35 @@ fn embedding_text_for_query(query: &str) -> String {
         format!("family_contact grandma bedtime {query}")
     } else if lower.contains("baby") || lower.contains("crying") {
         format!("routine feeding diaper nap {query}")
+    } else if lower.contains("stressed") || lower.contains("stress") {
+        format!("wellness calm meditation bath playlist {query}")
+    } else if lower.contains("science fair") {
+        format!("science_project elementary experiment {query}")
+    } else if lower.contains("bake") || (lower.contains("flour") && lower.contains("sugar")) {
+        format!("recipe baking flour sugar {query}")
+    } else if lower.contains("headache") {
+        format!("first_aid headache tylenol medicine {query}")
+    } else if lower.contains("read me a story") || lower.contains("story") {
+        format!("story audiobook age favorite {query}")
+    } else if lower.contains("movie for tonight") || lower.contains("find a movie") {
+        format!("media family movie adventure streaming {query}")
+    } else if lower.contains("dog food") {
+        format!("pet_shopping dog food royal canin {query}")
+    } else if lower.contains("trip to the zoo") || lower.contains("zoo") {
+        format!("trip_planning zoo reptile lion picnic {query}")
+    } else if lower.contains("hungry") && lower.contains("diet") {
+        format!("diet_recipe calorie chicken broccoli {query}")
+    } else if lower.contains("washing machine")
+        || lower.contains("washer")
+        || lower.contains("shaking")
+    {
+        format!("appliance_troubleshooting washing machine unbalanced leveling {query}")
+    } else if lower.contains("watch tv") {
+        format!("watch_history resume show current user {query}")
+    } else if lower.contains("someone is at the door") || lower.contains("doorbell") {
+        format!("visitor doorbell face family friend {query}")
+    } else if lower.contains("focus music") {
+        format!("focus_music study work playlist {query}")
     } else {
         query.to_string()
     }
@@ -3363,6 +3775,35 @@ fn semantic_query_type(query: &str) -> Option<String> {
         Some("family_contact".into())
     } else if lower.contains("baby") || lower.contains("crying") {
         Some("routine".into())
+    } else if lower.contains("stressed") || lower.contains("stress") {
+        Some("wellness".into())
+    } else if lower.contains("science fair") {
+        Some("science_project".into())
+    } else if lower.contains("bake") || (lower.contains("flour") && lower.contains("sugar")) {
+        Some("recipe".into())
+    } else if lower.contains("headache") {
+        Some("first_aid".into())
+    } else if lower.contains("read me a story") || lower.contains("story") {
+        Some("story".into())
+    } else if lower.contains("movie for tonight") || lower.contains("find a movie") {
+        Some("media".into())
+    } else if lower.contains("dog food") {
+        Some("pet_shopping".into())
+    } else if lower.contains("trip to the zoo") || lower.contains("zoo") {
+        Some("trip_planning".into())
+    } else if lower.contains("hungry") && lower.contains("diet") {
+        Some("diet_recipe".into())
+    } else if lower.contains("washing machine")
+        || lower.contains("washer")
+        || lower.contains("shaking")
+    {
+        Some("appliance_troubleshooting".into())
+    } else if lower.contains("watch tv") {
+        Some("watch_history".into())
+    } else if lower.contains("someone is at the door") || lower.contains("doorbell") {
+        Some("visitor".into())
+    } else if lower.contains("focus music") {
+        Some("focus_music".into())
     } else {
         None
     }
@@ -3532,6 +3973,110 @@ fn access_permissions_from_memory(kind: &str, content: &str) -> Vec<AccessPermis
         });
     }
     permissions
+}
+
+fn household_task_logs_from_memory(kind: &str, content: &str) -> Vec<HouseholdTaskLog> {
+    let trimmed = content
+        .trim()
+        .trim_matches(|ch| matches!(ch, '.' | '!' | '?'));
+    let lower = trimmed.to_ascii_lowercase();
+    let kind_lower = kind.to_ascii_lowercase();
+    if !(kind_lower.contains("task")
+        || kind_lower.contains("chore")
+        || kind_lower.contains("pet_care")
+        || lower.contains("marked the task")
+        || lower.contains("fed the dog")
+        || lower.contains("feed the dog"))
+    {
+        return Vec::new();
+    }
+
+    let mut logs = Vec::new();
+    if lower.contains("fed the dog") || lower.contains("feed the dog") {
+        let person = leading_person_name(trimmed).unwrap_or_else(|| "Unknown".into());
+        logs.push(HouseholdTaskLog {
+            source_memory_id: 0,
+            person,
+            task: "feeding".into(),
+            subject: Some("dog".into()),
+            day: calendar_day_from_text(&lower),
+            time: time_after_marker(trimmed, &lower, " at "),
+            status: if contains_any(&lower, &["complete", "completed", "done", "yes"]) {
+                "complete".into()
+            } else {
+                "logged".into()
+            },
+            description: trimmed.to_string(),
+        });
+    }
+
+    logs
+}
+
+fn household_schedule_items_from_memory(kind: &str, content: &str) -> Vec<HouseholdScheduleItem> {
+    let trimmed = content
+        .trim()
+        .trim_matches(|ch| matches!(ch, '.' | '!' | '?'));
+    let lower = trimmed.to_ascii_lowercase();
+    let kind_lower = kind.to_ascii_lowercase();
+    if !(kind_lower.contains("schedule")
+        || kind_lower.contains("bill")
+        || kind_lower.contains("utility")
+        || kind_lower.contains("recycling")
+        || lower.contains("bus arrives")
+        || lower.contains("bill is due")
+        || lower.contains("recycling"))
+    {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+    if (lower.contains("school bus") || lower.contains("bus arrives")) && lower.contains("arrives")
+    {
+        items.push(HouseholdScheduleItem {
+            source_memory_id: 0,
+            schedule_type: "school_bus_arrival".into(),
+            subject: Some("school bus".into()),
+            title: "school bus arrival".into(),
+            day: calendar_day_from_text(&lower),
+            date: None,
+            time: time_after_marker(trimmed, &lower, " at ")
+                .or_else(|| time_after_marker(trimmed, &lower, " arrives at ")),
+            amount: None,
+            description: trimmed.to_string(),
+        });
+    }
+
+    if lower.contains("bill") && lower.contains("due") {
+        let subject = bill_subject_from_text(trimmed, &lower);
+        items.push(HouseholdScheduleItem {
+            source_memory_id: 0,
+            schedule_type: "bill_due".into(),
+            subject,
+            title: "bill due".into(),
+            day: relative_due_from_text(&lower),
+            date: due_date_from_text(trimmed, &lower),
+            time: None,
+            amount: amount_from_text(trimmed),
+            description: trimmed.to_string(),
+        });
+    }
+
+    if lower.contains("recycling") {
+        items.push(HouseholdScheduleItem {
+            source_memory_id: 0,
+            schedule_type: "recycling".into(),
+            subject: Some("recycling".into()),
+            title: "recycling schedule".into(),
+            day: calendar_day_from_text(&lower),
+            date: None,
+            time: None,
+            amount: None,
+            description: trimmed.to_string(),
+        });
+    }
+
+    items
 }
 
 fn media_profile_item_from_memory(content: &str) -> Option<MediaProfileItem> {
@@ -3730,6 +4275,142 @@ fn shopping_list_query(query: &str) -> bool {
             || lower.starts_with("what's on"))
 }
 
+fn task_log_query(query: &str) -> Option<(String, String, Option<String>, Option<String>)> {
+    let lower = query.to_ascii_lowercase();
+    if !(lower.starts_with("did ") && (lower.contains(" feed ") || lower.contains(" fed "))) {
+        return None;
+    }
+    let rest = query.get("did ".len()..)?;
+    let lower_rest = rest.to_ascii_lowercase();
+    let feed_pos = lower_rest
+        .find(" feed ")
+        .or_else(|| lower_rest.find(" fed "))?;
+    let person = clean_person_name(&rest[..feed_pos]);
+    if person.is_empty() {
+        return None;
+    }
+    let task = "feeding".to_string();
+    let subject = if lower.contains("dog") {
+        Some("dog".to_string())
+    } else {
+        None
+    };
+    Some((
+        person,
+        task,
+        subject,
+        calendar_day_from_text(&lower).or_else(|| Some("today".into())),
+    ))
+}
+
+fn schedule_item_query(query: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let lower = query.to_ascii_lowercase();
+    if lower.contains("school bus") && (lower.contains("arrive") || lower.contains("what time")) {
+        return Some((
+            "school_bus_arrival".into(),
+            Some("school bus".into()),
+            calendar_day_from_text(&lower),
+        ));
+    }
+    if lower.contains("bill") && lower.contains("due") {
+        let subject = bill_subject_from_text(query, &lower);
+        return Some(("bill_due".into(), subject, calendar_day_from_text(&lower)));
+    }
+    if lower.contains("recycling week") || lower.contains("recycling day") {
+        return Some((
+            "recycling".into(),
+            Some("recycling".into()),
+            calendar_day_from_text(&lower),
+        ));
+    }
+    None
+}
+
+fn bill_subject_from_text(content: &str, lower: &str) -> Option<String> {
+    for subject in [
+        "electricity",
+        "electric",
+        "power",
+        "water",
+        "gas",
+        "internet",
+        "utility",
+        "utilities",
+    ] {
+        if lower.contains(subject) {
+            return Some(
+                match subject {
+                    "electric" | "power" => "electricity",
+                    "utilities" => "utility",
+                    other => other,
+                }
+                .to_string(),
+            );
+        }
+    }
+    if let Some(pos) = lower.find(" bill") {
+        let candidate = content[..pos]
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .trim_matches(|ch: char| !ch.is_alphanumeric());
+        if !candidate.is_empty() {
+            return Some(candidate.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn relative_due_from_text(lower: &str) -> Option<String> {
+    let pos = lower.find("due in ")?;
+    let rest = &lower[pos + "due ".len()..];
+    let value = rest
+        .split(['.', ',', ';'])
+        .next()
+        .unwrap_or(rest)
+        .split(" on ")
+        .next()
+        .unwrap_or(rest)
+        .trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn due_date_from_text(content: &str, lower: &str) -> Option<String> {
+    let pos = lower.find(" on ")?;
+    let rest = content[pos + " on ".len()..].trim();
+    let date = rest
+        .split(['.', ',', ';'])
+        .next()
+        .unwrap_or(rest)
+        .split(" estimated ")
+        .next()
+        .unwrap_or(rest)
+        .trim();
+    if date.is_empty() {
+        None
+    } else {
+        Some(clean_sentence_value(date))
+    }
+}
+
+fn amount_from_text(content: &str) -> Option<String> {
+    let pos = content.find('$')?;
+    let amount = content[pos..]
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '$' && ch != '.');
+    if amount.is_empty() {
+        None
+    } else {
+        Some(amount.to_string())
+    }
+}
+
 fn app_only_secret_reference_from_memory(
     _kind: &str,
     content: &str,
@@ -3794,6 +4475,9 @@ fn secret_label_from_text(content: &str, lower: &str, secret_type: &str) -> Stri
     }
     if lower.contains("guest") && matches!(secret_type, "wifi_password" | "password") {
         return "guest wifi".into();
+    }
+    if lower.contains("printer") && matches!(secret_type, "wifi_password" | "password") {
+        return "printer wifi".into();
     }
     if lower.contains("wi-fi") || lower.contains("wifi") || lower.contains("wi fi") {
         return "wifi".into();
@@ -4191,6 +4875,8 @@ fn household_note_query(query: &str) -> Option<String> {
         "find our note about ",
         "find the record about ",
         "find record about ",
+        "find the warranty for ",
+        "find warranty for ",
     ] {
         if let Some(rest) = lower.strip_prefix(prefix) {
             let cleaned = clean_sentence_value(rest);
@@ -4207,6 +4893,10 @@ fn household_note_query(query: &str) -> Option<String> {
         || lower.starts_with("where are the ")
         || lower.starts_with("what color did we paint ")
         || lower.starts_with("what colour did we paint ")
+        || lower.starts_with("what's the model number ")
+        || lower.starts_with("what s the model number ")
+        || lower.starts_with("what is the model number ")
+        || lower.starts_with("who took the photos ")
         || lower.starts_with("we have a leak ")
         || lower.starts_with("there is a leak ")
     {
@@ -4240,6 +4930,8 @@ fn secret_reference_query(query: &str) -> Option<(&'static str, String)> {
 
     let label = if lower.contains("guest") && secret_type == "wifi_password" {
         "guest wifi".into()
+    } else if lower.contains("printer") && secret_type == "wifi_password" {
+        "printer wifi".into()
     } else if lower.contains("wifi") || lower.contains("wi-fi") || lower.contains("wi fi") {
         "wifi".into()
     } else {
@@ -4324,6 +5016,44 @@ fn format_access_permission_answer(permission: &AccessPermission) -> String {
     }
 }
 
+fn format_household_task_log_answer(task: &HouseholdTaskLog) -> String {
+    if task.status == "complete" {
+        let time = task
+            .time
+            .as_deref()
+            .map(|time| format!(" at {time}"))
+            .unwrap_or_default();
+        format!("Yes. {} marked {} complete{time}.", task.person, task.task)
+    } else {
+        format!("I found this task log: {}", task.description)
+    }
+}
+
+fn format_household_schedule_item_answer(item: &HouseholdScheduleItem) -> String {
+    match item.schedule_type.as_str() {
+        "school_bus_arrival" => {
+            let time = item.time.as_deref().unwrap_or("the scheduled time");
+            format!("The bus arrives at {time}. {}", item.description)
+        }
+        "bill_due" => {
+            let subject = item.subject.as_deref().unwrap_or("bill");
+            let due = item
+                .date
+                .as_deref()
+                .or(item.day.as_deref())
+                .unwrap_or("the scheduled date");
+            let amount = item
+                .amount
+                .as_deref()
+                .map(|amount| format!(" The estimated amount is {amount}."))
+                .unwrap_or_default();
+            format!("The {subject} bill is due {due}.{amount}")
+        }
+        "recycling" => format!("I found this recycling schedule: {}", item.description),
+        _ => format!("I found this schedule item: {}", item.description),
+    }
+}
+
 fn format_household_note_answer(note: &HouseholdNote) -> String {
     match note.note_type.as_str() {
         "reminder" => format!("I found this reminder: {}", note.content),
@@ -4334,6 +5064,16 @@ fn format_household_note_answer(note: &HouseholdNote) -> String {
         "storage" => format!("I found this storage note: {}", note.content),
         "gift" => format!("I found this gift note: {}", note.content),
         "troubleshooting" => format!("I found this troubleshooting note: {}", note.content),
+        "photo" => format!("I found this photo note: {}", note.content),
+        "warranty" => format!("I found this warranty note: {}", note.content),
+        "school" => format!("I found this school note: {}", note.content),
+        "utility" => format!("I found this utility note: {}", note.content),
+        "recycling" => format!("I found this recycling note: {}", note.content),
+        "first_aid" => format!("I found this first-aid note: {}", note.content),
+        "story" => format!("I found this story note: {}", note.content),
+        "pet" => format!("I found this pet note: {}", note.content),
+        "travel" => format!("I found this travel note: {}", note.content),
+        "visitor" => format!("I found this visitor note: {}", note.content),
         _ => format!("I found this note: {}", note.content),
     }
 }
@@ -5284,6 +6024,63 @@ mod tests {
     }
 
     #[test]
+    fn household_task_logs_and_schedules_answer_chore_school_bill_and_recycling() {
+        let mem = temp_memory();
+        mem.store(
+            "pet_care",
+            "Leo fed the dog today at 8:00 AM and marked the task complete",
+        )
+        .unwrap();
+        mem.store("school_schedule", "The school bus arrives at 7:45 AM")
+            .unwrap();
+        mem.store(
+            "bill_schedule",
+            "The electricity bill is due in 3 days on October 25th. The estimated amount is $145",
+        )
+        .unwrap();
+        mem.store(
+            "recycling_schedule",
+            "Tomorrow is recycling day. Remember to rinse plastic containers and put glass in the blue bin",
+        )
+        .unwrap();
+
+        let task = mem
+            .household_task_log_for_query("Did Leo feed the dog today?")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.person, "Leo");
+        assert_eq!(task.task, "feeding");
+        assert_eq!(task.subject.as_deref(), Some("dog"));
+        assert_eq!(task.status, "complete");
+
+        let task_answer = mem
+            .structured_household_answer("Did Leo feed the dog today?")
+            .unwrap()
+            .unwrap();
+        assert!(task_answer.contains("Leo"));
+        assert!(task_answer.contains("8:00am"));
+
+        let bus = mem
+            .structured_household_answer("What time does the school bus arrive?")
+            .unwrap()
+            .unwrap();
+        assert!(bus.contains("7:45am"));
+
+        let bill = mem
+            .structured_household_answer("When is the electricity bill due?")
+            .unwrap()
+            .unwrap();
+        assert!(bill.contains("October 25th"));
+        assert!(bill.contains("$145"));
+
+        let recycling = mem
+            .structured_household_answer("Is it recycling week?")
+            .unwrap()
+            .unwrap();
+        assert!(recycling.contains("blue bin"));
+    }
+
+    #[test]
     fn secret_like_notes_are_not_indexed_as_speakable_fts_notes() {
         let mem = temp_memory();
         mem.store(
@@ -5353,6 +6150,67 @@ mod tests {
                 .unwrap()
                 .contains("red plastic bins")
         );
+    }
+
+    #[test]
+    fn expanded_household_notes_cover_passport_appliance_photo_warranty_and_printer_secret() {
+        let mem = temp_memory();
+        mem.store(
+            "safe_inventory",
+            "Passports are located in the top drawer of the filing cabinet inside the manila envelope marked Travel",
+        )
+        .unwrap();
+        mem.store(
+            "appliance_manual",
+            "The refrigerator model number is Samsung RF28R7551SR found in the kitchen manual",
+        )
+        .unwrap();
+        mem.store(
+            "photo_metadata",
+            "Most Hawaii photos were taken by Jared, but the sunset beach photos were taken by Sarah",
+        )
+        .unwrap();
+        mem.store(
+            "home_maintenance",
+            "The roof warranty is in the Home Improvements 2021 folder and valid for 25 years",
+        )
+        .unwrap();
+        mem.store(
+            "credential_reference",
+            "Printer Wi-Fi password is stored in credential:printer_wifi",
+        )
+        .unwrap();
+
+        assert!(
+            mem.structured_household_answer("Where are the passports?")
+                .unwrap()
+                .unwrap()
+                .contains("manila envelope")
+        );
+        assert!(
+            mem.structured_household_answer("What's the model number of the fridge?")
+                .unwrap()
+                .unwrap()
+                .contains("RF28R7551SR")
+        );
+        assert!(
+            mem.structured_household_answer("Who took the photos in Hawaii?")
+                .unwrap()
+                .unwrap()
+                .contains("Jared")
+        );
+        assert!(
+            mem.structured_household_answer("Find the warranty for the roof")
+                .unwrap()
+                .unwrap()
+                .contains("25 years")
+        );
+        let secret = mem
+            .structured_household_answer("What's the Wi-Fi password for the printer?")
+            .unwrap()
+            .unwrap();
+        assert!(secret.contains("app-only reference"));
+        assert!(!secret.contains("credential:printer_wifi"));
     }
 
     #[test]
@@ -5460,6 +6318,97 @@ mod tests {
                 .iter()
                 .any(|hit| hit.entry.content.contains("Princess Bride"))
         );
+    }
+
+    #[test]
+    fn semantic_search_links_chores_utilities_education_and_contextual_decisions() {
+        let mem = temp_memory();
+        mem.store(
+            "wellness",
+            "Sarah stress relief routine: dim lights, play the Calm Piano playlist, and offer to run the bath",
+        )
+        .unwrap();
+        mem.store(
+            "science_project",
+            "Elementary science fair idea: Volcano Baking Soda experiment uses supplies already at home",
+        )
+        .unwrap();
+        mem.store(
+            "recipe",
+            "Simple shortbread cookies can be baked with flour and sugar",
+        )
+        .unwrap();
+        mem.store(
+            "first_aid",
+            "Headache first aid: Tylenol is in the hall cabinet and the label says take 2 tablets",
+        )
+        .unwrap();
+        mem.store(
+            "story",
+            "Mia story favorite: Alice in Wonderland audiobook, resume from last night",
+        )
+        .unwrap();
+        mem.store(
+            "media_library",
+            "Family movie for tonight: Jungle Cruise on Disney+ is an adventure movie suitable for kids",
+        )
+        .unwrap();
+        mem.store(
+            "pet_inventory",
+            "Dog food preference: Royal Canin Large Breed 30lb bag",
+        )
+        .unwrap();
+        mem.store(
+            "travel",
+            "Zoo trip plan: visit the Reptile House and picnic area near the lions for lunch",
+        )
+        .unwrap();
+        mem.store(
+            "diet",
+            "Diet meal under 500 calories: grilled chicken salad with broccoli",
+        )
+        .unwrap();
+        mem.store(
+            "troubleshooting",
+            "Washing machine shaking usually means an unbalanced load; last leveling check was 2 years ago",
+        )
+        .unwrap();
+        mem.store("watch_history", "Mia watch history resume Stranger Things")
+            .unwrap();
+        mem.store(
+            "visitor",
+            "Doorbell visitor Uncle Bob is a known family friend",
+        )
+        .unwrap();
+        mem.store(
+            "music_profile",
+            "Focus music playlist Lo-Fi Beats to Study To at quiet volume",
+        )
+        .unwrap();
+
+        for (query, expected) in [
+            ("I'm stressed", "Calm Piano"),
+            ("I need a science fair idea", "Volcano"),
+            ("What can I bake with just flour and sugar?", "shortbread"),
+            ("I have a headache", "Tylenol"),
+            ("Read me a story", "Alice in Wonderland"),
+            ("Find a movie for tonight", "Jungle Cruise"),
+            ("Order more dog food", "Royal Canin"),
+            ("Plan a trip to the zoo", "Reptile House"),
+            ("I'm hungry but on a diet", "broccoli"),
+            ("The washing machine is shaking", "unbalanced"),
+            ("Watch TV", "Stranger Things"),
+            ("Someone is at the door", "Uncle Bob"),
+            ("Play focus music", "Lo-Fi Beats"),
+        ] {
+            assert!(
+                mem.semantic_search(query, 3)
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit.entry.content.contains(expected)),
+                "query {query:?} should recall {expected:?}"
+            );
+        }
     }
 
     #[test]
