@@ -1156,7 +1156,7 @@ fn compact_genie_runtime_rules(system_text: &str) -> String {
         "If no tool is needed, answer naturally in 1-3 short sentences.",
         "Use calculate for math, get_weather for weather, get_time for time, and system_info for system/Home Assistant/memory diagnostics.",
         "Use memory_recall when the user asks what you remember, what you know about them, or asks for their name.",
-        "Use memory_store only when the user explicitly asks you to remember/save something; never store secrets.",
+        "Use memory_store only when explicitly asked; never store secrets, access codes, lock combinations, or sensitive locations.",
     ];
 
     if system_text.contains("web_search") {

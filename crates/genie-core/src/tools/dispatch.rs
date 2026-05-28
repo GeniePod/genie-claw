@@ -465,7 +465,7 @@ impl ToolDispatcher {
 
         defs.push(ToolDef {
             name: "memory_store".into(),
-            description: "Explicitly store a safe household fact or preference. Use when the user says 'remember that...' or asks you to save something. Do not store passwords, one-time codes, payment details, keys, tokens, or private secrets.".into(),
+            description: "Explicitly store a safe household fact or preference. Use when the user says 'remember that...' or asks you to save something. Do not store passwords, one-time codes, payment details, keys, tokens, household access codes, lock combinations, sensitive document/key locations, or private secrets.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
