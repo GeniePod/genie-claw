@@ -140,6 +140,14 @@ pub struct HouseholdRule {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HouseholdNote {
+    pub source_memory_id: i64,
+    pub note_type: String,
+    pub title: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MemoryEvent {
     ts_ms: u64,
@@ -246,6 +254,42 @@ impl Memory {
 
             CREATE INDEX IF NOT EXISTS idx_household_rules_lookup
                 ON household_rules(rule_type, subject, normalized_person, updated_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS household_notes (
+                source_memory_id INTEGER PRIMARY KEY,
+                note_type        TEXT NOT NULL,
+                title            TEXT NOT NULL,
+                content          TEXT NOT NULL,
+                updated_ms       INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_household_notes_type
+                ON household_notes(note_type, updated_ms DESC);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS household_notes_fts USING fts5(
+                title,
+                content,
+                note_type UNINDEXED,
+                content='household_notes',
+                content_rowid='source_memory_id'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS household_notes_ai AFTER INSERT ON household_notes BEGIN
+                INSERT INTO household_notes_fts(rowid, title, content, note_type)
+                VALUES (new.source_memory_id, new.title, new.content, new.note_type);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS household_notes_ad AFTER DELETE ON household_notes BEGIN
+                INSERT INTO household_notes_fts(household_notes_fts, rowid, title, content, note_type)
+                VALUES('delete', old.source_memory_id, old.title, old.content, old.note_type);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS household_notes_au AFTER UPDATE ON household_notes BEGIN
+                INSERT INTO household_notes_fts(household_notes_fts, rowid, title, content, note_type)
+                VALUES('delete', old.source_memory_id, old.title, old.content, old.note_type);
+                INSERT INTO household_notes_fts(rowid, title, content, note_type)
+                VALUES (new.source_memory_id, new.title, new.content, new.note_type);
+            END;
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content,
@@ -360,6 +404,7 @@ impl Memory {
         rebuild_device_aliases(&conn)?;
         rebuild_household_profile_attributes(&conn)?;
         rebuild_household_rules(&conn)?;
+        rebuild_household_notes(&conn)?;
 
         // Older databases may predate the FTS update trigger or may have been
         // edited by a recovery tool. Rebuild once at open so recall and forget
@@ -907,6 +952,73 @@ impl Memory {
         Ok(entries)
     }
 
+    pub fn household_notes_search(&self, query: &str, limit: usize) -> Result<Vec<HouseholdNote>> {
+        let limit = limit.max(1);
+        let Some(fts_query) = build_fts_query(query) else {
+            return self.household_notes_like_fallback(query, limit);
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT n.source_memory_id, n.note_type, n.title, n.content,
+                    bm25(household_notes_fts) AS bm25_rank
+             FROM household_notes n
+             JOIN household_notes_fts f ON n.source_memory_id = f.rowid
+             WHERE household_notes_fts MATCH ?1
+             ORDER BY bm25_rank
+             LIMIT ?2",
+        )?;
+
+        let entries = stmt
+            .query_map(rusqlite::params![fts_query, limit], read_household_note)?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+
+        if entries.is_empty() {
+            self.household_notes_like_fallback(query, limit)
+        } else {
+            Ok(entries)
+        }
+    }
+
+    fn household_notes_like_fallback(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HouseholdNote>> {
+        let tokens = search_tokens(query);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let where_clause = tokens
+            .iter()
+            .map(|_| "(LOWER(title) LIKE ? OR LOWER(content) LIKE ?)".to_string())
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT source_memory_id, note_type, title, content, 0.0 AS bm25_rank
+             FROM household_notes
+             WHERE {where_clause}
+             ORDER BY updated_ms DESC, source_memory_id DESC
+             LIMIT ?"
+        );
+
+        let mut values = Vec::with_capacity(tokens.len() * 2 + 1);
+        for token in tokens {
+            let value = format!("%{}%", token);
+            values.push(value.clone());
+            values.push(value);
+        }
+        values.push(limit.to_string());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let entries = stmt
+            .query_map(params_from_iter(values.iter()), read_household_note)?
+            .filter_map(|row| row.ok())
+            .collect();
+        Ok(entries)
+    }
+
     pub fn structured_household_answer(&self, query: &str) -> Result<Option<String>> {
         if let Some((name, attribute)) = profile_attribute_query(query) {
             let attrs = self.profile_attributes(&name, attribute)?;
@@ -941,6 +1053,13 @@ impl Memory {
             let rules = self.household_rules(Some(&person), "homework", Some("homework"))?;
             if !rules.is_empty() {
                 return Ok(Some(format_rule_list_answer(&rules)));
+            }
+        }
+
+        if let Some(note_query) = household_note_query(query) {
+            let notes = self.household_notes_search(&note_query, 3)?;
+            if let Some(note) = notes.first() {
+                return Ok(Some(format_household_note_answer(note)));
             }
         }
 
@@ -1044,6 +1163,14 @@ impl Memory {
                 now_ms(),
             )?;
             upsert_household_rules_from_memory(&self.conn, id, &content, metadata, now_ms())?;
+            upsert_household_note_from_memory(
+                &self.conn,
+                id,
+                &next_kind,
+                &content,
+                metadata,
+                now_ms(),
+            )?;
             if existing.promoted {
                 self.rebuild_root_memory_file()?;
             }
@@ -1289,6 +1416,7 @@ impl Memory {
         upsert_device_alias_from_memory(&self.conn, id, content, metadata, now)?;
         upsert_household_profile_attributes_from_memory(&self.conn, id, content, metadata, now)?;
         upsert_household_rules_from_memory(&self.conn, id, content, metadata, now)?;
+        upsert_household_note_from_memory(&self.conn, id, kind, content, metadata, now)?;
         Ok(id)
     }
 
@@ -1493,6 +1621,15 @@ fn read_managed_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedMemory
     })
 }
 
+fn read_household_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<HouseholdNote> {
+    Ok(HouseholdNote {
+        source_memory_id: row.get(0)?,
+        note_type: row.get(1)?,
+        title: row.get(2)?,
+        content: row.get(3)?,
+    })
+}
+
 fn backfill_policy_columns(conn: &Connection) -> Result<()> {
     let mut stmt =
         conn.prepare("SELECT id, kind, content, scope, sensitivity, spoken_policy FROM memories")?;
@@ -1628,6 +1765,16 @@ fn rebuild_household_rules(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn rebuild_household_notes(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM household_notes", [])?;
+    let rows = shared_safe_memory_rows_with_kind(conn)?;
+    let now = now_ms();
+    for (id, kind, content, metadata) in rows {
+        upsert_household_note_from_memory(conn, id, &kind, &content, metadata, now)?;
+    }
+    Ok(())
+}
+
 fn shared_safe_memory_rows(
     conn: &Connection,
 ) -> Result<Vec<(i64, String, policy::MemoryPolicyMetadata)>> {
@@ -1646,6 +1793,34 @@ fn shared_safe_memory_rows(
                     sensitivity: policy::MemorySensitivity::from_storage(&row.get::<_, String>(3)?),
                     spoken_policy: policy::SpokenMemoryPolicy::from_storage(
                         &row.get::<_, String>(4)?,
+                    ),
+                },
+            ))
+        })?
+        .filter_map(|row| row.ok())
+        .collect();
+    Ok(rows)
+}
+
+fn shared_safe_memory_rows_with_kind(
+    conn: &Connection,
+) -> Result<Vec<(i64, String, String, policy::MemoryPolicyMetadata)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, content, scope, sensitivity, spoken_policy
+         FROM memories
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                policy::MemoryPolicyMetadata {
+                    scope: policy::MemoryScope::from_storage(&row.get::<_, String>(3)?),
+                    sensitivity: policy::MemorySensitivity::from_storage(&row.get::<_, String>(4)?),
+                    spoken_policy: policy::SpokenMemoryPolicy::from_storage(
+                        &row.get::<_, String>(5)?,
                     ),
                 },
             ))
@@ -1761,6 +1936,36 @@ fn upsert_household_rules_from_memory(
     Ok(())
 }
 
+fn upsert_household_note_from_memory(
+    conn: &Connection,
+    source_memory_id: i64,
+    kind: &str,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+    updated_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM household_notes WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+
+    if !policy::assess_memory_read(metadata, policy::MemoryReadContext::shared_room_voice()).allowed
+    {
+        return Ok(());
+    }
+
+    let Some((note_type, title, content)) = household_note_from_memory(kind, content) else {
+        return Ok(());
+    };
+
+    conn.execute(
+        "INSERT INTO household_notes (source_memory_id, note_type, title, content, updated_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![source_memory_id, note_type, title, content, updated_ms],
+    )?;
+    Ok(())
+}
+
 fn delete_structured_household_rows(conn: &Connection, source_memory_id: i64) -> Result<()> {
     conn.execute(
         "DELETE FROM household_profile_attributes WHERE source_memory_id = ?1",
@@ -1768,6 +1973,10 @@ fn delete_structured_household_rows(conn: &Connection, source_memory_id: i64) ->
     )?;
     conn.execute(
         "DELETE FROM household_rules WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+    conn.execute(
+        "DELETE FROM household_notes WHERE source_memory_id = ?1",
         [source_memory_id],
     )?;
     Ok(())
@@ -2040,6 +2249,85 @@ fn household_rules_from_memory(content: &str) -> Vec<HouseholdRule> {
     rules
 }
 
+fn household_note_from_memory(kind: &str, content: &str) -> Option<(String, String, String)> {
+    let trimmed = content
+        .trim()
+        .trim_matches(|ch| matches!(ch, '.' | '!' | '?'));
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let kind_lower = kind.to_ascii_lowercase();
+    let lower = trimmed.to_ascii_lowercase();
+    let (note_type, note_content) = if matches!(
+        kind_lower.as_str(),
+        "note" | "notes" | "reminder" | "manual" | "document" | "context"
+    ) {
+        (note_type_from_kind(&kind_lower, &lower), trimmed)
+    } else if let Some(rest) = lower
+        .strip_prefix("remember that ")
+        .and_then(|_| trimmed.get("remember that ".len()..))
+    {
+        ("note", rest.trim())
+    } else if let Some(rest) = lower
+        .strip_prefix("remember to ")
+        .and_then(|_| trimmed.get("remember to ".len()..))
+    {
+        ("reminder", rest.trim())
+    } else if let Some(rest) = lower
+        .strip_prefix("note: ")
+        .and_then(|_| trimmed.get("note: ".len()..))
+    {
+        ("note", rest.trim())
+    } else if lower.contains(" manual:") || lower.starts_with("manual:") {
+        ("manual", trimmed)
+    } else if lower.starts_with("watched ") || lower.contains(" watched ") {
+        ("media", trimmed)
+    } else {
+        return None;
+    };
+
+    let note_content = note_content
+        .trim()
+        .trim_matches(|ch| matches!(ch, '.' | '!' | '?'));
+    if note_content.is_empty() {
+        return None;
+    }
+
+    Some((
+        note_type.to_string(),
+        household_note_title(note_content),
+        note_content.to_string(),
+    ))
+}
+
+fn note_type_from_kind<'a>(kind: &'a str, lower_content: &str) -> &'a str {
+    match kind {
+        "reminder" => "reminder",
+        "manual" | "document" => "manual",
+        _ if lower_content.starts_with("watched ") || lower_content.contains(" watched ") => {
+            "media"
+        }
+        _ => "note",
+    }
+}
+
+fn household_note_title(content: &str) -> String {
+    let title = content
+        .split(['.', '!', '?'])
+        .next()
+        .unwrap_or(content)
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        "note".into()
+    } else {
+        title
+    }
+}
+
 fn parse_allergy_rule(content: &str, lower: &str) -> Option<(String, String)> {
     if let Some((person, rest)) = split_once_case_insensitive(content, lower, " is allergic to ") {
         return Some((clean_person_name(person), normalize_rule_subject(rest)));
@@ -2287,6 +2575,50 @@ fn homework_rule_query(query: &str) -> Option<String> {
     leading_person_name(query)
 }
 
+fn household_note_query(query: &str) -> Option<String> {
+    let query = query.trim();
+    let lower = query.to_ascii_lowercase();
+
+    for prefix in [
+        "what did i say about ",
+        "what did we say about ",
+        "find my note about ",
+        "find note about ",
+        "find the note about ",
+        "show my note about ",
+        "show the note about ",
+        "what is the note about ",
+        "what did i write about ",
+        "what did we write about ",
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let cleaned = clean_sentence_value(rest);
+            if !cleaned.is_empty() {
+                return Some(cleaned);
+            }
+        }
+    }
+
+    if lower.starts_with("where are ")
+        || lower.starts_with("where is ")
+        || lower.starts_with("where did i put ")
+        || lower.starts_with("where did we put ")
+        || lower.starts_with("where are the ")
+    {
+        return Some(query.to_string());
+    }
+
+    if lower.starts_with("what did we watch about ")
+        || lower.starts_with("what did i watch about ")
+        || lower.starts_with("what movie ")
+        || lower.starts_with("what was that movie ")
+    {
+        return Some(query.to_string());
+    }
+
+    None
+}
+
 fn format_profile_attribute_answer(attr: &HouseholdProfileAttribute) -> String {
     match attr.attribute.as_str() {
         "age" => format!("{} is {} years old.", attr.name, attr.value),
@@ -2322,6 +2654,15 @@ fn format_rule_list_answer(rules: &[HouseholdRule]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!("I found this rule: {items}")
+}
+
+fn format_household_note_answer(note: &HouseholdNote) -> String {
+    match note.note_type.as_str() {
+        "reminder" => format!("I found this reminder: {}", note.content),
+        "manual" => format!("I found these instructions: {}", note.content),
+        "media" => format!("I found this watch note: {}", note.content),
+        _ => format!("I found this note: {}", note.content),
+    }
 }
 
 fn possessive_named_profile(content: &str, lower: &str) -> Option<(&'static str, String)> {
@@ -3015,6 +3356,82 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(answer.contains("Mia must finish homework before screen time"));
+    }
+
+    #[test]
+    fn household_notes_index_and_search_fts() {
+        let mem = temp_memory();
+        mem.store(
+            "note",
+            "Remember to water the potted plant on the porch every Tuesday",
+        )
+        .unwrap();
+
+        let notes = mem.household_notes_search("potted plant porch", 3).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].note_type, "note");
+        assert!(notes[0].content.contains("potted plant"));
+    }
+
+    #[test]
+    fn household_notes_answer_note_and_storage_questions() {
+        let mem = temp_memory();
+        mem.store("note", "Bike lock hangs on the garage hook")
+            .unwrap();
+        mem.store(
+            "note",
+            "Extra AA and AAA batteries are in the junk drawer in the laundry room",
+        )
+        .unwrap();
+
+        let lock = mem
+            .structured_household_answer("Find my note about the bicycle lock")
+            .unwrap()
+            .unwrap();
+        assert!(lock.contains("garage hook"));
+
+        let batteries = mem
+            .structured_household_answer("Where are the extra batteries kept?")
+            .unwrap()
+            .unwrap();
+        assert!(batteries.contains("junk drawer"));
+    }
+
+    #[test]
+    fn household_notes_rebuild_on_reopen() {
+        let path = temp_memory_path("notes-reopen");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store("note", "Extra batteries are in the laundry room drawer")
+                .unwrap();
+        }
+
+        let mem = Memory::open(&path).unwrap();
+        let notes = mem.household_notes_search("batteries drawer", 3).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].content.contains("laundry room drawer"));
+    }
+
+    #[test]
+    fn private_household_note_is_not_indexed() {
+        let mem = temp_memory();
+        mem.store_with_metadata(
+            "note",
+            "Private safe code is 1234",
+            policy::MemoryPolicyMetadata {
+                scope: policy::MemoryScope::Private,
+                sensitivity: policy::MemorySensitivity::Restricted,
+                spoken_policy: policy::SpokenMemoryPolicy::AppOnly,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            mem.household_notes_search("safe code", 3)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

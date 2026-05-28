@@ -2444,6 +2444,30 @@ mod tests {
     }
 
     #[test]
+    fn memory_recall_answers_typed_household_note() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-household-note-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("note", "Bike lock hangs on the garage hook")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "find my note about bicycle lock"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("garage hook"));
+    }
+
+    #[test]
     fn memory_recall_hides_person_memory_in_shared_room_context() {
         let db = std::env::temp_dir().join(format!(
             "memory-recall-shared-room-test-{}.db",

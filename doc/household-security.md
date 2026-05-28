@@ -77,7 +77,8 @@ GenieClaw keeps these decisions separate:
   dad?", and safe device-alias memories feed exact Home Assistant target
   resolution before fuzzy matching; safe profile attributes and household rules
   answer low-latency questions about age, allergies, homework, and screen-time
-  constraints before FTS fallback
+  constraints before FTS fallback; safe household notes, reminders, manuals,
+  and watch notes are indexed in a typed local FTS table for direct note recall
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
   class such as household, person, sensitive, private, or restricted

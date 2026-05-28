@@ -53,6 +53,13 @@ pub fn route(text: &str) -> Option<ToolCall> {
         ));
     }
 
+    if let Some(entity) = scene_or_routine_activation_request(&normalized) {
+        return Some(tool(
+            "home_control",
+            serde_json::json!({ "entity": entity, "action": "activate" }),
+        ));
+    }
+
     if let Some(expression) = calculation_request(&normalized) {
         return Some(tool(
             "calculate",
@@ -79,7 +86,7 @@ pub fn route_for_available_tools(
     let call = route(text)?;
     if matches!(
         call.name.as_str(),
-        "home_status" | "home_undo" | "action_history"
+        "home_control" | "home_status" | "home_undo" | "action_history"
     ) && !home_available
     {
         return None;
@@ -143,6 +150,10 @@ fn memory_recall_query(text: &str) -> Option<String> {
         return Some(text.to_string());
     }
 
+    if is_household_note_question(text) {
+        return Some(text.to_string());
+    }
+
     for prefix in [
         "what do you remember about ",
         "what do you know about ",
@@ -181,6 +192,55 @@ fn is_structured_household_question(text: &str) -> bool {
         || (text.contains("allergic") || text.contains("allergy"))
         || text.contains("homework rule")
         || text.contains("homework rules")
+}
+
+fn is_household_note_question(text: &str) -> bool {
+    text.starts_with("what did i say about ")
+        || text.starts_with("what did we say about ")
+        || text.starts_with("find my note about ")
+        || text.starts_with("find note about ")
+        || text.starts_with("find the note about ")
+        || text.starts_with("show my note about ")
+        || text.starts_with("show the note about ")
+        || text.starts_with("what did i write about ")
+        || text.starts_with("what did we write about ")
+        || text.starts_with("where are ")
+        || text.starts_with("where is ")
+        || text.starts_with("where did i put ")
+        || text.starts_with("where did we put ")
+        || text.starts_with("what did we watch about ")
+        || text.starts_with("what did i watch about ")
+        || text.starts_with("what movie ")
+        || text.starts_with("what was that movie ")
+}
+
+fn scene_or_routine_activation_request(text: &str) -> Option<String> {
+    if matches!(
+        text,
+        "goodnight genieclaw"
+            | "good night genieclaw"
+            | "goodnight genie claw"
+            | "good night genie claw"
+    ) {
+        return Some("goodnight".into());
+    }
+
+    for prefix in ["activate ", "start ", "run "] {
+        if let Some(rest) = text.strip_prefix(prefix).map(str::trim)
+            && (rest.contains(" scene") || rest.contains(" routine"))
+        {
+            let entity = rest
+                .trim_end_matches(" scene")
+                .trim_end_matches(" routine")
+                .trim()
+                .to_string();
+            if !entity.is_empty() {
+                return Some(entity);
+            }
+        }
+    }
+
+    None
 }
 
 fn household_role_query(text: &str) -> Option<&'static str> {
@@ -688,6 +748,36 @@ mod tests {
     }
 
     #[test]
+    fn routes_household_note_questions_to_memory_recall() {
+        let call = route("Find my note about the bicycle lock code").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(
+            call.arguments["query"],
+            "find my note about the bicycle lock code"
+        );
+
+        let call = route("Where are the extra batteries kept?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(
+            call.arguments["query"],
+            "where are the extra batteries kept"
+        );
+    }
+
+    #[test]
+    fn routes_explicit_scene_and_routine_activation() {
+        let call = route("Goodnight, GenieClaw.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "goodnight");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Start bedtime reading scene").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "bedtime reading");
+        assert_eq!(call.arguments["action"], "activate");
+    }
+
+    #[test]
     fn routes_explicit_memory_search_to_memory_recall() {
         let call = route("search memory for Jared").unwrap();
         assert_eq!(call.name, "memory_recall");
@@ -812,6 +902,8 @@ mod tests {
         assert!(route_for_available_tools("what lights are on", true, true).is_some());
         assert!(route_for_available_tools("undo that", false, true).is_none());
         assert!(route_for_available_tools("undo that", true, true).is_some());
+        assert!(route_for_available_tools("goodnight genieclaw", false, true).is_none());
+        assert!(route_for_available_tools("goodnight genieclaw", true, true).is_some());
     }
 
     #[test]

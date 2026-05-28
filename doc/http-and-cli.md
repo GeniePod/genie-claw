@@ -405,6 +405,7 @@ surface currently includes:
 - media playback trigger
 - memory recall, status, forget, and store
 - timers
+- explicit scene/routine activation phrases such as "goodnight GenieClaw"
 
 Home-control execution now has three separate safety layers:
 
@@ -424,6 +425,8 @@ Memory tools are policy-aware:
   Home Assistant target resolution before fuzzy matching
 - safe profile attributes and household rules maintain local indexes for exact
   age, preference, allergy, homework, and screen-time recall
+- safe notes, reminders, manuals, and watch notes maintain a typed local FTS
+  index for direct questions such as "find my note about..." or "where are..."
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 
