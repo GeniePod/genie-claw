@@ -717,13 +717,17 @@ impl ToolDispatcher {
                 Ok(output)
             }
             Ok(home::ControlOutcome::ConfirmationRequired { reason, .. }) => {
-                let pending = self.confirmations.issue(
+                let Some(pending) = self.confirmations.issue(
                     &resolved_entity,
                     action,
                     value,
                     &reason,
                     exec_ctx.request_origin,
-                );
+                ) else {
+                    return Ok(
+                        "Too many pending home confirmations; confirm or wait for existing ones to expire before requesting another.".into(),
+                    );
+                };
                 self.audit_logger.append(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::ConfirmationIssued,

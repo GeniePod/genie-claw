@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ACTION_HISTORY_LIMIT: usize = 32;
+const MAX_PENDING_CONFIRMATIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -106,9 +107,12 @@ impl ConfirmationManager {
         value: Option<f64>,
         reason: &str,
         requested_by: RequestOrigin,
-    ) -> PendingConfirmation {
+    ) -> Option<PendingConfirmation> {
         let mut state = self.inner.lock().expect("confirmation manager lock");
         prune_expired(&mut state.pending);
+        if state.pending.len() >= MAX_PENDING_CONFIRMATIONS {
+            return None;
+        }
         state.next_id += 1;
         let created_ms = now_ms();
         // The token is a bearer secret: its only entropy is 128 CSPRNG bits.
@@ -127,7 +131,7 @@ impl ConfirmationManager {
             expires_ms: created_ms + 10 * 60 * 1000,
         };
         state.pending.insert(token, pending.clone());
-        pending
+        Some(pending)
     }
 
     pub fn confirm(&self, token: &str) -> Option<PendingConfirmation> {
@@ -446,13 +450,15 @@ mod tests {
     #[test]
     fn confirmation_manager_issues_and_confirms() {
         let manager = ConfirmationManager::default();
-        let pending = manager.issue(
-            "front door",
-            "unlock",
-            None,
-            "needs confirmation",
-            RequestOrigin::Voice,
-        );
+        let pending = manager
+            .issue(
+                "front door",
+                "unlock",
+                None,
+                "needs confirmation",
+                RequestOrigin::Voice,
+            )
+            .expect("issue should succeed");
         assert!(pending.token.starts_with("act-"));
         assert_eq!(manager.list().len(), 1);
 
@@ -469,8 +475,12 @@ mod tests {
     #[test]
     fn confirmation_tokens_are_unpredictable() {
         let manager = ConfirmationManager::default();
-        let first = manager.issue("front door", "unlock", None, "r", RequestOrigin::Api);
-        let second = manager.issue("front door", "unlock", None, "r", RequestOrigin::Api);
+        let first = manager
+            .issue("front door", "unlock", None, "r", RequestOrigin::Api)
+            .expect("issue should succeed");
+        let second = manager
+            .issue("front door", "unlock", None, "r", RequestOrigin::Api)
+            .expect("issue should succeed");
 
         assert_ne!(
             first.token, second.token,
@@ -503,7 +513,9 @@ mod tests {
     #[test]
     fn forged_token_is_rejected() {
         let manager = ConfirmationManager::default();
-        let pending = manager.issue("front door", "unlock", None, "r", RequestOrigin::Api);
+        let pending = manager
+            .issue("front door", "unlock", None, "r", RequestOrigin::Api)
+            .expect("issue should succeed");
 
         // Reconstruct what the old clock+counter token would have been.
         let forged_clock_counter = format!("act-{:x}-{:x}", pending.created_ms, 1);
@@ -534,6 +546,32 @@ mod tests {
             "the genuine token must still confirm"
         );
         assert!(manager.confirm(&pending.token).is_none(), "single use only");
+    }
+
+    #[test]
+    fn issue_returns_none_when_pending_cap_reached() {
+        let manager = ConfirmationManager::default();
+        for i in 0..MAX_PENDING_CONFIRMATIONS {
+            assert!(
+                manager
+                    .issue(
+                        &format!("entity-{i}"),
+                        "unlock",
+                        None,
+                        "cap test",
+                        RequestOrigin::Api,
+                    )
+                    .is_some(),
+                "issue {i} should succeed"
+            );
+        }
+        assert!(
+            manager
+                .issue("overflow", "unlock", None, "cap test", RequestOrigin::Api)
+                .is_none(),
+            "issue beyond cap must be rejected"
+        );
+        assert_eq!(manager.list().len(), MAX_PENDING_CONFIRMATIONS);
     }
 
     #[test]
