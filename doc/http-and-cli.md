@@ -429,6 +429,9 @@ Memory tools are policy-aware:
   index for direct questions such as "find my note about..." or "where are..."
 - password/code questions can resolve to app-only secret references without
   exposing the value in shared-room chat
+- selected safe preferences, notes, shopping, media, and manual memories also
+  maintain local embeddings for fuzzy household recall such as comfort,
+  lunchbox, and movie questions when exact words are missing
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 

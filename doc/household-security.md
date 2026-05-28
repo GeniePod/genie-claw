@@ -117,6 +117,8 @@ treated as ordinary recall.
 - Keep tool policy and actuation safety enabled.
 - Require confirmation for high-risk home actions.
 - Use separate hosts or OS users for people who should not share authority.
+- Keep fuzzy household recall local-first: embedded-memory rows are metadata in
+  the local SQLite store, not a remote vector service dependency.
 
 ## Runtime Contract
 

@@ -158,6 +158,10 @@ fn memory_recall_query(text: &str) -> Option<String> {
         return Some(text.to_string());
     }
 
+    if is_semantic_household_memory_question(text) {
+        return Some(text.to_string());
+    }
+
     for prefix in [
         "what do you remember about ",
         "what do you know about ",
@@ -216,6 +220,13 @@ fn is_household_note_question(text: &str) -> bool {
         || text.starts_with("what did i watch about ")
         || text.starts_with("what movie ")
         || text.starts_with("what was that movie ")
+}
+
+fn is_semantic_household_memory_question(text: &str) -> bool {
+    (text.contains("feeling cold") || text.contains("feel cold") || text.contains("i am cold"))
+        || (text.contains("snack") && (text.contains("lunchbox") || text.contains("lunch box")))
+        || (text.contains("detergent") && contains_any(text, &["like", "order", "more"]))
+        || (text.contains("movie") && text.contains("robot"))
 }
 
 fn is_app_only_secret_question(text: &str) -> bool {
@@ -798,6 +809,23 @@ mod tests {
         let call = route("Where is the gate code?").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "where is the gate code");
+    }
+
+    #[test]
+    fn routes_semantic_household_memory_questions_to_memory_recall() {
+        let call = route("I'm feeling cold").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "i m feeling cold");
+
+        let call = route("We need more snacks for Leo's lunchbox").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(
+            call.arguments["query"],
+            "we need more snacks for leo s lunchbox"
+        );
+
+        let call = route("What was the movie about a robot?").unwrap();
+        assert_eq!(call.name, "memory_recall");
     }
 
     #[test]

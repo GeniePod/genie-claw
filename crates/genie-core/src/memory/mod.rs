@@ -1,10 +1,12 @@
 pub mod decay;
+pub mod embedding;
 pub mod extract;
 pub mod inject;
 pub mod policy;
 pub mod recall;
 
 use anyhow::Result;
+use embedding::{EmbeddingProvider, LocalHashEmbeddingProvider};
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde::Serialize;
 use std::path::Path;
@@ -154,6 +156,13 @@ pub struct AppOnlySecretReference {
     pub secret_type: String,
     pub label: String,
     pub location_hint: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SemanticMemoryHit {
+    pub entry: MemoryEntry,
+    pub score: f64,
+    pub embedding_model: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -311,6 +320,18 @@ impl Memory {
             CREATE INDEX IF NOT EXISTS idx_app_only_secret_references_lookup
                 ON app_only_secret_references(secret_type, normalized_label, updated_ms DESC);
 
+            CREATE TABLE IF NOT EXISTS embedded_memories (
+                source_memory_id INTEGER PRIMARY KEY,
+                memory_type      TEXT NOT NULL,
+                embedding_model  TEXT NOT NULL,
+                dimensions       INTEGER NOT NULL,
+                embedding        TEXT NOT NULL,
+                updated_ms       INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_embedded_memories_type
+                ON embedded_memories(memory_type, updated_ms DESC);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content,
                 content='memories',
@@ -426,6 +447,7 @@ impl Memory {
         rebuild_household_rules(&conn)?;
         rebuild_household_notes(&conn)?;
         rebuild_app_only_secret_references(&conn)?;
+        rebuild_embedded_memories(&conn)?;
 
         // Older databases may predate the FTS update trigger or may have been
         // edited by a recovery tool. Rebuild once at open so recall and forget
@@ -1071,6 +1093,71 @@ impl Memory {
         Ok(entries)
     }
 
+    pub fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<SemanticMemoryHit>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let provider = LocalHashEmbeddingProvider;
+        let query_embedding = provider.embed(query);
+        let now = now_ms();
+        let query_hash = hash_query(query);
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.kind, m.content, m.created_ms, m.accessed_ms,
+                    m.recall_count, m.max_score, m.promoted, m.scope,
+                    m.sensitivity, m.spoken_policy,
+                    e.embedding_model, e.dimensions, e.embedding
+             FROM embedded_memories e
+             JOIN memories m ON m.id = e.source_memory_id
+             WHERE e.embedding_model = ?1",
+        )?;
+
+        let mut hits = stmt
+            .query_map([provider.model_name()], |row| {
+                let entry = read_entry(row)?;
+                let embedding_model: String = row.get(11)?;
+                let dimensions: i64 = row.get(12)?;
+                let embedding_json: String = row.get(13)?;
+                Ok((entry, embedding_model, dimensions as usize, embedding_json))
+            })?
+            .filter_map(|row| row.ok())
+            .filter_map(|(entry, embedding_model, dimensions, embedding_json)| {
+                parse_embedding(&embedding_json, dimensions).map(|embedding| {
+                    let score = embedding::cosine_similarity(&query_embedding, &embedding);
+                    SemanticMemoryHit {
+                        entry,
+                        score,
+                        embedding_model,
+                    }
+                })
+            })
+            .filter(|hit| hit.score >= embedding::SEMANTIC_MIN_SCORE)
+            .collect::<Vec<_>>();
+
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.entry.id.cmp(&a.entry.id))
+        });
+        hits.truncate(limit.max(1));
+
+        for hit in &hits {
+            if let Err(error) =
+                self.update_recall_tracking(hit.entry.id, now, hit.score, &query_hash)
+            {
+                tracing::error!(
+                    memory_id = hit.entry.id,
+                    error = %error,
+                    "semantic memory recall tracking update failed"
+                );
+            }
+        }
+
+        Ok(hits)
+    }
+
     pub fn structured_household_answer(&self, query: &str) -> Result<Option<String>> {
         if let Some((name, attribute)) = profile_attribute_query(query) {
             let attrs = self.profile_attributes(&name, attribute)?;
@@ -1231,6 +1318,14 @@ impl Memory {
                 now_ms(),
             )?;
             upsert_app_only_secret_reference_from_memory(
+                &self.conn,
+                id,
+                &next_kind,
+                &content,
+                metadata,
+                now_ms(),
+            )?;
+            upsert_embedded_memory_from_memory(
                 &self.conn,
                 id,
                 &next_kind,
@@ -1485,6 +1580,7 @@ impl Memory {
         upsert_household_rules_from_memory(&self.conn, id, content, metadata, now)?;
         upsert_household_note_from_memory(&self.conn, id, kind, content, metadata, now)?;
         upsert_app_only_secret_reference_from_memory(&self.conn, id, kind, content, metadata, now)?;
+        upsert_embedded_memory_from_memory(&self.conn, id, kind, content, metadata, now)?;
         Ok(id)
     }
 
@@ -1853,6 +1949,16 @@ fn rebuild_app_only_secret_references(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn rebuild_embedded_memories(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM embedded_memories", [])?;
+    let rows = shared_safe_memory_rows_with_kind(conn)?;
+    let now = now_ms();
+    for (id, kind, content, metadata) in rows {
+        upsert_embedded_memory_from_memory(conn, id, &kind, &content, metadata, now)?;
+    }
+    Ok(())
+}
+
 fn shared_safe_memory_rows(
     conn: &Connection,
 ) -> Result<Vec<(i64, String, policy::MemoryPolicyMetadata)>> {
@@ -2077,6 +2183,44 @@ fn upsert_app_only_secret_reference_from_memory(
     Ok(())
 }
 
+fn upsert_embedded_memory_from_memory(
+    conn: &Connection,
+    source_memory_id: i64,
+    kind: &str,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+    updated_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM embedded_memories WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+
+    if !should_embed_memory(kind, content, metadata) {
+        return Ok(());
+    }
+
+    let provider = LocalHashEmbeddingProvider;
+    let embedding_text = embedding_text_for_memory(kind, content);
+    let embedding = provider.embed(&embedding_text);
+    let embedding_json = serde_json::to_string(&embedding)?;
+
+    conn.execute(
+        "INSERT INTO embedded_memories (
+            source_memory_id, memory_type, embedding_model, dimensions, embedding, updated_ms
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            source_memory_id,
+            semantic_memory_type(kind, content),
+            provider.model_name(),
+            provider.dimensions() as i64,
+            embedding_json,
+            updated_ms
+        ],
+    )?;
+    Ok(())
+}
+
 fn delete_structured_household_rows(conn: &Connection, source_memory_id: i64) -> Result<()> {
     conn.execute(
         "DELETE FROM household_profile_attributes WHERE source_memory_id = ?1",
@@ -2092,6 +2236,10 @@ fn delete_structured_household_rows(conn: &Connection, source_memory_id: i64) ->
     )?;
     conn.execute(
         "DELETE FROM app_only_secret_references WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+    conn.execute(
+        "DELETE FROM embedded_memories WHERE source_memory_id = ?1",
         [source_memory_id],
     )?;
     Ok(())
@@ -2440,6 +2588,63 @@ fn household_note_title(content: &str) -> String {
         "note".into()
     } else {
         title
+    }
+}
+
+fn should_embed_memory(kind: &str, content: &str, metadata: policy::MemoryPolicyMetadata) -> bool {
+    if secret_type_from_text(&content.to_ascii_lowercase()).is_some() {
+        return false;
+    }
+    if !policy::assess_memory_read(metadata, policy::MemoryReadContext::shared_room_voice()).allowed
+    {
+        return false;
+    }
+
+    let kind = kind.to_ascii_lowercase();
+    let lower = content.to_ascii_lowercase();
+    matches!(
+        kind.as_str(),
+        "preference" | "context" | "fact" | "note" | "document" | "manual" | "shopping" | "movie"
+    ) || content.len() >= 48
+        || lower.contains("thermostat")
+        || lower.contains("lunchbox")
+        || lower.contains("lunch box")
+        || lower.contains("snack")
+        || lower.contains("movie")
+        || lower.contains("watched")
+        || lower.contains("detergent")
+        || lower.contains("coffee machine")
+}
+
+fn semantic_memory_type(kind: &str, content: &str) -> String {
+    let lower = content.to_ascii_lowercase();
+    if lower.contains("thermostat") || lower.contains("temperature") {
+        "home_comfort".into()
+    } else if lower.contains("lunchbox")
+        || lower.contains("lunch box")
+        || lower.contains("snack")
+        || lower.contains("detergent")
+    {
+        "shopping".into()
+    } else if lower.contains("movie") || lower.contains("watched") {
+        "media".into()
+    } else if lower.contains("manual") || lower.contains("coffee machine") {
+        "device_manual".into()
+    } else {
+        kind.trim().to_ascii_lowercase()
+    }
+}
+
+fn embedding_text_for_memory(kind: &str, content: &str) -> String {
+    format!("{} {}", semantic_memory_type(kind, content), content)
+}
+
+fn parse_embedding(value: &str, dimensions: usize) -> Option<Vec<f32>> {
+    let embedding = serde_json::from_str::<Vec<f32>>(value).ok()?;
+    if embedding.len() == dimensions {
+        Some(embedding)
+    } else {
+        None
     }
 }
 
@@ -3713,6 +3918,70 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn semantic_search_links_cold_to_thermostat_preference() {
+        let mem = temp_memory();
+        mem.store(
+            "preference",
+            "Jared prefers the living room thermostat at 72F.",
+        )
+        .unwrap();
+
+        let hits = mem.semantic_search("I'm feeling cold", 3).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.content.contains("thermostat"));
+    }
+
+    #[test]
+    fn semantic_search_links_lunchbox_snacks() {
+        let mem = temp_memory();
+        mem.store(
+            "shopping",
+            "Leo's lunchbox snacks include granola bars and fruit snacks.",
+        )
+        .unwrap();
+
+        let hits = mem
+            .semantic_search("We need more snacks for Leo's lunchbox", 3)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.content.contains("granola bars"));
+    }
+
+    #[test]
+    fn semantic_search_links_robot_movie_hint() {
+        let mem = temp_memory();
+        mem.store(
+            "note",
+            "Watched The Iron Giant with the kids - they loved it.",
+        )
+        .unwrap();
+
+        let hits = mem
+            .semantic_search("What movie had a robot that wanted to be a real boy?", 3)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.content.contains("Iron Giant"));
+    }
+
+    #[test]
+    fn semantic_embeddings_rebuild_on_reopen() {
+        let path = temp_memory_path("semantic-reopen");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store(
+                "preference",
+                "Jared prefers the living room thermostat at 72F.",
+            )
+            .unwrap();
+        }
+
+        let reopened = Memory::open(&path).unwrap();
+        let hits = reopened.semantic_search("I'm feeling cold", 3).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.content.contains("thermostat"));
     }
 
     #[test]

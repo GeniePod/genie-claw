@@ -2496,6 +2496,89 @@ mod tests {
     }
 
     #[test]
+    fn memory_recall_answers_semantic_home_comfort_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-comfort-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "preference",
+                "Jared prefers the living room thermostat at 72F.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "I'm feeling cold"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("thermostat"));
+        assert!(output.contains("72F"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_lunchbox_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-lunchbox-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "shopping",
+                "Leo's lunchbox snacks include granola bars and fruit snacks.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "We need more snacks for Leo's lunchbox"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("granola bars"));
+        assert!(output.contains("fruit snacks"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_movie_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-movie-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "note",
+                "Watched The Iron Giant with the kids - they loved it.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "what was the movie about a robot that wanted to be a real boy"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("Iron Giant"));
+    }
+
+    #[test]
     fn memory_recall_hides_person_memory_in_shared_room_context() {
         let db = std::env::temp_dir().join(format!(
             "memory-recall-shared-room-test-{}.db",
