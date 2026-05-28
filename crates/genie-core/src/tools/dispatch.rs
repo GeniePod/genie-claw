@@ -2134,6 +2134,30 @@ mod tests {
     }
 
     #[test]
+    fn memory_store_rejects_household_access_code() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-store-access-code-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "remember that the gate code is 5829",
+                "category": "fact"
+            }))
+            .unwrap();
+
+        assert!(result.contains("should not store household access codes"));
+
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert!(mem.search("gate", 5).unwrap().is_empty());
+    }
+
+    #[test]
     fn memory_recall_formats_name_answers_naturally() {
         let db = std::env::temp_dir().join(format!("memory-recall-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&db);

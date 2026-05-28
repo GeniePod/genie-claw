@@ -2,7 +2,8 @@
 //!
 //! This is the code-level version of the product memory policy:
 //! household memory is useful by default, private memory is opt-in, and
-//! high-risk secrets should not be captured through room voice.
+//! high-risk secrets and sensitive household locations should not be
+//! captured through room voice.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryScope {
@@ -340,6 +341,29 @@ fn restricted_secret_reason(lower: &str) -> Option<&'static str> {
     if contains_any(
         lower,
         &[
+            "gate code",
+            "door code",
+            "garage code",
+            "alarm code",
+            "security code",
+            "safe code",
+            "safe combination",
+            "lock combination",
+            "lock combo",
+            "bike lock combo",
+            "bicycle lock combo",
+            "bike lock combination",
+            "bicycle lock combination",
+        ],
+    ) {
+        return Some(
+            "I should not store household access codes or lock combinations as voice memory.",
+        );
+    }
+
+    if contains_any(
+        lower,
+        &[
             "credit card",
             "card number",
             "cvv",
@@ -357,7 +381,74 @@ fn restricted_secret_reason(lower: &str) -> Option<&'static str> {
         );
     }
 
+    if describes_sensitive_location(lower) {
+        return Some(
+            "I should not store sensitive document, key, or safe locations as voice memory.",
+        );
+    }
+
     None
+}
+
+fn describes_sensitive_location(lower: &str) -> bool {
+    let sensitive_object = contains_any(
+        lower,
+        &[
+            "passport",
+            "passports",
+            "birth certificate",
+            "birth certificates",
+            "social security card",
+            "ssn card",
+            "government id",
+            "house key",
+            "spare key",
+            "safe key",
+            "car title",
+            "property deed",
+        ],
+    );
+    if sensitive_object && contains_location_phrase(lower) {
+        return true;
+    }
+
+    contains_any(
+        lower,
+        &[
+            "documents are in the safe",
+            "documents are inside the safe",
+            "important documents are in",
+            "important documents are kept",
+            "valuables are in the safe",
+            "valuables are inside the safe",
+        ],
+    )
+}
+
+fn contains_location_phrase(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            " is in ",
+            " are in ",
+            " is inside ",
+            " are inside ",
+            " is kept in ",
+            " are kept in ",
+            " is kept at ",
+            " are kept at ",
+            " is stored in ",
+            " are stored in ",
+            " is stored at ",
+            " are stored at ",
+            " is hidden in ",
+            " are hidden in ",
+            " is hidden under ",
+            " are hidden under ",
+            " under ",
+            " behind ",
+        ],
+    )
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -384,6 +475,24 @@ mod tests {
         assert!(!decision.allowed);
         assert_eq!(decision.disclosure, MemoryDisclosure::Deny);
         assert!(decision.reason.contains("passwords"));
+    }
+
+    #[test]
+    fn household_access_code_memory_is_rejected() {
+        let decision = assess_memory_write("fact", "the gate code is 5829");
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.disclosure, MemoryDisclosure::Deny);
+        assert!(decision.reason.contains("access codes"));
+    }
+
+    #[test]
+    fn sensitive_location_memory_is_rejected() {
+        let decision = assess_memory_write("fact", "the passports are in the safe");
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.disclosure, MemoryDisclosure::Deny);
+        assert!(decision.reason.contains("sensitive document"));
     }
 
     #[test]

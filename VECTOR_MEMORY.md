@@ -175,6 +175,8 @@ Suggested shape:
   - promoted memories
   - imported profile/doc facts
   - high-signal notes
+- skip memories that policy marks restricted, app-only, or not safe for the
+  target disclosure class
 
 Do not embed every turn by default.
 
@@ -266,6 +268,8 @@ If semantic memory is added on Jetson, these rules should stay in force:
 - the default deployment must not require a vector backend
 - semantic indexing must be opt-in
 - embeddings should be computed selectively, not for every utterance
+- restricted memories, credentials, access codes, and sensitive document/key
+  locations must not be embedded
 - vector memory must not reduce LLM reliability
 - if GPU memory is tight, semantic search must disable itself automatically
 

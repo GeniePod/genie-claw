@@ -55,12 +55,39 @@ memory as product data with visibility rules:
 - household facts can be recalled in shared spaces
 - personal facts need speaker/profile context before disclosure
 - sensitive facts should not be volunteered by voice
+- secrets, access codes, credentials, and sensitive document/key locations are
+  not valid shared-room memory
 - dashboard memory management should show editable saved memories, not raw
   database rows or config files
 
 Speaker recognition improves routing; it is not a hard security boundary unless
 the deployment explicitly adds biometric enrollment, local profile storage,
 fallback policy, and user-visible review.
+
+## Memory Retrieval Is Not Authorization
+
+Recall answers the question "what candidate facts might be relevant?" It does
+not answer "may this fact be revealed?" or "may this action execute?"
+
+GenieClaw keeps these decisions separate:
+
+- recall layer: structured records, SQLite `FTS5`, and optional semantic
+  retrieval can find candidate memories
+- classification layer: each memory is scoped and tagged by sensitivity before
+  it is injected, spoken, or shown
+- policy layer: the current origin, room context, speaker confidence, and
+  memory metadata decide whether disclosure is allowed, confirm-required,
+  app-only, or denied
+- action layer: device control, media, purchases, security, network, and other
+  side effects pass through tool policy and actuation safety even if memory
+  retrieval found the right target
+- audit layer: tool execution records the tool name, origin, success state, and
+  argument keys without logging secret values
+
+This means a memory hit can still produce a refusal or confirmation request.
+For example, a remembered allergy may be safe to reveal to a caregiver, while a
+gate code, Wi-Fi password, safe location, or purchase request must not be
+treated as ordinary recall.
 
 ## Practical Rules
 
