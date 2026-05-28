@@ -128,19 +128,22 @@ Response:
 
 High-frequency home phrases are routed before model tool selection when the
 intent is unambiguous. Current local-first routes include household memory
-recall for school, schedule, allowance, grocery inventory, medical appointment,
-vet appointment, sunset, utility payment, receipt/manual/tool/storage,
-education, dictionary, entertainment, travel planning, meal planning, guest
-context, fitness, food-safety, substitutions, DIY, and location questions;
-health hydration logs; app-only credential
-references for Wi-Fi/password/code/account/confirmation-number questions; and integration-backed
-`home_control`/`home_status` calls for explicit physical requests such as
-holiday lights, front-gate state, driveway ice status, sprinklers, lock-up,
+recall for school, schedule, community/business hours, allowance, grocery
+inventory, medical appointment, vet appointment, sunset, utility payment,
+receipt/manual/tool/storage/safety-equipment notes, education, dictionary,
+entertainment, travel planning, meal planning, guest context, fitness,
+food-safety, substitutions, DIY, gift history, game-night context, and location
+questions; health hydration logs; app-only credential references for
+Wi-Fi/password/code/account/confirmation-number questions; media routes for
+focus music and morning news; web search for explicit news/search requests; and
+integration-backed `home_control`/`home_status` calls for explicit physical
+requests such as holiday lights, fireplace, ventilation, front-gate state,
+driveway ice status, sprinklers, lock-up/all-off/work-from-home scenes,
 porch-light arrival triggers, rain-arrival and parking-lot safety routines,
-phone finder, timers, slow-cooker setup, dryer completion, basement humidity,
-solar generation, car lock state, stove status, package status, and freezer telemetry. Those
-physical results still depend on the configured home provider and actuation
-policy.
+locked-out unlock confirmation, phone finder, timers, slow-cooker setup, dryer
+completion, basement humidity, solar generation, tire pressure, mailbox, car
+lock state, stove status, package status, and freezer telemetry. Those physical
+results still depend on the configured home provider and actuation policy.
 
 ### `POST /api/chat/stream`
 

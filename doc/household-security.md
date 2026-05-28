@@ -88,9 +88,10 @@ GenieClaw keeps these decisions separate:
   safe household notes, reminders, manuals, warranties, receipts, utility notes,
   first-aid notes, education notes, dictionary notes, story/media notes,
   inventory notes, storage notes, meal history, commute notes, pantry notes,
-  travel notes, contact notes, delivery notes, location notes, shopping notes,
-  tool notes, DIY notes, fitness notes, food-safety notes, and watch notes are
-  indexed in a typed local FTS table for direct note recall
+  travel notes, contact/contractor notes, delivery notes, location notes,
+  shopping notes, tool notes, DIY notes, fitness notes, food-safety notes,
+  safety-equipment notes, school documents, recipe notes, gift history, and
+  watch notes are indexed in a typed local FTS table for direct note recall
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
   class such as household, person, sensitive, private, or restricted
@@ -100,7 +101,9 @@ GenieClaw keeps these decisions separate:
 - action layer: device control, media, purchases, security, network, phone
   finder, sprinklers, locks/gates, freezer telemetry, and other side effects
   pass through tool policy and actuation safety even if memory retrieval found
-  the right target; tool results and audit events carry an action class such as
+  the right target; work-from-home/all-off scenes, fireplace/ventilation,
+  tire-pressure, mailbox, and locked-out flows still resolve through this action
+  layer; tool results and audit events carry an action class such as
   `read_only`, `memory_write`, `home_actuation`, `network`, `media`, `timer`,
   or `diagnostic`
 - audit layer: tool execution records the tool name, origin, success state, and
