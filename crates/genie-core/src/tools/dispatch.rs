@@ -908,7 +908,9 @@ impl ToolDispatcher {
             .get("label")
             .and_then(|v| v.as_str())
             .unwrap_or("timer");
-        self.timers.set(seconds, label);
+        self.timers
+            .set(seconds, label)
+            .map_err(|e| anyhow::anyhow!(e))?;
         Ok(format!("Timer set for {} seconds: {}", seconds, label))
     }
 
