@@ -400,7 +400,10 @@ fn load_library_from_memfd(bytes: &[u8], label: &str) -> Result<Library> {
     let c_label = std::ffi::CString::new(label).unwrap_or_default();
     // SAFETY: memfd_create is a simple syscall; no memory-safety preconditions.
     let fd = unsafe {
-        libc::memfd_create(c_label.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        libc::memfd_create(
+            c_label.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
     };
     if fd < 0 {
         anyhow::bail!("memfd_create failed: {}", std::io::Error::last_os_error());
@@ -410,8 +413,7 @@ fn load_library_from_memfd(bytes: &[u8], label: &str) -> Result<Library> {
     // "dropped" — we need it alive for sealing and dlopen below.
     let write_result = {
         // SAFETY: fd is valid and we own it exclusively at this point.
-        let mut file =
-            std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        let mut file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
         file.write_all(bytes)
     };
     if let Err(e) = write_result {
@@ -422,8 +424,7 @@ fn load_library_from_memfd(bytes: &[u8], label: &str) -> Result<Library> {
 
     // Seal: prevent any future writes or size changes.  F_SEAL_SEAL prevents
     // further seals from being added after this call.
-    let seals =
-        libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
     // SAFETY: fd is open; F_ADD_SEALS takes a seals bitmask as its third arg.
     if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
         unsafe { libc::close(fd) };
@@ -1149,8 +1150,7 @@ mod tests {
         let signature = sign_file(&key, &so_path);
         write_signed_manifest(&dir, &signature, "geniepod");
 
-        let mut loader =
-            SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
         let name = loader.load_skill(&so_path).unwrap();
         assert_eq!(name, "hello_world");
         assert!(
