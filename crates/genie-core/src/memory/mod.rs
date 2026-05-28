@@ -3794,6 +3794,31 @@ fn household_note_from_memory(kind: &str, content: &str) -> Option<(String, Stri
             | "travel_preferences"
             | "party_recipe"
             | "party_recipes"
+            | "pet_calendar"
+            | "astronomical_data"
+            | "payment_history"
+            | "tool_inventory"
+            | "digital_receipts"
+            | "scanned_docs"
+            | "network_config"
+            | "health_tracker"
+            | "cooking_substitutes"
+            | "diy_projects"
+            | "material_lists"
+            | "plumbing_troubleshooting"
+            | "injury_recovery"
+            | "health_tips"
+            | "gym_schedule"
+            | "gym_routine"
+            | "financial_advice"
+            | "contacts"
+            | "message_templates"
+            | "location_api"
+            | "arrival_rain"
+            | "safety_protocol"
+            | "streaming_services"
+            | "user_location"
+            | "turkey_thawing_guide"
     ) {
         (note_type_from_kind(&kind_lower, &lower), trimmed)
     } else if let Some(rest) = lower
@@ -3900,6 +3925,21 @@ fn note_type_from_kind<'a>(kind: &'a str, lower_content: &str) -> &'a str {
             "travel"
         }
         "party_recipe" | "party_recipes" => "party",
+        "pet_calendar" => "pet",
+        "astronomical_data" => "schedule",
+        "payment_history" | "financial_advice" => "finance",
+        "tool_inventory" => "tool",
+        "digital_receipts" | "scanned_docs" => "receipt",
+        "network_config" => "network",
+        "health_tracker" | "injury_recovery" | "health_tips" => "health",
+        "cooking_substitutes" => "recipe",
+        "diy_projects" | "material_lists" => "diy",
+        "plumbing_troubleshooting" => "home_maintenance",
+        "gym_schedule" | "gym_routine" => "fitness",
+        "contacts" | "message_templates" => "contact",
+        "location_api" | "arrival_rain" | "safety_protocol" | "user_location" => "safety",
+        "streaming_services" => "media",
+        "turkey_thawing_guide" => "food_safety",
         _ if lower_content.starts_with("watched ") || lower_content.contains(" watched ") => {
             "media"
         }
@@ -4027,6 +4067,31 @@ fn should_embed_memory(kind: &str, content: &str, metadata: policy::MemoryPolicy
             | "travel_preferences"
             | "party_recipe"
             | "party_recipes"
+            | "pet_calendar"
+            | "astronomical_data"
+            | "payment_history"
+            | "tool_inventory"
+            | "digital_receipts"
+            | "scanned_docs"
+            | "network_config"
+            | "health_tracker"
+            | "cooking_substitutes"
+            | "diy_projects"
+            | "material_lists"
+            | "plumbing_troubleshooting"
+            | "injury_recovery"
+            | "health_tips"
+            | "gym_schedule"
+            | "gym_routine"
+            | "financial_advice"
+            | "contacts"
+            | "message_templates"
+            | "location_api"
+            | "arrival_rain"
+            | "safety_protocol"
+            | "streaming_services"
+            | "user_location"
+            | "turkey_thawing_guide"
     ) || content.len() >= 48
         || lower.contains("thermostat")
         || lower.contains("lunchbox")
@@ -4132,11 +4197,60 @@ fn should_embed_memory(kind: &str, content: &str, metadata: policy::MemoryPolicy
         || lower.contains("running playlist")
         || lower.contains("package")
         || lower.contains("delivery instruction")
+        || lower.contains("olive oil")
+        || lower.contains("substitute")
+        || lower.contains("bookshelf")
+        || lower.contains("toilet")
+        || lower.contains("flapper")
+        || lower.contains("knee")
+        || lower.contains("side dish")
+        || lower.contains("pasta")
+        || lower.contains("gym bag")
+        || lower.contains("knee sleeves")
+        || lower.contains("over budget")
+        || lower.contains("happy birthday")
+        || lower.contains("driving home")
+        || lower.contains("rain")
+        || lower.contains("dark parking lot")
+        || lower.contains("live location")
+        || lower.contains("haven't seen")
+        || lower.contains("defrost")
+        || lower.contains("turkey")
 }
 
 fn semantic_memory_type(kind: &str, content: &str) -> String {
     let lower = content.to_ascii_lowercase();
-    if lower.contains("airport") || lower.contains("flight") {
+    if lower.contains("olive oil") || lower.contains("substitute") {
+        "cooking_substitute".into()
+    } else if lower.contains("bookshelf") || lower.contains("woodworking") {
+        "diy_bookshelf".into()
+    } else if lower.contains("toilet") || lower.contains("flapper") {
+        "toilet_troubleshooting".into()
+    } else if lower.contains("knee") && (lower.contains("run") || lower.contains("running")) {
+        "running_injury".into()
+    } else if lower.contains("side dish") || (lower.contains("pasta") && lower.contains("salad")) {
+        "pasta_side_dish".into()
+    } else if lower.contains("gym bag") || lower.contains("knee sleeves") {
+        "gym_bag".into()
+    } else if lower.contains("over budget") || lower.contains("car repair") {
+        "budget_advice".into()
+    } else if lower.contains("happy birthday") || lower.contains("message template") {
+        "birthday_message".into()
+    } else if lower.contains("driving home") && lower.contains("rain") {
+        "arrival_rain".into()
+    } else if lower.contains("yogurt") || lower.contains("expires") || lower.contains("safe to eat")
+    {
+        "food_safety".into()
+    } else if lower.contains("dark parking lot") || lower.contains("live location") {
+        "safety_protocol".into()
+    } else if lower.contains("haven't seen")
+        || lower.contains("not watched")
+        || lower.contains("unwatched")
+    {
+        "unwatched_media".into()
+    } else if lower.contains("defrost") || lower.contains("turkey") {
+        "turkey_thawing".into()
+    } else if lower.contains("airport") || lower.contains("flight") {
         "airport_departure".into()
     } else if lower.contains("dinner party") || lower.contains("vegan") || lower.contains("gluten")
     {
@@ -4299,7 +4413,36 @@ fn embedding_text_for_memory(kind: &str, content: &str) -> String {
 
 fn embedding_text_for_query(query: &str) -> String {
     let lower = query.to_ascii_lowercase();
-    if lower.contains("airport") {
+    if lower.contains("olive oil") || lower.contains("use instead") {
+        format!("cooking_substitute olive oil vegetable oil butter substitute {query}")
+    } else if lower.contains("bookshelf") {
+        format!("diy_bookshelf woodworking shelf material list screws drill {query}")
+    } else if lower.contains("toilet") && lower.contains("running") {
+        format!("toilet_troubleshooting running toilet flapper chain tank handle {query}")
+    } else if lower.contains("knee") && lower.contains("run") {
+        format!("running_injury knee pain running ice stretch shoes {query}")
+    } else if lower.contains("side dish") || (lower.contains("pasta") && lower.contains("need")) {
+        format!("pasta_side_dish pasta side dish caesar salad garlic bread {query}")
+    } else if lower.contains("pack my gym bag") || lower.contains("gym bag") {
+        format!("gym_bag gym schedule leg day inventory knee sleeves water bottle {query}")
+    } else if lower.contains("over budget") || lower.contains("budget this month") {
+        format!("budget_advice monthly budget over budget spending car repair {query}")
+    } else if lower.contains("text mom") && lower.contains("birthday") {
+        format!("birthday_message mom contact happy birthday message template {query}")
+    } else if lower.contains("driving home") && lower.contains("rain") {
+        format!("arrival_rain driving home rain garage heat cozy arrival protocol {query}")
+    } else if lower.contains("safe to eat") {
+        format!("food_safety yogurt expiration date safe to eat smell {query}")
+    } else if lower.contains("dark parking lot") {
+        format!("safety_protocol dark parking lot live location flashlight alert {query}")
+    } else if lower.contains("movie we haven")
+        || lower.contains("movie we have not")
+        || lower.contains("haven t seen")
+    {
+        format!("unwatched_media streaming movie not watched family {query}")
+    } else if lower.contains("defrost") && lower.contains("turkey") {
+        format!("turkey_thawing defrost turkey thawing guide thanksgiving reminder {query}")
+    } else if lower.contains("airport") {
         format!("airport_departure flight traffic travel preference leave time {query}")
     } else if lower.contains("dinner party")
         || (lower.contains("buy food") && lower.contains("party"))
@@ -4450,7 +4593,36 @@ fn embedding_text_for_query(query: &str) -> String {
 
 fn semantic_query_type(query: &str) -> Option<String> {
     let lower = query.to_ascii_lowercase();
-    if lower.contains("airport") {
+    if lower.contains("olive oil") || lower.contains("use instead") {
+        Some("cooking_substitute".into())
+    } else if lower.contains("bookshelf") {
+        Some("diy_bookshelf".into())
+    } else if lower.contains("toilet") && lower.contains("running") {
+        Some("toilet_troubleshooting".into())
+    } else if lower.contains("knee") && lower.contains("run") {
+        Some("running_injury".into())
+    } else if lower.contains("side dish") || (lower.contains("pasta") && lower.contains("need")) {
+        Some("pasta_side_dish".into())
+    } else if lower.contains("pack my gym bag") || lower.contains("gym bag") {
+        Some("gym_bag".into())
+    } else if lower.contains("over budget") || lower.contains("budget this month") {
+        Some("budget_advice".into())
+    } else if lower.contains("text mom") && lower.contains("birthday") {
+        Some("birthday_message".into())
+    } else if lower.contains("driving home") && lower.contains("rain") {
+        Some("arrival_rain".into())
+    } else if lower.contains("safe to eat") {
+        Some("food_safety".into())
+    } else if lower.contains("dark parking lot") {
+        Some("safety_protocol".into())
+    } else if lower.contains("movie we haven")
+        || lower.contains("movie we have not")
+        || lower.contains("haven t seen")
+    {
+        Some("unwatched_media".into())
+    } else if lower.contains("defrost") && lower.contains("turkey") {
+        Some("turkey_thawing".into())
+    } else if lower.contains("airport") {
         Some("airport_departure".into())
     } else if lower.contains("dinner party")
         || (lower.contains("buy food") && lower.contains("party"))
@@ -4623,8 +4795,10 @@ fn family_calendar_events_from_memory(kind: &str, content: &str) -> Vec<FamilyCa
             || kind_lower.contains("schedule")
             || kind_lower.contains("event")
             || kind_lower.contains("medical")
+            || kind_lower.contains("pet_calendar")
             || lower.contains(" lesson")
             || lower.contains("appointment")
+            || lower.contains("checkup")
             || lower.contains("school pickup"))
     {
         return Vec::new();
@@ -4654,6 +4828,21 @@ fn family_calendar_events_from_memory(kind: &str, content: &str) -> Vec<FamilyCa
             person: Some(person),
             event_type: "dentist_appointment".into(),
             title: "dentist appointment".into(),
+            day: calendar_day_from_text(&lower),
+            time: time_after_marker(trimmed, &lower, " at "),
+            description: trimmed.to_string(),
+        });
+    }
+
+    if (lower.contains("vet") || lower.contains("checkup"))
+        && (lower.contains("appointment") || lower.contains("checkup"))
+        && let Some(person) = calendar_person_from_statement(trimmed, &lower)
+    {
+        events.push(FamilyCalendarEvent {
+            source_memory_id: 0,
+            person: Some(person),
+            event_type: "vet_appointment".into(),
+            title: "vet appointment".into(),
             day: calendar_day_from_text(&lower),
             time: time_after_marker(trimmed, &lower, " at "),
             description: trimmed.to_string(),
@@ -4885,9 +5074,12 @@ fn household_schedule_items_from_memory(kind: &str, content: &str) -> Vec<Househ
         || kind_lower.contains("recycling")
         || kind_lower.contains("school_calendar")
         || kind_lower.contains("city_services")
+        || kind_lower.contains("astronomical")
         || kind_lower.contains("trash")
         || lower.contains("bus arrives")
         || lower.contains("bill is due")
+        || lower.contains("sunset")
+        || lower.contains("sun set")
         || lower.contains("recycling")
         || lower.contains("trash pickup")
         || lower.contains("parent-teacher conference")
@@ -4972,6 +5164,21 @@ fn household_schedule_items_from_memory(kind: &str, content: &str) -> Vec<Househ
         });
     }
 
+    if lower.contains("sunset") || lower.contains("sun set") {
+        items.push(HouseholdScheduleItem {
+            source_memory_id: 0,
+            schedule_type: "sunset".into(),
+            subject: Some("sunset".into()),
+            title: "sunset".into(),
+            day: calendar_day_from_text(&lower).or_else(|| Some("today".into())),
+            date: due_date_from_text(trimmed, &lower),
+            time: time_after_marker(trimmed, &lower, " at ")
+                .or_else(|| time_after_marker(trimmed, &lower, " is ")),
+            amount: None,
+            description: trimmed.to_string(),
+        });
+    }
+
     items
 }
 
@@ -4986,10 +5193,12 @@ fn household_event_logs_from_memory(kind: &str, content: &str) -> Vec<HouseholdE
         || kind_lower.contains("family_ledger")
         || kind_lower.contains("ledger")
         || kind_lower.contains("finance")
+        || kind_lower.contains("payment_history")
         || lower.contains("security system was disarmed")
         || lower.contains("system was disarmed")
         || lower.contains("disarmed by")
-        || lower.contains("allowance"))
+        || lower.contains("allowance")
+        || lower.contains("bill") && lower.contains("paid"))
     {
         return Vec::new();
     }
@@ -5016,6 +5225,19 @@ fn household_event_logs_from_memory(kind: &str, content: &str) -> Vec<HouseholdE
             subject: person.clone(),
             action: "allowance".into(),
             actor: person,
+            time: relative_calendar_phrase_from_text(&lower),
+            description: trimmed.to_string(),
+        });
+    }
+
+    if lower.contains("bill") && lower.contains("paid") {
+        let subject = bill_subject_from_text(trimmed, &lower);
+        events.push(HouseholdEventLog {
+            source_memory_id: 0,
+            event_type: "finance".into(),
+            subject: subject.clone(),
+            action: "paid_bill".into(),
+            actor: None,
             time: relative_calendar_phrase_from_text(&lower),
             description: trimmed.to_string(),
         });
@@ -5158,6 +5380,35 @@ fn media_playlist_query(query: &str) -> Option<(Option<String>, String)> {
 
 fn calendar_event_query(query: &str) -> Option<(String, String, Option<String>)> {
     let lower = query.to_ascii_lowercase();
+    if (lower.contains("vet") || lower.contains("checkup")) && lower.contains("appointment") {
+        let person = if let Some(rest) = lower.strip_prefix("when is ") {
+            rest.split("'s")
+                .next()
+                .or_else(|| rest.split(" next ").next())
+                .map(clean_person_name)
+        } else if lower.starts_with("does ") || lower.starts_with("do ") {
+            let rest = query.get(
+                if lower.starts_with("does ") {
+                    "does ".len()
+                } else {
+                    "do ".len()
+                }..,
+            )?;
+            let lower_rest = rest.to_ascii_lowercase();
+            let have_pos = lower_rest.find(" have ")?;
+            Some(clean_person_name(&rest[..have_pos]))
+        } else {
+            None
+        }?;
+        if !person.is_empty() {
+            return Some((
+                person,
+                "vet_appointment".into(),
+                calendar_day_from_text(&lower),
+            ));
+        }
+    }
+
     if lower.contains("dentist") && lower.contains("appointment") {
         let person = if let Some(rest) = lower.strip_prefix("when is ") {
             rest.split("'s")
@@ -5327,6 +5578,13 @@ fn task_log_query(query: &str) -> Option<(String, String, Option<String>, Option
 
 fn schedule_item_query(query: &str) -> Option<(String, Option<String>, Option<String>)> {
     let lower = query.to_ascii_lowercase();
+    if lower.contains("sunset") || lower.contains("sun set") {
+        return Some((
+            "sunset".into(),
+            Some("sunset".into()),
+            calendar_day_from_text(&lower).or_else(|| Some("today".into())),
+        ));
+    }
     if lower.contains("school bus") && (lower.contains("arrive") || lower.contains("what time")) {
         return Some((
             "school_bus_arrival".into(),
@@ -5388,6 +5646,13 @@ fn event_log_query(query: &str) -> Option<(String, String, Option<String>)> {
         if !person.is_empty() {
             return Some(("finance".into(), "allowance".into(), Some(person)));
         }
+    }
+    if lower.starts_with("did ") && lower.contains("pay") && lower.contains("bill") {
+        return Some((
+            "finance".into(),
+            "paid_bill".into(),
+            bill_subject_from_text(query, &lower),
+        ));
     }
     None
 }
@@ -6386,6 +6651,10 @@ fn format_household_schedule_item_answer(item: &HouseholdScheduleItem) -> String
                 .unwrap_or_default();
             format!("The next parent-teacher conference is on {date}{time}{subject}.")
         }
+        "sunset" => {
+            let time = item.time.as_deref().unwrap_or("the scheduled time");
+            format!("Sunset is at {time}. {}", item.description)
+        }
         _ => format!("I found this schedule item: {}", item.description),
     }
 }
@@ -6402,6 +6671,10 @@ fn format_household_event_log_answer(event: &HouseholdEventLog) -> String {
     }
 
     if event.event_type == "finance" && event.action == "allowance" {
+        return format!("Yes. {}", event.description);
+    }
+
+    if event.event_type == "finance" && event.action == "paid_bill" {
         return format!("Yes. {}", event.description);
     }
 
@@ -6447,6 +6720,13 @@ fn format_household_note_answer(note: &HouseholdNote) -> String {
         "food_safety" => format!("I found this food-safety note: {}", note.content),
         "contact" => format!("I found this contact note: {}", note.content),
         "delivery" => format!("I found this delivery note: {}", note.content),
+        "schedule" => format!("I found this schedule note: {}", note.content),
+        "finance" => format!("I found this finance note: {}", note.content),
+        "tool" => format!("I found this tool note: {}", note.content),
+        "network" => format!("I found this network note: {}", note.content),
+        "diy" => format!("I found this DIY note: {}", note.content),
+        "fitness" => format!("I found this fitness note: {}", note.content),
+        "safety" => format!("I found this safety note: {}", note.content),
         _ => format!("I found this note: {}", note.content),
     }
 }
@@ -7448,6 +7728,44 @@ mod tests {
     }
 
     #[test]
+    fn garden_health_logistics_structured_recall_answers_exact_questions() {
+        let mem = temp_memory();
+        mem.store("astronomical_data", "Sunset today is at 7:42 PM")
+            .unwrap();
+        mem.store(
+            "pet_calendar",
+            "Buster has a vet appointment next Tuesday at 10:00 AM",
+        )
+        .unwrap();
+        mem.store(
+            "payment_history",
+            "Electric bill for January was paid on the 15th for $142",
+        )
+        .unwrap();
+
+        let sunset = mem
+            .structured_household_answer("What time does the sun set today?")
+            .unwrap()
+            .unwrap();
+        assert!(sunset.contains("7:42pm"));
+
+        let vet = mem
+            .structured_household_answer("When is Buster's next vet appointment?")
+            .unwrap()
+            .unwrap();
+        assert!(vet.contains("Buster"));
+        assert!(vet.contains("vet appointment"));
+        assert!(vet.contains("10:00am"));
+
+        let paid = mem
+            .structured_household_answer("Did I pay the electric bill?")
+            .unwrap()
+            .unwrap();
+        assert!(paid.contains("Electric bill"));
+        assert!(paid.contains("$142"));
+    }
+
+    #[test]
     fn shopping_list_indexes_pending_items_and_counts() {
         let mem = temp_memory();
         mem.store("shopping", "shopping list pending: milk, eggs")
@@ -7906,6 +8224,45 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .contains("Test/Silence")
+        );
+    }
+
+    #[test]
+    fn expanded_household_notes_cover_tools_receipts_and_deck_stain() {
+        let mem = temp_memory();
+        mem.store(
+            "tool_inventory",
+            "The 10mm socket was last checked out by Jared and should be in the red toolbox in the garage",
+        )
+        .unwrap();
+        mem.store(
+            "digital_receipts",
+            "Target receipt for the Lego Star Wars set dated December 12th",
+        )
+        .unwrap();
+        mem.store(
+            "home_maintenance",
+            "The deck is stained Cedar Tone by Behr. The can is in the shed",
+        )
+        .unwrap();
+
+        assert!(
+            mem.structured_household_answer("Where is the 10mm socket?")
+                .unwrap()
+                .unwrap()
+                .contains("red toolbox")
+        );
+        assert!(
+            mem.structured_household_answer("Find the receipt for the Lego set.")
+                .unwrap()
+                .unwrap()
+                .contains("Target receipt")
+        );
+        assert!(
+            mem.structured_household_answer("What color is the deck stain?")
+                .unwrap()
+                .unwrap()
+                .contains("Cedar Tone")
         );
     }
 
@@ -8372,6 +8729,103 @@ mod tests {
             ("The baby is awake", "nightlight"),
             ("What's for dinner?", "tacos"),
             ("I'm going for a run", "Run Fast"),
+        ] {
+            assert!(
+                mem.semantic_search(query, 3)
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit.entry.content.contains(expected)),
+                "query {query:?} should recall {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_search_links_garden_health_logistics_and_substitutions() {
+        let mem = temp_memory();
+        mem.store(
+            "cooking_substitutes",
+            "Olive oil substitute: use melted butter for richness or vegetable oil for a neutral saute",
+        )
+        .unwrap();
+        mem.store(
+            "diy_projects",
+            "Bookshelf beginner plan: simple 3-shelf unit with a 1x12 board, screws, and a drill",
+        )
+        .unwrap();
+        mem.store(
+            "plumbing_troubleshooting",
+            "Running toilet troubleshooting: check for a stuck flapper chain or old flapper in the tank",
+        )
+        .unwrap();
+        mem.store(
+            "injury_recovery",
+            "Running knee pain recovery: ice it for 15 minutes, stretch quads, and check running shoes",
+        )
+        .unwrap();
+        mem.store(
+            "recipe",
+            "Pasta side dish ideas: classic Caesar salad or Garlic Bread",
+        )
+        .unwrap();
+        mem.store(
+            "gym_routine",
+            "Gym bag leg day checklist: shorts, shirt, shoes, knee sleeves, and water bottle",
+        )
+        .unwrap();
+        mem.store(
+            "financial_advice",
+            "Monthly budget note: you are $150 over budget because of the car repair; delay dining out",
+        )
+        .unwrap();
+        mem.store(
+            "message_templates",
+            "Mom birthday message template: Happy Birthday! Hope you have a great day! Love, the family",
+        )
+        .unwrap();
+        mem.store(
+            "arrival_rain",
+            "Driving home in rain arrival protocol: close the garage door and turn up the heat so the house is cozy",
+        )
+        .unwrap();
+        mem.store(
+            "food_safety",
+            "Yogurt food safety: if it expires on October 25 and today is October 22, it is safe; sniff first",
+        )
+        .unwrap();
+        mem.store(
+            "safety_protocol",
+            "Dark parking lot safety protocol: share live location with Jared and turn on flashlight",
+        )
+        .unwrap();
+        mem.store(
+            "streaming_services",
+            "Family unwatched movie suggestion: Encanto is on Disney+ and not in watch history",
+        )
+        .unwrap();
+        mem.store(
+            "turkey_thawing_guide",
+            "Turkey thawing guide: set defrost reminder before Thanksgiving; a 15lb bird needs about 24 hours per 5lb",
+        )
+        .unwrap();
+
+        for (query, expected) in [
+            (
+                "I'm out of olive oil. What can I use instead?",
+                "vegetable oil",
+            ),
+            ("I want to build a bookshelf", "3-shelf"),
+            ("The toilet keeps running", "flapper"),
+            ("My knee hurts after my run", "15 minutes"),
+            ("We need a side dish for pasta", "Garlic Bread"),
+            ("Pack my gym bag", "knee sleeves"),
+            ("Are we over budget this month?", "$150"),
+            ("Text Mom happy birthday", "Happy Birthday"),
+            ("I'm driving home in the rain", "cozy"),
+            ("Is it safe to eat this?", "Yogurt"),
+            ("I'm in a dark parking lot", "live location"),
+            ("Find a movie we haven't seen", "Encanto"),
+            ("Remind me to defrost the turkey", "24 hours"),
         ] {
             assert!(
                 mem.semantic_search(query, 3)

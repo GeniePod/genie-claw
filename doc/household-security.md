@@ -83,13 +83,14 @@ GenieClaw keeps these decisions separate:
   resolution before fuzzy matching; safe profile attributes and household rules
   answer low-latency questions about age, shoe sizes, allergies, homework, and
   screen-time constraints before FTS fallback; safe calendar, access,
-  chore/task-log, schedule, finance/event-log, security-event, and pantry
+  chore/task-log, schedule, finance/payment-event, security-event, and pantry
   inventory memories answer local exact-match questions before fuzzy fallback;
   safe household notes, reminders, manuals, warranties, receipts, utility notes,
   first-aid notes, education notes, dictionary notes, story/media notes,
   inventory notes, storage notes, meal history, commute notes, pantry notes,
   travel notes, contact notes, delivery notes, location notes, shopping notes,
-  and watch notes are indexed in a typed local FTS table for direct note recall
+  tool notes, DIY notes, fitness notes, food-safety notes, and watch notes are
+  indexed in a typed local FTS table for direct note recall
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
   class such as household, person, sensitive, private, or restricted
@@ -130,8 +131,8 @@ treated as ordinary recall.
   the local SQLite store, not a remote vector service dependency.
 - Keep household indexes typed and inspectable. Calendar events, shopping-list
   items, access permissions, chore/task logs, household schedules, event logs,
-  finance/allowance logs, device aliases, and media targets are local SQLite
-  rows derived from safe memory records, not remote profile data.
+  finance/allowance/payment logs, device aliases, and media targets are local
+  SQLite rows derived from safe memory records, not remote profile data.
 - Store playlists as provider targets instead of secrets. Credential and access
   code memories should remain app-only references and are not spoken in
   shared-room chat.

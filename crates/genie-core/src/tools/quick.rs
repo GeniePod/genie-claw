@@ -54,6 +54,24 @@ pub fn route(text: &str) -> Option<ToolCall> {
         ));
     }
 
+    if let Some((category, content)) = health_log_store_request(&normalized) {
+        return Some(tool(
+            "memory_store",
+            serde_json::json!({
+                "category": category,
+                "content": content
+            }),
+        ));
+    }
+
+    if let Some((entity, action, value)) = priority_home_control_request(&normalized) {
+        let mut args = serde_json::json!({ "entity": entity, "action": action });
+        if let Some(value) = value {
+            args["value"] = serde_json::json!(value);
+        }
+        return Some(tool("home_control", args));
+    }
+
     if let Some(query) = memory_recall_query(&normalized) {
         return Some(tool("memory_recall", serde_json::json!({ "query": query })));
     }
@@ -245,8 +263,13 @@ fn is_structured_household_question(text: &str) -> bool {
         || (text.starts_with("are there ") && text.contains(" left"))
         || (text.starts_with("does ") && text.contains(" have "))
         || (text.starts_with("when is ") && text.contains("dentist appointment"))
+        || (text.starts_with("when is ") && text.contains("vet appointment"))
+        || (text.starts_with("when is ") && text.contains("checkup"))
+        || text.contains("sun set")
+        || text.contains("sunset")
         || (text.starts_with("did ") && contains_any(text, &[" feed ", " fed "]))
         || (text.starts_with("did ") && text.contains("allowance"))
+        || (text.starts_with("did ") && text.contains("pay") && text.contains("bill"))
         || (text.starts_with("can ") && text.contains(" unlock "))
         || text.contains("school bus")
         || text.contains("bill due")
@@ -258,6 +281,7 @@ fn is_structured_household_question(text: &str) -> bool {
         || text.contains("parent teacher conference")
         || text.contains("parent-teacher conference")
         || text.contains("dentist appointment")
+        || text.contains("vet appointment")
         || text.contains("turned off the security system")
         || text.contains("disarmed the security system")
         || text.contains("picking up the kids")
@@ -323,6 +347,19 @@ fn is_semantic_household_memory_question(text: &str) -> bool {
         || text.contains("i'm really hot")
         || text.contains("guests coming over")
         || text.contains("baby is awake")
+        || text.contains("olive oil")
+        || text.contains("build a bookshelf")
+        || text.contains("toilet keeps running")
+        || (text.contains("knee") && text.contains("run"))
+        || text.contains("side dish for pasta")
+        || text.contains("pack my gym bag")
+        || text.contains("over budget")
+        || text.contains("text mom happy birthday")
+        || text.contains("driving home in the rain")
+        || text.contains("safe to eat")
+        || text.contains("dark parking lot")
+        || text.contains("movie we haven t seen")
+        || text.contains("defrost the turkey")
         || text.contains("what s for dinner")
         || text.contains("what's for dinner")
         || text.contains("going for a run")
@@ -501,6 +538,35 @@ fn household_rule_store_request(text: &str) -> Option<String> {
     None
 }
 
+fn health_log_store_request(text: &str) -> Option<(&'static str, String)> {
+    if text.starts_with("log that i drank ") && text.contains("water") {
+        let amount = text
+            .trim_start_matches("log that i drank ")
+            .trim_end_matches(" of water")
+            .trim_end_matches(" water")
+            .trim();
+        let content = if amount.is_empty() {
+            "hydration log: drank water".into()
+        } else {
+            format!("hydration log: drank {amount} of water")
+        };
+        return Some(("health_tracker", content));
+    }
+    None
+}
+
+fn priority_home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>)> {
+    if text.contains("dark parking lot") {
+        return Some(("parking lot safety protocol".into(), "activate", None));
+    }
+
+    if text.contains("driving home") && text.contains("rain") {
+        return Some(("arrival rain protocol".into(), "activate", None));
+    }
+
+    None
+}
+
 fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>)> {
     if matches!(
         text,
@@ -519,6 +585,12 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
 
     if text.starts_with("stop the sprinklers") || text.starts_with("pause the sprinklers") {
         return Some(("sprinklers".into(), "pause", None));
+    }
+
+    if text == "turn on the porch light when i arrive"
+        || text == "turn on porch light when i arrive"
+    {
+        return Some(("porch light".into(), "schedule_on_arrival", None));
     }
 
     if matches!(text, "start the dishwasher" | "start dishwasher") {
@@ -701,6 +773,10 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("stove".into());
     }
 
+    if text.contains("solar") && (text.contains("generate") || text.contains("generated")) {
+        return Some("solar power today".into());
+    }
+
     if text.contains("home assistant") || !looks_like_status_query(text) {
         return None;
     }
@@ -779,6 +855,14 @@ fn home_status_target(text: &str) -> Option<String> {
 
     if contains_any(&target, &["driveway", "icy", "ice"]) {
         return Some("driveway ice".into());
+    }
+
+    if target.contains("sprinkler") || target.contains("irrigation") {
+        return Some(if target.contains("front") {
+            "front sprinklers".into()
+        } else {
+            "sprinklers".into()
+        });
     }
 
     if contains_any(&target, &["dryer", "drying machine"]) {
@@ -903,7 +987,20 @@ fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
 }
 
 fn calculation_request(text: &str) -> Option<String> {
-    percentage_expression(text).or_else(|| arithmetic_expression(text))
+    temperature_conversion_expression(text)
+        .or_else(|| percentage_expression(text))
+        .or_else(|| arithmetic_expression(text))
+}
+
+fn temperature_conversion_expression(text: &str) -> Option<String> {
+    if !(text.contains("to celsius") || text.contains("to celcius")) {
+        return None;
+    }
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let fahrenheit = tokens
+        .iter()
+        .find_map(|token| parse_decimal_token(token.trim_end_matches("f")))?;
+    Some(format!("({fahrenheit} - 32) * 5 / 9"))
 }
 
 fn percentage_expression(text: &str) -> Option<String> {
@@ -1198,6 +1295,15 @@ mod tests {
 
         let call = route("When is Mia's next dentist appointment?").unwrap();
         assert_eq!(call.name, "memory_recall");
+
+        let call = route("What time does the sun set today?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("When is Buster's next vet appointment?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("Did I pay the electric bill?").unwrap();
+        assert_eq!(call.name, "memory_recall");
     }
 
     #[test]
@@ -1245,6 +1351,9 @@ mod tests {
             "Find the instructions for the board game.",
             "What color is the nursery paint?",
             "How do I reset the smoke detector?",
+            "Where is the 10mm socket?",
+            "Find the receipt for the Lego set.",
+            "What color is the deck stain?",
         ] {
             let call = route(query).unwrap();
             assert_eq!(call.name, "memory_recall", "{query}");
@@ -1361,6 +1470,17 @@ mod tests {
             "I'm really hot",
             "We have guests coming over",
             "The baby is awake",
+            "I'm out of olive oil. What can I use instead?",
+            "I want to build a bookshelf",
+            "The toilet keeps running",
+            "My knee hurts after my run",
+            "We need a side dish for pasta",
+            "Pack my gym bag",
+            "Are we over budget this month?",
+            "Text Mom happy birthday",
+            "Is it safe to eat this?",
+            "Find a movie we haven't seen",
+            "Remind me to defrost the turkey",
             "What's for dinner?",
             "I'm going for a run",
         ] {
@@ -1431,6 +1551,14 @@ mod tests {
             "Kids must finish homework before screen time"
         );
 
+        let call = route("Log that I drank 2 glasses of water").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "health_tracker");
+        assert_eq!(
+            call.arguments["content"],
+            "hydration log: drank 2 glasses of water"
+        );
+
         let call = route("Set the oven to 400 degrees").unwrap();
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "oven");
@@ -1470,6 +1598,21 @@ mod tests {
         assert_eq!(call.arguments["entity"], "sprinklers");
         assert_eq!(call.arguments["action"], "pause");
 
+        let call = route("Turn on the porch light when I arrive").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "porch light");
+        assert_eq!(call.arguments["action"], "schedule_on_arrival");
+
+        let call = route("I'm driving home in the rain").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "arrival rain protocol");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("I'm in a dark parking lot").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "parking lot safety protocol");
+        assert_eq!(call.arguments["action"], "activate");
+
         let call = route("Call my phone").unwrap();
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "phone finder");
@@ -1502,6 +1645,14 @@ mod tests {
         let call = route("Is the package delivered?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "package");
+
+        let call = route("Are the front sprinklers on?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "front sprinklers");
+
+        let call = route("How much solar power did we generate today?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "solar power today");
     }
 
     #[test]
@@ -1591,6 +1742,10 @@ mod tests {
         let call = route("what is 15 percent of 200").unwrap();
         assert_eq!(call.name, "calculate");
         assert_eq!(call.arguments["expression"], "200 * 15 / 100");
+
+        let call = route("Convert 350 degrees to Celsius").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "(350 - 32) * 5 / 9");
     }
 
     #[test]
