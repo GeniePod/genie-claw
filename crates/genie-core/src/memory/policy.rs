@@ -447,6 +447,8 @@ fn restricted_secret_reason(lower: &str) -> Option<&'static str> {
             "credit card",
             "card number",
             "cvv",
+            "account number",
+            "confirmation number",
             "bank account",
             "routing number",
             "social security",

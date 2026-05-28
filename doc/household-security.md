@@ -62,6 +62,8 @@ memory as product data with visibility rules:
 - password/code memories may be represented as app-only references, but the
   shared-room assistant should point users to the local dashboard or credential
   store instead of speaking values
+- account numbers and travel confirmation numbers are also app-only references;
+  they are not indexed as speakable household notes
 
 Speaker recognition improves routing; it is not a hard security boundary unless
 the deployment explicitly adds biometric enrollment, local profile storage,
@@ -81,13 +83,13 @@ GenieClaw keeps these decisions separate:
   resolution before fuzzy matching; safe profile attributes and household rules
   answer low-latency questions about age, shoe sizes, allergies, homework, and
   screen-time constraints before FTS fallback; safe calendar, access,
-  chore/task-log, schedule, finance/event-log, and security-event memories
-  answer local exact-match questions before fuzzy fallback; safe household
-  notes, reminders, manuals, warranties, receipts, utility notes, first-aid
-  notes, education notes, dictionary notes, story/media notes, inventory notes,
-  storage notes, meal history, commute notes, pantry notes, location notes,
-  shopping notes, and watch notes are indexed in a typed local FTS table for
-  direct note recall
+  chore/task-log, schedule, finance/event-log, security-event, and pantry
+  inventory memories answer local exact-match questions before fuzzy fallback;
+  safe household notes, reminders, manuals, warranties, receipts, utility notes,
+  first-aid notes, education notes, dictionary notes, story/media notes,
+  inventory notes, storage notes, meal history, commute notes, pantry notes,
+  travel notes, contact notes, delivery notes, location notes, shopping notes,
+  and watch notes are indexed in a typed local FTS table for direct note recall
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
   class such as household, person, sensitive, private, or restricted
@@ -133,9 +135,10 @@ treated as ordinary recall.
 - Store playlists as provider targets instead of secrets. Credential and access
   code memories should remain app-only references and are not spoken in
   shared-room chat.
-- Do not store router, Wi-Fi, access-code, or lock-combination values as
-  speakable notes. They are either rejected by memory-write policy or reduced to
-  app-only references for local-dashboard viewing.
+- Do not store router, Wi-Fi, access-code, lock-combination, account-number, or
+  confirmation-number values as speakable notes. They are either rejected by
+  memory-write policy or reduced to app-only references for local-dashboard
+  viewing.
 
 ## Runtime Contract
 

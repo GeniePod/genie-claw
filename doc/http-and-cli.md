@@ -128,13 +128,16 @@ Response:
 
 High-frequency home phrases are routed before model tool selection when the
 intent is unambiguous. Current local-first routes include household memory
-recall for school, schedule, allowance, receipt/manual/storage, education,
-dictionary, entertainment, and location questions; app-only credential
-references for Wi-Fi/password/code questions; and integration-backed
+recall for school, schedule, allowance, grocery inventory, medical appointment,
+receipt/manual/storage, education, dictionary, entertainment, travel planning,
+meal planning, guest context, and location questions; app-only credential
+references for Wi-Fi/password/code/account/confirmation-number questions; and integration-backed
 `home_control`/`home_status` calls for explicit physical requests such as
 holiday lights, front-gate state, driveway ice status, sprinklers, lock-up,
-phone finder, slow-cooker setup, and freezer telemetry. Those physical results
-still depend on the configured home provider and actuation policy.
+phone finder, timers, slow-cooker setup, dryer completion, basement humidity,
+car lock state, stove status, package status, and freezer telemetry. Those
+physical results still depend on the configured home provider and actuation
+policy.
 
 ### `POST /api/chat/stream`
 
