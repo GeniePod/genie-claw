@@ -100,6 +100,7 @@ pub struct ManagedMemoryEntry {
     pub scope: String,
     pub sensitivity: String,
     pub spoken_policy: String,
+    pub disclosure_class: String,
     pub namespace: String,
     pub canonical_note: Option<String>,
     pub display_order: i64,
@@ -565,14 +566,13 @@ impl Memory {
             .collect::<Vec<_>>();
 
         for entry in &mut entries {
-            entry.namespace = canonical_namespace(
-                &entry.kind,
-                policy::MemoryPolicyMetadata {
-                    scope: policy::MemoryScope::from_storage(&entry.scope),
-                    sensitivity: policy::MemorySensitivity::from_storage(&entry.sensitivity),
-                    spoken_policy: policy::SpokenMemoryPolicy::from_storage(&entry.spoken_policy),
-                },
-            );
+            let metadata = policy::MemoryPolicyMetadata {
+                scope: policy::MemoryScope::from_storage(&entry.scope),
+                sensitivity: policy::MemorySensitivity::from_storage(&entry.sensitivity),
+                spoken_policy: policy::SpokenMemoryPolicy::from_storage(&entry.spoken_policy),
+            };
+            entry.disclosure_class = policy::classify_memory(metadata).as_str().to_string();
+            entry.namespace = canonical_namespace(&entry.kind, metadata);
             entry.canonical_note = if entry.promoted {
                 Some(format!(
                     "memory/{}",
@@ -1207,6 +1207,7 @@ fn read_managed_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedMemory
         scope: row.get::<_, String>(7)?,
         sensitivity: row.get::<_, String>(8)?,
         spoken_policy: row.get::<_, String>(9)?,
+        disclosure_class: String::new(),
         namespace: String::new(),
         canonical_note: None,
         display_order: row.get::<_, i64>(10).unwrap_or(i64::MAX),
@@ -2001,6 +2002,7 @@ mod tests {
         let entries = mem.list_managed(10).unwrap();
         let entry = entries.into_iter().find(|entry| entry.id == id).unwrap();
         assert_eq!(entry.namespace, "household.preference");
+        assert_eq!(entry.disclosure_class, "household");
         assert_eq!(
             entry.canonical_note.as_deref(),
             Some("memory/namespaces/household/preference.md")

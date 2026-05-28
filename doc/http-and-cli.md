@@ -318,7 +318,7 @@ Served by `crates/genie-api/src/routes.rs`.
 | `GET` | `/api/actuation/actions` | Recent executed actions from `genie-core` |
 | `GET` | `/api/actuation/audit` | Recent actuation audit events |
 | `POST` | `/api/actuation/confirm` | Confirm a pending actuation token |
-| `GET` | `/api/memories` | List saved memories for dashboard management |
+| `GET` | `/api/memories` | List saved memories with scope, sensitivity, disclosure class, and dashboard ordering |
 | `POST` | `/api/memories/update` | Update one memory row |
 | `POST` | `/api/memories/delete` | Delete one memory row |
 | `POST` | `/api/memories/reorder` | Persist memory display order |
