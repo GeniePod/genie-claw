@@ -128,23 +128,25 @@ Response:
 
 High-frequency home phrases are routed before model tool selection when the
 intent is unambiguous. Current local-first routes include household memory
-recall for school, schedule, community/business hours, allowance, grocery
+recall for school, schedule, community/business/channel-guide hours, allowance, grocery
 inventory, medical appointment, vet appointment, sunset, utility payment,
-appliance state, environment/location/waste events,
+appliance state, environment/location/waste/finance/health events,
 receipt/manual/tool/storage/safety-equipment notes, education, dictionary,
 entertainment, travel planning, meal planning, guest context, fitness,
-food-safety, substitutions, DIY, gift history, game-night context, media
-preferences, and location questions; health hydration/weight logs; app-only
-credential references for Wi-Fi/password/code/account/subscription/confirmation
-questions; media routes for focus music and morning news; web search for
-explicit news/search requests; and integration-backed `home_control`/
-`home_status` calls for explicit physical requests such as holiday lights,
-fireplace, ventilation, upstairs lights, robot mower, smoke-detector tests,
+food-safety, substitutions, DIY, wardrobe, service booking, gift history,
+game-night context, media preferences, and location questions; health
+hydration/weight logs; app-only credential references for
+Wi-Fi/password/code/account/subscription/confirmation/spare-key questions;
+media routes for focus music and morning news; web search for explicit
+news/search requests; and integration-backed `home_control`/`home_status` calls
+for explicit physical requests such as holiday lights, TV, security alarm,
+nap mode, fireplace, ventilation, upstairs lights, robot mower, smoke-detector tests,
 front-gate state, driveway ice status, sprinklers, lock-up/all-off/
 work-from-home scenes, porch-light arrival triggers, rain-arrival and
 parking-lot safety routines, locked-out unlock confirmation, phone finder,
-timers, slow-cooker setup, dryer completion, basement/attic environment status,
-solar generation, tire pressure, mailbox, car lock state, stove status, package
+timers, slow-cooker setup, dryer completion, baby breathing monitor, iron
+state, water-heater readiness, basement/attic environment status, solar
+generation, tire pressure, mailbox, car lock state, stove status, package
 status, garage-door status, and freezer telemetry. Those physical results still
 depend on the configured home provider and actuation policy.
 
