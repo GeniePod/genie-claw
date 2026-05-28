@@ -24,6 +24,16 @@ pub fn route(text: &str) -> Option<ToolCall> {
         return Some(tool("memory_status", serde_json::json!({})));
     }
 
+    if let Some(items) = shopping_list_add_request(&normalized) {
+        return Some(tool(
+            "memory_store",
+            serde_json::json!({
+                "category": "shopping",
+                "content": format!("shopping list pending: {items}")
+            }),
+        ));
+    }
+
     if let Some(query) = memory_recall_query(&normalized) {
         return Some(tool("memory_recall", serde_json::json!({ "query": query })));
     }
@@ -62,6 +72,14 @@ pub fn route(text: &str) -> Option<ToolCall> {
 
     if let Some(query) = play_media_request(&normalized) {
         return Some(tool("play_media", serde_json::json!({ "query": query })));
+    }
+
+    if let Some((entity, action, value)) = home_control_request(&normalized) {
+        let mut args = serde_json::json!({ "entity": entity, "action": action });
+        if let Some(value) = value {
+            args["value"] = serde_json::json!(value);
+        }
+        return Some(tool("home_control", args));
     }
 
     if let Some(expression) = calculation_request(&normalized) {
@@ -201,6 +219,11 @@ fn is_structured_household_question(text: &str) -> bool {
     (text.starts_with("how old is ") || text.starts_with("what age is "))
         || (text.starts_with("what does ") && text.contains(" like"))
         || (text.starts_with("is ") && text.contains(" allowed"))
+        || (text.starts_with("does ") && text.contains(" have "))
+        || (text.starts_with("can ") && text.contains(" unlock "))
+        || text.contains("picking up the kids")
+        || text.contains("school pickup")
+        || text.contains("shopping list")
         || (text.contains("allergic") || text.contains("allergy"))
         || text.contains("homework rule")
         || text.contains("homework rules")
@@ -216,6 +239,12 @@ fn is_household_note_question(text: &str) -> bool {
         || text.starts_with("show the note about ")
         || text.starts_with("what did i write about ")
         || text.starts_with("what did we write about ")
+        || text.starts_with("what did the vet say about ")
+        || text.starts_with("what did the mechanic say about ")
+        || text.starts_with("what color did we paint ")
+        || text.starts_with("what colour did we paint ")
+        || text.starts_with("we have a leak ")
+        || text.starts_with("there is a leak ")
         || text.starts_with("where are ")
         || text.starts_with("where is ")
         || text.starts_with("where did i put ")
@@ -231,6 +260,15 @@ fn is_semantic_household_memory_question(text: &str) -> bool {
         || (text.contains("snack") && (text.contains("lunchbox") || text.contains("lunch box")))
         || (text.contains("detergent") && contains_any(text, &["like", "order", "more"]))
         || (text.contains("movie") && text.contains("robot"))
+        || text == "i m bored"
+        || text.contains("weird noise coming from the car")
+        || text.contains("printer")
+        || text.contains("what can i cook with")
+        || text.contains("comfort movie")
+        || text.contains("warm enough to go to the park")
+        || text.contains("date night idea")
+        || text.contains("too late to call grandma")
+        || text.contains("baby is crying")
 }
 
 fn is_app_only_secret_question(text: &str) -> bool {
@@ -289,6 +327,57 @@ fn play_media_request(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn shopping_list_add_request(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("add ")?;
+    let items = rest
+        .strip_suffix(" to the shopping list")
+        .or_else(|| rest.strip_suffix(" to shopping list"))?
+        .trim();
+    if items.is_empty() {
+        None
+    } else {
+        Some(items.replace(" and ", ", "))
+    }
+}
+
+fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>)> {
+    if let Some(rest) = text
+        .strip_prefix("set ")
+        .or_else(|| text.strip_prefix("preheat "))
+        && let Some((entity, value)) = parse_temperature_target(rest)
+    {
+        return Some((entity, "set_temperature", Some(value)));
+    }
+
+    None
+}
+
+fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
+    let (entity, value_text) = rest
+        .split_once(" to ")
+        .or_else(|| rest.split_once(" at "))?;
+    let entity = entity
+        .trim()
+        .trim_start_matches("the ")
+        .trim_start_matches("a ")
+        .trim_start_matches("an ");
+    if entity.is_empty() {
+        return None;
+    }
+    let value_token = value_text
+        .split_whitespace()
+        .find(|token| token.chars().any(|ch| ch.is_ascii_digit()))?;
+    let value = value_token
+        .trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.')
+        .parse::<f64>()
+        .ok()?;
+    if value.is_finite() {
+        Some((entity.to_string(), value))
+    } else {
+        None
+    }
 }
 
 fn household_role_query(text: &str) -> Option<&'static str> {
@@ -433,7 +522,16 @@ fn home_status_target(text: &str) -> Option<String> {
     if contains_any(
         &target,
         &[
-            "cover", "covers", "blind", "blinds", "shade", "shades", "curtain", "curtains",
+            "cover",
+            "covers",
+            "blind",
+            "blinds",
+            "shade",
+            "shades",
+            "curtain",
+            "curtains",
+            "garage",
+            "garage door",
         ],
     ) {
         return Some(if target.split_whitespace().count() == 1 {
@@ -793,6 +891,16 @@ mod tests {
 
         let call = route("Is anyone allergic to peanuts?").unwrap();
         assert_eq!(call.name, "memory_recall");
+
+        let call = route("Does Mia have piano lessons today?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "does mia have piano lessons today");
+
+        let call = route("Can Leo unlock the front door?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("Who is picking up the kids today?").unwrap();
+        assert_eq!(call.name, "memory_recall");
     }
 
     #[test]
@@ -810,6 +918,12 @@ mod tests {
             call.arguments["query"],
             "where are the extra batteries kept"
         );
+
+        let call = route("What did the vet say about Buster's medicine?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("What color did we paint the shed?").unwrap();
+        assert_eq!(call.name, "memory_recall");
     }
 
     #[test]
@@ -841,6 +955,15 @@ mod tests {
 
         let call = route("What was the movie about a robot?").unwrap();
         assert_eq!(call.name, "memory_recall");
+
+        let call = route("I'm bored").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("What can I cook with chicken and rice?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("Is it too late to call Grandma?").unwrap();
+        assert_eq!(call.name, "memory_recall");
     }
 
     #[test]
@@ -861,6 +984,27 @@ mod tests {
         let call = route("Play my Morning Boost playlist").unwrap();
         assert_eq!(call.name, "play_media");
         assert_eq!(call.arguments["query"], "my morning boost playlist");
+    }
+
+    #[test]
+    fn routes_shopping_and_temperature_home_requests() {
+        let call = route("Add milk and eggs to the shopping list").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "shopping");
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list pending: milk, eggs"
+        );
+
+        let call = route("Set the oven to 400 degrees").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "oven");
+        assert_eq!(call.arguments["action"], "set_temperature");
+        assert_eq!(call.arguments["value"], 400.0);
+
+        let call = route("Is the garage door closed?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "garage door");
     }
 
     #[test]

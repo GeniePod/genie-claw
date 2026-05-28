@@ -426,15 +426,25 @@ Memory tools are policy-aware:
 - safe media-profile memories maintain a local playlist index, so requests like
   "play my Morning Boost playlist" resolve a remembered provider target before
   media mode starts
+- safe calendar, shopping-list, and access-permission memories maintain local
+  typed indexes for questions such as "does Mia have piano today?", "what is on
+  the shopping list?", and "can Leo unlock the front door?"
 - safe profile attributes and household rules maintain local indexes for exact
   age, preference, allergy, homework, and screen-time recall
-- safe notes, reminders, manuals, and watch notes maintain a typed local FTS
-  index for direct questions such as "find my note about..." or "where are..."
+- safe notes, reminders, manuals, pet health, maintenance, storage, gift,
+  troubleshooting, recipe, and watch notes maintain a typed local FTS index for
+  direct questions such as "find my note about...", "what did the vet say...",
+  "what color did we paint...", or "where are..."
 - password/code questions can resolve to app-only secret references without
   exposing the value in shared-room chat
-- selected safe preferences, notes, shopping, media, and manual memories also
-  maintain local embeddings for fuzzy household recall such as comfort,
-  lunchbox, and movie questions when exact words are missing
+- selected safe preferences, notes, shopping, activity, troubleshooting, recipe,
+  media, maintenance, routine, and manual memories also maintain local
+  embeddings for fuzzy household recall such as comfort, lunchbox, bored-child,
+  printer, car-noise, recipe, date-night, and movie questions when exact words
+  are missing
+- live answers still require live tools: garage/lock/thermostat state comes from
+  Home Assistant, weather comes from the weather tool, and sensors such as baby
+  monitors or location history are not simulated by memory recall
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 

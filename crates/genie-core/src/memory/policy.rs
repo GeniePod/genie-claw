@@ -397,6 +397,8 @@ fn restricted_secret_reason(lower: &str) -> Option<&'static str> {
         lower,
         &[
             "password",
+            "pass:",
+            " pass:",
             "passcode",
             "one-time code",
             "one time code",

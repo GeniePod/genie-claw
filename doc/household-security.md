@@ -119,9 +119,15 @@ treated as ordinary recall.
 - Use separate hosts or OS users for people who should not share authority.
 - Keep fuzzy household recall local-first: embedded-memory rows are metadata in
   the local SQLite store, not a remote vector service dependency.
+- Keep household indexes typed and inspectable. Calendar events, shopping-list
+  items, access permissions, device aliases, and media targets are local SQLite
+  rows derived from safe memory records, not remote profile data.
 - Store playlists as provider targets instead of secrets. Credential and access
   code memories should remain app-only references and are not spoken in
   shared-room chat.
+- Do not store router, Wi-Fi, access-code, or lock-combination values as
+  speakable notes. They are either rejected by memory-write policy or reduced to
+  app-only references for local-dashboard viewing.
 
 ## Runtime Contract
 
