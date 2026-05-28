@@ -2032,9 +2032,7 @@ mod tests {
     #[test]
     fn rebuild_leaves_no_staging_artifacts_on_success() {
         let mem = temp_memory();
-        let id = mem
-            .store("preference", "User likes chamomile tea")
-            .unwrap();
+        let id = mem.store("preference", "User likes chamomile tea").unwrap();
         mem.mark_promoted(id).unwrap();
 
         // Staging directories and temp files must be cleaned up after a
@@ -2050,14 +2048,10 @@ mod tests {
         // a second rebuild replaces it — if the first rebuild completed, the
         // second must produce the updated content and not a partial state.
         let mem = temp_memory();
-        let first = mem
-            .store("preference", "User likes chamomile tea")
-            .unwrap();
+        let first = mem.store("preference", "User likes chamomile tea").unwrap();
         mem.mark_promoted(first).unwrap();
 
-        let note_path = mem
-            .canonical_dir
-            .join("namespaces/household/preference.md");
+        let note_path = mem.canonical_dir.join("namespaces/household/preference.md");
         let original_text = std::fs::read_to_string(&note_path).unwrap();
         assert!(original_text.contains("chamomile tea"));
 
