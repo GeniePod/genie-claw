@@ -88,10 +88,28 @@ pub async fn get_tegrastats(config: &Config) -> Response {
             content_type: "application/json",
             body: json,
         },
-        _ => Response {
-            status: 200,
-            content_type: "application/json",
-            body: "[]".into(),
+        Ok(Err(e)) => {
+            tracing::error!(%e, "failed to read tegrastats from governor.db");
+            Response {
+                status: 500,
+                content_type: "application/json",
+                body: serde_json::json!({
+                    "error": "failed to read tegrastats data",
+                    "detail": e
+                })
+                .to_string(),
+            }
+        },
+        Err(e) => {
+            tracing::error!(%e, "tegrastats spawn_blocking panicked or was cancelled");
+            Response {
+                status: 500,
+                content_type: "application/json",
+                body: serde_json::json!({
+                    "error": "internal error reading tegrastats"
+                })
+                .to_string(),
+            }
         },
     }
 }
@@ -1117,5 +1135,18 @@ mod tests {
         );
         assert_eq!(wakeword.source, "config");
         assert_eq!(wakeword.sub_state, "disabled");
+    }
+
+    #[tokio::test]
+    async fn tegrastats_returns_500_when_db_does_not_exist() {
+        let mut config = test_config();
+        // Point to a path that definitely doesn't exist
+        config.data_dir = std::path::PathBuf::from("/tmp/nonexistent-tegrastats-test-12345");
+
+        let response = get_tegrastats(&config).await;
+
+        assert_eq!(response.status, 500);
+        assert!(response.body.contains("error"));
+        assert!(response.body.contains("failed to read tegrastats data"));
     }
 }
