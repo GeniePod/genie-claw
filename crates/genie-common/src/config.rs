@@ -1340,7 +1340,11 @@ impl Config {
             self.core.ha_token.clone()
         };
         let trimmed = raw.trim().to_string();
-        if trimmed.is_empty() { None } else { Some(Zeroizing::new(trimmed)) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(Zeroizing::new(trimmed))
+        }
     }
 
     /// Whether the current deployment should manage a given service alias.
@@ -1390,7 +1394,11 @@ impl Config {
             self.telegram.bot_token.clone()
         };
         let trimmed = raw.trim().to_string();
-        if trimmed.is_empty() { None } else { Some(Zeroizing::new(trimmed)) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(Zeroizing::new(trimmed))
+        }
     }
 
     pub fn connectivity_enabled(&self) -> bool {

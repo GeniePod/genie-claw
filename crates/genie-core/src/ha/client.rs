@@ -205,9 +205,7 @@ impl HaClient {
         // embedded in a single heap allocation alongside the rest of the
         // headers. The token is written as a separate `write_all` from a
         // Zeroizing<String> that is wiped when the async block returns.
-        let head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer ",
-        );
+        let head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer ",);
         let tail = if let Some(body) = body {
             format!(
                 "\r\nContent-Type: {ct}\r\nContent-Length: {cl}\r\nConnection: close\r\n\r\n{body}",
