@@ -113,6 +113,14 @@ pub struct HouseholdProfile {
     pub role: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceAlias {
+    pub source_memory_id: i64,
+    pub alias: String,
+    pub target_id: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MemoryEvent {
     ts_ms: u64,
@@ -178,6 +186,18 @@ impl Memory {
 
             CREATE INDEX IF NOT EXISTS idx_household_profiles_role
                 ON household_profiles(role, updated_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS device_aliases (
+                source_memory_id INTEGER PRIMARY KEY,
+                alias            TEXT NOT NULL,
+                normalized_alias TEXT NOT NULL,
+                target_id        TEXT NOT NULL,
+                kind             TEXT NOT NULL,
+                updated_ms       INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_device_aliases_normalized_alias
+                ON device_aliases(normalized_alias, updated_ms DESC);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content,
@@ -289,6 +309,7 @@ impl Memory {
 
         backfill_policy_columns(&conn)?;
         rebuild_household_profiles(&conn)?;
+        rebuild_device_aliases(&conn)?;
 
         // Older databases may predate the FTS update trigger or may have been
         // edited by a recovery tool. Rebuild once at open so recall and forget
@@ -742,6 +763,32 @@ impl Memory {
         Ok(profiles)
     }
 
+    pub fn device_alias(&self, alias: &str) -> Result<Option<DeviceAlias>> {
+        let normalized = normalize_alias_key(alias);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT source_memory_id, alias, target_id, kind
+             FROM device_aliases
+             WHERE normalized_alias = ?1
+             ORDER BY updated_ms DESC, source_memory_id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query([normalized])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        Ok(Some(DeviceAlias {
+            source_memory_id: row.get(0)?,
+            alias: row.get(1)?,
+            target_id: row.get(2)?,
+            kind: row.get(3)?,
+        }))
+    }
+
     /// Delete a memory by ID.
     pub fn delete_by_id(&self, id: i64) -> Result<bool> {
         let existing = self.get_by_id(id)?;
@@ -753,6 +800,10 @@ impl Memory {
         {
             self.conn.execute(
                 "DELETE FROM household_profiles WHERE source_memory_id = ?1",
+                [id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM device_aliases WHERE source_memory_id = ?1",
                 [id],
             )?;
             if entry.promoted {
@@ -825,6 +876,7 @@ impl Memory {
                 metadata,
                 now_ms(),
             )?;
+            upsert_device_alias_from_memory(&self.conn, id, &content, metadata, now_ms())?;
             if existing.promoted {
                 self.rebuild_root_memory_file()?;
             }
@@ -1067,6 +1119,7 @@ impl Memory {
         )?;
         let id = self.conn.last_insert_rowid();
         upsert_household_profile_from_memory(&self.conn, id, kind, content, metadata, now)?;
+        upsert_device_alias_from_memory(&self.conn, id, content, metadata, now)?;
         Ok(id)
     }
 
@@ -1352,6 +1405,40 @@ fn rebuild_household_profiles(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn rebuild_device_aliases(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM device_aliases", [])?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, content, scope, sensitivity, spoken_policy
+         FROM memories
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                policy::MemoryPolicyMetadata {
+                    scope: policy::MemoryScope::from_storage(&row.get::<_, String>(2)?),
+                    sensitivity: policy::MemorySensitivity::from_storage(&row.get::<_, String>(3)?),
+                    spoken_policy: policy::SpokenMemoryPolicy::from_storage(
+                        &row.get::<_, String>(4)?,
+                    ),
+                },
+            ))
+        })?
+        .filter_map(|row| row.ok())
+        .collect::<Vec<_>>();
+    drop(stmt);
+
+    let now = now_ms();
+    for (id, content, metadata) in rows {
+        upsert_device_alias_from_memory(conn, id, &content, metadata, now)?;
+    }
+
+    Ok(())
+}
+
 fn upsert_household_profile_from_memory(
     conn: &Connection,
     source_memory_id: i64,
@@ -1382,6 +1469,48 @@ fn upsert_household_profile_from_memory(
     Ok(())
 }
 
+fn upsert_device_alias_from_memory(
+    conn: &Connection,
+    source_memory_id: i64,
+    content: &str,
+    metadata: policy::MemoryPolicyMetadata,
+    updated_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM device_aliases WHERE source_memory_id = ?1",
+        [source_memory_id],
+    )?;
+
+    if !policy::assess_memory_read(metadata, policy::MemoryReadContext::shared_room_voice()).allowed
+    {
+        return Ok(());
+    }
+
+    let Some((alias, target_id)) = device_alias_from_memory(content) else {
+        return Ok(());
+    };
+    let normalized_alias = normalize_alias_key(&alias);
+    if normalized_alias.is_empty() || target_id.is_empty() {
+        return Ok(());
+    }
+    let kind = device_alias_kind(&target_id);
+
+    conn.execute(
+        "INSERT INTO device_aliases (
+            source_memory_id, alias, normalized_alias, target_id, kind, updated_ms
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            source_memory_id,
+            alias,
+            normalized_alias,
+            target_id,
+            kind,
+            updated_ms
+        ],
+    )?;
+    Ok(())
+}
+
 fn household_profile_from_memory(_kind: &str, content: &str) -> Option<(String, &'static str)> {
     let lower = content.to_ascii_lowercase();
 
@@ -1398,6 +1527,111 @@ fn household_profile_from_memory(_kind: &str, content: &str) -> Option<(String, 
     }
 
     None
+}
+
+fn device_alias_from_memory(content: &str) -> Option<(String, String)> {
+    let trimmed = content
+        .trim()
+        .trim_matches(|ch| matches!(ch, '.' | '!' | '?'));
+    let lower = trimmed.to_ascii_lowercase();
+
+    for marker in [
+        " maps to ",
+        " points to ",
+        " targets ",
+        " target is ",
+        " entity is ",
+        " device is ",
+        " means ",
+        " = ",
+        " -> ",
+        " is ",
+    ] {
+        if let Some(pos) = lower.find(marker) {
+            let alias = clean_device_alias(&trimmed[..pos]);
+            let target = clean_device_target(&trimmed[pos + marker.len()..]);
+            if is_valid_device_alias_pair(&alias, &target, marker == " is ") {
+                return Some((alias, target));
+            }
+        }
+    }
+
+    None
+}
+
+fn clean_device_alias(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("remember that ")
+        .trim_start_matches("remember ")
+        .trim_start_matches("the ")
+        .trim_matches(|ch: char| matches!(ch, '"' | '\''))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn clean_device_target(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("the ")
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '.' | ',' | '!' | '?'))
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn is_valid_device_alias_pair(alias: &str, target: &str, broad_marker: bool) -> bool {
+    if alias.is_empty() || target.is_empty() || alias.eq_ignore_ascii_case(target) {
+        return false;
+    }
+
+    let alias_lower = alias.to_ascii_lowercase();
+    let target_lower = target.to_ascii_lowercase();
+    let looks_like_target = target_lower.contains('.') || target_lower.starts_with("smartplug_");
+    let looks_like_alias = [
+        "light",
+        "lights",
+        "lamp",
+        "plug",
+        "switch",
+        "outlet",
+        "thermostat",
+        "scene",
+        "routine",
+        "fan",
+    ]
+    .iter()
+    .any(|term| alias_lower.contains(term));
+
+    let explicit_alias_shape = !broad_marker && alias.split_whitespace().count() <= 6;
+
+    looks_like_target && (looks_like_alias || explicit_alias_shape)
+}
+
+fn normalize_alias_key(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn device_alias_kind(target_id: &str) -> String {
+    target_id
+        .split_once('.')
+        .map(|(domain, _)| domain.to_string())
+        .unwrap_or_else(|| "entity".into())
 }
 
 fn possessive_named_profile(content: &str, lower: &str) -> Option<(&'static str, String)> {
@@ -1988,6 +2222,58 @@ mod tests {
         .unwrap();
 
         assert!(mem.household_profiles_by_role("dad").unwrap().is_empty());
+    }
+
+    #[test]
+    fn device_alias_memory_indexes_exact_target() {
+        let mem = temp_memory();
+        mem.store("fact", "Playroom lights maps to light.playroom")
+            .unwrap();
+
+        let alias = mem.device_alias("playroom lights").unwrap().unwrap();
+        assert_eq!(alias.target_id, "light.playroom");
+        assert_eq!(alias.kind, "light");
+    }
+
+    #[test]
+    fn device_alias_allows_room_alias_for_explicit_target_marker() {
+        let mem = temp_memory();
+        mem.store("fact", "Playroom maps to smartplug_04").unwrap();
+
+        let alias = mem.device_alias("playroom").unwrap().unwrap();
+        assert_eq!(alias.target_id, "smartplug_04");
+    }
+
+    #[test]
+    fn device_aliases_rebuild_on_reopen() {
+        let path = temp_memory_path("device-alias-reopen");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store("fact", "Movie night scene maps to scene.movie_night")
+                .unwrap();
+        }
+
+        let mem = Memory::open(&path).unwrap();
+        let alias = mem.device_alias("movie night scene").unwrap().unwrap();
+        assert_eq!(alias.target_id, "scene.movie_night");
+    }
+
+    #[test]
+    fn private_device_alias_memory_is_not_indexed() {
+        let mem = temp_memory();
+        mem.store_with_metadata(
+            "private_fact",
+            "Bedroom camera maps to switch.private_camera",
+            policy::MemoryPolicyMetadata {
+                scope: policy::MemoryScope::Private,
+                sensitivity: policy::MemorySensitivity::Cautious,
+                spoken_policy: policy::SpokenMemoryPolicy::AppOnly,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(mem.device_alias("bedroom camera").unwrap().is_none());
     }
 
     #[test]

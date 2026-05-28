@@ -74,7 +74,8 @@ GenieClaw keeps these decisions separate:
 - recall layer: structured records, SQLite `FTS5`, and optional semantic
   retrieval can find candidate memories; safe relationship memories also feed a
   local household-profile index for exact role questions such as "who is the
-  dad?"
+  dad?", and safe device-alias memories feed exact Home Assistant target
+  resolution before fuzzy matching
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
   class such as household, person, sensitive, private, or restricted

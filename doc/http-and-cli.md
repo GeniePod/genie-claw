@@ -420,6 +420,8 @@ Memory tools are policy-aware:
 - memory recall defaults to shared-room-safe disclosure
 - safe relationship memories maintain a local household-profile index for exact
   role recall before FTS fallback
+- safe device-alias memories maintain a local alias index for exact
+  Home Assistant target resolution before fuzzy matching
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 

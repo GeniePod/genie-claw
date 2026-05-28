@@ -618,6 +618,7 @@ impl ToolDispatcher {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
         let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let resolved_entity = self.resolve_device_alias(entity_name);
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -632,7 +633,7 @@ impl ToolDispatcher {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedPolicy,
                 origin: exec_ctx.request_origin,
-                entity: entity_name.to_string(),
+                entity: resolved_entity.clone(),
                 action: action.to_string(),
                 value,
                 reason: reason.clone(),
@@ -657,7 +658,7 @@ impl ToolDispatcher {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedRuntime,
                 origin: exec_ctx.request_origin,
-                entity: entity_name.to_string(),
+                entity: resolved_entity.clone(),
                 action: action.to_string(),
                 value,
                 reason: reason.clone(),
@@ -670,7 +671,7 @@ impl ToolDispatcher {
         }
         match home::control(
             ha.as_ref(),
-            entity_name,
+            &resolved_entity,
             action,
             value,
             &self.actuation_safety,
@@ -683,7 +684,7 @@ impl ToolDispatcher {
                 let recorded = if let Some(original_id) = undo_of {
                     self.action_ledger.record_undo(
                         original_id,
-                        entity_name,
+                        &resolved_entity,
                         action,
                         value,
                         exec_ctx.request_origin,
@@ -692,7 +693,7 @@ impl ToolDispatcher {
                     )
                 } else {
                     self.action_ledger.record(
-                        entity_name,
+                        &resolved_entity,
                         action,
                         value,
                         exec_ctx.request_origin,
@@ -704,7 +705,7 @@ impl ToolDispatcher {
                     ts_ms: now_ms(),
                     status: AuditStatus::Executed,
                     origin: exec_ctx.request_origin,
-                    entity: entity_name.to_string(),
+                    entity: resolved_entity.clone(),
                     action: action.to_string(),
                     value,
                     reason: "home action executed".into(),
@@ -717,7 +718,7 @@ impl ToolDispatcher {
             }
             Ok(home::ControlOutcome::ConfirmationRequired { reason, .. }) => {
                 let pending = self.confirmations.issue(
-                    entity_name,
+                    &resolved_entity,
                     action,
                     value,
                     &reason,
@@ -727,7 +728,7 @@ impl ToolDispatcher {
                     ts_ms: now_ms(),
                     status: AuditStatus::ConfirmationIssued,
                     origin: exec_ctx.request_origin,
-                    entity: entity_name.to_string(),
+                    entity: resolved_entity.clone(),
                     action: action.to_string(),
                     value,
                     reason: reason.clone(),
@@ -760,7 +761,7 @@ impl ToolDispatcher {
                     ts_ms: now_ms(),
                     status,
                     origin: exec_ctx.request_origin,
-                    entity: entity_name.to_string(),
+                    entity: resolved_entity,
                     action: action.to_string(),
                     value,
                     reason: error.clone(),
@@ -877,8 +878,24 @@ impl ToolDispatcher {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
         let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let entity_name = self.resolve_device_alias(entity_name);
 
-        home::status(ha.as_ref(), entity_name).await
+        home::status(ha.as_ref(), &entity_name).await
+    }
+
+    fn resolve_device_alias(&self, query: &str) -> String {
+        let Some(memory) = &self.memory else {
+            return query.to_string();
+        };
+        let Ok(memory) = memory.lock() else {
+            return query.to_string();
+        };
+        memory
+            .device_alias(query)
+            .ok()
+            .flatten()
+            .map(|alias| alias.target_id)
+            .unwrap_or_else(|| query.to_string())
     }
 
     fn exec_set_timer(&self, args: &serde_json::Value) -> Result<String> {
@@ -1987,6 +2004,52 @@ mod tests {
         assert!(history.success);
         assert!(history.output.contains("turn_on kitchen light"));
         assert!(history.output.contains("undo: turn_off"));
+    }
+
+    #[tokio::test]
+    async fn home_control_resolves_structured_device_alias() {
+        let db = std::env::temp_dir().join(format!(
+            "home-control-device-alias-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("fact", "Playroom lights maps to light.playroom")
+            .unwrap();
+
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
+            executed: executed.clone(),
+        })))
+        .with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: serde_json::json!({
+                        "entity": "playroom lights",
+                        "action": "turn_on"
+                    }),
+                },
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Dashboard,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::TurnOn]);
+
+        let history = dispatcher
+            .execute(&ToolCall {
+                name: "action_history".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await;
+        assert!(history.output.contains("turn_on light.playroom"));
     }
 
     #[tokio::test]
