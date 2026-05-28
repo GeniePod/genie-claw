@@ -175,8 +175,8 @@ struct TelegramApi {
     /// 1 even when the config asks for 0, otherwise voice messages would
     /// deadlock waiting for a permit that never comes.
     voice_permits: Arc<Semaphore>,
-    /// Bounds total concurrent in-flight update tasks (issue #278). Always
-    /// >= `voice_permits` count so the voice inner semaphore is never the
+    /// Bounds total concurrent in-flight update tasks (issue #278). Always at
+    /// least `voice_permits` count so the voice inner semaphore is never the
     /// tighter outer constraint.
     update_permits: Arc<Semaphore>,
     /// Per-chat serialization (issue #77 / #278): a single chat_id processes
@@ -1305,9 +1305,18 @@ mod tests {
         // Issue #278: max_parallel_updates = 3 means only three update tasks
         // can be in-flight at once; a fourth acquire must block.
         let api = test_api(2, 3);
-        let p1 = Arc::clone(&api.update_permits).acquire_owned().await.unwrap();
-        let p2 = Arc::clone(&api.update_permits).acquire_owned().await.unwrap();
-        let p3 = Arc::clone(&api.update_permits).acquire_owned().await.unwrap();
+        let p1 = Arc::clone(&api.update_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let p2 = Arc::clone(&api.update_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let p3 = Arc::clone(&api.update_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
 
         let fourth = api.update_permits.try_acquire();
         assert!(fourth.is_err(), "fourth permit must be blocked");
@@ -1372,6 +1381,10 @@ mod tests {
         let mut locks = ChatLocks::new();
         let _m1 = locks.get(10);
         let _m2 = locks.get(20);
-        assert_eq!(locks.len(), 2, "recently accessed entries must not be evicted");
+        assert_eq!(
+            locks.len(),
+            2,
+            "recently accessed entries must not be evicted"
+        );
     }
 }
