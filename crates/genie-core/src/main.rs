@@ -370,9 +370,8 @@ async fn main() -> Result<()> {
                         piper_model: config.core.piper_model.clone(),
                         max_parallel_voice: config.telegram.voice.max_parallel_voice,
                     },
-                    origin_token: telegram_origin_token,
-                    max_parallel_updates: config.telegram.max_parallel_updates,
                     origin_token: telegram_origin_token.map(zeroize::Zeroizing::new),
+                    max_parallel_updates: config.telegram.max_parallel_updates,
                 };
 
                 tracing::info!(

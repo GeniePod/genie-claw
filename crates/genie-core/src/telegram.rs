@@ -40,11 +40,10 @@ pub struct TelegramRuntimeConfig {
     /// the `telegram` origin instead of treating the (forgeable) header as
     /// proof (issue #232). `None` when no token is configured, in which case
     /// the loopback `core_base_url` is trusted by transport.
-    pub origin_token: Option<String>,
+    pub origin_token: Option<Zeroizing<String>>,
     /// Bound on concurrent in-flight update tasks (issue #278). Clamped to
     /// >= `voice.max_parallel_voice` at construction time.
     pub max_parallel_updates: usize,
-    pub origin_token: Option<Zeroizing<String>>,
 }
 
 /// Voice-message ingestion settings for the Telegram channel (issue #42).
