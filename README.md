@@ -4,8 +4,7 @@
 [![Jetson cross-compile](https://github.com/GeniePod/genie-claw/actions/workflows/cross.yml/badge.svg)](https://github.com/GeniePod/genie-claw/actions/workflows/cross.yml)
 [![Audit](https://github.com/GeniePod/genie-claw/actions/workflows/audit.yml/badge.svg)](https://github.com/GeniePod/genie-claw/actions/workflows/audit.yml)
 
-**Low-latency, limited-context AI harness for private on-device homes: native to
-GeniePod Home and maintained across SBC profiles.**
+**Low-latency, limited-context AI harness for private on-device homes.**
 
 GenieClaw is the Rust agent layer for GeniePod Home. It is built for small local
 models, tight VRAM budgets, and a 4096-token Jetson baseline. This repo owns
@@ -16,51 +15,19 @@ The product goal is a private household agent that is fast because it receives
 the right family memory, room/device state, and safety context, not because it
 sends large prompts to a remote model.
 
-GenieClaw is not the voice pipeline, the LLM runtime, the OS, the final
-home-control runtime, or the product app layer.
+This is a real engineering project, not a toy demo or token-burning issue
+target. The OpenClaw engineering posture here is simple: make the local agent
+more native, deterministic, measurable, and reliable on Jetson-class hardware.
 
 The default agent contract is intentionally small: the Jetson profile uses
 `[agent].context_window_tokens = 4096`. Larger adaptive contexts can exist for
 stronger models, but provider/runtime paths must pass the 4096-token harness
 first.
 
-Jetson remains the flagship GeniePod Home target, but SBC support is maintained
-as part of the product architecture. The `raspberry_pi` and `portable_sbc`
-profiles must continue to run the headless agent, memory, tools, HTTP/CLI
-surfaces, and home-provider boundaries without assuming Jetson-only voice,
-CUDA, or systemd behavior. Hardware-specific features may be absent on those
-profiles, but the agent contract should remain usable and testable.
-
-## Boundary
-
-| Layer | Owner | Notes |
-|-------|-------|-------|
-| Agent layer | `genie-claw` | Prompt policy, limited-context harness, memory, tools, skills, smart-home intent, safety, audit, channels |
-| LLM runtime | [`genie-ai-runtime`](https://github.com/GeniePod/genie-ai-runtime) | Jetson-first local inference runtime; `llama.cpp` remains selectable |
-| Voice boundary | External/runtime layer | Wake, VAD, STT, TTS, audio streaming, voice session protocol |
-| Home boundary | External/runtime layer | AI-native device graph, local IoT boundary, and final actuation gate |
-| Home Assistant | Transitional provider | Current integration target behind the home-provider boundary |
-| Platform and apps | External layers | OS/platform, web, and mobile surfaces stay outside this repo |
-
-Full stack shape:
-
-```text
-user channel / voice runtime
-          |
-          v
-   genie-claw agent layer
-    |        |        |
- memory   tools   safety/audit
-    |        |        |
-    v        v        v
-genie-ai-runtime   Home Assistant today
-                   native home boundary later
-```
-
 ## What Works Today
 
 - local chat through `genie-core`
-- transitional voice-session adapter while voice/audio moves behind an external boundary
+- transitional voice-session adapter
 - LLM backend facade for `genie-ai-runtime` and selectable `llama.cpp`
 - SQLite conversation history and policy-aware family/household memory
 - Home Assistant adapter with confirmations, rate limits, and audit logging
@@ -79,17 +46,48 @@ Current workspace version: `v1.0.0-alpha.9`.
 - keep the agent fast and reliable inside a 4096-token Jetson context
 - tune the AI harness around high-signal home context, family memory, and typed tools
 - improve accuracy through deterministic device state and memory retrieval, not larger prompts
-- split long-term wake/VAD/STT/TTS ownership behind an external voice boundary
-- keep Home Assistant behind a provider boundary during the transition
-- use optional API/OAuth providers only for testing, development portability, and transitional validation
-- keep maintained SBC profiles, laptops, and Macs usable without making Jetson less native
+- add BFCL-based scoring for tool-call accuracy and regressions
+- validate hardware-facing and performance-sensitive changes on Jetson Orin Nano 8GB whenever possible
+- reject broad changes that make the agent less native, slower, less deterministic, or harder to test
 
-## Agent Contract
+Everything else is secondary until the local home agent is fast, accurate, and
+measurable under the Jetson 4096-token constraint.
+
+## Product Quality Bar
+
+PRs must improve the product behavior or make it easier to measure product
+behavior. Low-signal generated code, demo-only routes, prompt growth without a
+measured accuracy gain, and feature churn that is not tested against the agent
+harness should be closed.
+
+Every non-trivial PR should answer:
+
+- what home-agent behavior changed
+- how it affects the 4096-token harness
+- which typed tools, memory retrieval paths, or deterministic device-state paths
+  it improves
+- what was tested locally, in CI, and, when relevant, on Jetson Orin Nano 8GB
+- whether any Jetson validation gap remains
+
+Docs-only changes can use static checks. Code that touches routing, memory,
+tool calls, home state, prompt assembly, latency, or hardware behavior needs
+real tests. If Jetson testing is not possible before opening a PR, state that
+gap directly and keep the change small enough to review and reproduce.
+
+## Immediate Engineering Plan
+
+1. Add BFCL scoring for tool-call accuracy.
+2. Build deterministic fixtures for home state, family memory, and typed tools.
+3. Score expected tool names and arguments, not just natural-language answers.
+4. Track regressions in CI and keep a Jetson Orin Nano 8GB validation path for
+   latency, memory pressure, and native runtime behavior.
+5. Use the scores to improve routing, memory retrieval, and typed-tool accuracy
+   before expanding prompts or adding broader features.
+
+## Agent Harness Contract
 
 The repo now has explicit code-level contract surfaces for the new direction:
 
-- `genie_core::runtime_boundary` declares the AI, voice, and home runtime
-  boundaries so GenieClaw remains the agent layer.
 - `genie_core::agent_harness` checks prompt, tool manifest, memory hydration,
   response reserve, and optional provider context against the Jetson 4096-token
   baseline.
@@ -98,10 +96,9 @@ The repo now has explicit code-level contract surfaces for the new direction:
   cache metadata to runtimes that understand the `nvext` extension.
 - `[agent]` in `geniepod.toml` selects the maintained runtime profile:
   `jetson`, `raspberry_pi`, `portable_sbc`, `laptop`, or `mac`.
-- `[optional_ai_provider]` is disabled by default. API-key, OAuth-bearer, and
-  other remote/alternate providers exist only for better testing, development
-  portability, and transitional validation; they must keep their configured
-  context at or below `[agent].context_window_tokens`.
+- Alternate providers and profiles must keep their configured context at or
+  below `[agent].context_window_tokens` unless a specific test intentionally
+  proves a larger-context path without weakening the Jetson baseline.
 
 ## Quick Start
 
@@ -132,7 +129,7 @@ For Jetson setup, deployment, and Home Assistant wiring, use
 
 - [`GETTING_STARTED.md`](GETTING_STARTED.md) - local dev, Docker, Jetson bring-up, and deploy
 - [`LOW_LATENCY_HOME_AGENT.md`](LOW_LATENCY_HOME_AGENT.md) - product goal for the low-latency private home harness
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) - Genie ecosystem boundaries
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) - Genie ecosystem architecture
 - [`doc/README.md`](doc/README.md) - documentation map
 - [`doc/implementation-status.md`](doc/implementation-status.md) - implemented, partial, external, and planned work
 - [`CHANGELOG.md`](CHANGELOG.md) - alpha release notes
