@@ -40,4 +40,7 @@ opt-level = "z"     # Optimize for binary size
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# panic = "abort" was intentionally removed: skill cdylibs rely on catch_unwind
+# for fault isolation, and abort strategy silently voids that barrier at runtime.
+# Cargo does not allow panic to be overridden per-package, so the workspace must
+# use "unwind" (the Rust default) to keep skill fault containment functional.
