@@ -1,0 +1,21 @@
+{"id":"home-light-kitchen-on","response":"{\"tool\":\"home_control\",\"arguments\":{\"action\":\"turn_on\",\"entity\":\"kitchen lights\"}}"}
+{"id":"timer-cookies","response":"```json\n{\"tool\":\"set_timer\",\"arguments\":{\"seconds\":720,\"label\":\"cookies\"}}\n```"}
+{"id":"time-current","response":"{\"tool\":\"get_time\",\"arguments\":{}}"}
+{"id":"memory-grandma-wifi","response":"I'll search the local family notes. {\"tool\":\"memory_recall\",\"arguments\":{\"query\":\"Grandma Wi-Fi note\",\"limit\":3}}"}
+{"id":"weather-school-pickup","response":"{\"tool\":\"get_weather\",\"arguments\":{\"location\":\"home\",\"fresh\":true}}"}
+{"id":"no-tool-reassurance","response":"You're welcome, Leo."}
+{"id":"openai-wrapper-office-standby","response":"{\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"home_control\",\"arguments\":\"{\\\"entity\\\":\\\"office standby power\\\",\\\"action\\\":\\\"turn_off\\\"}\"}}]}"}
+{"id":"home-status-freezer","response":"{\"tool\":\"home_status\",\"arguments\":{\"entity\":\"garage freezer\"}}"}
+{"id":"home-undo-last-action","response":"{\"tool\":\"home_undo\",\"arguments\":{}}"}
+{"id":"action-history-away-delta","response":"{\"tool\":\"action_history\",\"arguments\":{}}"}
+{"id":"calculate-oven-conversion","response":"{\"tool\":\"calculate\",\"arguments\":{\"expression\":\"(350 - 32) * 5 / 9\"}}"}
+{"id":"system-info-jetson-memory","response":"{\"tool\":\"system_info\",\"arguments\":{}}"}
+{"id":"memory-store-night-light","response":"{\"tool\":\"memory_store\",\"arguments\":{\"content\":\"Leo likes the green night-light better.\",\"category\":\"preference\"}}"}
+{"id":"memory-forget-old-combo","response":"{\"tool\":\"memory_forget\",\"arguments\":{\"query\":\"old locker combination\"}}"}
+{"id":"play-media-study","response":"{\"tool\":\"play_media\",\"arguments\":{\"query\":\"Mia study playlist\"}}"}
+{"id":"web-search-stock","response":"{\"tool\":\"web_search\",\"arguments\":{\"query\":\"AAPL stock price\",\"limit\":3,\"fresh\":true}}"}
+{"id":"home-thermostat-set","response":"{\"tool\":\"home_control\",\"arguments\":{\"entity\":\"living room thermostat\",\"action\":\"set_temperature\",\"value\":72.0}}"}
+{"id":"home-status-back-burner","response":"{\"tool\":\"home_status\",\"arguments\":{\"entity\":\"back burner\"}}"}
+{"id":"multi-homework-timer","response":"[{\"tool\":\"home_control\",\"arguments\":{\"entity\":\"homework mode\",\"action\":\"activate\"}},{\"tool\":\"set_timer\",\"arguments\":{\"seconds\":2700,\"label\":\"homework focus\"}}]"}
+{"id":"function-call-memory-status","response":"{\"function_call\":{\"name\":\"memory_status\",\"arguments\":\"{}\"}}"}
+{"id":"single-key-calculate","response":"{\"calculate\":{\"expression\":\"2 + 2\"}}"}

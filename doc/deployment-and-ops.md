@@ -56,6 +56,26 @@ The practical reason is simple:
 
 ## Supported Bring-Up Styles
 
+### Maintained SBC Profiles
+
+Jetson remains the flagship deployment target, but Raspberry Pi and generic
+portable SBC profiles are maintained for the headless agent path.
+
+Maintained means these surfaces should remain usable without Jetson-only
+assumptions:
+
+- config loading with `[agent].runtime_profile = "raspberry_pi"` or
+  `"portable_sbc"`
+- `genie-core` HTTP/chat surfaces
+- `genie-ctl` CLI surfaces
+- memory and tool routing
+- Home Assistant or fake home-provider boundaries
+- optional provider/test harness paths
+
+Voice, CUDA acceleration, `genie-ai-runtime`, and Jetson-specific systemd
+behavior may be unavailable or replaced by lighter local services on those
+profiles.
+
 ### Dev Machine
 
 Use `deploy/config/geniepod.dev.toml` and point `genie-core` at any local
@@ -199,7 +219,7 @@ These are current system realities, not bugs in the docs:
 
 - LLM context size is constrained by Jetson memory and model choice.
 - Voice mode is more sensitive to process scheduling, audio-device selection, and GPU time-sharing than plain chat mode.
-- The connectivity boundary exists, but full ESP-Hosted-NG OS ownership belongs in `genie-os`, not in this runtime repo.
+- The connectivity boundary exists, but full ESP-Hosted-NG OS ownership belongs in the platform/OS layer, not in this runtime repo.
 - The ESP32-C6 UART path is currently a health/capability boundary, not a full Thread/Matter controller implementation.
 - Local speaker identity is useful for household memory routing, not security-grade authentication.
 - Multilingual voice depends on installed STT/TTS models and per-language device testing.

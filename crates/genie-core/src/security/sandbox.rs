@@ -106,14 +106,14 @@ fn apply_landlock_linux(config_dir: &Path, data_dir: &Path) -> Result<(), String
 pub fn validate_inference_route(url: &str) -> Result<(), String> {
     let host = extract_host(url);
 
-    match host.as_str() {
-        "127.0.0.1" | "localhost" | "::1" | "[::1]" => Ok(()),
-        h if h.starts_with("127.") => Ok(()), // 127.0.0.0/8 loopback
-        _ => Err(format!(
+    if is_loopback_host(&host) {
+        Ok(())
+    } else {
+        Err(format!(
             "inference route rejected: {} is not localhost. \
              GeniePod only allows LLM calls to local endpoints.",
             url
-        )),
+        ))
     }
 }
 
@@ -227,14 +227,43 @@ fn find_secret_matches(text: &str, pattern: &SecretPattern) -> Vec<String> {
 }
 
 fn extract_host(url: &str) -> String {
+    let url = url.trim();
     let stripped = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
 
-    let host_port = stripped.split('/').next().unwrap_or(stripped);
-    let host = host_port.split(':').next().unwrap_or(host_port);
-    host.to_lowercase()
+    let authority = stripped.split('/').next().unwrap_or(stripped);
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.find(']')
+            .map(|idx| host_port[..=idx + 1].to_string())
+            .unwrap_or_else(|| host_port.to_string())
+    } else {
+        host_port.split(':').next().unwrap_or(host_port).to_string()
+    };
+    host.to_ascii_lowercase()
+}
+
+/// True when `host` is a literal loopback target (not a hostname that merely
+/// starts with a loopback-looking prefix).
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    let ip_str = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    ip_str
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -246,6 +275,14 @@ mod tests {
         assert!(validate_inference_route("http://127.0.0.1:8080/v1").is_ok());
         assert!(validate_inference_route("http://localhost:8080").is_ok());
         assert!(validate_inference_route("http://127.0.0.2:8080").is_ok());
+        assert!(validate_inference_route("http://[::1]:8080/v1").is_ok());
+    }
+
+    #[test]
+    fn reject_loopback_looking_hostnames() {
+        assert!(validate_inference_route("http://127.evil.com:8080/v1").is_err());
+        assert!(validate_inference_route("http://127.0.0.1.attacker.com:8080/v1").is_err());
+        assert!(validate_inference_route("http://localhost.evil.com:8080/v1").is_err());
     }
 
     #[test]
@@ -325,6 +362,8 @@ mod tests {
         assert_eq!(extract_host("http://127.0.0.1:8080/v1"), "127.0.0.1");
         assert_eq!(extract_host("http://localhost:3000"), "localhost");
         assert_eq!(extract_host("https://api.openai.com/v1"), "api.openai.com");
+        assert_eq!(extract_host("http://[::1]:8080/v1"), "[::1]");
+        assert_eq!(extract_host("http://user@127.0.0.1:8080/v1"), "127.0.0.1");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use zeroize::Zeroizing;
 
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
@@ -26,10 +27,10 @@ fn next_temp_nonce() -> u64 {
     TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TelegramRuntimeConfig {
     pub api_base: String,
-    pub bot_token: String,
+    pub bot_token: Zeroizing<String>,
     pub core_base_url: String,
     pub poll_timeout_secs: u64,
     pub allowed_chat_ids: Vec<i64>,
@@ -39,7 +40,7 @@ pub struct TelegramRuntimeConfig {
     /// the `telegram` origin instead of treating the (forgeable) header as
     /// proof (issue #232). `None` when no token is configured, in which case
     /// the loopback `core_base_url` is trusted by transport.
-    pub origin_token: Option<String>,
+    pub origin_token: Option<Zeroizing<String>>,
 }
 
 /// Voice-message ingestion settings for the Telegram channel (issue #42).
@@ -197,7 +198,7 @@ impl TelegramApi {
 
         let req = self
             .client
-            .post(self.method_url("getUpdates"))
+            .post(self.method_url("getUpdates").as_str())
             .json(&payload);
 
         let resp: TelegramEnvelope<Vec<TelegramUpdate>> = req
@@ -534,7 +535,7 @@ impl TelegramApi {
 
         let resp: TelegramEnvelope<serde_json::Value> = self
             .client
-            .post(self.method_url("sendVoice"))
+            .post(self.method_url("sendVoice").as_str())
             .multipart(form)
             .send()
             .await
@@ -559,7 +560,7 @@ impl TelegramApi {
         let payload = serde_json::json!({ "file_id": file_id });
         let env: TelegramEnvelope<TelegramFile> = self
             .client
-            .post(self.method_url("getFile"))
+            .post(self.method_url("getFile").as_str())
             .json(&payload)
             .send()
             .await
@@ -584,16 +585,16 @@ impl TelegramApi {
             .file_path
             .context("Telegram getFile returned no file_path")?;
 
-        let download_url = format!(
+        let download_url = Zeroizing::new(format!(
             "{}/file/bot{}/{}",
             self.config.api_base.trim_end_matches('/'),
-            self.config.bot_token,
+            self.config.bot_token.as_str(),
             file_path
-        );
+        ));
 
         let bytes = self
             .client
-            .get(&download_url)
+            .get(download_url.as_str())
             .send()
             .await
             .context("Telegram file download failed")?
@@ -748,7 +749,7 @@ impl TelegramApi {
             .post(format!("{}/api/chat", self.config.core_base_url))
             .header("X-Genie-Origin", "telegram");
         if let Some(token) = &self.config.origin_token {
-            builder = builder.header("X-Genie-Origin-Token", token);
+            builder = builder.header("X-Genie-Origin-Token", token.as_str());
         }
         let response: CoreChatResponse = builder
             .json(&request)
@@ -773,7 +774,7 @@ impl TelegramApi {
 
             let resp: TelegramEnvelope<serde_json::Value> = self
                 .client
-                .post(self.method_url("sendMessage"))
+                .post(self.method_url("sendMessage").as_str())
                 .json(&payload)
                 .send()
                 .await
@@ -799,13 +800,13 @@ impl TelegramApi {
         self.config.allow_all_chats || self.config.allowed_chat_ids.contains(&chat_id)
     }
 
-    fn method_url(&self, method: &str) -> String {
-        format!(
+    fn method_url(&self, method: &str) -> Zeroizing<String> {
+        Zeroizing::new(format!(
             "{}/bot{}/{}",
             self.config.api_base.trim_end_matches('/'),
-            self.config.bot_token,
+            self.config.bot_token.as_str(),
             method
-        )
+        ))
     }
 }
 
@@ -1023,7 +1024,7 @@ mod tests {
             Client::new(),
             TelegramRuntimeConfig {
                 api_base: "https://example.test".into(),
-                bot_token: "test-token".into(),
+                bot_token: "test-token".to_string().into(),
                 core_base_url: "http://127.0.0.1:0".into(),
                 poll_timeout_secs: 1,
                 allowed_chat_ids: vec![],
