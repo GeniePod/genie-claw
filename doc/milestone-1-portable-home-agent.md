@@ -1,7 +1,7 @@
 # Milestone 1 Portable Home Agent Architecture
 
-Milestone 1 should keep GenieClaw focused on GeniePod Home while making the
-project easier to validate without Jetson hardware.
+Milestone 1 should keep GenieClaw focused on NVIDIA Jetson Orin 8GB while making
+the project easier to validate without Jetson hardware.
 
 The goal is not to turn GenieClaw into a generic hosted assistant. The goal is
 to keep the Jetson-first home AI agent intact and make most contribution paths
@@ -11,7 +11,7 @@ portable, deterministic, and reviewable by CI.
 
 The original target remains specific:
 
-- GeniePod Home on Jetson-class hardware
+- NVIDIA Jetson Orin 8GB hardware
 - local-first voice interaction
 - `genie-ai-runtime` as the flagship local LLM runtime
 - Home Assistant today, external home boundary as the longer-term direction
@@ -32,8 +32,8 @@ machines while preserving the final Jetson appliance shape.
 - Raspberry Pi and generic portable SBC profiles remain maintained targets for
   the headless agent, memory, tools, HTTP/CLI, and home-provider boundaries.
 - The full default-feature build must continue to represent the original
-  GeniePod Home goal: local runtime, voice, home control, family memory, safety,
-  audit, and `genie-ai-runtime` integration.
+  NVIDIA Jetson Orin 8GB goal: local runtime, voice, home control, family
+  memory, safety, audit, and `genie-ai-runtime` integration.
 - Small context is a product constraint. The baseline target is currently 4096
   tokens.
 - Every provider path must work correctly under the small-context contract before

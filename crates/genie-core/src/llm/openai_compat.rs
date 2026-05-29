@@ -317,9 +317,8 @@ const GENIE_RUNTIME_BODY_OVERHEAD_BYTES: usize = 512;
 const GENIE_RUNTIME_CONTEXT_MAX_BYTES: usize = 900;
 /// Cap outbound LLM HTTP bodies so a buggy backend cannot OOM genie-core.
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const GENIE_RUNTIME_COMPACT_SYSTEM: &str =
-    "You are GeniePod Home. Answer the user's latest request directly and concisely.";
-const GENIE_RUNTIME_COMPACT_SYSTEM_PREFIX: &str = "You are GeniePod Home. Reply briefly for voice. Use a tool only when required. Tool calls must be ONLY JSON: {\"tool\":\"tool_name\",\"arguments\":{}}. No markdown.";
+const GENIE_RUNTIME_COMPACT_SYSTEM: &str = "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB. Answer the user's latest request directly and concisely.";
+const GENIE_RUNTIME_COMPACT_SYSTEM_PREFIX: &str = "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB. Reply briefly for voice. Use a tool only when required. Tool calls must be ONLY JSON: {\"tool\":\"tool_name\",\"arguments\":{}}. No markdown.";
 const SYSTEM_PROMPT_PREFIX_CACHE_SCOPE: &str = "system_prompt_prefix";
 const SYSTEM_PROMPT_PREFIX_CACHE_KEY_PREFIX: &str = "system-prompt-prefix:";
 const SYSTEM_PROMPT_PREFIX_CACHE_MARKERS: [&str; 2] = [
@@ -1156,7 +1155,7 @@ fn compact_genie_runtime_rules(system_text: &str) -> String {
         "If no tool is needed, answer naturally in 1-3 short sentences.",
         "Use calculate for math, get_weather for weather, get_time for time, and system_info for system/Home Assistant/memory diagnostics.",
         "Use memory_recall when the user asks what you remember, what you know about them, or asks for their name.",
-        "Use memory_store only when the user explicitly asks you to remember/save something; never store secrets.",
+        "Use memory_store only when explicitly asked; never store secrets, access codes, lock combinations, or sensitive locations.",
     ];
 
     if system_text.contains("web_search") {
@@ -1389,7 +1388,7 @@ mod tests {
     fn genie_runtime_profile_serializes_system_prompt_prefix_cache_hint() {
         let profile = RequestProfile::genie_ai_runtime();
         let hints = LlmRequestHints::agent_turn("conv-abc", 512);
-        let static_prompt = "You are GeniePod Home.\nUse tools safely.";
+        let static_prompt = "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB.\nUse tools safely.";
         let marker = "\n\nRelevant household context:\n";
         let full_prompt = format!("{static_prompt}{marker}Jared lives here.");
         let prepared = profile
@@ -1537,7 +1536,7 @@ mod tests {
         assert!(serialized_messages.contains("memory_recall"));
         assert!(serialized_messages.contains("Jared lives here"));
         assert!(serialized_messages.contains("Say hello from the GeniePod web UI."));
-        assert!(serialized_messages.contains("GeniePod Home"));
+        assert!(serialized_messages.contains("NVIDIA Jetson Orin 8GB"));
         assert!(!serialized_messages.contains("older assistant turn"));
         assert!(prepared.body.len() < GENIE_RUNTIME_MAX_BODY_BYTES);
     }
@@ -1566,7 +1565,7 @@ mod tests {
         assert!(prepared.body.len() < GENIE_RUNTIME_MAX_BODY_BYTES);
         assert!(serialized_messages.contains("memory_recall"));
         assert!(serialized_messages.contains("What is my name?"));
-        assert!(serialized_messages.contains("GeniePod Home"));
+        assert!(serialized_messages.contains("NVIDIA Jetson Orin 8GB"));
         assert!(!serialized_messages.contains("tool manifest tool manifest"));
     }
 

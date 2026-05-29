@@ -3,7 +3,7 @@ name = "genie-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Local home AI runtime for GeniePod Home — prompt engine, tools, memory, voice loop, and local APIs."
+description = "Local home AI runtime native to NVIDIA Jetson Orin 8GB — prompt engine, tools, memory, voice loop, and local APIs."
 
 [lib]
 name = "genie_core"
