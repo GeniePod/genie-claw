@@ -40,7 +40,7 @@ first.
 - BFCL-style local tool-call scoring through `genie-ctl bfcl-score`
 - Jetson aarch64 cross-compile CI
 
-Current workspace version: `v1.0.0-alpha.9`.
+Current workspace version: `v1.0.0-alpha.10`.
 
 ## Current Focus
 

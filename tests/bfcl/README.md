@@ -44,6 +44,31 @@ cargo run -p genie-ctl -- bfcl-score \
   --predictions tests/bfcl/local/ha_home_predictions.jsonl
 ```
 
+## Current Progress Baseline
+
+Latest operator-reported local run on 2026-05-29:
+
+```text
+generated 208 BFCL cases from 475 Home Assistant Intents sentence templates
+generated 208 quick-router BFCL predictions
+tool calls: 35
+
+BFCL tool-call score
+cases:               208
+parse_accuracy:      16.83%
+tool_name_accuracy:  16.35%
+argument_accuracy:   5.77%
+strict_accuracy:     5.77%
+missing_predictions: 0
+failures:            196
+```
+
+Interpretation: the scorer/importer path is working, prediction coverage is
+complete, and the current deterministic quick-router baseline is intentionally
+low on the broader Home Assistant Intents suite. The next progress target is
+not larger prompts; it is improving deterministic intent routing, entity/slot
+normalization, and typed-tool argument accuracy for high-signal home commands.
+
 The fixture format is intentionally plain:
 
 - `home_tool_cases.jsonl`: one case per line with `id`, `prompt`,
