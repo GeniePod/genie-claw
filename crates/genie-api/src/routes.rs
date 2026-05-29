@@ -815,13 +815,40 @@ pub async fn post_memory_reorder(config: &Config, body: Option<&str>) -> Respons
     }
 }
 
+const MAX_CORE_PROXY_RESPONSE_BYTES: usize = 1024 * 1024;
+const CORE_PROXY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn read_core_proxy_response(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = tokio::time::timeout(CORE_PROXY_READ_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| "core response read timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > MAX_CORE_PROXY_RESPONSE_BYTES {
+            return Err(format!(
+                "core response exceeds {} bytes",
+                MAX_CORE_PROXY_RESPONSE_BYTES
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
+}
+
 async fn proxy_core_json(
     config: &Config,
     method: &str,
     path: &str,
     body: Option<&str>,
 ) -> Result<CoreProxyResponse, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
     let addr = config.core_http_addr();
@@ -847,11 +874,7 @@ async fn proxy_core_json(
         .write_all(request.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .map_err(|e| e.to_string())?;
+    let raw = read_core_proxy_response(&mut stream).await?;
     let raw = String::from_utf8_lossy(&raw);
     let (head, body) = raw
         .split_once("\r\n\r\n")
@@ -1117,5 +1140,40 @@ mod tests {
         );
         assert_eq!(wakeword.source, "config");
         assert_eq!(wakeword.sub_state, "disabled");
+    }
+
+    #[tokio::test]
+    async fn read_core_proxy_response_rejects_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let max = MAX_CORE_PROXY_RESPONSE_BYTES;
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9999999\r\n\r\n")
+                .await;
+            let chunk = vec![b'x'; 8192];
+            loop {
+                let _ = stream.write_all(&chunk).await;
+            }
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await;
+        let error = read_core_proxy_response(&mut stream).await.unwrap_err();
+        server.abort();
+
+        assert!(
+            error.contains(&format!("core response exceeds {max} bytes")),
+            "expected size cap error, got: {error}"
+        );
     }
 }
