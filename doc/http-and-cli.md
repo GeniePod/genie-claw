@@ -494,7 +494,10 @@ Memory tools are policy-aware:
   social, commute, pantry, comfort, location, vehicle/tax/cooking-reference,
   TV/community schedule, bank-login app-only, creative/story/literature/photo,
   trail/camping/cocktail/date-night/taco-bar, school checklists, appliance
-  filters/manuals, tablet chargers, kid routines,
+  filters/manuals, tablet chargers, kid routines, school/project forms,
+  debate/poem/project documents, water-heater receipts, camera/privacy reports,
+  guest-network device reports, filter-change notes, garage-change reports,
+  plumber shutoff notes, and emergency/safety-equipment locations,
   and watch notes maintain a typed
   local FTS index for direct questions such as "find my note about...", "what
   did the vet say...", "what color did we paint...", "how do I clean...", or
@@ -515,14 +518,20 @@ Memory tools are policy-aware:
   fever, snow, homework-check, weather-report, anxiety, Roman-history,
   mood-music, washer-leak, bike-security, garden watering, chickpea recipes,
   hallway-light troubleshooting, sleep comfort, night-hallway safety, outlet-spill
-  safety, and taco-bar planning
+  safety, after-dinner cleanup, board-game setup, glare/reading comfort,
+  post-bath comfort, quiet drawing, workshop dust control, school-night reset,
+  guest breakfast, low-power mode, family dinner screens, appliance-noise causes,
+  air-quality/pollen causes, camera privacy, freezer/laundry safety automations,
+  and taco-bar planning
   questions when exact words are missing
 - live answers still require live tools: garage/lock/thermostat state comes from
   Home Assistant, weather comes from the weather tool, media playback comes from
   the local media path, and sensors such as baby monitors, cameras, face
   recognition, smart-fridge inventories, purchase carts, car remote start,
   traffic, Bluetooth trackers, microphones, or location history are not
-  simulated by memory recall
+  simulated by memory recall; scenario routes for current lights, guest Wi-Fi
+  clients, noisy appliances, water pressure, camera privacy, and final safety
+  sweeps therefore go through live tool/status boundaries when configured
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 

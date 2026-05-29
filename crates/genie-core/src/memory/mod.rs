@@ -4171,6 +4171,57 @@ fn household_note_from_memory(kind: &str, content: &str) -> Option<(String, Stri
             | "dishwasher_rack_state"
             | "kitchen_item_locations"
             | "door_sensor_states"
+            | "project_lists"
+            | "project_list_items"
+            | "sensor_alert_rules"
+            | "privacy_audit_log"
+            | "family_messages"
+            | "message_events"
+            | "camera_access_logs"
+            | "privacy_mode_events"
+            | "camera_recording_rules"
+            | "meal_memory_embeddings"
+            | "child_media_rules"
+            | "media_preferences"
+            | "pet_feeding_events"
+            | "pet_care_profiles"
+            | "outdoor_air_quality_feed"
+            | "indoor_air_quality_sensors"
+            | "power_events"
+            | "holiday_calendar"
+            | "alarm_preference_embeddings"
+            | "network_clients"
+            | "known_devices"
+            | "outdoor_temperature_sensors"
+            | "moisture_sensors"
+            | "router_stats"
+            | "bandwidth_usage"
+            | "activity_templates"
+            | "camera_health"
+            | "image_quality_metrics"
+            | "maintenance_notes"
+            | "garage_door_events"
+            | "water_pressure_sensors"
+            | "home_utility_thresholds"
+            | "water_valve_state"
+            | "camera_person_events"
+            | "humidity_sensors"
+            | "dehumidifier_state"
+            | "filter_life_remaining"
+            | "user_print_rules"
+            | "printer_supplies"
+            | "cooking_sessions"
+            | "appliance_safety_profiles"
+            | "camera_privacy_rules"
+            | "room_sensor_history"
+            | "do_not_disturb_rules"
+            | "temporary_mode_overrides"
+            | "lock_status"
+            | "smoke_detector_status"
+            | "security_modes"
+            | "recipe_ingredients"
+            | "school_forms"
+            | "meal_notes_fts"
     ) {
         (note_type_from_kind(&kind_lower, &lower), trimmed)
     } else if let Some(rest) = lower
@@ -4483,6 +4534,40 @@ fn note_type_from_kind<'a>(kind: &'a str, lower_content: &str) -> &'a str {
         "plant_care_profiles" | "last_watered_events" => "garden",
         "dishwasher_rack_state" | "kitchen_item_locations" => "inventory",
         "door_sensor_states" => "security",
+        "project_lists" | "project_list_items" => "school",
+        "sensor_alert_rules" => "device",
+        "privacy_audit_log"
+        | "camera_access_logs"
+        | "privacy_mode_events"
+        | "camera_recording_rules"
+        | "camera_privacy_rules" => "privacy",
+        "family_messages" | "message_events" => "family",
+        "meal_memory_embeddings" => "meal",
+        "child_media_rules" | "media_preferences" => "media",
+        "pet_feeding_events" | "pet_care_profiles" => "pet",
+        "outdoor_air_quality_feed" | "indoor_air_quality_sensors" => "health",
+        "power_events" => "device",
+        "holiday_calendar" => "schedule",
+        "alarm_preference_embeddings" => "schedule",
+        "network_clients" | "known_devices" | "router_stats" | "bandwidth_usage" => "network",
+        "outdoor_temperature_sensors" | "moisture_sensors" => "safety",
+        "activity_templates" => "activity",
+        "camera_health" | "image_quality_metrics" | "maintenance_notes" => "home_maintenance",
+        "garage_door_events" => "security",
+        "water_pressure_sensors" | "home_utility_thresholds" | "water_valve_state" => "utility",
+        "camera_person_events" => "security",
+        "humidity_sensors" | "dehumidifier_state" | "filter_life_remaining" => "home_comfort",
+        "user_print_rules" | "printer_supplies" => "device",
+        "cooking_sessions" => "recipe",
+        "appliance_safety_profiles" => "safety",
+        "room_sensor_history" => "home_comfort",
+        "do_not_disturb_rules" => "home_comfort",
+        "temporary_mode_overrides" => "routine",
+        "lock_status" | "security_modes" => "security",
+        "smoke_detector_status" => "safety",
+        "recipe_ingredients" => "recipe",
+        "school_forms" => "school",
+        "meal_notes_fts" => "meal",
         "notification_rules" | "do_not_disturb_rule" => "home_comfort",
         "gas_sensors" | "stove_state" | "safety_profiles" => "safety",
         "shopping_list_items" => "shopping",
@@ -4924,6 +5009,57 @@ fn should_embed_memory(kind: &str, content: &str, metadata: policy::MemoryPolicy
             | "dishwasher_rack_state"
             | "kitchen_item_locations"
             | "door_sensor_states"
+            | "project_lists"
+            | "project_list_items"
+            | "sensor_alert_rules"
+            | "privacy_audit_log"
+            | "family_messages"
+            | "message_events"
+            | "camera_access_logs"
+            | "privacy_mode_events"
+            | "camera_recording_rules"
+            | "meal_memory_embeddings"
+            | "child_media_rules"
+            | "media_preferences"
+            | "pet_feeding_events"
+            | "pet_care_profiles"
+            | "outdoor_air_quality_feed"
+            | "indoor_air_quality_sensors"
+            | "power_events"
+            | "holiday_calendar"
+            | "alarm_preference_embeddings"
+            | "network_clients"
+            | "known_devices"
+            | "outdoor_temperature_sensors"
+            | "moisture_sensors"
+            | "router_stats"
+            | "bandwidth_usage"
+            | "activity_templates"
+            | "camera_health"
+            | "image_quality_metrics"
+            | "maintenance_notes"
+            | "garage_door_events"
+            | "water_pressure_sensors"
+            | "home_utility_thresholds"
+            | "water_valve_state"
+            | "camera_person_events"
+            | "humidity_sensors"
+            | "dehumidifier_state"
+            | "filter_life_remaining"
+            | "user_print_rules"
+            | "printer_supplies"
+            | "cooking_sessions"
+            | "appliance_safety_profiles"
+            | "camera_privacy_rules"
+            | "room_sensor_history"
+            | "do_not_disturb_rules"
+            | "temporary_mode_overrides"
+            | "lock_status"
+            | "smoke_detector_status"
+            | "security_modes"
+            | "recipe_ingredients"
+            | "school_forms"
+            | "meal_notes_fts"
     ) || content.len() >= 48
         || lower.contains("thermostat")
         || lower.contains("lunchbox")
@@ -5145,7 +5281,9 @@ fn should_embed_memory(kind: &str, content: &str, metadata: policy::MemoryPolicy
 
 fn semantic_memory_type(kind: &str, content: &str) -> String {
     let lower = content.to_ascii_lowercase();
-    if lower.contains("bedtime story")
+    if let Some(memory_type) = contextual_household_batch_five_type(&lower) {
+        memory_type.into()
+    } else if lower.contains("bedtime story")
         || (lower.contains("story") && lower.contains("leo") && lower.contains("bedtime"))
     {
         "bedtime_story".into()
@@ -5913,13 +6051,250 @@ fn semantic_memory_type(kind: &str, content: &str) -> String {
     }
 }
 
+fn contextual_household_batch_five_type(lower: &str) -> Option<&'static str> {
+    if lower.contains("after dinner cleanup") || lower.contains("after-dinner cleanup") {
+        Some("after_dinner_cleanup")
+    } else if lower.contains("upstairs lights") && lower.contains("on") {
+        Some("upstairs_lights_on")
+    } else if lower.contains("front door") && lower.contains("grandma") {
+        Some("grandma_front_door_permission")
+    } else if lower.contains("debate") && lower.contains("school lunch") {
+        Some("school_lunch_debate")
+    } else if lower.contains("board games") {
+        Some("board_game_scene")
+    } else if lower.contains("basement") && lower.contains("humid") {
+        Some("basement_humidity_cause")
+    } else if lower.contains("test practice") && lower.contains("notification") {
+        Some("test_practice_notifications")
+    } else if lower.contains("rain boots") {
+        Some("rain_boots_location")
+    } else if lower.contains("charging tonight") || lower.contains("need charging") {
+        Some("charging_tonight")
+    } else if lower.contains("coffee") && lower.contains("wake") {
+        Some("coffee_wake_brew")
+    } else if lower.contains("fan on low") && lower.contains("sleep") {
+        Some("sleep_fan_low_preference")
+    } else if lower.contains("cold after bath") || lower.contains("post-bath") {
+        Some("post_bath_comfort")
+    } else if lower.contains("slow cooker") && lower.contains("timer chart") {
+        Some("slow_cooker_timer_chart")
+    } else if lower.contains("basement flood check") {
+        Some("basement_flood_check")
+    } else if lower.contains("garage camera") && lower.contains("bike") {
+        Some("garage_bike_camera")
+    } else if lower.contains("next filter change") {
+        Some("next_filter_change")
+    } else if lower.contains("puzzle") && lower.contains("dad") {
+        Some("puzzle_done_reminder")
+    } else if lower.contains("temporary")
+        && lower.contains("grandma")
+        && (lower.contains("code") || lower.contains("access"))
+    {
+        Some("grandma_temporary_code")
+    } else if lower.contains("glare") || lower.contains("glarey") || lower.contains("glary") {
+        Some("desk_glare_comfort")
+    } else if lower.contains("front door")
+        && lower.contains("leo")
+        && (lower.contains("locked") || lower.contains("auto-lock"))
+    {
+        Some("front_door_after_leo")
+    } else if lower.contains("water heater") && lower.contains("receipt") {
+        Some("water_heater_receipt")
+    } else if lower.contains("quiet drawing") {
+        Some("quiet_drawing_time")
+    } else if lower.contains("print") && lower.contains("homework") {
+        Some("homework_print_permission")
+    } else if lower.contains("upstairs") && lower.contains("cooler") && lower.contains("leo") {
+        Some("upstairs_cool_except_leo")
+    } else if lower.contains("noisy appliance") || lower.contains("high-spin") {
+        Some("noisy_appliance")
+    } else if lower.contains("tooth fairy box") {
+        Some("tooth_fairy_box")
+    } else if lower.contains("white extension cord") {
+        Some("white_extension_cord")
+    } else if lower.contains("family dinner") && lower.contains("screens") {
+        Some("family_dinner_screens")
+    } else if lower.contains("garage") && lower.contains("today") && lower.contains("changed") {
+        Some("garage_changes_today")
+    } else if lower.contains("stairs bright") || lower.contains("stairwell") {
+        Some("stairwell_bright")
+    } else if lower.contains("water my plant") || lower.contains("plant after school") {
+        Some("plant_after_school_reminder")
+    } else if lower.contains("chicken") && lower.contains("peanut") {
+        Some("peanut_free_chicken_recipe")
+    } else if lower.contains("security alarm chirp") || lower.contains("low-battery chirp") {
+        Some("security_alarm_chirp")
+    } else if lower.contains("microwave") {
+        Some("microwave_permission")
+    } else if lower.contains("rehearsal comfort") {
+        Some("rehearsal_comfort")
+    } else if lower.contains("backyard") && (lower.contains("who") || lower.contains("jared")) {
+        Some("backyard_presence")
+    } else if lower.contains("workshop dust") {
+        Some("workshop_dust_control")
+    } else if lower.contains("bedtime chart") {
+        Some("bedtime_chart_remaining")
+    } else if lower.contains("closet light") && lower.contains("open") {
+        Some("closet_light_automation")
+    } else if lower.contains("upstairs window") && lower.contains("rain") {
+        Some("upstairs_window_before_rain")
+    } else if lower.contains("low-power") || lower.contains("low power") {
+        Some("low_power_mode")
+    } else if lower.contains("vaccination form") {
+        Some("vaccination_form")
+    } else if lower.contains("field trip form") {
+        Some("field_trip_form_signed")
+    } else if lower.contains("animal show") {
+        Some("animal_show_low_volume")
+    } else if lower.contains("guest wi-fi")
+        || lower.contains("guest wi fi")
+        || lower.contains("guest wifi")
+    {
+        Some("guest_wifi_devices")
+    } else if lower.contains("front entry lights") && lower.contains("mia") {
+        Some("entry_lights_until_mia")
+    } else if lower.contains("side path") && (lower.contains("icy") || lower.contains("ice")) {
+        Some("side_path_ice_risk")
+    } else if lower.contains("dripping") {
+        Some("dripping_leak_check")
+    } else if lower.contains("office internet") && lower.contains("slow") {
+        Some("office_internet_slow")
+    } else if lower.contains("school-night reset") || lower.contains("school night reset") {
+        Some("school_night_reset")
+    } else if lower.contains("photo backdrop") {
+        Some("photo_backdrop_instructions")
+    } else if lower.contains("red marker") {
+        Some("red_marker_location")
+    } else if lower.contains("freezer") && lower.contains("above 10") {
+        Some("freezer_threshold_alert")
+    } else if lower.contains("chores") && lower.contains("skip") {
+        Some("leo_skipped_chores")
+    } else if lower.contains("mirror lights") {
+        Some("mirror_lights_only")
+    } else if lower.contains("cat sleep") {
+        Some("cat_sleep_permission")
+    } else if lower.contains("grilling lights")
+        || (lower.contains("backyard") && lower.contains("grilling"))
+    {
+        Some("grilling_lights")
+    } else if lower.contains("purifier") && lower.contains("high") {
+        Some("purifier_high_reason")
+    } else if lower.contains("swim meet") && lower.contains("packing") {
+        Some("swim_meet_packing_list")
+    } else if lower.contains("next step") && lower.contains("cookies") {
+        Some("cookie_recipe_next_step")
+    } else if lower.contains("outdoor cameras") && lower.contains("clean") {
+        Some("outdoor_camera_cleaning")
+    } else if lower.contains("garage") && lower.contains("jared left") {
+        Some("garage_closed_after_jared")
+    } else if lower.contains("project list")
+        && (lower.contains("batteries") || lower.contains("poster board"))
+    {
+        Some("project_list_supplies")
+    } else if (lower.contains("scared") && lower.contains("downstairs"))
+        || lower.contains("downstairs reassurance")
+    {
+        Some("downstairs_reassurance")
+    } else if lower.contains("furnace") && lower.contains("code 31") {
+        Some("furnace_code_31")
+    } else if lower.contains("dinner warm") || lower.contains("keep dinner warm") {
+        Some("dinner_warm_until_jared")
+    } else if lower.contains("quiet time") && lower.contains("wednesday") {
+        Some("wednesday_quiet_time")
+    } else if lower.contains("cat") && lower.contains("too much") {
+        Some("cat_feeding_amount")
+    } else if lower.contains("oldest") && lower.contains("fridge") {
+        Some("oldest_fridge_food")
+    } else if lower.contains("outside is cleaner") || lower.contains("outdoor air is cleaner") {
+        Some("cleaner_outside_air")
+    } else if lower.contains("lamp") && lower.contains("flicker") {
+        Some("lamp_flicker_reason")
+    } else if lower.contains("garage door") && lower.contains("open") {
+        Some("garage_door_permission")
+    } else if lower.contains("holiday lighting") {
+        Some("holiday_lighting_schedule")
+    } else if lower.contains("shutoff valve") || lower.contains("water shutoff") {
+        Some("plumber_shutoff_note")
+    } else if lower.contains("rainy-day alarm") || lower.contains("rainy day alarm") {
+        Some("rainy_day_alarm")
+    } else if lower.contains("soccer practice")
+        && (lower.contains("what do")
+            || lower.contains("need for")
+            || lower.contains("bring")
+            || lower.contains("gear")
+            || lower.contains("cleats")
+            || lower.contains("shin guards"))
+    {
+        Some("soccer_practice_gear")
+    } else if lower.contains("bypass") && lower.contains("sensor") {
+        Some("sensor_bypass_report")
+    } else if lower.contains("guest breakfast") {
+        Some("guest_breakfast_mode")
+    } else if lower.contains("winter poem") || (lower.contains("poem") && lower.contains("winter"))
+    {
+        Some("winter_poem")
+    } else if lower.contains("laundry room") && lower.contains("scary") {
+        Some("laundry_room_reassurance")
+    } else if lower.contains("water pressure") {
+        Some("water_pressure_status")
+    } else if lower.contains("oven") && lower.contains("preheat") {
+        Some("oven_preheat_reminder")
+    } else if lower.contains("hallway camera") && lower.contains("privacy") {
+        Some("hallway_camera_privacy")
+    } else if lower.contains("cookies") && lower.contains("cool") {
+        Some("cookie_cooling_alert")
+    } else if lower.contains("vacuum") && lower.contains("dining room") {
+        Some("vacuum_dining_room_skip")
+    } else if lower.contains("toddler gate") {
+        Some("toddler_gate_instructions")
+    } else if lower.contains("room smells weird") || lower.contains("elevated voc") {
+        Some("room_smell_air_quality")
+    } else if lower.contains("dad saw") || lower.contains("message read") {
+        Some("message_read_status")
+    } else if (lower.contains("laundry leak") || lower.contains("laundry leaks"))
+        && (lower.contains("shutoff") || lower.contains("shut off"))
+    {
+        Some("laundry_leak_shutoff")
+    } else if lower.contains("backpacks") && lower.contains("door") {
+        Some("entryway_backpacks")
+    } else if lower.contains("alarm") && lower.contains("skip") && lower.contains("holiday") {
+        Some("alarm_skip_holidays")
+    } else if lower.contains("morning checklist") && lower.contains("wall") {
+        Some("morning_checklist_display")
+    } else if lower.contains("privacy report") && lower.contains("camera") {
+        Some("camera_privacy_report")
+    } else if lower.contains("green bowl") {
+        Some("green_bowl_recipe")
+    } else if lower.contains("practice drums") {
+        Some("drums_permission")
+    } else if (lower.contains("flashlight") && lower.contains("lights go out"))
+        || lower.contains("emergency flashlight")
+    {
+        Some("emergency_flashlight")
+    } else if lower.contains("automation fired the most") {
+        Some("top_automation_today")
+    } else if (lower.contains("upstairs warmer") && lower.contains("kids"))
+        || lower.contains("kids morning upstairs warmth")
+    {
+        Some("kids_morning_warmth")
+    } else if lower.contains("tournament") && lower.contains("snacks") {
+        Some("tournament_snacks")
+    } else if lower.contains("final safety sweep") {
+        Some("final_safety_sweep")
+    } else {
+        None
+    }
+}
+
 fn embedding_text_for_memory(kind: &str, content: &str) -> String {
     format!("{} {}", semantic_memory_type(kind, content), content)
 }
 
 fn embedding_text_for_query(query: &str) -> String {
     let lower = query.to_ascii_lowercase();
-    if lower.contains("cold") && lower.contains("living room") {
+    if let Some(memory_type) = contextual_household_batch_five_type(&lower) {
+        format!("{memory_type} {query}")
+    } else if lower.contains("cold") && lower.contains("living room") {
         format!("person_room_comfort sarah cold living room thermostat cozy 72 {query}")
     } else if lower.contains("watch cartoons") {
         format!(
@@ -6638,7 +7013,9 @@ fn embedding_text_for_query(query: &str) -> String {
 
 fn semantic_query_type(query: &str) -> Option<String> {
     let lower = query.to_ascii_lowercase();
-    if lower.contains("cold") && lower.contains("living room") {
+    if let Some(memory_type) = contextual_household_batch_five_type(&lower) {
+        Some(memory_type.into())
+    } else if lower.contains("cold") && lower.contains("living room") {
         Some("person_room_comfort".into())
     } else if lower.contains("watch cartoons") {
         Some("screen_time_status".into())
@@ -9476,6 +9853,7 @@ fn household_note_query(query: &str) -> Option<String> {
         "find the manual for ",
         "find the user manual for ",
         "find manual for ",
+        "where did i save ",
         "find the instructions for ",
         "find instructions for ",
         "who do we call for ",
@@ -9617,6 +9995,113 @@ fn household_note_query(query: &str) -> Option<String> {
         || lower.contains("guest speaker")
         || lower.contains("end of day")
         || lower.contains("end-of-day")
+        || lower.contains("after dinner cleanup")
+        || lower.contains("after-dinner cleanup")
+        || lower.contains("upstairs lights")
+        || lower.contains("front door") && lower.contains("grandma")
+        || lower.contains("debate") && lower.contains("school lunch")
+        || lower.contains("board games")
+        || lower.contains("basement humid")
+        || lower.contains("test practice")
+        || lower.contains("rain boots")
+        || lower.contains("charging tonight")
+        || lower.contains("coffee") && lower.contains("wake")
+        || lower.contains("fan on low") && lower.contains("sleep")
+        || lower.contains("cold after bath")
+        || lower.contains("slow cooker") && lower.contains("timer chart")
+        || lower.contains("basement flood check")
+        || lower.contains("garage camera") && lower.contains("bike")
+        || lower.contains("next filter change")
+        || lower.contains("puzzle") && lower.contains("dad")
+        || lower.contains("temporary code") && lower.contains("grandma")
+        || lower.contains("glarey")
+        || lower.contains("front door locked after")
+        || lower.contains("water heater receipt")
+        || lower.contains("quiet drawing")
+        || lower.contains("print my homework")
+        || lower.contains("upstairs cooler") && lower.contains("leo")
+        || lower.contains("noisy appliance")
+        || lower.contains("tooth fairy box")
+        || lower.contains("white extension cord")
+        || lower.contains("family dinner") && lower.contains("screens")
+        || lower.contains("changed in the garage today")
+        || lower.contains("stairs bright")
+        || lower.contains("water my plant")
+        || lower.contains("chicken recipe") && lower.contains("peanut")
+        || lower.contains("security alarm chirp")
+        || lower.contains("use the microwave")
+        || lower.contains("rehearsal comfort")
+        || lower.contains("who s in the backyard")
+        || lower.contains("who's in the backyard")
+        || lower.contains("workshop dust control")
+        || lower.contains("bedtime chart")
+        || lower.contains("closet light")
+        || lower.contains("upstairs window before the rain")
+        || lower.contains("low power mode")
+        || lower.contains("low-power mode")
+        || lower.contains("vaccination form")
+        || lower.contains("field trip form")
+        || lower.contains("animal show")
+        || lower.contains("guest wi fi")
+        || lower.contains("guest wifi")
+        || lower.contains("guest wi-fi")
+        || lower.contains("front entry lights")
+        || lower.contains("side path icy")
+        || lower.contains("dripping")
+        || lower.contains("office internet slow")
+        || lower.contains("school night reset")
+        || lower.contains("school-night reset")
+        || lower.contains("photo backdrop")
+        || lower.contains("red marker")
+        || lower.contains("freezer") && lower.contains("above 10")
+        || lower.contains("chores did leo skip")
+        || lower.contains("mirror lights")
+        || lower.contains("cat sleep")
+        || lower.contains("grilling")
+        || lower.contains("purifier on high")
+        || lower.contains("swim meet")
+        || lower.contains("next step") && lower.contains("cookies")
+        || lower.contains("outdoor cameras need cleaning")
+        || lower.contains("garage close after jared")
+        || lower.contains("project list")
+        || lower.contains("scared to go downstairs")
+        || lower.contains("furnace") && lower.contains("code 31")
+        || lower.contains("dinner warm")
+        || lower.contains("quiet time") && lower.contains("wednesday")
+        || lower.contains("feed the cat too much")
+        || lower.contains("oldest thing in the fridge")
+        || lower.contains("outside is cleaner")
+        || lower.contains("lamp flickering")
+        || lower.contains("open the garage door")
+        || lower.contains("holiday lighting")
+        || lower.contains("shutoff valve")
+        || lower.contains("rainy day alarm")
+        || lower.contains("rainy-day alarm")
+        || lower.contains("soccer practice")
+        || lower.contains("bypass a sensor")
+        || lower.contains("guest breakfast")
+        || lower.contains("winter poem")
+        || lower.contains("laundry room not scary")
+        || lower.contains("water pressure")
+        || lower.contains("oven") && lower.contains("preheat")
+        || lower.contains("hallway camera")
+        || lower.contains("cookies are cool")
+        || lower.contains("vacuum avoid")
+        || lower.contains("toddler gate")
+        || lower.contains("room smells weird")
+        || lower.contains("dad see my message")
+        || lower.contains("laundry leaks again")
+        || lower.contains("backpacks are by the door")
+        || lower.contains("alarm skip holidays")
+        || lower.contains("morning checklist")
+        || lower.contains("privacy report") && lower.contains("cameras")
+        || lower.contains("green bowl")
+        || lower.contains("practice drums")
+        || lower.contains("flashlight") && lower.contains("lights go out")
+        || lower.contains("automation fired")
+        || lower.contains("upstairs warmer") && lower.contains("kids")
+        || lower.contains("tournament") && lower.contains("snacks")
+        || lower.contains("final safety sweep")
     {
         return Some(query.to_string());
     }
@@ -12601,6 +13086,147 @@ mod tests {
     }
 
     #[test]
+    fn contextual_family_routines_fifth_batch_answer_exact_and_fts_questions() {
+        let mem = temp_memory();
+        for (kind, content) in [
+            (
+                "documents_fts",
+                "Mia debate school lunch research: Civics folder latest draft School Lunch Debate Notes",
+            ),
+            (
+                "item_location_events",
+                "Leo rain boots location: rain boots are by the mudroom drying mat",
+            ),
+            (
+                "manuals_fts",
+                "Slow cooker timer chart: slow cooker manual has the timer chart in the cooking guide section",
+            ),
+            (
+                "camera_object_events",
+                "Mia garage bike camera: Mia's bike was seen in the garage near the workbench at 4:09 PM",
+            ),
+            (
+                "documents_fts",
+                "New water heater receipt: receipt is in Home Projects and linked to the installation record",
+            ),
+            (
+                "inventory_items",
+                "White extension cord: in the craft bin under the dining-room sideboard for Mia's project",
+            ),
+            (
+                "recipes_fts",
+                "Peanut-free chicken recipe: lemon chicken rice bowls are peanut-free and rated highly",
+            ),
+            (
+                "health_documents_fts",
+                "Leo vaccination form: latest active vaccination form is in Health Documents",
+            ),
+            (
+                "school_forms",
+                "Mia field trip form: Mom signed the field trip form this morning",
+            ),
+            (
+                "project_notes_fts",
+                "Photo backdrop instructions: saved in Mia's art project folder",
+            ),
+            (
+                "inventory_items",
+                "Red marker location: red marker should be in the dining-room craft caddy",
+            ),
+            (
+                "cooking_sessions",
+                "Cookie recipe next step: scoop the dough onto the baking sheet, leaving space between each cookie",
+            ),
+            (
+                "manuals_fts",
+                "Furnace code 31: listed under pressure switch troubleshooting in the furnace manual",
+            ),
+            (
+                "home_project_notes_fts",
+                "Plumber shutoff valve note: secondary shutoff valve is behind the laundry-room access panel",
+            ),
+            (
+                "documents_fts",
+                "Mia winter poem: saved in English folder as First Snow Draft",
+            ),
+            (
+                "manuals_fts",
+                "Toddler gate instructions: pressure-mount setup note attached to visitor safety bin",
+            ),
+            (
+                "meal_notes_fts",
+                "Green bowl recipe: sesame noodle salad was served in the big green bowl",
+            ),
+            (
+                "safety_equipment_log",
+                "Emergency flashlight: child-accessible flashlight is in the lower mudroom drawer",
+            ),
+            (
+                "activity_notes_fts",
+                "Mia tournament snacks: pretzels, apple slices, cheese stick, and blue sports drink",
+            ),
+        ] {
+            mem.store(kind, content).unwrap();
+        }
+
+        for (query, expected) in [
+            (
+                "Find my debate research about school lunches",
+                "School Lunch Debate Notes",
+            ),
+            ("Where did I leave my rain boots?", "mudroom drying mat"),
+            (
+                "Find the slow cooker manual and timer chart",
+                "cooking guide",
+            ),
+            ("Did the garage camera see my bike?", "4:09 PM"),
+            (
+                "Find the receipt for the new water heater",
+                "installation record",
+            ),
+            (
+                "Where is the white extension cord for my project?",
+                "craft bin",
+            ),
+            ("Find a chicken recipe without peanuts", "lemon chicken"),
+            ("Find Leo's vaccination form", "Health Documents"),
+            ("Did Mom sign my field trip form?", "this morning"),
+            ("Find the photo backdrop instructions", "art project folder"),
+            ("Where's the red marker?", "craft caddy"),
+            ("Read me the next step for cookies", "scoop the dough"),
+            (
+                "Find furnace manual troubleshooting code 31",
+                "pressure switch",
+            ),
+            (
+                "Find the note about the plumber's shutoff valve",
+                "laundry-room access panel",
+            ),
+            ("Where did I save my poem about winter?", "First Snow Draft"),
+            ("Find the toddler gate instructions", "pressure-mount"),
+            (
+                "Find the recipe where we used the green bowl",
+                "sesame noodle salad",
+            ),
+            (
+                "Where's the flashlight if the lights go out?",
+                "lower mudroom drawer",
+            ),
+            (
+                "What snacks did we pack for my last tournament?",
+                "blue sports drink",
+            ),
+        ] {
+            let answer = mem.structured_household_answer(query).unwrap();
+            assert!(answer.is_some(), "query {query:?} should have an answer");
+            assert!(
+                answer.unwrap().contains(expected),
+                "query {query:?} should include {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn semantic_search_links_cold_to_thermostat_preference() {
         let mem = temp_memory();
         mem.store(
@@ -14528,6 +15154,649 @@ mod tests {
             ("Sarah: Start a calm morning for Leo", "slower checklist"),
             ("Mia: What's the password for the guest speaker?", "4821"),
             ("Jared: Make an end-of-day house summary", "two windows"),
+        ] {
+            assert!(
+                mem.semantic_search(query, 3)
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit.entry.content.contains(expected)),
+                "query {query:?} should recall {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_search_links_contextual_household_controls_and_reports_fifth_batch() {
+        let mem = temp_memory();
+        for (kind, content) in [
+            (
+                "scenes",
+                "After-dinner cleanup mode: kitchen lights bright, dishwasher queued, and robot vacuum cleans kitchen dining",
+            ),
+            (
+                "device_states",
+                "Upstairs lights on report: Mia desk lamp, Leo night-light, and hallway sconce are still on",
+            ),
+            (
+                "trusted_contacts",
+                "Grandma front door permission: Grandma Elaine is recognized and Leo may open the front door while Mom is notified",
+            ),
+            (
+                "documents_fts",
+                "Mia debate school lunch research: Civics folder latest draft School Lunch Debate Notes",
+            ),
+            (
+                "activity_preference_embeddings",
+                "Board games living room scene: brighter table lights, TV off, and 71F seating temperature",
+            ),
+            (
+                "humidity_sensors",
+                "Basement humidity cause: basement window open during damp weather and dehumidifier paused since noon",
+            ),
+            (
+                "do_not_disturb_rules",
+                "Mia test practice notifications: block notifications except Mom during test practice",
+            ),
+            (
+                "item_location_events",
+                "Leo rain boots location: rain boots are by the mudroom drying mat",
+            ),
+            (
+                "battery_status",
+                "Charging tonight report: Mia laptop, Leo tablet, and Jared garage headset should be charged tonight",
+            ),
+            (
+                "scheduled_device_actions",
+                "Coffee wake brew: coffee maker starts when Jared's wake-up alarm goes off",
+            ),
+            (
+                "preference",
+                "Mia sleep fan preference: fan on low for sleep",
+            ),
+            (
+                "comfort_preference_embeddings",
+                "Leo post-bath comfort: warm bathroom area and turn on the towel warmer",
+            ),
+            (
+                "manuals_fts",
+                "Slow cooker timer chart: timer chart is in the slow cooker cooking guide section",
+            ),
+            (
+                "water_leak_sensors",
+                "Basement flood check clear: no wet leak sensors and sump pump last ran normally",
+            ),
+            (
+                "camera_object_events",
+                "Mia garage bike camera: bike seen in garage near the workbench at 4:09 PM",
+            ),
+            (
+                "maintenance_schedule",
+                "Next filter change: upstairs air purifier filter due in 6 days",
+            ),
+            (
+                "reminders",
+                "Puzzle done reminder: when Leo says the puzzle is done, tell Dad",
+            ),
+            (
+                "access_permissions",
+                "Grandma temporary access: Grandma Elaine's temporary door access active until 9:00 PM",
+            ),
+            (
+                "activity_preference_embeddings",
+                "Mia desk glare comfort: lower desk lamp slightly and adjust blinds to reduce glare",
+            ),
+            (
+                "access_logs",
+                "Front door after Leo arrival: door opened, closed, then locked automatically 45 seconds later",
+            ),
+            (
+                "documents_fts",
+                "Water heater receipt: Home Projects receipt linked to installation record",
+            ),
+            (
+                "activity_preference_embeddings",
+                "Leo quiet drawing time: warm light, soft music, and fewer interruptions",
+            ),
+            (
+                "user_print_rules",
+                "Mia homework print permission: printer online and paper available",
+            ),
+            (
+                "hvac_zones",
+                "Upstairs cooler except Leo: cool upstairs zones while leaving Leo's room unchanged",
+            ),
+            (
+                "audio_event_classifications",
+                "Noisy appliance report: washing machine vibration pattern during high-spin cycle",
+            ),
+            (
+                "device_events",
+                "Leo tooth fairy box: contact sensor stayed closed since bedtime",
+            ),
+            (
+                "inventory_items",
+                "White extension cord location: craft bin under the dining-room sideboard",
+            ),
+            (
+                "network_access_rules",
+                "Family dinner screens: pause kid screens and stop room media sessions during family dinner",
+            ),
+            (
+                "camera_object_events",
+                "Garage changes today: side door opened twice, Mia bike moved near workbench, freezer normal",
+            ),
+            (
+                "device_states",
+                "Stairwell bright scene: stairwell lights set to 90 percent child-safe brightness",
+            ),
+            (
+                "reminder",
+                "Mia plant after school reminder: water her plant after school",
+            ),
+            (
+                "recipes_fts",
+                "Peanut-free chicken recipe: lemon chicken rice bowls are peanut-free and rated highly",
+            ),
+            (
+                "device_alerts",
+                "Security alarm chirp: low-battery chirp from side-yard contact sensor, not intrusion",
+            ),
+            (
+                "family_rules",
+                "Leo microwave permission: allowed only while Mom is in the kitchen",
+            ),
+            (
+                "activity_preference_embeddings",
+                "Mia rehearsal comfort: saved temperature, fan speed, and humidity for rehearsal comfort",
+            ),
+            (
+                "camera_person_events",
+                "Backyard presence: Jared is recognized in the backyard and nobody else is recognized",
+            ),
+            (
+                "activity_preference_embeddings",
+                "Workshop dust control: garage exhaust fan running and purifier set to high",
+            ),
+            (
+                "routine_steps",
+                "Leo bedtime chart remaining: pajamas, story time, and lights out",
+            ),
+            (
+                "automation_rules",
+                "Mia closet light automation: closet light turns on when the door opens and auto-off after no motion",
+            ),
+            (
+                "window_sensor_events",
+                "Upstairs window before rain: window closed at 2:14 PM and rain started at 2:37 PM",
+            ),
+            (
+                "temporary_mode_overrides",
+                "Low-power mode until five: reduce lights, eco hold thermostat, and turn off standby-safe loads",
+            ),
+            (
+                "health_documents_fts",
+                "Leo vaccination form: latest active vaccination form is in Health Documents",
+            ),
+            (
+                "school_forms",
+                "Mia field trip form signed: Mom signed it this morning",
+            ),
+            (
+                "child_media_rules",
+                "Leo animal show low volume: allowed animal show with volume kept low",
+            ),
+            (
+                "network_clients",
+                "Guest Wi-Fi devices: babysitter phone, Grandma Elaine tablet, and one unknown device",
+            ),
+            (
+                "automation_rules",
+                "Entry lights until Mia home: front entry lights held on until Mia geofence arrival",
+            ),
+            (
+                "outdoor_temperature_sensors",
+                "Side path ice risk: below freezing and surface sensor wet",
+            ),
+            (
+                "safety_intent_embeddings",
+                "Dripping leak check: bathroom sink sensor dry but Mom should look nearby",
+            ),
+            (
+                "router_stats",
+                "Office internet slow reason: backup drive large upload saturating office network",
+            ),
+            (
+                "routines",
+                "School-night reset: kids devices wind down, lights dim, and morning prep list on kitchen display",
+            ),
+            (
+                "project_notes_fts",
+                "Photo backdrop instructions: saved in Mia's art project folder",
+            ),
+            (
+                "inventory_items",
+                "Red marker location: dining-room craft caddy",
+            ),
+            (
+                "sensor_alert_rules",
+                "Freezer threshold alert: notify Jared if freezer rises above 10F",
+            ),
+            (
+                "chore_assignments",
+                "Leo skipped chores this week: toy cleanup Tuesday and lunchbox emptying Thursday",
+            ),
+            (
+                "device_states",
+                "Mia mirror lights only: non-mirror lights off and mirror lights on",
+            ),
+            (
+                "family_rules",
+                "Cat sleep permission: school nights require Mom and Dad approval for cat in Leo's room",
+            ),
+            (
+                "scenes",
+                "Backyard grilling lights: grill task lights bright and path lights at medium",
+            ),
+            (
+                "automation_runs",
+                "Mia purifier high reason: elevated dust triggered automatic high mode",
+            ),
+            (
+                "activity_templates",
+                "Mia swim meet packing list: swimsuit, towel, goggles, cap, water bottle, snack, and dry clothes",
+            ),
+            (
+                "cooking_sessions",
+                "Cookie recipe next step: scoop dough onto the baking sheet with space between cookies",
+            ),
+            (
+                "camera_health",
+                "Outdoor camera cleaning report: side-yard and driveway cameras likely need cleaning",
+            ),
+            (
+                "garage_door_events",
+                "Garage closed after Jared left: garage closed two minutes after Jared left and stayed closed",
+            ),
+            (
+                "project_list_items",
+                "Mia project list supplies: batteries and poster board are on the project list",
+            ),
+            (
+                "comfort_preference_embeddings",
+                "Downstairs reassurance: stair and kitchen lights on and parents notified",
+            ),
+            (
+                "manuals_fts",
+                "Furnace code 31: pressure switch troubleshooting section",
+            ),
+            (
+                "appliance_safety_profiles",
+                "Dinner warm until Jared arrives: oven keep-warm within safe duration limit",
+            ),
+            (
+                "automation_rules",
+                "Mia Wednesday quiet time: quiet time scheduled after school every Wednesday",
+            ),
+            (
+                "pet_feeding_events",
+                "Cat feeding amount check: amount logged is within today's feeding plan",
+            ),
+            (
+                "food_inventory",
+                "Oldest fridge food: lentil soup should be eaten today",
+            ),
+            (
+                "indoor_air_quality_sensors",
+                "Cleaner outside air: motorized kitchen window opened while bedroom windows stay closed for pollen control",
+            ),
+            (
+                "power_events",
+                "Mia lamp flicker reason: smart plug reports unstable power, lamp turned off and Dad told",
+            ),
+            (
+                "family_rules",
+                "Leo garage door permission: children cannot operate garage door alone",
+            ),
+            (
+                "automation_rules",
+                "Holiday lighting schedule: holiday lights from sunset to 10:30 PM with energy limit",
+            ),
+            (
+                "home_project_notes_fts",
+                "Plumber shutoff valve note: secondary shutoff valve behind laundry-room access panel",
+            ),
+            (
+                "alarm_preference_embeddings",
+                "Mia rainy-day alarm: rainy-day sound, slower light ramp, and earlier start tomorrow",
+            ),
+            (
+                "activity_templates",
+                "Leo soccer practice gear: cleats, shin guards, water bottle, and light jacket",
+            ),
+            (
+                "security_audit_log",
+                "Sensor bypass report: Sarah bypassed laundry-room window sensor at 9:12 AM for cleaning",
+            ),
+            (
+                "scenes",
+                "Guest breakfast mode: kitchen lights on, guest coffee brewing, breakfast notes on counter display",
+            ),
+            (
+                "documents_fts",
+                "Mia winter poem: English folder file First Snow Draft",
+            ),
+            (
+                "comfort_preference_embeddings",
+                "Leo laundry room not scary: brighter laundry-room light and soft sound",
+            ),
+            (
+                "water_pressure_sensors",
+                "Water pressure status: current water pressure 58 PSI, normal for the house",
+            ),
+            (
+                "appliance_events",
+                "Oven preheat reminder: notify Sarah when oven finishes preheating",
+            ),
+            (
+                "privacy_audit_log",
+                "Hallway camera privacy: privacy mode for 20 minutes while sleepover guests change, safety sensors active",
+            ),
+            (
+                "cooking_sessions",
+                "Cookie cooling alert: tell Leo when cookies have cooled enough to eat safely",
+            ),
+            (
+                "vacuum_events",
+                "Vacuum dining room skip: temporary no-go zone active around Mia's school project",
+            ),
+            (
+                "manuals_fts",
+                "Toddler gate instructions: pressure-mount setup note attached to visitor safety bin",
+            ),
+            (
+                "air_quality_sensors",
+                "Mia room smell air quality: elevated VOCs, purifier on, vent opened, tell parents if stronger",
+            ),
+            (
+                "message_events",
+                "Leo Dad message read status: Dad saw Leo's message at 4:23 PM",
+            ),
+            (
+                "automation_rules",
+                "Laundry leak shutoff: shut main water valve and alert Jared and Sarah if laundry sensor gets wet",
+            ),
+            (
+                "ble_tag_events",
+                "Entryway backpacks: Leo's backpack is by the door and Mia's backpack is not there",
+            ),
+            (
+                "alarms",
+                "Mia alarm skip holidays: recurring alarm skips school holidays",
+            ),
+            (
+                "routine_steps",
+                "Leo morning checklist display: active morning checklist on hallway display",
+            ),
+            (
+                "camera_access_logs",
+                "Camera privacy report: no unusual access, hallway camera privacy once, outdoor cameras normal",
+            ),
+            (
+                "meal_memory_embeddings",
+                "Green bowl recipe: sesame noodle salad served in the big green bowl",
+            ),
+            (
+                "family_rules",
+                "Mia drums permission: practice drums now with practice pads and door closed",
+            ),
+            (
+                "safety_equipment_log",
+                "Emergency flashlight location: child-accessible flashlight in lower mudroom drawer",
+            ),
+            (
+                "automation_runs",
+                "Top automation today: hallway motion-light automation fired 18 times",
+            ),
+            (
+                "automation_rules",
+                "Kids morning upstairs warmth: upstairs warms automatically while Leo and Mia get ready",
+            ),
+            (
+                "activity_notes_fts",
+                "Mia tournament snacks: pretzels, apple slices, cheese stick, and blue sports drink",
+            ),
+            (
+                "security_modes",
+                "Final safety sweep: doors locked, smoke detectors normal, no leaks, oven off, one upstairs window open",
+            ),
+        ] {
+            mem.store(kind, content).unwrap();
+        }
+
+        for (query, expected) in [
+            ("Sarah: Start after-dinner cleanup mode", "robot vacuum"),
+            (
+                "Jared: Which lights are still on upstairs?",
+                "Mia desk lamp",
+            ),
+            (
+                "Leo: Can I open the front door for Grandma?",
+                "Grandma Elaine",
+            ),
+            (
+                "Mia: Find my debate research about school lunches",
+                "School Lunch Debate Notes",
+            ),
+            (
+                "Sarah: Make the living room good for board games",
+                "table lights",
+            ),
+            ("Jared: Why is the basement humid?", "dehumidifier"),
+            (
+                "Mia: Block notifications except Mom during my test practice",
+                "except Mom",
+            ),
+            ("Leo: Where did I leave my rain boots?", "mudroom"),
+            ("Sarah: What needs charging tonight?", "garage headset"),
+            ("Jared: Start the coffee when I wake up", "wake-up alarm"),
+            (
+                "Mia: Remember I like the fan on low for sleep",
+                "fan on low",
+            ),
+            ("Leo: I'm cold after bath", "towel warmer"),
+            (
+                "Sarah: Find the slow cooker manual and timer chart",
+                "cooking guide",
+            ),
+            ("Jared: Run basement flood check", "clear"),
+            ("Mia: Did the garage camera see my bike?", "4:09 PM"),
+            ("Sarah: When is the next filter change?", "6 days"),
+            ("Leo: Tell Dad when my puzzle is done", "tell Dad"),
+            ("Jared: Create a temporary code for Grandma", "9:00 PM"),
+            ("Mia: My desk feels glarey", "reduce glare"),
+            (
+                "Sarah: Was the front door locked after Leo came in?",
+                "45 seconds",
+            ),
+            (
+                "Jared: Find the receipt for the new water heater",
+                "installation record",
+            ),
+            ("Leo: Start quiet drawing time", "soft music"),
+            ("Mia: Can I print my homework?", "paper"),
+            (
+                "Sarah: Make upstairs cooler but leave Leo's room alone",
+                "unchanged",
+            ),
+            ("Jared: What's the noisy appliance?", "washing machine"),
+            ("Leo: Did my tooth fairy box stay closed?", "stayed closed"),
+            (
+                "Mia: Where is the white extension cord for my project?",
+                "craft bin",
+            ),
+            (
+                "Sarah: Turn off screens during family dinner",
+                "Family dinner",
+            ),
+            ("Jared: What changed in the garage today?", "side door"),
+            ("Leo: Make the stairs bright", "90 percent"),
+            (
+                "Mia: Remind me to water my plant after school",
+                "after school",
+            ),
+            (
+                "Sarah: Find a chicken recipe without peanuts",
+                "lemon chicken",
+            ),
+            ("Jared: Why did the security alarm chirp?", "low-battery"),
+            ("Leo: Can I use the microwave?", "Mom"),
+            (
+                "Mia: Save this temperature as rehearsal comfort",
+                "rehearsal",
+            ),
+            ("Sarah: Who's in the backyard?", "Jared"),
+            ("Jared: Start workshop dust control", "purifier"),
+            ("Leo: What's left on my bedtime chart?", "pajamas"),
+            (
+                "Mia: Make my closet light turn on when I open it",
+                "auto-off",
+            ),
+            (
+                "Sarah: Did I close the upstairs window before the rain?",
+                "2:14 PM",
+            ),
+            (
+                "Jared: Put the house in low-power mode until five",
+                "standby-safe",
+            ),
+            ("Sarah: Find Leo's vaccination form", "Health Documents"),
+            ("Mia: Did Mom sign my field trip form?", "this morning"),
+            ("Leo: Put on an animal show, but not loud", "low"),
+            ("Jared: What devices are on guest Wi-Fi?", "unknown device"),
+            (
+                "Sarah: Keep the front entry lights on until Mia gets home",
+                "geofence",
+            ),
+            ("Mia: Is the side path icy?", "below freezing"),
+            ("Leo: I hear dripping", "sensor dry"),
+            ("Jared: Why is the office internet slow?", "backup drive"),
+            ("Sarah: Start school-night reset", "morning prep"),
+            ("Mia: Find the photo backdrop instructions", "art project"),
+            ("Leo: Where's the red marker?", "craft caddy"),
+            (
+                "Jared: Notify me if the freezer goes above 10 degrees",
+                "10F",
+            ),
+            ("Sarah: What chores did Leo skip this week?", "Tuesday"),
+            ("Mia: Turn on only the mirror lights", "mirror lights on"),
+            ("Leo: Can the cat sleep in my room?", "approval"),
+            ("Jared: Set backyard lights for grilling", "path lights"),
+            ("Sarah: Why is Mia's purifier on high?", "dust"),
+            ("Mia: Make a packing list for my swim meet", "goggles"),
+            ("Leo: Read me the next step for cookies", "scoop dough"),
+            ("Jared: Which outdoor cameras need cleaning?", "driveway"),
+            (
+                "Sarah: Did the garage close after Jared left?",
+                "two minutes",
+            ),
+            (
+                "Mia: Add batteries and poster board to my project list",
+                "poster board",
+            ),
+            ("Leo: I'm too scared to go downstairs", "parents notified"),
+            (
+                "Jared: Find furnace manual troubleshooting code 31",
+                "pressure switch",
+            ),
+            (
+                "Sarah: Keep dinner warm until Jared arrives",
+                "safe duration",
+            ),
+            (
+                "Mia: Schedule quiet time after school on Wednesdays",
+                "Wednesday",
+            ),
+            ("Leo: Did I feed the cat too much?", "within"),
+            (
+                "Jared: What's the oldest thing in the fridge?",
+                "lentil soup",
+            ),
+            (
+                "Sarah: Open windows if the air outside is cleaner",
+                "kitchen window",
+            ),
+            ("Mia: Why is my lamp flickering?", "unstable power"),
+            ("Leo: Can I open the garage door?", "cannot"),
+            ("Jared: Create a holiday lighting schedule", "10:30 PM"),
+            (
+                "Sarah: Find the note about the plumber's shutoff valve",
+                "access panel",
+            ),
+            ("Mia: Use my rainy-day alarm tomorrow", "light ramp"),
+            ("Leo: What do I need for soccer practice?", "shin guards"),
+            ("Jared: Did anyone bypass a sensor?", "9:12 AM"),
+            ("Sarah: Start guest breakfast mode", "coffee"),
+            (
+                "Mia: Where did I save my poem about winter?",
+                "First Snow Draft",
+            ),
+            ("Leo: Make the laundry room not scary", "brighter"),
+            ("Jared: What's the current water pressure?", "58 PSI"),
+            (
+                "Sarah: Remind me to check the oven after it preheats",
+                "preheating",
+            ),
+            (
+                "Mia: Turn off the hallway camera while sleepover guests change",
+                "privacy mode",
+            ),
+            (
+                "Leo: Tell me when the cookies are cool enough",
+                "cooled enough",
+            ),
+            (
+                "Jared: Why did the vacuum avoid the dining room?",
+                "no-go zone",
+            ),
+            (
+                "Sarah: Find the toddler gate instructions",
+                "pressure-mount",
+            ),
+            ("Mia: My room smells weird", "elevated VOCs"),
+            ("Leo: Did Dad see my message?", "4:23 PM"),
+            (
+                "Jared: Shut off the water automatically if the laundry leaks again",
+                "main water valve",
+            ),
+            ("Sarah: Which backpacks are by the door?", "Leo's backpack"),
+            ("Mia: Make my alarm skip holidays", "school holidays"),
+            (
+                "Leo: Turn on my morning checklist on the wall",
+                "hallway display",
+            ),
+            (
+                "Jared: Give me a privacy report for the cameras",
+                "no unusual access",
+            ),
+            (
+                "Sarah: Find the recipe where we used the green bowl",
+                "sesame noodle",
+            ),
+            ("Mia: Can I practice drums now?", "practice pads"),
+            (
+                "Leo: Where's the flashlight if the lights go out?",
+                "mudroom drawer",
+            ),
+            ("Jared: Which automation fired the most today?", "18 times"),
+            (
+                "Sarah: Make upstairs warmer when the kids are getting ready",
+                "automatically",
+            ),
+            (
+                "Mia: What snacks did we pack for my last tournament?",
+                "blue sports drink",
+            ),
+            ("Jared: Run a final safety sweep", "one upstairs window"),
         ] {
             assert!(
                 mem.semantic_search(query, 3)
