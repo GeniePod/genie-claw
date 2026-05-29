@@ -202,27 +202,42 @@ impl Governor {
         let reason = format!("{} -> {}", from, target);
         tracing::info!(from = %from, to = %target, "mode transition");
 
-        // Stop services not needed in target mode.
+        let mut stopped = Vec::new();
+        let mut started = Vec::new();
+
         for alias in target.stopped_services() {
             let Some(unit) = self.service_unit_for_alias(alias) else {
                 continue;
             };
-            ServiceCtl::stop(&unit).await?;
+            if ServiceCtl::is_active(&unit).await {
+                ServiceCtl::stop(&unit).await?;
+                stopped.push(StoppedService {
+                    alias,
+                    unit: unit.clone(),
+                });
+            }
         }
 
-        // Handle LLM model swap — failure aborts the transition (issue #241).
-        self.apply_llm_swaps(from, target).await?;
+        if let Err(e) = self.apply_llm_swaps(from, target, &mut stopped).await {
+            self.rollback_transition(from, target, &stopped, &started)
+                .await;
+            return Err(e);
+        }
         if matches!((from, target), (Mode::Media, _)) {
             let _ = tokio::fs::remove_file("/run/geniepod/media_mode").await;
         }
 
-        // Start services required by target mode.
         for alias in target.required_services() {
             let Some(unit) = self.service_unit_for_alias(alias) else {
                 continue;
             };
             if !ServiceCtl::is_active(&unit).await {
-                ServiceCtl::start(&unit).await?;
+                if let Err(e) = ServiceCtl::start(&unit).await {
+                    self.rollback_transition(from, target, &stopped, &started)
+                        .await;
+                    return Err(e);
+                }
+                started.push(unit);
             }
         }
 
@@ -267,11 +282,19 @@ impl Governor {
             .unwrap_or_else(|| "genie-ai-runtime.service".into())
     }
 
-    async fn apply_llm_swaps(&self, from: Mode, target: Mode) -> Result<()> {
+    async fn apply_llm_swaps(
+        &self,
+        from: Mode,
+        target: Mode,
+        stopped: &mut Vec<StoppedService>,
+    ) -> Result<()> {
         match (from, target) {
             (_, Mode::Media) => {
                 let unit = self.llm_service_unit();
-                ServiceCtl::stop(&unit).await?;
+                if ServiceCtl::is_active(&unit).await {
+                    ServiceCtl::stop(&unit).await?;
+                    stopped.push(StoppedService { alias: "llm", unit });
+                }
             }
             (Mode::Media, _)
             | (Mode::Day | Mode::NightA, Mode::NightB)
@@ -286,6 +309,45 @@ impl Governor {
         }
         Ok(())
     }
+
+    /// Best-effort undo of partial transition work before returning the original error.
+    async fn rollback_transition(
+        &self,
+        from: Mode,
+        target: Mode,
+        stopped: &[StoppedService],
+        started: &[String],
+    ) {
+        for unit in started.iter().rev() {
+            if let Err(e) = ServiceCtl::stop(unit).await {
+                tracing::error!(unit = %unit, error = %e, "rollback stop failed");
+            }
+        }
+
+        for alias in service_aliases_to_restore(from, stopped) {
+            let Some(unit) = self.service_unit_for_alias(alias) else {
+                continue;
+            };
+            if let Err(e) = ServiceCtl::start(&unit).await {
+                tracing::error!(unit = %unit, alias, error = %e, "rollback start failed");
+            }
+        }
+
+        if transition_changes_llm_weights(from, target)
+            && let Some(model) = from.llm_model()
+        {
+            let unit = self.llm_service_unit();
+            let path = format!("/opt/geniepod/models/{}", model);
+            if let Err(e) = ServiceCtl::swap_llm_model(&unit, &path).await {
+                tracing::error!(
+                    unit = %unit,
+                    model = %path,
+                    error = %e,
+                    "rollback LLM model swap failed"
+                );
+            }
+        }
+    }
 }
 
 fn llm_model_for_transition(from: Mode, target: Mode) -> Option<&'static str> {
@@ -294,6 +356,28 @@ fn llm_model_for_transition(from: Mode, target: Mode) -> Option<&'static str> {
         (Mode::Day | Mode::NightA, Mode::NightB) => Mode::NightB.llm_model(),
         (Mode::NightB, Mode::Day) => Mode::Day.llm_model(),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoppedService {
+    alias: &'static str,
+    unit: String,
+}
+
+fn service_aliases_to_restore(from: Mode, stopped: &[StoppedService]) -> Vec<&'static str> {
+    stopped
+        .iter()
+        .map(|svc| svc.alias)
+        .filter(|alias| from.required_services().contains(alias))
+        .collect()
+}
+
+fn transition_changes_llm_weights(from: Mode, target: Mode) -> bool {
+    match (from.llm_model(), target.llm_model()) {
+        (Some(from_model), Some(to_model)) => from_model != to_model,
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
     }
 }
 
@@ -510,5 +594,37 @@ mod tests {
             Mode::Day.llm_model()
         );
         assert!(llm_model_for_transition(Mode::Day, Mode::NightA).is_none());
+    }
+
+    #[test]
+    fn rollback_restores_services_required_by_source_mode_after_stop() {
+        let stopped = vec![
+            StoppedService {
+                alias: "homeassistant",
+                unit: "home-assistant.service".into(),
+            },
+            StoppedService {
+                alias: "nextcloud",
+                unit: "nextcloud.service".into(),
+            },
+        ];
+
+        assert_eq!(
+            service_aliases_to_restore(Mode::Day, &stopped),
+            vec!["homeassistant"]
+        );
+    }
+
+    #[test]
+    fn day_to_night_b_stops_ha_before_llm_swap_attempt() {
+        assert!(Mode::NightB.stopped_services().contains(&"homeassistant"));
+        assert!(llm_model_for_transition(Mode::Day, Mode::NightB).is_some());
+        assert!(transition_changes_llm_weights(Mode::Day, Mode::NightB));
+    }
+
+    #[test]
+    fn rollback_restores_source_llm_weights_after_failed_swap() {
+        assert!(transition_changes_llm_weights(Mode::Day, Mode::NightB));
+        assert_eq!(Mode::Day.llm_model(), Some("nemotron-4b-q4_k_m.gguf"));
     }
 }
