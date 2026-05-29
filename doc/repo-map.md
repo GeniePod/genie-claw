@@ -14,6 +14,7 @@
 | Local-only `ROADMAP.md` | Private product roadmap, ignored by git when present |
 | `doc/` | Current documentation entry point |
 | `doc/implementation-status.md` | Source of truth for implemented, partial, external, and planned work |
+| `doc/memory-system.md` | Implemented memory storage, recall, policy, and extension design |
 | `crates/` | Workspace crates |
 | `deploy/` | Configs, scripts, systemd units, Docker assets |
 | `skills/` | Native skill examples and guide |

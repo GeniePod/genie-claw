@@ -25,6 +25,7 @@ Where current code is transitional, the docs call that out explicitly.
 - [http-and-cli.md](http-and-cli.md): `genie-core` HTTP API, `genie-api` dashboard API, and `genie-ctl`
 - [household-security.md](household-security.md): family/shared-memory trust model and redacted config policy
 - [core-subsystems.md](core-subsystems.md): LLM, prompt, tools, memory, voice, Telegram, security, and skills
+- [memory-system.md](memory-system.md): implemented memory architecture, storage model, recall layers, policy, and extension guidance
 - [deployment-and-ops.md](deployment-and-ops.md): local dev, Docker, Jetson deploy, systemd, and operations
 - [milestone-1-portable-home-agent.md](milestone-1-portable-home-agent.md): M1 architecture movement for portable validation without weakening the limited-context home-agent goal
 - [repo-map.md](repo-map.md): top-level files, directories, and module map
