@@ -460,3 +460,73 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
         "one executed plus one blocked_runtime home_control event"
     );
 }
+
+#[tokio::test]
+async fn tool_gate_home_control_rejects_missing_or_invalid_arguments() {
+    let paths = TestAuditPaths::new();
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = paths.dispatcher(
+        Some(Arc::new(FakeHomeProvider::light(executed.clone()))),
+        ToolPolicyConfig::default(),
+        ActuationSafetyConfig::default(),
+    );
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Dashboard,
+        ..ToolExecutionContext::default()
+    };
+
+    let cases: Vec<(serde_json::Value, &str)> = vec![
+        (serde_json::json!({}), "entity"),
+        (
+            serde_json::json!({"entity": "", "action": "turn_on"}),
+            "entity",
+        ),
+        (serde_json::json!({"entity": "kitchen light"}), "action"),
+        (
+            serde_json::json!({"entity": "kitchen light", "action": "turnn_on"}),
+            "invalid",
+        ),
+        (
+            serde_json::json!({"entity": "kitchen light", "action": 1}),
+            "string",
+        ),
+    ];
+
+    for (arguments, hint) in &cases {
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: arguments.clone(),
+                },
+                ctx,
+            )
+            .await;
+        assert!(
+            !result.success,
+            "expected rejection for {arguments}: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(hint),
+            "expected '{hint}' in error: {}",
+            result.output
+        );
+    }
+
+    assert!(
+        executed.lock().unwrap().is_empty(),
+        "invalid home_control must not reach the home provider"
+    );
+
+    let tool_events = read_jsonl(&paths.tool_audit);
+    assert_eq!(tool_events.len(), cases.len());
+    for event in &tool_events {
+        assert_eq!(event["tool"], "home_control");
+        assert_eq!(event["success"], false);
+    }
+    assert!(
+        read_jsonl(&paths.actuation_audit).is_empty(),
+        "schema validation failures must not write actuation audit entries"
+    );
+}

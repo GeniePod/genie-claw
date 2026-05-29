@@ -617,12 +617,9 @@ impl ToolDispatcher {
             .ha
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
-        let resolved_entity = self.resolve_device_alias(entity_name);
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("toggle");
+        let entity_name = require_non_empty_entity_arg("home_control", args)?;
+        let resolved_entity = self.resolve_device_alias(&entity_name);
+        let action = require_home_control_action(args)?;
         let value = args.get("value").and_then(|v| v.as_f64());
         if !actuation_origin_allowed(&self.actuation_safety, exec_ctx.request_origin) {
             let reason = format!(
@@ -877,8 +874,8 @@ impl ToolDispatcher {
             .ha
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
-        let entity_name = self.resolve_device_alias(entity_name);
+        let entity_name = require_non_empty_entity_arg("home_status", args)?;
+        let entity_name = self.resolve_device_alias(&entity_name);
 
         home::status(ha.as_ref(), &entity_name).await
     }
@@ -1294,6 +1291,52 @@ fn actuation_origin_allowed(config: &ActuationSafetyConfig, origin: RequestOrigi
         .allowed_origins
         .iter()
         .any(|allowed| allowed.trim().eq_ignore_ascii_case(origin.as_policy_key()))
+}
+
+/// Actions allowed by the `home_control` tool schema (`tool_defs`).
+const HOME_CONTROL_ACTIONS: &[&str] = &[
+    "turn_on",
+    "turn_off",
+    "toggle",
+    "set_brightness",
+    "set_temperature",
+    "open",
+    "close",
+    "lock",
+    "unlock",
+    "activate",
+];
+
+fn require_non_empty_entity_arg(tool: &str, args: &serde_json::Value) -> Result<String> {
+    match args.get("entity") {
+        Some(value) if value.is_string() => {
+            let entity = value.as_str().unwrap().trim();
+            if entity.is_empty() {
+                anyhow::bail!("{tool} requires a non-empty 'entity' string");
+            }
+            Ok(entity.to_string())
+        }
+        Some(_) => anyhow::bail!("{tool} requires 'entity' to be a string"),
+        None => anyhow::bail!("{tool} requires 'entity'"),
+    }
+}
+
+fn require_home_control_action(args: &serde_json::Value) -> Result<&'static str> {
+    let action = match args.get("action") {
+        Some(value) if value.is_string() => value.as_str().unwrap(),
+        Some(_) => anyhow::bail!("home_control requires 'action' to be a string"),
+        None => anyhow::bail!("home_control requires 'action'"),
+    };
+    HOME_CONTROL_ACTIONS
+        .iter()
+        .copied()
+        .find(|allowed| *allowed == action)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "home_control action '{action}' is invalid; expected one of: {}",
+                HOME_CONTROL_ACTIONS.join(", ")
+            )
+        })
 }
 
 impl ActuationRateLimiter {
@@ -2160,6 +2203,78 @@ mod tests {
             })
             .await;
         assert!(history.output.contains("turn_on light.playroom"));
+    }
+
+    #[tokio::test]
+    async fn home_control_rejects_missing_or_invalid_arguments() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
+            executed: executed.clone(),
+        })));
+        let ctx = ToolExecutionContext {
+            request_origin: RequestOrigin::Dashboard,
+            ..ToolExecutionContext::default()
+        };
+
+        let missing_entity = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ctx,
+            )
+            .await;
+        assert!(!missing_entity.success);
+        assert!(missing_entity.output.contains("entity"));
+
+        let typo_action = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: serde_json::json!({
+                        "entity": "kitchen light",
+                        "action": "turnn_on"
+                    }),
+                },
+                ctx,
+            )
+            .await;
+        assert!(!typo_action.success);
+        assert!(typo_action.output.contains("invalid"));
+
+        let missing_action = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: serde_json::json!({"entity": "kitchen light"}),
+                },
+                ctx,
+            )
+            .await;
+        assert!(!missing_action.success);
+        assert!(missing_action.output.contains("action"));
+
+        assert!(executed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn home_status_rejects_missing_entity() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
+            executed: executed.clone(),
+        })));
+
+        let result = dispatcher
+            .execute(&ToolCall {
+                name: "home_status".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("entity"));
+        assert!(executed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
