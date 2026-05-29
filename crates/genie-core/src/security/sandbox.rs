@@ -18,6 +18,7 @@
 /// ## RAM cost: ZERO
 /// These are kernel-level enforcement mechanisms. Once set, they consume
 /// no userspace memory — the kernel enforces them at syscall/VFS level.
+use std::net::IpAddr;
 use std::path::Path;
 
 /// Apply Landlock filesystem restrictions.
@@ -104,17 +105,65 @@ fn apply_landlock_linux(config_dir: &Path, data_dir: &Path) -> Result<(), String
 /// Prevents SSRF: even if the LLM tricks the tool system into making
 /// HTTP requests, they can only reach configured local endpoints.
 pub fn validate_inference_route(url: &str) -> Result<(), String> {
-    let host = extract_host(url);
+    let host = parse_url_host(url).ok_or_else(|| {
+        format!(
+            "inference route rejected: {} is not a valid http(s) URL.",
+            url.trim()
+        )
+    })?;
+    validate_inference_host(&host)
+}
 
-    match host.as_str() {
-        "127.0.0.1" | "localhost" | "::1" | "[::1]" => Ok(()),
-        h if h.starts_with("127.") => Ok(()), // 127.0.0.0/8 loopback
-        _ => Err(format!(
-            "inference route rejected: {} is not localhost. \
-             GeniePod only allows LLM calls to local endpoints.",
-            url
-        )),
+/// Validate that a bare host (from host/port LLM config) is loopback-only.
+pub fn validate_inference_host(host: &str) -> Result<(), String> {
+    let normalized = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_lowercase();
+    if is_loopback_host(&normalized) {
+        Ok(())
+    } else {
+        Err(format!(
+            "inference route rejected: host {host} is not localhost. \
+             GeniePod only allows LLM calls to local endpoints."
+        ))
     }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    if host.starts_with("localhost.") {
+        return false;
+    }
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn parse_url_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let stripped = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))?;
+    let authority = stripped.split(&['/', '?', '#'][..]).next()?;
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return Some(rest[..end].to_string());
+    }
+    let host = authority
+        .rsplit_once(':')
+        .filter(|(host, port)| {
+            !host.is_empty()
+                && !host.contains(':')
+                && port.chars().all(|c| c.is_ascii_digit())
+        })
+        .map(|(host, _)| host)
+        .unwrap_or(authority);
+    Some(host.to_lowercase())
 }
 
 /// Sanitize LLM output — remove any leaked secrets before showing to user.
@@ -227,14 +276,7 @@ fn find_secret_matches(text: &str, pattern: &SecretPattern) -> Vec<String> {
 }
 
 fn extract_host(url: &str) -> String {
-    let stripped = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
-
-    let host_port = stripped.split('/').next().unwrap_or(stripped);
-    let host = host_port.split(':').next().unwrap_or(host_port);
-    host.to_lowercase()
+    parse_url_host(url).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -254,6 +296,13 @@ mod tests {
         assert!(validate_inference_route("http://192.168.1.100:8080").is_err());
         assert!(validate_inference_route("http://10.0.0.1:8080").is_err());
         assert!(validate_inference_route("https://example.com").is_err());
+    }
+
+    #[test]
+    fn reject_loopback_looking_suffix_hosts() {
+        assert!(validate_inference_route("http://127.0.0.1.attacker.com:8080/v1").is_err());
+        assert!(validate_inference_route("http://localhost.evil.com:8080").is_err());
+        assert!(validate_inference_host("127.0.0.1.attacker.com").is_err());
     }
 
     #[test]

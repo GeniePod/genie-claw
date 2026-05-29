@@ -106,15 +106,15 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
-    pub fn new(host: &str, port: u16) -> Self {
+    pub fn new(host: &str, port: u16) -> Result<Self> {
         Self::llama_cpp(host, port)
     }
 
-    pub fn from_url(url: &str) -> Self {
+    pub fn from_url(url: &str) -> Result<Self> {
         Self::from_llama_cpp_url(url)
     }
 
-    pub fn from_service_config(service: &ServiceEndpoint) -> Self {
+    pub fn from_service_config(service: &ServiceEndpoint) -> Result<Self> {
         Self::from_service_config_with_timeouts(service, LlmTimeouts::default())
     }
 
@@ -127,7 +127,7 @@ impl LlmClient {
     pub fn from_service_config_with_timeouts(
         service: &ServiceEndpoint,
         timeouts: LlmTimeouts,
-    ) -> Self {
+    ) -> Result<Self> {
         match service.backend {
             LlmBackendKind::LlamaCpp => {
                 Self::from_llama_cpp_url_with_timeouts(&service.url, timeouts)
@@ -138,43 +138,46 @@ impl LlmClient {
         }
     }
 
-    pub fn llama_cpp(host: &str, port: u16) -> Self {
-        Self {
-            backend: Box::new(LlamaCppBackend::new(host, port)),
-        }
+    pub fn llama_cpp(host: &str, port: u16) -> Result<Self> {
+        Ok(Self {
+            backend: Box::new(LlamaCppBackend::new(host, port)?),
+        })
     }
 
-    pub fn from_llama_cpp_url(url: &str) -> Self {
-        Self {
-            backend: Box::new(LlamaCppBackend::from_url(url)),
-        }
+    pub fn from_llama_cpp_url(url: &str) -> Result<Self> {
+        Ok(Self {
+            backend: Box::new(LlamaCppBackend::from_url(url)?),
+        })
     }
 
-    pub fn from_llama_cpp_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Self {
-        Self {
-            backend: Box::new(LlamaCppBackend::from_url_with_timeouts(url, timeouts)),
-        }
+    pub fn from_llama_cpp_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Result<Self> {
+        Ok(Self {
+            backend: Box::new(LlamaCppBackend::from_url_with_timeouts(url, timeouts)?),
+        })
     }
 
-    pub fn genie_ai_runtime(host: &str, port: u16) -> Self {
-        Self {
-            backend: Box::new(GenieAiRuntimeBackend::new(host, port)),
-        }
+    pub fn genie_ai_runtime(host: &str, port: u16) -> Result<Self> {
+        Ok(Self {
+            backend: Box::new(GenieAiRuntimeBackend::new(host, port)?),
+        })
     }
 
-    pub fn from_genie_ai_runtime_url(url: &str) -> Self {
-        Self {
-            backend: Box::new(GenieAiRuntimeBackend::from_url(url)),
-        }
+    pub fn from_genie_ai_runtime_url(url: &str) -> Result<Self> {
+        Ok(Self {
+            backend: Box::new(GenieAiRuntimeBackend::from_url(url)?),
+        })
     }
 
-    pub fn from_genie_ai_runtime_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Self {
-        Self {
-            backend: Box::new(GenieAiRuntimeBackend::from_url_with_timeouts(url, timeouts)),
-        }
+    pub fn from_genie_ai_runtime_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Result<Self> {
+        Ok(Self {
+            backend: Box::new(GenieAiRuntimeBackend::from_url_with_timeouts(url, timeouts)?),
+        })
     }
 
-    pub fn from_openai_compatible_url_with_bearer_token(url: &str, token: impl AsRef<str>) -> Self {
+    pub fn from_openai_compatible_url_with_bearer_token(
+        url: &str,
+        token: impl AsRef<str>,
+    ) -> Result<Self> {
         Self::from_openai_compatible_url_with_bearer_token_and_timeouts(
             url,
             token,
@@ -186,20 +189,20 @@ impl LlmClient {
         url: &str,
         token: impl AsRef<str>,
         timeouts: LlmTimeouts,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             backend: Box::new(
                 OpenAiCompatibleBackend::from_url_with_bearer_token_and_timeouts(
                     url, token, timeouts,
-                ),
+                )?,
             ),
-        }
+        })
     }
 
     pub fn from_openai_compatible_url_with_bearer_token_env(
         url: &str,
         env_var: impl AsRef<str>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::from_openai_compatible_url_with_bearer_token_env_and_timeouts(
             url,
             env_var,
@@ -211,14 +214,14 @@ impl LlmClient {
         url: &str,
         env_var: impl AsRef<str>,
         timeouts: LlmTimeouts,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             backend: Box::new(
                 OpenAiCompatibleBackend::from_url_with_bearer_token_env_and_timeouts(
                     url, env_var, timeouts,
-                ),
+                )?,
             ),
-        }
+        })
     }
 
     /// Construct an in-memory LLM client that replays the given scripted
@@ -328,13 +331,13 @@ mod tests {
 
     #[test]
     fn legacy_constructor_keeps_llama_cpp_default() {
-        let client = LlmClient::from_url("http://127.0.0.1:8080/health");
+        let client = LlmClient::from_url("http://127.0.0.1:8080/health").unwrap();
         assert_eq!(client.backend_name(), "llama.cpp");
     }
 
     #[test]
     fn can_construct_genie_ai_runtime_client() {
-        let client = LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:8080/health");
+        let client = LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:8080/health").unwrap();
         assert_eq!(client.backend_name(), "genie-ai-runtime");
     }
 
@@ -343,7 +346,8 @@ mod tests {
         let client = LlmClient::from_openai_compatible_url_with_bearer_token(
             "http://127.0.0.1:8080/v1",
             "oauth-token",
-        );
+        )
+        .unwrap();
         assert_eq!(client.backend_name(), "openai-compatible");
     }
 
@@ -353,8 +357,21 @@ mod tests {
             url: "http://127.0.0.1:8080/health".into(),
             systemd_unit: "genie-ai-runtime.service".into(),
             backend: LlmBackendKind::GenieAiRuntime,
-        });
+        })
+        .unwrap();
 
         assert_eq!(client.backend_name(), "genie-ai-runtime");
+    }
+
+    #[test]
+    fn service_config_rejects_remote_llm_url() {
+        assert!(
+            LlmClient::from_service_config(&ServiceEndpoint {
+                url: "http://192.168.1.50:8080/v1".into(),
+                systemd_unit: "genie-ai-runtime.service".into(),
+                backend: LlmBackendKind::GenieAiRuntime,
+            })
+            .is_err()
+        );
     }
 }

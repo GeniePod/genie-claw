@@ -10,30 +10,30 @@ pub struct GenieAiRuntimeBackend {
 }
 
 impl GenieAiRuntimeBackend {
-    pub fn new(host: &str, port: u16) -> Self {
-        Self {
+    pub fn new(host: &str, port: u16) -> Result<Self> {
+        Ok(Self {
             inner: OpenAiCompatClient::new_with_profile(
                 "genie-ai-runtime",
                 host,
                 port,
                 RequestProfile::genie_ai_runtime(),
-            ),
-        }
+            )?,
+        })
     }
 
-    pub fn from_url(url: &str) -> Self {
+    pub fn from_url(url: &str) -> Result<Self> {
         Self::from_url_with_timeouts(url, LlmTimeouts::default())
     }
 
-    pub fn from_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Self {
-        Self {
+    pub fn from_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Result<Self> {
+        Ok(Self {
             inner: OpenAiCompatClient::from_url_with_profile_and_timeouts(
                 "genie-ai-runtime",
                 url,
                 RequestProfile::genie_ai_runtime(),
                 timeouts,
-            ),
-        }
+            )?,
+        })
     }
 }
 

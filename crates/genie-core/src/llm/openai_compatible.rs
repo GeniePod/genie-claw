@@ -11,7 +11,7 @@ pub struct OpenAiCompatibleBackend {
 }
 
 impl OpenAiCompatibleBackend {
-    pub fn from_url_with_bearer_token(url: &str, token: impl AsRef<str>) -> Self {
+    pub fn from_url_with_bearer_token(url: &str, token: impl AsRef<str>) -> Result<Self> {
         Self::from_url_with_bearer_token_and_timeouts(url, token, LlmTimeouts::default())
     }
 
@@ -19,19 +19,19 @@ impl OpenAiCompatibleBackend {
         url: &str,
         token: impl AsRef<str>,
         timeouts: LlmTimeouts,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             inner: OpenAiCompatClient::from_url_with_profile_and_timeouts(
                 "openai-compatible",
                 url,
                 RequestProfile::generic(),
                 timeouts,
-            )
+            )?
             .with_bearer_token(token),
-        }
+        })
     }
 
-    pub fn from_url_with_bearer_token_env(url: &str, env_var: impl AsRef<str>) -> Self {
+    pub fn from_url_with_bearer_token_env(url: &str, env_var: impl AsRef<str>) -> Result<Self> {
         Self::from_url_with_bearer_token_env_and_timeouts(url, env_var, LlmTimeouts::default())
     }
 
@@ -39,16 +39,16 @@ impl OpenAiCompatibleBackend {
         url: &str,
         env_var: impl AsRef<str>,
         timeouts: LlmTimeouts,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             inner: OpenAiCompatClient::from_url_with_profile_and_timeouts(
                 "openai-compatible",
                 url,
                 RequestProfile::generic(),
                 timeouts,
-            )
+            )?
             .with_bearer_token_env(env_var),
-        }
+        })
     }
 }
 

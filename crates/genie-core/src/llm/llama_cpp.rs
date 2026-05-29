@@ -10,25 +10,25 @@ pub struct LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
-    pub fn new(host: &str, port: u16) -> Self {
-        Self {
-            inner: OpenAiCompatClient::new("llama.cpp", host, port),
-        }
+    pub fn new(host: &str, port: u16) -> Result<Self> {
+        Ok(Self {
+            inner: OpenAiCompatClient::new("llama.cpp", host, port)?,
+        })
     }
 
-    pub fn from_url(url: &str) -> Self {
+    pub fn from_url(url: &str) -> Result<Self> {
         Self::from_url_with_timeouts(url, LlmTimeouts::default())
     }
 
-    pub fn from_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Self {
-        Self {
+    pub fn from_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Result<Self> {
+        Ok(Self {
             inner: OpenAiCompatClient::from_url_with_profile_and_timeouts(
                 "llama.cpp",
                 url,
                 RequestProfile::generic(),
                 timeouts,
-            ),
-        }
+            )?,
+        })
     }
 }
 

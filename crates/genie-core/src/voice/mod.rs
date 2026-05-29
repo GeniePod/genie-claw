@@ -48,7 +48,7 @@ impl VoiceOrchestrator {
                 config.core.llm_read_timeout_secs,
                 config.core.llm_request_timeout_secs,
             ),
-        );
+        )?;
 
         let ha = crate::ha::provider_from_config(&config);
         let skill_loader = crate::skills::load_all_with_policy(

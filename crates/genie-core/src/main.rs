@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
         config.core.llm_read_timeout_secs,
         config.core.llm_request_timeout_secs,
     );
-    let llm = llm::LlmClient::from_service_config_with_timeouts(&config.services.llm, llm_timeouts);
+    let llm = llm::LlmClient::from_service_config_with_timeouts(&config.services.llm, llm_timeouts)?;
     tracing::info!(
         backend = %llm.backend_name(),
         connect_timeout_secs = config.core.llm_connect_timeout_secs,

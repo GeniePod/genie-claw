@@ -2671,7 +2671,7 @@ mod tests {
         let _ = std::fs::remove_file(&memory_path);
         let _ = std::fs::remove_file(&conversations_path);
 
-        let llm = crate::llm::LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:1/health");
+        let llm = crate::llm::LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:1/health").unwrap();
         let tools = ToolDispatcher::new(None);
         let connectivity = NullConnectivityController::from_config(&ConnectivityConfig::default());
         let memory = shared_memory(&memory_path);
@@ -3263,7 +3263,7 @@ mod tests {
 
         let system_prompt = "You are a helpful assistant.";
         super::ChatServer::new(
-            LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:1/health"),
+            LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:1/health").unwrap(),
             ToolDispatcher::new(None),
             std::sync::Arc::new(NullConnectivityController::from_config(
                 &ConnectivityConfig::default(),

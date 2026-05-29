@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+use crate::security::sandbox::{validate_inference_host, validate_inference_route};
+
 use super::LlmRequestHints;
 
 /// Network timeouts applied to every backend read, write, and connect.
@@ -328,7 +330,7 @@ const SYSTEM_PROMPT_PREFIX_CACHE_MARKERS: [&str; 2] = [
 ];
 
 impl OpenAiCompatClient {
-    pub fn new(backend_name: &'static str, host: &str, port: u16) -> Self {
+    pub fn new(backend_name: &'static str, host: &str, port: u16) -> Result<Self> {
         Self::new_with_profile(backend_name, host, port, RequestProfile::generic())
     }
 
@@ -337,7 +339,7 @@ impl OpenAiCompatClient {
         host: &str,
         port: u16,
         request_profile: RequestProfile,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_profile_and_timeouts(
             backend_name,
             host,
@@ -353,18 +355,19 @@ impl OpenAiCompatClient {
         port: u16,
         request_profile: RequestProfile,
         timeouts: LlmTimeouts,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        validate_inference_host(host).map_err(anyhow::Error::msg)?;
+        Ok(Self {
             backend_name,
             host: host.to_string(),
             port,
             request_profile,
             timeouts,
             auth: None,
-        }
+        })
     }
 
-    pub fn from_url(backend_name: &'static str, url: &str) -> Self {
+    pub fn from_url(backend_name: &'static str, url: &str) -> Result<Self> {
         Self::from_url_with_profile(backend_name, url, RequestProfile::generic())
     }
 
@@ -372,7 +375,7 @@ impl OpenAiCompatClient {
         backend_name: &'static str,
         url: &str,
         request_profile: RequestProfile,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::from_url_with_profile_and_timeouts(
             backend_name,
             url,
@@ -386,19 +389,20 @@ impl OpenAiCompatClient {
         url: &str,
         request_profile: RequestProfile,
         timeouts: LlmTimeouts,
-    ) -> Self {
+    ) -> Result<Self> {
+        validate_inference_route(url).map_err(anyhow::Error::msg)?;
         let stripped = url.strip_prefix("http://").unwrap_or(url);
         let (host_port, _) = stripped.split_once('/').unwrap_or((stripped, ""));
         let (host, port_str) = host_port.split_once(':').unwrap_or((host_port, "8080"));
         let port = port_str.parse().unwrap_or(8080);
-        Self {
+        Ok(Self {
             backend_name,
             host: host.to_string(),
             port,
             request_profile,
             timeouts,
             auth: None,
-        }
+        })
     }
 
     pub fn backend_name(&self) -> &str {
@@ -1308,9 +1312,14 @@ mod tests {
 
     #[test]
     fn parse_url() {
-        let client = OpenAiCompatClient::from_url("test-backend", "http://127.0.0.1:8080/v1");
+        let client = OpenAiCompatClient::from_url("test-backend", "http://127.0.0.1:8080/v1").unwrap();
         assert_eq!(client.host, "127.0.0.1");
         assert_eq!(client.port, 8080);
+    }
+
+    #[test]
+    fn from_url_rejects_remote_inference_route() {
+        assert!(OpenAiCompatClient::from_url("test-backend", "http://192.168.1.50:8080/v1").is_err());
     }
 
     #[test]
@@ -1793,6 +1802,7 @@ mod tests {
                 request: Duration::from_secs(2),
             },
         )
+        .unwrap()
         .with_bearer_token("oauth-access-token");
 
         let response = client
@@ -1858,7 +1868,8 @@ mod tests {
                 read: Duration::from_millis(200),
                 request: Duration::from_millis(200),
             },
-        );
+        )
+        .unwrap();
 
         let start = std::time::Instant::now();
         let result = client
@@ -1913,7 +1924,8 @@ mod tests {
                 read: Duration::from_millis(200),
                 request: Duration::from_secs(2),
             },
-        );
+        )
+        .unwrap();
 
         let start = std::time::Instant::now();
         let mut tokens = String::new();
