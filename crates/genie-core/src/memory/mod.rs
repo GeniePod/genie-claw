@@ -1180,11 +1180,26 @@ impl Memory {
         std::fs::write(&index_staging, index_text)?;
         std::fs::write(&file_staging, root_text)?;
 
-        // All writes succeeded — destroy the old state and rename into place.
-        // The window between remove and rename is intentionally tiny; SQLite
-        // remains authoritative so a crash here is recoverable by rerunning.
-        let _ = std::fs::remove_dir_all(&namespaces_dir);
-        std::fs::rename(&namespaces_staging, &namespaces_dir)?;
+        // All staging writes succeeded — swap the live directories and files.
+        //
+        // Ordering guarantee: sideline the live namespaces dir under a .bak
+        // name *before* renaming staging into the live slot.  If the process
+        // dies between the two renames the .bak holds the previous export and
+        // the next call will clean it up at the top of this function (see
+        // `remove_dir_all(&namespaces_bak)` below).  The MEMORY/INDEX file
+        // renames are atomic overwrites on POSIX so they need no backup.
+        let namespaces_bak = self.canonical_dir.join("namespaces.bak");
+        // Clean up any stale backup left by a previous interrupted run.
+        let _ = std::fs::remove_dir_all(&namespaces_bak);
+        if namespaces_dir.exists() {
+            std::fs::rename(&namespaces_dir, &namespaces_bak)?;
+        }
+        if let Err(e) = std::fs::rename(&namespaces_staging, &namespaces_dir) {
+            // Restore the sidelined backup so the caller is no worse off.
+            let _ = std::fs::rename(&namespaces_bak, &namespaces_dir);
+            return Err(e.into());
+        }
+        let _ = std::fs::remove_dir_all(&namespaces_bak);
         std::fs::rename(&index_staging, &index_file)?;
         std::fs::rename(&file_staging, &file)?;
 
@@ -2035,9 +2050,10 @@ mod tests {
         let id = mem.store("preference", "User likes chamomile tea").unwrap();
         mem.mark_promoted(id).unwrap();
 
-        // Staging directories and temp files must be cleaned up after a
-        // successful rebuild so they don't accumulate across calls.
+        // Staging directories, backup dirs, and temp files must all be cleaned
+        // up after a successful rebuild so they don't accumulate across calls.
         assert!(!mem.canonical_dir.join("namespaces.tmp").exists());
+        assert!(!mem.canonical_dir.join("namespaces.bak").exists());
         assert!(!mem.canonical_dir.join("MEMORY.md.tmp").exists());
         assert!(!mem.canonical_dir.join("INDEX.md.tmp").exists());
     }
@@ -2067,5 +2083,64 @@ mod tests {
 
         // No staging debris left behind.
         assert!(!mem.canonical_dir.join("namespaces.tmp").exists());
+    }
+
+    #[test]
+    fn rebuild_recovers_from_mid_crash_sidelined_backup() {
+        // Regression test for the data-loss window that existed when the old
+        // code ran `remove_dir_all(namespaces)` before `rename(staging →
+        // namespaces)`.  With the backup-rename-restore ordering a crash
+        // between the two renames leaves `namespaces.bak` intact; the next
+        // rebuild must clean it up and produce correct output from SQLite —
+        // the original export content is never permanently lost.
+        let mem = temp_memory();
+        let first = mem.store("preference", "User likes chamomile tea").unwrap();
+        mem.mark_promoted(first).unwrap();
+
+        let namespaces_dir = mem.canonical_dir.join("namespaces");
+        let namespaces_bak = mem.canonical_dir.join("namespaces.bak");
+
+        // Confirm the live dir was created by the initial rebuild.
+        assert!(namespaces_dir.exists(), "namespaces/ must exist after first rebuild");
+
+        // Simulate the mid-crash state: the live dir was sidelined to .bak
+        // (step 1 of the swap) but the staging→live rename never happened
+        // (step 2).  Replicate by manually moving the live dir aside.
+        std::fs::rename(&namespaces_dir, &namespaces_bak).unwrap();
+        assert!(!namespaces_dir.exists());
+        assert!(namespaces_bak.exists());
+
+        // Trigger another rebuild.  It must tolerate the stale .bak, clean it
+        // up, and rebuild everything from the authoritative SQLite store.
+        let second = mem
+            .store("preference", "User likes peppermint tea")
+            .unwrap();
+        mem.mark_promoted(second).unwrap();
+
+        // Live dir must be recreated with up-to-date content.
+        assert!(
+            namespaces_dir.exists(),
+            "namespaces/ must be recreated after recovery rebuild"
+        );
+        assert!(
+            !namespaces_bak.exists(),
+            "stale namespaces.bak must be removed at the start of the next rebuild"
+        );
+
+        let note = namespaces_dir.join("household/preference.md");
+        let text = std::fs::read_to_string(&note).unwrap();
+        assert!(
+            text.contains("chamomile tea"),
+            "original content must survive: {text}"
+        );
+        assert!(
+            text.contains("peppermint tea"),
+            "new content must be present: {text}"
+        );
+
+        // No staging debris.
+        assert!(!mem.canonical_dir.join("namespaces.tmp").exists());
+        assert!(!mem.canonical_dir.join("MEMORY.md.tmp").exists());
+        assert!(!mem.canonical_dir.join("INDEX.md.tmp").exists());
     }
 }
