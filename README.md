@@ -38,7 +38,8 @@ first.
 - system-prompt SHA exposed in boot logs, `/api/health`, and `genie-ctl status`
   to prove deterministic prompt assembly across restarts
 - BFCL-style local tool-call scoring through `genie-ctl bfcl-score`,
-  `genie-ctl bfcl-predict-quick`, and `genie-ctl bfcl-predict-llm`
+  `genie-ctl bfcl-score-llm`, `genie-ctl bfcl-predict-quick`, and
+  `genie-ctl bfcl-predict-llm`
 - Jetson aarch64 cross-compile CI
 
 Current workspace version: `v1.0.0-alpha.10`.

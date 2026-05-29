@@ -66,6 +66,20 @@ Start or verify the local LLM runtime first, then run:
 
 ```bash
 GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml \
+cargo run -p genie-ctl -- bfcl-score-llm \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_home_llm_predictions.jsonl \
+  --max-tokens 160
+```
+
+This generates local-model predictions, scores them immediately, and optionally
+writes the raw prediction JSONL through `--out`.
+
+Use the older two-step path when you already have predictions or want to inspect
+raw model output before scoring:
+
+```bash
+GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml \
 cargo run -p genie-ctl -- bfcl-predict-llm \
   --cases tests/bfcl/local/ha_home_cases.jsonl \
   --out tests/bfcl/local/ha_home_llm_predictions.jsonl \
@@ -80,16 +94,16 @@ For a short Jetson smoke test before a longer run:
 
 ```bash
 GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml \
-cargo run -p genie-ctl -- bfcl-predict-llm \
+cargo run -p genie-ctl -- bfcl-score-llm \
   --cases tests/bfcl/local/ha_home_cases.jsonl \
   --out tests/bfcl/local/ha_home_llm_smoke_predictions.jsonl \
   --limit 25 \
   --max-tokens 160
 ```
 
-`bfcl-predict-llm` defaults to JSON response mode. If a local runtime rejects
-OpenAI-compatible `response_format`, add `--no-json-mode` and score the raw
-responses anyway.
+`bfcl-score-llm` and `bfcl-predict-llm` default to JSON response mode. If a
+local runtime rejects OpenAI-compatible `response_format`, add `--no-json-mode`
+and score the raw responses anyway.
 
 ## Current Progress Baseline
 

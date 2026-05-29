@@ -387,6 +387,7 @@ Implemented in `crates/genie-ctl/src/main.rs`.
 | `genie-ctl history` | Show current conversation history |
 | `genie-ctl tools` | List available tools |
 | `genie-ctl bfcl-score --cases C --predictions P [--json]` | Score BFCL-style tool-call fixtures |
+| `genie-ctl bfcl-score-llm --cases C [--out P] [--json] [--max-tokens N] [--limit N]` | Generate and score local LLM BFCL predictions |
 | `genie-ctl bfcl-predict-quick --cases C --out P` | Generate deterministic quick-router BFCL predictions |
 | `genie-ctl bfcl-predict-llm --cases C --out P [--max-tokens N] [--limit N]` | Generate local LLM BFCL predictions |
 | `genie-ctl bfcl-import-ha-intents --source DIR --out C [--language en] [--limit N]` | Convert Home Assistant Intents into attributed BFCL cases |
@@ -413,6 +414,24 @@ cargo run -p genie-ctl -- bfcl-score \
 The scorer parses raw JSON, fenced JSON, embedded JSON, and OpenAI-compatible
 `tool_calls` wrappers. It reports parse, tool-name, argument, and strict exact
 accuracy. Use `--json` for machine-readable output suitable for CI.
+
+### `genie-ctl bfcl-score-llm`
+
+Runs the configured local LLM against BFCL cases, scores the generated tool
+calls immediately, and optionally saves raw predictions:
+
+```bash
+GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml \
+cargo run -p genie-ctl -- bfcl-score-llm \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_home_llm_predictions.jsonl \
+  --max-tokens 160
+```
+
+The command calls `[services.llm]` directly. It does not execute tools or touch
+the home backend. Use `--limit N` for Jetson smoke tests, `--json` for a
+machine-readable score report, and `--no-json-mode` when a runtime does not
+support OpenAI-compatible JSON response mode.
 
 ### `genie-ctl bfcl-predict-quick`
 

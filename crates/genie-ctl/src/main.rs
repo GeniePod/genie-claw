@@ -14,6 +14,8 @@
 //!                              Generate deterministic quick-router predictions
 //!   genie-ctl bfcl-predict-llm --cases CASES.jsonl --out PREDS.jsonl
 //!                              Generate local LLM tool-call predictions
+//!   genie-ctl bfcl-score-llm --cases CASES.jsonl [--out PREDS.jsonl]
+//!                              Generate and score local LLM tool-call predictions
 //!   genie-ctl bfcl-import-ha-intents --source INTENTS_DIR --out CASES.jsonl
 //!                              Convert Home Assistant Intents into BFCL cases
 //!   genie-ctl skill ...       Manage loadable skill modules
@@ -144,6 +146,10 @@ async fn main() -> Result<()> {
             let score_args = parse_bfcl_score_args(&args[2..])?;
             cmd_bfcl_score(&score_args)?;
         }
+        "bfcl-score-llm" | "bfcl-score-local-llm" | "eval-bfcl-llm" => {
+            let score_args = parse_bfcl_score_llm_args(&args[2..])?;
+            cmd_bfcl_score_llm(&score_args).await?;
+        }
         "bfcl-predict-quick" => {
             let predict_args = parse_bfcl_predict_quick_args(&args[2..])?;
             let generated = cmd_bfcl_predict_quick(&predict_args)?;
@@ -249,6 +255,8 @@ COMMANDS:
     tools               List available tools
     bfcl-score --cases C --predictions P [--json]
                         Score tool-call accuracy from JSONL fixtures
+    bfcl-score-llm --cases C [--out P] [--json] [--max-tokens N] [--limit N]
+                        Generate and score local LLM predictions without executing tools
     bfcl-predict-quick --cases C --out P
                         Generate deterministic quick-router predictions
     bfcl-predict-llm --cases C --out P [--max-tokens N] [--limit N]
@@ -978,6 +986,16 @@ struct BfclScoreArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct BfclScoreLlmArgs {
+    cases: PathBuf,
+    out: Option<PathBuf>,
+    max_tokens: u32,
+    limit: Option<usize>,
+    json_mode: bool,
+    json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BfclPredictQuickArgs {
     cases: PathBuf,
     out: PathBuf,
@@ -1001,6 +1019,14 @@ struct BfclPredictQuickReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BfclPredictLlmReport {
     total_cases: usize,
+    tool_calls: usize,
+    backend: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct BfclLlmPredictionRun {
+    cases: Vec<genie_core::eval::bfcl::BfclCase>,
+    predictions: Vec<genie_core::eval::bfcl::BfclPrediction>,
     tool_calls: usize,
     backend: String,
 }
@@ -1100,6 +1126,114 @@ fn parse_bfcl_score_args(args: &[String]) -> Result<BfclScoreArgs> {
     Ok(BfclScoreArgs {
         cases,
         predictions,
+        json,
+    })
+}
+
+fn parse_bfcl_score_llm_args(args: &[String]) -> Result<BfclScoreLlmArgs> {
+    let mut cases = None;
+    let mut out = None;
+    let mut max_tokens = BFCL_LLM_DEFAULT_MAX_TOKENS;
+    let mut limit = None;
+    let mut json_mode = true;
+    let mut json = false;
+    let mut idx = 0;
+
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--cases" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--cases requires a JSONL path");
+                };
+                cases = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--out" | "--predictions" | "--preds" | "--predictions-out" | "--preds-out" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--out requires a JSONL output path");
+                };
+                out = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--max-tokens" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--max-tokens requires a value");
+                };
+                max_tokens = parse_positive_u32("--max-tokens", value)?;
+                idx += 2;
+            }
+            "--limit" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--limit requires a value");
+                };
+                limit = Some(parse_positive_usize("--limit", value)?);
+                idx += 2;
+            }
+            "--json-mode" => {
+                json_mode = true;
+                idx += 1;
+            }
+            "--no-json-mode" => {
+                json_mode = false;
+                idx += 1;
+            }
+            "--json" => {
+                json = true;
+                idx += 1;
+            }
+            _ if arg.starts_with("--cases=") => {
+                cases = Some(PathBuf::from(arg.trim_start_matches("--cases=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--out=") => {
+                out = Some(PathBuf::from(arg.trim_start_matches("--out=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--predictions=") => {
+                out = Some(PathBuf::from(arg.trim_start_matches("--predictions=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--preds=") => {
+                out = Some(PathBuf::from(arg.trim_start_matches("--preds=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--predictions-out=") => {
+                out = Some(PathBuf::from(arg.trim_start_matches("--predictions-out=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--preds-out=") => {
+                out = Some(PathBuf::from(arg.trim_start_matches("--preds-out=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--max-tokens=") => {
+                max_tokens =
+                    parse_positive_u32("--max-tokens", arg.trim_start_matches("--max-tokens="))?;
+                idx += 1;
+            }
+            _ if arg.starts_with("--limit=") => {
+                limit = Some(parse_positive_usize(
+                    "--limit",
+                    arg.trim_start_matches("--limit="),
+                )?);
+                idx += 1;
+            }
+            other => anyhow::bail!("unknown bfcl-score-llm option: {}", other),
+        }
+    }
+
+    let Some(cases) = cases else {
+        anyhow::bail!(
+            "Usage: genie-ctl bfcl-score-llm --cases CASES.jsonl [--out PREDICTIONS.jsonl] [--json] [--max-tokens N] [--limit N]"
+        );
+    };
+
+    Ok(BfclScoreLlmArgs {
+        cases,
+        out,
+        max_tokens,
+        limit,
+        json_mode,
         json,
     })
 }
@@ -1323,7 +1457,54 @@ fn cmd_bfcl_score(args: &BfclScoreArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("BFCL tool-call score");
+    print_bfcl_report("BFCL tool-call score", &report);
+
+    Ok(())
+}
+
+async fn cmd_bfcl_score_llm(args: &BfclScoreLlmArgs) -> Result<()> {
+    let run =
+        generate_bfcl_llm_predictions(&args.cases, args.max_tokens, args.limit, args.json_mode)
+            .await?;
+
+    if let Some(out) = &args.out {
+        write_bfcl_predictions_jsonl(out, &run.predictions)?;
+    }
+
+    let report = genie_core::eval::bfcl::score_cases(&run.cases, &run.predictions);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "backend": run.backend,
+                "generated_predictions": run.predictions.len(),
+                "tool_calls": run.tool_calls,
+                "predictions_out": args.out,
+                "report": report,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("BFCL local-LLM tool-call score");
+    println!("backend:             {}", run.backend);
+    println!("generated_predictions: {}", run.predictions.len());
+    println!("tool_calls:          {}", run.tool_calls);
+    if let Some(out) = &args.out {
+        println!("predictions:         {}", out.display());
+    }
+    print_bfcl_report_metrics(&report);
+
+    Ok(())
+}
+
+fn print_bfcl_report(title: &str, report: &genie_core::eval::bfcl::BfclReport) {
+    println!("{title}");
+    print_bfcl_report_metrics(report);
+}
+
+fn print_bfcl_report_metrics(report: &genie_core::eval::bfcl::BfclReport) {
     println!("cases:               {}", report.total_cases);
     println!(
         "parse_accuracy:      {}",
@@ -1362,8 +1543,6 @@ fn cmd_bfcl_score(args: &BfclScoreArgs) -> Result<()> {
             println!("  {}: {}", failure.id, detail);
         }
     }
-
-    Ok(())
 }
 
 fn cmd_bfcl_predict_quick(args: &BfclPredictQuickArgs) -> Result<BfclPredictQuickReport> {
@@ -1405,8 +1584,28 @@ fn cmd_bfcl_predict_quick(args: &BfclPredictQuickArgs) -> Result<BfclPredictQuic
 }
 
 async fn cmd_bfcl_predict_llm(args: &BfclPredictLlmArgs) -> Result<BfclPredictLlmReport> {
-    let cases = genie_core::eval::bfcl::load_cases_jsonl(&args.cases)?;
-    let system_prompt = build_bfcl_llm_system_prompt(&cases);
+    let run =
+        generate_bfcl_llm_predictions(&args.cases, args.max_tokens, args.limit, args.json_mode)
+            .await?;
+
+    write_bfcl_predictions_jsonl(&args.out, &run.predictions)?;
+
+    Ok(BfclPredictLlmReport {
+        total_cases: run.predictions.len(),
+        tool_calls: run.tool_calls,
+        backend: run.backend,
+    })
+}
+
+async fn generate_bfcl_llm_predictions(
+    cases_path: &Path,
+    max_tokens: u32,
+    limit: Option<usize>,
+    json_mode: bool,
+) -> Result<BfclLlmPredictionRun> {
+    let cases = genie_core::eval::bfcl::load_cases_jsonl(cases_path)?;
+    let selected_cases = select_bfcl_cases(cases, limit);
+    let system_prompt = build_bfcl_llm_system_prompt(&selected_cases);
     let config = Config::load()?;
     let timeouts = genie_core::llm::LlmTimeouts::from_secs(
         config.core.llm_connect_timeout_secs,
@@ -1419,49 +1618,62 @@ async fn cmd_bfcl_predict_llm(args: &BfclPredictLlmArgs) -> Result<BfclPredictLl
     );
     let backend = llm.backend_name().to_string();
 
-    if let Some(parent) = args.out.parent()
+    let mut predictions = Vec::with_capacity(selected_cases.len());
+    let mut tool_calls = 0;
+
+    for case in &selected_cases {
+        let messages = build_bfcl_llm_messages(&system_prompt, &case.prompt);
+        let hints =
+            genie_core::llm::LlmRequestHints::agent_turn(format!("bfcl-{}", case.id), max_tokens);
+        let response_format = json_mode.then(genie_core::llm::ResponseFormat::json);
+        let response = llm
+            .chat_with_format_and_hints(&messages, Some(max_tokens), response_format, Some(&hints))
+            .await
+            .with_context(|| format!("local LLM prediction failed for BFCL case {}", case.id))?;
+
+        tool_calls += genie_core::tools::parse_tool_calls_for_eval(&response).len();
+        predictions.push(genie_core::eval::bfcl::BfclPrediction {
+            id: case.id.clone(),
+            response,
+        });
+    }
+
+    Ok(BfclLlmPredictionRun {
+        cases: selected_cases,
+        predictions,
+        tool_calls,
+        backend,
+    })
+}
+
+fn select_bfcl_cases(
+    cases: Vec<genie_core::eval::bfcl::BfclCase>,
+    limit: Option<usize>,
+) -> Vec<genie_core::eval::bfcl::BfclCase> {
+    cases
+        .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .collect()
+}
+
+fn write_bfcl_predictions_jsonl(
+    path: &Path,
+    predictions: &[genie_core::eval::bfcl::BfclPrediction],
+) -> Result<()> {
+    if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
     }
 
-    let mut writer = std::io::BufWriter::new(fs::File::create(&args.out)?);
-    let mut total_cases = 0;
-    let mut tool_calls = 0;
-
-    for case in cases.iter().take(args.limit.unwrap_or(usize::MAX)) {
-        let messages = build_bfcl_llm_messages(&system_prompt, &case.prompt);
-        let hints = genie_core::llm::LlmRequestHints::agent_turn(
-            format!("bfcl-{}", case.id),
-            args.max_tokens,
-        );
-        let response_format = args.json_mode.then(genie_core::llm::ResponseFormat::json);
-        let response = llm
-            .chat_with_format_and_hints(
-                &messages,
-                Some(args.max_tokens),
-                response_format,
-                Some(&hints),
-            )
-            .await
-            .with_context(|| format!("local LLM prediction failed for BFCL case {}", case.id))?;
-
-        tool_calls += genie_core::tools::parse_tool_calls_for_eval(&response).len();
-        let prediction = genie_core::eval::bfcl::BfclPrediction {
-            id: case.id.clone(),
-            response,
-        };
-        serde_json::to_writer(&mut writer, &prediction)?;
+    let mut writer = std::io::BufWriter::new(fs::File::create(path)?);
+    for prediction in predictions {
+        serde_json::to_writer(&mut writer, prediction)?;
         writer.write_all(b"\n")?;
-        total_cases += 1;
     }
     writer.flush()?;
 
-    Ok(BfclPredictLlmReport {
-        total_cases,
-        tool_calls,
-        backend,
-    })
+    Ok(())
 }
 
 fn build_bfcl_llm_messages(system_prompt: &str, prompt: &str) -> Vec<genie_core::llm::Message> {
@@ -2768,6 +2980,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_bfcl_score_llm_args_supports_scoring_options() {
+        let args = vec![
+            "--cases=tests/bfcl/local/ha_home_cases.jsonl".to_string(),
+            "--out=tests/bfcl/local/ha_home_llm_predictions.jsonl".to_string(),
+            "--max-tokens=128".to_string(),
+            "--limit".to_string(),
+            "40".to_string(),
+            "--json".to_string(),
+            "--no-json-mode".to_string(),
+        ];
+
+        let parsed = parse_bfcl_score_llm_args(&args).unwrap();
+
+        assert_eq!(
+            parsed.cases,
+            PathBuf::from("tests/bfcl/local/ha_home_cases.jsonl")
+        );
+        assert_eq!(
+            parsed.out,
+            Some(PathBuf::from(
+                "tests/bfcl/local/ha_home_llm_predictions.jsonl"
+            ))
+        );
+        assert_eq!(parsed.max_tokens, 128);
+        assert_eq!(parsed.limit, Some(40));
+        assert!(parsed.json);
+        assert!(!parsed.json_mode);
+    }
+
+    #[test]
     fn parse_bfcl_predict_quick_args_supports_output_aliases() {
         let args = vec![
             "--cases=tests/bfcl/local/ha_home_cases.jsonl".to_string(),
@@ -2839,6 +3081,48 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].role, "user");
         assert!(messages[1].content.contains("kitchen light"));
+    }
+
+    #[test]
+    fn bfcl_llm_case_limit_scores_only_selected_cases() {
+        let cases = vec![
+            genie_core::eval::bfcl::BfclCase {
+                id: "case-1".to_string(),
+                category: None,
+                source: None,
+                prompt: "what time is it".to_string(),
+                expected_tool_calls: vec![genie_core::eval::bfcl::ExpectedToolCall {
+                    name: "get_time".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                allow_extra_arguments: false,
+            },
+            genie_core::eval::bfcl::BfclCase {
+                id: "case-2".to_string(),
+                category: None,
+                source: None,
+                prompt: "turn on the kitchen lights".to_string(),
+                expected_tool_calls: vec![genie_core::eval::bfcl::ExpectedToolCall {
+                    name: "home_control".to_string(),
+                    arguments: serde_json::json!({
+                        "entity": "kitchen lights",
+                        "action": "turn_on",
+                    }),
+                }],
+                allow_extra_arguments: false,
+            },
+        ];
+
+        let selected = select_bfcl_cases(cases, Some(1));
+        let predictions = vec![genie_core::eval::bfcl::BfclPrediction {
+            id: "case-1".to_string(),
+            response: r#"{"tool":"get_time","arguments":{}}"#.to_string(),
+        }];
+        let report = genie_core::eval::bfcl::score_cases(&selected, &predictions);
+
+        assert_eq!(report.total_cases, 1);
+        assert_eq!(report.missing_predictions, 0);
+        assert_eq!(report.strict_matches, 1);
     }
 
     #[test]
