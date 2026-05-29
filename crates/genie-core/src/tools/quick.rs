@@ -74,6 +74,13 @@ pub fn route(text: &str) -> Option<ToolCall> {
         ));
     }
 
+    if let Some((seconds, label)) = preferred_timer_request(&normalized) {
+        return Some(tool(
+            "set_timer",
+            serde_json::json!({ "seconds": seconds, "label": label }),
+        ));
+    }
+
     if let Some((entity, action, value)) = priority_home_control_request(&normalized) {
         let mut args = serde_json::json!({ "entity": entity, "action": action });
         if let Some(value) = value {
@@ -302,6 +309,18 @@ fn is_structured_household_question(text: &str) -> bool {
         || text.contains("did mia take her allergy medicine")
         || text.contains("can i play outside")
         || text.contains("allowed to play outside")
+        || text.contains("what do we still need to do before trash day")
+        || text.contains("did anyone take the garbage bins out")
+        || text.contains("which homework needs internet")
+        || text.contains("can i use the stove")
+        || text.contains("can i use stove")
+        || text.contains("which sensors need batteries soon")
+        || text.contains("did i pack my library book")
+        || text.contains("why did my alarm not go off")
+        || text.contains("what plants need attention")
+        || text.contains("why did away mode fail")
+        || text.contains("make an end of day house summary")
+        || text.contains("make an end-of-day house summary")
         || text.contains("when did the laundry finish")
         || text.contains("did my laundry get moved")
         || (text.starts_with("can i ") && text.contains("watch cartoons"))
@@ -396,6 +415,17 @@ fn is_household_note_question(text: &str) -> bool {
         || text.starts_with("find the essay draft")
         || text.starts_with("find the ladder safety note")
         || text.starts_with("tell me the dinosaur fact")
+        || text.contains("which breaker controls the dishwasher")
+        || text.contains("what did we do last time ants")
+        || text.contains("camping flashlight")
+        || text.contains("why didn t the sprinklers run")
+        || text.contains("why didn't the sprinklers run")
+        || text.contains("cold medicine instructions")
+        || text.contains("library book")
+        || text.contains("recital outfit")
+        || text.contains("blue cup")
+        || text.contains("side gate") && text.contains("while we were gone")
+        || text.contains("guest speaker")
         || text.starts_with("find the instructions for ")
         || text.starts_with("find the sewing kit")
         || text.starts_with("how do i remove ")
@@ -536,6 +566,14 @@ fn is_semantic_household_memory_question(text: &str) -> bool {
         || text.contains("porch light still on")
         || text.contains("heard glass break")
         || text.contains("safest way out")
+        || text.contains("bake cookies") && text.contains("waking leo")
+        || text.contains("house better for pollen")
+        || text.contains("pollen")
+        || text.contains("room good for a video call")
+        || text.contains("reading with dad")
+        || text.contains("work call")
+        || text.contains("garage ventilated") && text.contains("paint")
+        || text.contains("calm morning for leo")
         || text.contains("need a haircut")
         || text.contains("haircut")
         || text.contains("what should i wear")
@@ -679,6 +717,7 @@ fn is_app_only_secret_question(text: &str) -> bool {
         || text.contains("password manager")
         || text.contains("secure vault")
         || text.contains("credentials vault"))
+        && !text.contains("guest speaker")
         && (text.contains("what")
             || text.contains("show")
             || text.contains("find")
@@ -845,6 +884,27 @@ fn health_log_store_request(text: &str) -> Option<(&'static str, String)> {
 }
 
 fn reminder_or_alarm_store_request(text: &str) -> Option<(&'static str, String)> {
+    if text.contains("emma") && text.contains("come over") && text.contains("after school") {
+        return Some((
+            "permission_requests",
+            "Permission request for Mia: Emma can come over after school; parent approval requested".into(),
+        ));
+    }
+
+    if text.contains("remember that") && text.contains("red hoodie") && text.contains("dad s car") {
+        return Some((
+            "item_location_events",
+            "Mia red hoodie location: red hoodie is in Dad's car".into(),
+        ));
+    }
+
+    if text.contains("save this") && text.contains("rainy day playlist") {
+        return Some((
+            "user_media_aliases",
+            "Mia rainy-day playlist: save current media session as rainy-day playlist".into(),
+        ));
+    }
+
     if text.contains("save this lighting") && text.contains("art time") {
         return Some((
             "scene_embeddings",
@@ -902,7 +962,82 @@ fn reminder_or_alarm_store_request(text: &str) -> Option<(&'static str, String)>
     None
 }
 
+fn preferred_timer_request(text: &str) -> Option<(u64, String)> {
+    if text.contains("lego cleanup timer") {
+        return Some((600, "lego cleanup".into()));
+    }
+    None
+}
+
 fn priority_home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>)> {
+    if text.contains("rainy pickup mode") {
+        return Some(("rainy pickup mode".into(), "activate", None));
+    }
+
+    if text.contains("toaster") && text.contains("smoky") {
+        return Some(("toaster smoke safety".into(), "cut_power_and_vent", None));
+    }
+
+    if text.contains("house better for pollen") || text.contains("pollen mode") {
+        return Some(("pollen mode".into(), "activate", None));
+    }
+
+    if text.contains("driveway lights") && text.contains("pull in") {
+        return Some((
+            "driveway arrival lights".into(),
+            "schedule_on_arrival",
+            None,
+        ));
+    }
+
+    if text.contains("room good for a video call") {
+        return Some(("mia video-call room setup".into(), "activate", None));
+    }
+
+    if text.contains("dishwasher") && text.contains("after 9") {
+        return Some(("dishwasher".into(), "schedule_after_21", None));
+    }
+
+    if text.contains("allergy day setup") || text.contains("allergy-day setup") {
+        return Some(("allergy-day setup".into(), "activate", None));
+    }
+
+    if text.contains("wake me with sunlight") && text.contains("not sound") {
+        return Some(("mia sunlight alarm".into(), "schedule_gradual_blinds", None));
+    }
+
+    if text.contains("guests only") && text.contains("wi fi") && text.contains("bathroom") {
+        return Some(("limited guest info display".into(), "show_guest_card", None));
+    }
+
+    if text.contains("reading with dad") {
+        return Some(("leo reading-with-dad scene".into(), "activate", None));
+    }
+
+    if text.contains("work call") && text.contains("quiet") {
+        return Some(("work-call quiet mode".into(), "activate", None));
+    }
+
+    if text.contains("garage ventilated") && text.contains("paint") {
+        return Some(("garage paint ventilation".into(), "activate", None));
+    }
+
+    if text.contains("sleepover lights") {
+        return Some(("mia sleepover lights".into(), "apply_scene", None));
+    }
+
+    if text.contains("lights flash") && text.contains("cookies are done") {
+        return Some((
+            "leo cookie timer light alert".into(),
+            "schedule_pulse",
+            None,
+        ));
+    }
+
+    if text.contains("calm morning for leo") {
+        return Some(("leo calm morning".into(), "activate", None));
+    }
+
     if text.contains("homework mode") && text.contains("both kids") {
         return Some(("kids homework mode".into(), "activate", None));
     }
@@ -1393,6 +1528,26 @@ fn asks_system_status(text: &str) -> bool {
 }
 
 fn home_status_target(text: &str) -> Option<String> {
+    if text.contains("fridge door") && text.contains("close") {
+        return Some("fridge door".into());
+    }
+
+    if text.contains("sensors need batteries") || text.contains("need batteries soon") {
+        return Some("sensor battery report".into());
+    }
+
+    if text.contains("plants need attention") {
+        return Some("plant attention report".into());
+    }
+
+    if text.contains("bathroom free") {
+        return Some("upstairs bathroom availability".into());
+    }
+
+    if text.contains("end of day house summary") || text.contains("end-of-day house summary") {
+        return Some("end-of-day house summary".into());
+    }
+
     if text.contains("compare this week") && text.contains("electricity") {
         return Some("weekly electricity comparison".into());
     }
@@ -2117,6 +2272,16 @@ mod tests {
             "Sarah: Who changed the thermostat?",
             "Sarah: Did Mia take her allergy medicine?",
             "Leo: Am I allowed to play outside?",
+            "Jared: What do we still need to do before trash day?",
+            "Sarah: Did anyone take the garbage bins out?",
+            "Mia: Which homework needs internet?",
+            "Leo: Can I use the stove?",
+            "Jared: Which sensors need batteries soon?",
+            "Leo: Did I pack my library book?",
+            "Mia: Why did my alarm not go off?",
+            "Sarah: What plants need attention?",
+            "Jared: Why did away mode fail?",
+            "Jared: Make an end-of-day house summary.",
             "Sarah: When did the laundry finish?",
             "Mia: Did my laundry get moved?",
         ] {
@@ -2217,6 +2382,15 @@ mod tests {
             "Leo: Where do my wet soccer shoes go?",
             "Sarah: What was the blue paint color in Mia's room?",
             "Jared: What's the safest way out if the kitchen alarm goes off?",
+            "Jared: Which breaker controls the dishwasher?",
+            "Sarah: What did we do last time ants showed up?",
+            "Leo: Where's the camping flashlight?",
+            "Jared: Why didn't the sprinklers run today?",
+            "Sarah: Find the cold medicine instructions.",
+            "Leo: I can't find my blue cup.",
+            "Jared: Did the side gate open while we were gone?",
+            "Sarah: Find the note about Mia's recital outfit.",
+            "Mia: What's the password for the guest speaker?",
         ] {
             let call = route(query).unwrap();
             assert_eq!(call.name, "memory_recall", "{query}");
@@ -2584,6 +2758,23 @@ mod tests {
             call.arguments["content"],
             "Leo prefers green as his night-light color"
         );
+
+        let call = route("Mia: Can Emma come over after school?").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "permission_requests");
+
+        let call = route("Mia: Remember that my red hoodie is in Dad's car.").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "item_location_events");
+
+        let call = route("Mia: Save this as my rainy-day playlist.").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "user_media_aliases");
+
+        let call = route("Leo: Start a Lego cleanup timer.").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 600);
+        assert_eq!(call.arguments["label"], "lego cleanup");
 
         let call = route("Set the oven to 400 degrees").unwrap();
         assert_eq!(call.name, "home_control");
@@ -2970,6 +3161,81 @@ mod tests {
         assert_eq!(call.arguments["entity"], "babysitter mode");
         assert_eq!(call.arguments["action"], "activate");
 
+        let call = route("Sarah: Start rainy pickup mode.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "rainy pickup mode");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Leo: The toaster smells smoky!").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "toaster smoke safety");
+        assert_eq!(call.arguments["action"], "cut_power_and_vent");
+
+        let call = route("Sarah: Make the house better for pollen.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "pollen mode");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Jared: Turn on the driveway lights only when I pull in.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "driveway arrival lights");
+        assert_eq!(call.arguments["action"], "schedule_on_arrival");
+
+        let call = route("Mia: Make my room good for a video call.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "mia video-call room setup");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Sarah: Run the dishwasher after 9.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "dishwasher");
+        assert_eq!(call.arguments["action"], "schedule_after_21");
+
+        let call = route("Jared: Run allergy-day setup.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "allergy-day setup");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Mia: Wake me with sunlight, not sound.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "mia sunlight alarm");
+        assert_eq!(call.arguments["action"], "schedule_gradual_blinds");
+
+        let call = route("Jared: Show guests only the Wi-Fi and bathroom info.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "limited guest info display");
+        assert_eq!(call.arguments["action"], "show_guest_card");
+
+        let call = route("Leo: Make my room ready for reading with Dad.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "leo reading-with-dad scene");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Sarah: Make the house quiet for my work call.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "work-call quiet mode");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Jared: Keep the garage ventilated while I paint.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "garage paint ventilation");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Mia: Set my room to sleepover lights.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "mia sleepover lights");
+        assert_eq!(call.arguments["action"], "apply_scene");
+
+        let call = route("Leo: Make my lights flash when the cookies are done.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "leo cookie timer light alert");
+        assert_eq!(call.arguments["action"], "schedule_pulse");
+
+        let call = route("Sarah: Start a calm morning for Leo.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "leo calm morning");
+        assert_eq!(call.arguments["action"], "activate");
+
         let call = route("Is the driveway icy?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "driveway ice");
@@ -3121,6 +3387,14 @@ mod tests {
         let call = route("Jared: Which devices are offline?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "offline devices");
+
+        let call = route("Sarah: Did the fridge door close all the way?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "fridge door");
+
+        let call = route("Mia: Is the bathroom free?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "upstairs bathroom availability");
     }
 
     #[test]

@@ -102,7 +102,9 @@ GenieClaw keeps these decisions separate:
   watering, recipe feedback, routine steps, automation troubleshooting,
   sleep/night-safety, porch quieting, stain/laundry guides, leftovers,
   backpack/key/package/document locations, allergy action plans, school-task
-  state, project notes, guest/babysitter notes, outlet/gas/water-leak/glass-break
+  state, project/electrical-panel notes, trash-day prep, pest-history,
+  homework-connectivity, plant-care, alarm-failure, side-gate-away, guest-device,
+  and end-of-day summaries, guest/babysitter notes, outlet/gas/water-leak/glass-break
   safety, wellness/anxiety, weather-report, and social-logistics context, and
   protected account, lock-code, or key-location references are indexed in
   typed local tables for direct note recall or app-only disclosure
@@ -121,12 +123,16 @@ GenieClaw keeps these decisions separate:
   connected-car warmup/navigation, vacation-mode, fall-alert, smoke-ventilation,
   working-late, movie-night/away/dinner-prep/study/focus/cozy/reading/night-hallway
   scenes, network-pause, bedtime reading overrides, quiet porch/piano modes,
-  toddler-safe kitchen, robot vacuum, lock-except rules, homework mode, sleepover
-  guest mode, babysitter mode, contractor garage access, YouTube task blocking,
-  quiet security, shower comfort, star projector scenes, outlet-spill, water-leak,
-  glass-break, and gas safety,
+  toddler-safe kitchen, robot vacuum, lock-except rules, homework mode, rainy pickup,
+  sleepover guest mode, babysitter mode, work-call quiet, pollen/allergy-day modes,
+  video-call and reading-with-parent scenes, driveway-arrival lighting, dishwasher
+  deferred start, guest-info display, sunlight-alarm scheduling, contractor garage
+  access, YouTube task blocking, quiet security, shower comfort, star projector and
+  sleepover-light scenes, cookie-done light alerts, garage paint ventilation,
+  outlet-spill, toaster-smoke, water-leak, glass-break, and gas safety,
   self-cleaning-oven, water-pressure, sump-pump, sous-vide, camera-motion,
   unlocked-door/window, electricity, draft/offline-device, sprinkler-history,
+  fridge-door, plant, sensor-battery, bathroom-availability, end-of-day, and
   morning-readiness,
   nursery-air-quality, iron, water-heater, garage-door, and
   locked-out flows still resolve through this action layer;

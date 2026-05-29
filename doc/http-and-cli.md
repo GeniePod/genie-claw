@@ -142,7 +142,9 @@ pet-care, bus pickup, snack permission, dinner-attendee, chores, leftovers,
 sleepover approval, allergy-plan, stain-removal, school-note, charger/backpack/document,
 key/package/laundry locations, thermostat audits, allergy medicine, dinosaur facts,
 Grandma Wi-Fi notes, outdoor-play rules, wet-shoe guides, paint/project notes,
-device alerts, and safety-route guidance,
+device alerts, safety-route guidance, electrical-panel maps, trash-day prep,
+pest-history, homework-connectivity, plant-care, alarm-failure, side-gate-away,
+guest-device, and end-of-day summaries,
 wellness/anxiety, weather-report, social-logistics, and location questions; health
 hydration/weight logs; app-only credential references for
 Wi-Fi/password/bank-login/code/account/subscription/confirmation/spare-key questions;
@@ -164,7 +166,11 @@ homework/sleepover-guest/babysitter modes, network pause, YouTube task blocking,
 robot vacuum, notification mute, lock-except, contractor access, video-call hooks,
 star-projector controls, quiet security, shower comfort, outlet-spill/water-leak/glass-break/gas safety,
 self-cleaning oven, oven, water-pressure, sump-pump, sous-vide, camera motion,
-unlocked doors/windows, electricity/draft/offline-device/sprinkler/morning-readiness status, nursery
+unlocked doors/windows, rainy-pickup, toaster-smoke, pollen/allergy-day,
+driveway-arrival lighting, video-call/reading-with-parent/work-call/calm-morning
+scenes, guest-info displays, sunlight alarms, deferred dishwasher starts,
+sleepover lights, cookie-done light alerts, garage paint ventilation,
+electricity/draft/offline-device/sprinkler/fridge-door/plant/sensor-battery/bathroom-availability/end-of-day/morning-readiness status, nursery
 air-quality, and freezer/freezer-door telemetry. Those physical results still
 depend on the configured home provider and actuation policy.
 
