@@ -89,12 +89,20 @@ pub async fn get_tegrastats(config: &Config) -> Response {
             body: json,
         },
         Ok(Err(e)) => {
+            // Distinguish transient errors (locked DB) from permanent ones.
+            let is_transient = e.to_lowercase().contains("database is locked")
+                || e.to_lowercase().contains("database is busy");
+            let status = if is_transient { 503 } else { 500 };
             tracing::error!(%e, "failed to read tegrastats from governor.db");
             Response {
-                status: 500,
+                status,
                 content_type: "application/json",
                 body: serde_json::json!({
-                    "error": "failed to read tegrastats data",
+                    "error": if is_transient {
+                        "tegrastats data temporarily unavailable"
+                    } else {
+                        "failed to read tegrastats data"
+                    },
                     "detail": e
                 })
                 .to_string(),
