@@ -130,13 +130,14 @@ High-frequency home phrases are routed before model tool selection when the
 intent is unambiguous. Current local-first routes include household memory
 recall for school, schedule, community/business/channel-guide/subscription/TV/city-meeting hours, allowance, grocery
 inventory, medical appointment, vet appointment, sunset, utility payment,
-appliance state, environment/location/waste/finance/market/fitness/health events,
+appliance state, environment/location/presence/access/waste/finance/market/fitness/health events,
 receipt/manual/tool/storage/safety-equipment notes, tax and vehicle documents,
 education, dictionary,
 entertainment, travel planning, meal planning, guest context, fitness,
 food-safety, substitutions, DIY, wardrobe, service booking, gift history,
 game-night context, media preferences, hobby, podcast, language-learning,
 creative/story/literature/photo recall, hiking/camping/cocktail/date-night/taco-bar planning,
+contextual comfort, kid screen-time, checklists, package/garden/recipe/automation recall,
 wellness/anxiety, weather-report, social-logistics, and location questions; health
 hydration/weight logs; app-only credential references for
 Wi-Fi/password/bank-login/code/account/subscription/confirmation/spare-key questions;
@@ -152,7 +153,9 @@ state, water-heater readiness, basement/attic environment status, solar
 generation, tire pressure, mailbox, car lock state, pool cleaner, printer ink,
 baby-monitor state, speed-limit lookup, stove status, package status,
 garage-door status, connected-car warmup/navigation, vacation/fall/smoke/working-late
-protocols, self-cleaning oven, water-pressure, sump-pump, sous-vide, nursery
+protocols, movie-night/away/dinner-prep/study/cozy/reading/night-hallway scenes,
+network pause, outlet-spill safety, self-cleaning oven, oven, water-pressure,
+sump-pump, sous-vide, camera motion, unlocked doors, nursery
 air-quality, and freezer telemetry. Those physical results still
 depend on the configured home provider and actuation policy.
 
@@ -465,8 +468,9 @@ Memory tools are policy-aware:
   recycling week?", plus school calendar items such as parent-teacher
   conferences
 - safe household event-log memories maintain a local typed index for audit-style
-  questions such as "who turned off the security system?" without repeating
-  keypad/code details in the spoken answer
+  questions such as "who turned off the security system?", "who opened the
+  garage door?", or "is Mia home?" without repeating keypad/code details in the
+  spoken answer
 - safe profile attributes and household rules maintain local indexes for exact
   age, preference, allergy, homework, and screen-time recall
 - safe notes, reminders, manuals, pet health, maintenance, storage, gift,
@@ -474,7 +478,8 @@ Memory tools are policy-aware:
   story, first-aid, visitor, inventory, meal-history, shopping-list, beverage,
   social, commute, pantry, comfort, location, vehicle/tax/cooking-reference,
   TV/community schedule, bank-login app-only, creative/story/literature/photo,
-  trail/camping/cocktail/date-night/taco-bar,
+  trail/camping/cocktail/date-night/taco-bar, school checklists, appliance
+  filters/manuals, tablet chargers, kid routines,
   and watch notes maintain a typed
   local FTS index for direct questions such as "find my note about...", "what
   did the vet say...", "what color did we paint...", "how do I clean...", or
@@ -493,7 +498,9 @@ Memory tools are policy-aware:
   painting, stomach-care, magic, manicure, charity, French learning, podcast,
   motivation, wardrobe-shoe, thirst, yoga, sunbathing, guys-night, Thai-food,
   fever, snow, homework-check, weather-report, anxiety, Roman-history,
-  mood-music, washer-leak, bike-security, and taco-bar planning
+  mood-music, washer-leak, bike-security, garden watering, chickpea recipes,
+  hallway-light troubleshooting, sleep comfort, night-hallway safety, outlet-spill
+  safety, and taco-bar planning
   questions when exact words are missing
 - live answers still require live tools: garage/lock/thermostat state comes from
   Home Assistant, weather comes from the weather tool, media playback comes from
