@@ -128,13 +128,51 @@ Response:
 
 High-frequency home phrases are routed before model tool selection when the
 intent is unambiguous. Current local-first routes include household memory
-recall for school, schedule, allowance, receipt/manual/storage, education,
-dictionary, entertainment, and location questions; app-only credential
-references for Wi-Fi/password/code questions; and integration-backed
-`home_control`/`home_status` calls for explicit physical requests such as
-holiday lights, front-gate state, driveway ice status, sprinklers, lock-up,
-phone finder, slow-cooker setup, and freezer telemetry. Those physical results
-still depend on the configured home provider and actuation policy.
+recall for school, schedule, community/business/channel-guide/subscription/TV/city-meeting hours, allowance, grocery
+inventory, medical appointment, vet appointment, sunset, utility payment,
+appliance state, environment/location/presence/access/waste/finance/market/fitness/health events,
+receipt/manual/tool/storage/safety-equipment notes, tax and vehicle documents,
+education, dictionary,
+entertainment, travel planning, meal planning, guest context, fitness,
+food-safety, substitutions, DIY, wardrobe, service booking, gift history,
+game-night context, media preferences, hobby, podcast, language-learning,
+creative/story/literature/photo recall, hiking/camping/cocktail/date-night/taco-bar planning,
+contextual comfort, kid screen-time, checklists, package/garden/recipe/automation recall,
+pet-care, bus pickup, snack permission, dinner-attendee, chores, leftovers,
+sleepover approval, allergy-plan, stain-removal, school-note, charger/backpack/document,
+key/package/laundry locations, thermostat audits, allergy medicine, dinosaur facts,
+Grandma Wi-Fi notes, outdoor-play rules, wet-shoe guides, paint/project notes,
+device alerts, safety-route guidance, electrical-panel maps, trash-day prep,
+pest-history, homework-connectivity, plant-care, alarm-failure, side-gate-away,
+guest-device, and end-of-day summaries,
+wellness/anxiety, weather-report, social-logistics, and location questions; health
+hydration/weight logs; app-only credential references for
+Wi-Fi/password/bank-login/code/account/subscription/confirmation/spare-key questions;
+media routes for focus music, morning news, and weather reports; web search for explicit
+news/search/market-price requests; and integration-backed `home_control`/`home_status` calls
+for explicit physical requests such as holiday lights, TV, security alarm,
+nap mode, fireplace, ventilation, upstairs lights, robot mower, smoke-detector tests,
+front-gate state, driveway ice status, sprinklers, lock-up/all-off/
+work-from-home scenes, porch-light arrival triggers, rain-arrival and
+parking-lot safety routines, locked-out unlock confirmation, phone finder,
+timers, slow-cooker setup, dryer completion, baby breathing monitor, iron
+state, water-heater readiness, basement/attic environment status, solar
+generation, tire pressure, mailbox, car lock state, pool cleaner, printer ink,
+baby-monitor state, speed-limit lookup, stove status, package status,
+garage-door status, connected-car warmup/navigation, vacation/fall/smoke/working-late
+protocols, movie-night/away/dinner-prep/study/cozy/reading/night-hallway scenes,
+focus/quiet-porch/storm-prep/bedtime-override/piano-quiet/toddler-safe/spaceship scenes,
+homework/sleepover-guest/babysitter modes, network pause, YouTube task blocking,
+robot vacuum, notification mute, lock-except, contractor access, video-call hooks,
+star-projector controls, quiet security, shower comfort, outlet-spill/water-leak/glass-break/gas safety,
+self-cleaning oven, oven, water-pressure, sump-pump, sous-vide, camera motion,
+unlocked doors/windows, rainy-pickup, toaster-smoke, pollen/allergy-day,
+driveway-arrival lighting, video-call/reading-with-parent/work-call/calm-morning
+scenes, guest-info displays, sunlight alarms, deferred dishwasher starts,
+sleepover lights, cookie-done light alerts, garage paint ventilation,
+electricity/draft/offline-device/sprinkler/fridge-door/plant/sensor-battery/bathroom-availability/end-of-day/morning-readiness status, nursery
+air-quality, and freezer/freezer-door telemetry. Those physical results still
+depend on the configured home provider and actuation policy.
 
 ### `POST /api/chat/stream`
 
@@ -348,6 +386,11 @@ Implemented in `crates/genie-ctl/src/main.rs`.
 | `genie-ctl search [--fresh] [--limit N] <QUERY>` | Direct web search |
 | `genie-ctl history` | Show current conversation history |
 | `genie-ctl tools` | List available tools |
+| `genie-ctl bfcl-score --cases C --predictions P [--json]` | Score BFCL-style tool-call fixtures |
+| `genie-ctl bfcl-score-llm --cases C [--out P] [--json] [--max-tokens N] [--limit N]` | Generate and score local LLM BFCL predictions |
+| `genie-ctl bfcl-predict-quick --cases C --out P` | Generate deterministic quick-router BFCL predictions |
+| `genie-ctl bfcl-predict-llm --cases C --out P [--max-tokens N] [--limit N]` | Generate local LLM BFCL predictions |
+| `genie-ctl bfcl-import-ha-intents --source DIR --out C [--language en] [--limit N]` | Convert Home Assistant Intents into attributed BFCL cases |
 | `genie-ctl connectivity` | Show coprocessor boundary status |
 | `genie-ctl skill ...` | Manage loadable skills |
 | `genie-ctl speaker ...` | Manage local speaker identity profiles |
@@ -357,6 +400,71 @@ Implemented in `crates/genie-ctl/src/main.rs`.
 | `genie-ctl diag` | Diagnostics summary |
 | `genie-ctl support-bundle [PATH]` | Write a JSON diagnostics bundle |
 | `genie-ctl version` | Version output |
+
+### `genie-ctl bfcl-score`
+
+Scores local JSONL fixtures for tool-call accuracy without executing tools:
+
+```bash
+cargo run -p genie-ctl -- bfcl-score \
+  --cases tests/bfcl/home_tool_cases.jsonl \
+  --predictions tests/bfcl/home_tool_predictions.jsonl
+```
+
+The scorer parses raw JSON, fenced JSON, embedded JSON, and OpenAI-compatible
+`tool_calls` wrappers. It reports parse, tool-name, argument, and strict exact
+accuracy. Use `--json` for machine-readable output suitable for CI.
+
+### `genie-ctl bfcl-score-llm`
+
+Runs the configured local LLM against BFCL cases, scores the generated tool
+calls immediately, and optionally saves raw predictions:
+
+```bash
+GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml \
+cargo run -p genie-ctl -- bfcl-score-llm \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_home_llm_predictions.jsonl \
+  --max-tokens 160
+```
+
+The command calls `[services.llm]` directly. It does not execute tools or touch
+the home backend. Use `--limit N` for Jetson smoke tests, `--json` for a
+machine-readable score report, and `--no-json-mode` when a runtime does not
+support OpenAI-compatible JSON response mode.
+
+### `genie-ctl bfcl-predict-quick`
+
+Generates a side-effect-free prediction file from GenieClaw's deterministic
+quick router:
+
+```bash
+cargo run -p genie-ctl -- bfcl-predict-quick \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_home_predictions.jsonl
+```
+
+Use this as the baseline for fast-path home intent coverage. Low scores here
+mean deterministic routing, entity normalization, or typed-tool argument
+construction need work.
+
+### `genie-ctl bfcl-predict-llm`
+
+Generates a side-effect-free prediction file from the configured local LLM:
+
+```bash
+GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml \
+cargo run -p genie-ctl -- bfcl-predict-llm \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_home_llm_predictions.jsonl \
+  --max-tokens 160
+```
+
+This command calls `[services.llm]` directly, asks for compact JSON tool calls,
+and writes raw model responses for `bfcl-score`. It does not execute tools or
+touch the home backend. Use `--limit N` for Jetson smoke tests and
+`--no-json-mode` when a runtime does not support OpenAI-compatible JSON
+response mode.
 
 ### `genie-ctl support-bundle`
 
@@ -445,14 +553,22 @@ Memory tools are policy-aware:
   recycling week?", plus school calendar items such as parent-teacher
   conferences
 - safe household event-log memories maintain a local typed index for audit-style
-  questions such as "who turned off the security system?" without repeating
-  keypad/code details in the spoken answer
+  questions such as "who turned off the security system?", "who opened the
+  garage door?", or "is Mia home?" without repeating keypad/code details in the
+  spoken answer
 - safe profile attributes and household rules maintain local indexes for exact
   age, preference, allergy, homework, and screen-time recall
 - safe notes, reminders, manuals, pet health, maintenance, storage, gift,
   troubleshooting, recipe, warranty, school, utility, recycling, photo,
   story, first-aid, visitor, inventory, meal-history, shopping-list, beverage,
-  social, commute, pantry, comfort, location, and watch notes maintain a typed
+  social, commute, pantry, comfort, location, vehicle/tax/cooking-reference,
+  TV/community schedule, bank-login app-only, creative/story/literature/photo,
+  trail/camping/cocktail/date-night/taco-bar, school checklists, appliance
+  filters/manuals, tablet chargers, kid routines, school/project forms,
+  debate/poem/project documents, water-heater receipts, camera/privacy reports,
+  guest-network device reports, filter-change notes, garage-change reports,
+  plumber shutoff notes, and emergency/safety-equipment locations,
+  and watch notes maintain a typed
   local FTS index for direct questions such as "find my note about...", "what
   did the vet say...", "what color did we paint...", "how do I clean...", or
   "where are..."
@@ -466,14 +582,26 @@ Memory tools are policy-aware:
   printer, car-noise, recipe, date-night, movie, science-fair, headache,
   zoo-trip, diet-meal, washing-machine, visitor, watch-history, focus-music,
   scary-movie, hydration, brightness, loneliness, commute, tacos, humidity,
-  first-aid, key-location, outdoor-sound, pizza, remote-start, and arrival
+  first-aid, key-location, outdoor-sound, pizza, remote-start, arrival,
+  painting, stomach-care, magic, manicure, charity, French learning, podcast,
+  motivation, wardrobe-shoe, thirst, yoga, sunbathing, guys-night, Thai-food,
+  fever, snow, homework-check, weather-report, anxiety, Roman-history,
+  mood-music, washer-leak, bike-security, garden watering, chickpea recipes,
+  hallway-light troubleshooting, sleep comfort, night-hallway safety, outlet-spill
+  safety, after-dinner cleanup, board-game setup, glare/reading comfort,
+  post-bath comfort, quiet drawing, workshop dust control, school-night reset,
+  guest breakfast, low-power mode, family dinner screens, appliance-noise causes,
+  air-quality/pollen causes, camera privacy, freezer/laundry safety automations,
+  and taco-bar planning
   questions when exact words are missing
 - live answers still require live tools: garage/lock/thermostat state comes from
   Home Assistant, weather comes from the weather tool, media playback comes from
   the local media path, and sensors such as baby monitors, cameras, face
   recognition, smart-fridge inventories, purchase carts, car remote start,
   traffic, Bluetooth trackers, microphones, or location history are not
-  simulated by memory recall
+  simulated by memory recall; scenario routes for current lights, guest Wi-Fi
+  clients, noisy appliances, water pressure, camera privacy, and final safety
+  sweeps therefore go through live tool/status boundaries when configured
 - person/private/restricted memories may be withheld unless stronger read context is supplied
 - memory status reports canonical artifact counts plus policy-scope counts
 

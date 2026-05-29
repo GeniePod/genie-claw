@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn digest_is_64_hex_chars() {
-        let digest = sha256_hex("GeniePod Home");
+        let digest = sha256_hex("NVIDIA Jetson Orin 8GB");
         assert_eq!(digest.len(), 64);
         assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
     }

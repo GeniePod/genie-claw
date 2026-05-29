@@ -1,4 +1,4 @@
-//! Shared-space memory policy for GeniePod Home.
+//! Shared-space memory policy for the NVIDIA Jetson Orin 8GB-native home agent.
 //!
 //! This is the code-level version of the product memory policy:
 //! household memory is useful by default, private memory is opt-in, and
@@ -447,6 +447,8 @@ fn restricted_secret_reason(lower: &str) -> Option<&'static str> {
             "credit card",
             "card number",
             "cvv",
+            "account number",
+            "confirmation number",
             "bank account",
             "routing number",
             "social security",

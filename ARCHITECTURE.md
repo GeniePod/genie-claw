@@ -208,7 +208,7 @@ running:
 
 | Profile | Purpose |
 | --- | --- |
-| `jetson` | Flagship GeniePod Home path; 4096-token baseline and local runtime default |
+| `jetson` | Flagship NVIDIA Jetson Orin 8GB path; 4096-token baseline and local runtime default |
 | `raspberry_pi` | Maintained SBC profile for the headless agent, memory, tools, HTTP/CLI, and home-provider boundaries |
 | `portable_sbc` | Maintained generic SBC profile where voice, CUDA, and full home runtimes may be absent |
 | `laptop` | Developer profile for local tests, docs, and provider integration |
