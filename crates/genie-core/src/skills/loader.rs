@@ -1328,9 +1328,9 @@ mod tests {
     /// End-to-end TOCTOU regression: a signed skill is loaded via the memfd
     /// path; replacing the .so on disk afterwards has no effect on the already-
     /// loaded library because the kernel loaded the sealed in-memory copy.
-    #[test]
+    #[tokio::test]
     #[cfg(target_os = "linux")]
-    fn loader_toctou_disk_swap_after_load_has_no_effect() {
+    async fn loader_toctou_disk_swap_after_load_has_no_effect() {
         let (dir, keys_dir, so_path, key) = signed_skill_dirs("toctou", "geniepod");
         let signature = sign_file(&key, &so_path);
         write_signed_manifest(&dir, &signature, "geniepod");
@@ -1349,7 +1349,7 @@ mod tests {
         std::fs::write(&so_path, b"attacker payload swapped after verification").unwrap();
 
         let skill = loader.get_mut("hello_world").unwrap();
-        let (success, output) = skill.execute_parsed(r#"{"name":"TOCTOU"}"#);
+        let (success, output) = skill.execute_parsed(r#"{"name":"TOCTOU"}"#).await;
         assert!(success, "skill execution failed after disk swap: {output}");
         assert!(
             output.contains("TOCTOU"),
