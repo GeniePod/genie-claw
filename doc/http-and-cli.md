@@ -128,17 +128,19 @@ Response:
 
 High-frequency home phrases are routed before model tool selection when the
 intent is unambiguous. Current local-first routes include household memory
-recall for school, schedule, community/business/channel-guide hours, allowance, grocery
+recall for school, schedule, community/business/channel-guide/subscription hours, allowance, grocery
 inventory, medical appointment, vet appointment, sunset, utility payment,
-appliance state, environment/location/waste/finance/health events,
-receipt/manual/tool/storage/safety-equipment notes, education, dictionary,
+appliance state, environment/location/waste/finance/market/health events,
+receipt/manual/tool/storage/safety-equipment notes, tax and vehicle documents,
+education, dictionary,
 entertainment, travel planning, meal planning, guest context, fitness,
 food-safety, substitutions, DIY, wardrobe, service booking, gift history,
-game-night context, media preferences, and location questions; health
+game-night context, media preferences, hobby, podcast, language-learning,
+weather-report, social-logistics, and location questions; health
 hydration/weight logs; app-only credential references for
 Wi-Fi/password/code/account/subscription/confirmation/spare-key questions;
-media routes for focus music and morning news; web search for explicit
-news/search requests; and integration-backed `home_control`/`home_status` calls
+media routes for focus music, morning news, and weather reports; web search for explicit
+news/search/market-price requests; and integration-backed `home_control`/`home_status` calls
 for explicit physical requests such as holiday lights, TV, security alarm,
 nap mode, fireplace, ventilation, upstairs lights, robot mower, smoke-detector tests,
 front-gate state, driveway ice status, sprinklers, lock-up/all-off/
@@ -146,8 +148,9 @@ work-from-home scenes, porch-light arrival triggers, rain-arrival and
 parking-lot safety routines, locked-out unlock confirmation, phone finder,
 timers, slow-cooker setup, dryer completion, baby breathing monitor, iron
 state, water-heater readiness, basement/attic environment status, solar
-generation, tire pressure, mailbox, car lock state, stove status, package
-status, garage-door status, and freezer telemetry. Those physical results still
+generation, tire pressure, mailbox, car lock state, pool cleaner, printer ink,
+baby-monitor state, speed-limit lookup, stove status, package status,
+garage-door status, and freezer telemetry. Those physical results still
 depend on the configured home provider and actuation policy.
 
 ### `POST /api/chat/stream`
@@ -466,7 +469,8 @@ Memory tools are policy-aware:
 - safe notes, reminders, manuals, pet health, maintenance, storage, gift,
   troubleshooting, recipe, warranty, school, utility, recycling, photo,
   story, first-aid, visitor, inventory, meal-history, shopping-list, beverage,
-  social, commute, pantry, comfort, location, and watch notes maintain a typed
+  social, commute, pantry, comfort, location, vehicle/tax/cooking-reference,
+  and watch notes maintain a typed
   local FTS index for direct questions such as "find my note about...", "what
   did the vet say...", "what color did we paint...", "how do I clean...", or
   "where are..."
@@ -480,7 +484,10 @@ Memory tools are policy-aware:
   printer, car-noise, recipe, date-night, movie, science-fair, headache,
   zoo-trip, diet-meal, washing-machine, visitor, watch-history, focus-music,
   scary-movie, hydration, brightness, loneliness, commute, tacos, humidity,
-  first-aid, key-location, outdoor-sound, pizza, remote-start, and arrival
+  first-aid, key-location, outdoor-sound, pizza, remote-start, arrival,
+  painting, stomach-care, magic, manicure, charity, French learning, podcast,
+  motivation, wardrobe-shoe, thirst, yoga, sunbathing, guys-night, Thai-food,
+  fever, snow, homework-check, and weather-report
   questions when exact words are missing
 - live answers still require live tools: garage/lock/thermostat state comes from
   Home Assistant, weather comes from the weather tool, media playback comes from

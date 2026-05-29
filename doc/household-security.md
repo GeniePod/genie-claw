@@ -83,8 +83,8 @@ GenieClaw keeps these decisions separate:
   resolution before fuzzy matching; safe profile attributes and household rules
   answer low-latency questions about age, shoe sizes, allergies, homework, and
   screen-time constraints before FTS fallback; safe calendar, access,
-  chore/task-log, schedule/channel-guide, appliance-state, environment,
-  location, waste-collection, finance/payment-event, health-reading,
+  chore/task-log, schedule/channel-guide/subscription, appliance-state, environment,
+  location, waste-collection, finance/market/payment-event, health-reading,
   security-event, and pantry inventory memories answer local exact-match
   questions before fuzzy fallback;
   safe household notes, reminders, manuals, warranties, receipts, utility notes,
@@ -92,9 +92,10 @@ GenieClaw keeps these decisions separate:
   inventory notes, storage notes, meal history, commute notes, pantry notes,
   travel notes, contact/contractor notes, delivery notes, location notes,
   shopping notes, tool notes, DIY notes, fitness notes, food-safety notes,
-  safety-equipment notes, school documents, recipe notes, gift history, and
-  watch notes, appliance manuals, contact/vet records, wardrobe/DIY/service
-  context, and protected account or key-location references are indexed in
+  safety-equipment notes, school documents, recipe notes, gift history, tax and
+  vehicle documents, cooking references, hobby, podcast, language-learning,
+  wardrobe/DIY/service, weather-report, and social-logistics context, and
+  protected account, lock-code, or key-location references are indexed in
   typed local tables for direct note recall or app-only disclosure
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
@@ -106,8 +107,9 @@ GenieClaw keeps these decisions separate:
   finder, sprinklers, locks/gates, freezer telemetry, and other side effects
   pass through tool policy and actuation safety even if memory retrieval found
   the right target; work-from-home/all-off scenes, fireplace/ventilation,
-  tire-pressure, mailbox, robot-mower, upstairs-light, smoke-detector,
-  TV/alarm, nap-mode, baby-monitor, iron, water-heater, garage-door, and
+  tire-pressure, mailbox, robot-mower, pool-cleaner, upstairs-light,
+  smoke-detector, TV/alarm, nap-mode, baby-monitor, printer-ink, speed-limit,
+  iron, water-heater, garage-door, and
   locked-out flows still resolve through this action layer;
   tool results and audit events carry an action class such as
   `read_only`, `memory_write`, `home_actuation`, `network`, `media`, `timer`,

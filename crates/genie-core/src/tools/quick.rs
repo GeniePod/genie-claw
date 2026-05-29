@@ -261,6 +261,7 @@ fn is_structured_household_question(text: &str) -> bool {
             "what is my weight" | "what s my weight" | "what's my weight"
         )
         || (text.starts_with("what channel is ") || text.starts_with("what channel s "))
+        || (text.contains("subscription") && (text.contains("due") || text.contains("renew")))
         || (text.starts_with("what does ") && text.contains(" like"))
         || (text.starts_with("what size shoe does ") && text.contains(" wear"))
         || (text.starts_with("what shoe size does ") && text.contains(" wear"))
@@ -335,6 +336,13 @@ fn is_household_note_question(text: &str) -> bool {
         || text.starts_with("find the manual for ")
         || text.starts_with("find the instructions for ")
         || text.starts_with("find the sewing kit")
+        || text.starts_with("how long do i boil ")
+        || text.starts_with("how long should i boil ")
+        || text.starts_with("what is the doctor")
+        || text.starts_with("what s the doctor")
+        || text.starts_with("what's the doctor")
+        || text.starts_with("find the manual for the car")
+        || text.starts_with("where are the tax documents")
         || text.starts_with("what is the license plate")
         || text.starts_with("what s the license plate")
         || text.starts_with("what's the license plate")
@@ -367,7 +375,35 @@ fn is_household_note_question(text: &str) -> bool {
 }
 
 fn is_semantic_household_memory_question(text: &str) -> bool {
-    text.contains("need a haircut")
+    if text.contains("printer") && text.contains("out of ink") {
+        return false;
+    }
+
+    text.contains("want to paint")
+        || text.contains("stomach ache")
+        || text.contains("teach me magic")
+        || text.contains("magic trick")
+        || text.contains("need a manicure")
+        || text.contains("good charity")
+        || text.contains("learn french")
+        || text.contains("suggest a podcast")
+        || text.contains("motivating speech")
+        || text.contains("what shoes go with")
+        || text == "i m thirsty"
+        || text == "i am thirsty"
+        || text == "i'm thirsty"
+        || text.contains("going to yoga")
+        || text.contains("yoga class")
+        || text.contains("sunbathing")
+        || text.contains("guys night")
+        || text.contains("order thai food")
+        || text.contains("have a fever")
+        || text.contains("it s snowing")
+        || text.contains("it's snowing")
+        || text.contains("mia doing her homework")
+        || text.contains("i m back")
+        || text.contains("i'm back")
+        || text.contains("need a haircut")
         || text.contains("haircut")
         || text.contains("what should i wear")
         || text.contains("wear to the wedding")
@@ -500,7 +536,8 @@ fn is_app_only_secret_question(text: &str) -> bool {
         || (text.contains("code")
             && (text.contains("account")
                 || text.contains("netflix")
-                || text.contains("subscription")))
+                || text.contains("subscription")
+                || text.contains("shed")))
         || text.contains("combination")
         || text.contains("combo")
         || text.contains("confirmation number")
@@ -510,6 +547,7 @@ fn is_app_only_secret_question(text: &str) -> bool {
             || text.contains("find")
             || text.contains("where")
             || text.contains("number")
+            || text.contains("key")
             || text.contains("wifi")
             || text.contains("wi fi"))
 }
@@ -529,16 +567,20 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
             | "lock up house"
             | "turn off everything"
             | "turn everything off"
+            | "i m back"
+            | "i am back"
     ) {
-        return Some(if text == "i m home" || text == "i am home" {
-            "arrival".into()
-        } else if text == "lock up the house" || text == "lock up house" {
-            "lock up house".into()
-        } else if text == "turn off everything" || text == "turn everything off" {
-            "all off".into()
-        } else {
-            "goodnight".into()
-        });
+        return Some(
+            if matches!(text, "i m home" | "i am home" | "i m back" | "i am back") {
+                "arrival".into()
+            } else if text == "lock up the house" || text == "lock up house" {
+                "lock up house".into()
+            } else if text == "turn off everything" || text == "turn everything off" {
+                "all off".into()
+            } else {
+                "goodnight".into()
+            },
+        );
     }
 
     for prefix in ["activate ", "start ", "run "] {
@@ -575,6 +617,16 @@ fn play_media_request(text: &str) -> Option<String> {
             | "play morning news"
     ) {
         return Some("morning news".into());
+    }
+
+    if matches!(
+        text,
+        "play the weather report"
+            | "play weather report"
+            | "put on the weather report"
+            | "put on weather report"
+    ) {
+        return Some("local weather report".into());
     }
 
     for prefix in ["please play ", "play ", "start ", "put on "] {
@@ -684,6 +736,20 @@ fn priority_home_control_request(text: &str) -> Option<(String, &'static str, Op
 fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>)> {
     if matches!(text, "turn off the tv" | "turn off tv") {
         return Some(("tv".into(), "turn_off", None));
+    }
+
+    if matches!(
+        text,
+        "turn on the pool cleaner" | "turn on pool cleaner" | "start the pool cleaner"
+    ) {
+        return Some(("pool cleaner".into(), "start", None));
+    }
+
+    if matches!(
+        text,
+        "set the thermostat to eco mode" | "set thermostat to eco mode"
+    ) {
+        return Some(("thermostat".into(), "set_preset", None));
     }
 
     if matches!(
@@ -909,6 +975,28 @@ fn asks_system_status(text: &str) -> bool {
 }
 
 fn home_status_target(text: &str) -> Option<String> {
+    if text.contains("speed limit") {
+        return Some("speed limit".into());
+    }
+
+    if text.starts_with("did ") && text.contains("lock") && text.contains("car") {
+        return Some("car locks".into());
+    }
+
+    if text.starts_with("did ")
+        && (text.contains("package arrive") || text.contains("package arrived"))
+    {
+        return Some("package".into());
+    }
+
+    if text.contains("printer") && text.contains("ink") {
+        return Some("printer ink".into());
+    }
+
+    if text.contains("baby monitor") {
+        return Some("baby monitor".into());
+    }
+
     if text.contains("baby") && text.contains("breathing") {
         return Some("baby breathing monitor".into());
     }
@@ -1111,6 +1199,24 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
 fn web_search_request(text: &str) -> Option<String> {
     if text.starts_with("search memory ") || text.starts_with("search memories ") {
         return None;
+    }
+
+    if text.contains("stock price") {
+        let subject = text
+            .split_once("stock price of ")
+            .map(|(_, subject)| subject)
+            .or_else(|| {
+                text.split_once("stock price for ")
+                    .map(|(_, subject)| subject)
+            })
+            .unwrap_or("")
+            .trim();
+        let query = if subject.is_empty() {
+            "stock price".to_string()
+        } else {
+            format!("{subject} stock price")
+        };
+        return Some(query);
     }
 
     if matches!(text, "read the news" | "read news" | "what s the news") {
@@ -1490,6 +1596,7 @@ mod tests {
             "Did the trash truck come yet?",
             "What is the temperature in the attic?",
             "Is Mia home from school?",
+            "When is the subscription due?",
         ] {
             let call = route(query).unwrap();
             assert_eq!(call.name, "memory_recall", "{query}");
@@ -1556,6 +1663,11 @@ mod tests {
             "Where are the spare keys?",
             "What is the license plate number?",
             "What is the warranty for the fridge?",
+            "Find the warranty for the laptop.",
+            "Find the manual for the car.",
+            "Where are the tax documents?",
+            "How long do I boil an egg?",
+            "What is the doctor's number?",
         ] {
             let call = route(query).unwrap();
             assert_eq!(call.name, "memory_recall", "{query}");
@@ -1606,6 +1718,12 @@ mod tests {
         assert_eq!(call.name, "memory_recall");
 
         let call = route("Find the password for the guest network.").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("Where is the spare key?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("What is the code for the shed?").unwrap();
         assert_eq!(call.name, "memory_recall");
     }
 
@@ -1723,6 +1841,24 @@ mod tests {
             "What should we do with the kids today?",
             "The toilet is clogged again",
             "Sew a button on my shirt",
+            "I want to paint",
+            "I have a stomach ache",
+            "Teach me magic tricks",
+            "I need a manicure",
+            "What's a good charity?",
+            "I want to learn French",
+            "Suggest a podcast",
+            "I need a motivating speech",
+            "What shoes go with this dress?",
+            "I'm thirsty",
+            "I'm going to yoga class",
+            "I'm sunbathing",
+            "Plan a guys' night",
+            "Order Thai food",
+            "I have a fever",
+            "It's snowing",
+            "Is Mia doing her homework?",
+            "I'm back",
         ] {
             let call = route(query).unwrap();
             assert_eq!(call.name, "memory_recall", "{query}");
@@ -1775,6 +1911,10 @@ mod tests {
         let call = route("Put on the morning news").unwrap();
         assert_eq!(call.name, "play_media");
         assert_eq!(call.arguments["query"], "morning news");
+
+        let call = route("Play the weather report").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "local weather report");
     }
 
     #[test]
@@ -1905,6 +2045,16 @@ mod tests {
         assert_eq!(call.arguments["entity"], "security alarm");
         assert_eq!(call.arguments["action"], "arm");
 
+        let call = route("Turn on the pool cleaner").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "pool cleaner");
+        assert_eq!(call.arguments["action"], "start");
+
+        let call = route("Set the thermostat to Eco mode").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "thermostat");
+        assert_eq!(call.arguments["action"], "set_preset");
+
         let call = route("I'm going to take a nap").unwrap();
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "nap mode");
@@ -1984,6 +2134,33 @@ mod tests {
         let call = route("Is the baby breathing?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "baby breathing monitor");
+
+        let call = route("Did I lock the car?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "car locks");
+
+        let call = route("Is the printer out of ink?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "printer ink");
+
+        let call = route("Is the baby monitor on?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "baby monitor");
+
+        let call = route("What's the speed limit here?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "speed limit");
+
+        let call = route("Did the package arrive?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "package");
+    }
+
+    #[test]
+    fn routes_market_queries_to_web_search() {
+        let call = route("What is the stock price of Apple?").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert!(call.arguments["query"].as_str().unwrap().contains("apple"));
     }
 
     #[test]
