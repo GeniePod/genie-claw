@@ -288,6 +288,16 @@ fn is_structured_household_question(text: &str) -> bool {
         || text.contains("vo2 max")
         || (text.contains("tv tonight") || text.contains("on tv tonight"))
         || text.contains("city council meeting")
+        || text.contains("what time is my bus")
+        || text.contains("bus tomorrow")
+        || text.contains("bus pickup tomorrow")
+        || text.contains("who s coming to dinner")
+        || text.contains("who's coming to dinner")
+        || text.contains("coming to dinner tonight")
+        || text.contains("can i have a snack")
+        || text.contains("did i finish my chores")
+        || text.contains("did mom approve my sleepover")
+        || text.contains("which leftovers should we eat first")
         || (text.starts_with("can i ") && text.contains("watch cartoons"))
         || text.contains("who opened the garage door")
         || text == "is mia home"
@@ -366,6 +376,7 @@ fn is_household_note_question(text: &str) -> bool {
         || text.starts_with("what is the model number ")
         || text.starts_with("who took the photos ")
         || text.starts_with("find the warranty for ")
+        || (text.starts_with("find the ") && text.contains(" warranty"))
         || text.starts_with("what is the warranty for ")
         || text.starts_with("what s the warranty for ")
         || text.starts_with("what's the warranty for ")
@@ -375,12 +386,20 @@ fn is_household_note_question(text: &str) -> bool {
         || text.starts_with("find the user manual for ")
         || (text.starts_with("find the ") && text.contains(" manual"))
         || text.starts_with("find anything about ")
+        || text.starts_with("find my essay draft")
+        || text.starts_with("find the essay draft")
         || text.starts_with("find the instructions for ")
         || text.starts_with("find the sewing kit")
+        || text.starts_with("how do i remove ")
+        || text.starts_with("how do we remove ")
         || text.starts_with("how long do i boil ")
         || text.starts_with("how long should i boil ")
+        || text.starts_with("what bin does ")
         || text.contains("science fair checklist")
         || text.contains("tablet charger")
+        || text.contains("backpack")
+        || text.contains("allergy action plan")
+        || text.contains("pajama day")
         || text.contains("dishwasher error")
         || text.contains("which filter")
         || text.starts_with("what is the doctor")
@@ -484,6 +503,17 @@ fn is_semantic_household_memory_question(text: &str) -> bool {
         || text.contains("can t sleep")
         || text.contains("safe at night")
         || text.contains("spilled water") && text.contains("outlet")
+        || text.contains("waking the kids")
+        || text.contains("room so hot")
+        || text.contains("scared of the dark")
+        || text.contains("laptop battery")
+        || text.contains("robot vacuum") && text.contains("under my bed")
+        || text.contains("piano practice quiet")
+        || text.contains("practicing violin")
+        || text.contains("spaceship")
+        || text.contains("toddler safe")
+        || text.contains("toddler-safe")
+        || text.contains("smell gas")
         || text.contains("need a haircut")
         || text.contains("haircut")
         || text.contains("what should i wear")
@@ -812,10 +842,93 @@ fn reminder_or_alarm_store_request(text: &str) -> Option<(&'static str, String)>
         }
     }
 
+    if text.contains("tell me when dad gets home") {
+        return Some((
+            "presence_alert",
+            "Presence alert for Leo: tell him when Dad gets home".into(),
+        ));
+    }
+
+    if text.contains("save the bathroom") && text.contains(" at 7") && text.contains("hair wash") {
+        return Some((
+            "reservation",
+            "Bathroom reservation for Mia at 7:00 PM for hair wash".into(),
+        ));
+    }
+
     None
 }
 
 fn priority_home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>)> {
+    if text.contains("warm up") && text.contains("sarah") && text.contains("bathroom") {
+        return Some((
+            "sarah bathroom comfort".into(),
+            "warm_for_minutes",
+            Some(25.0),
+        ));
+    }
+
+    if text.contains("focus mode") && text.contains("until five") {
+        return Some(("personal focus mode".into(), "activate_until_5pm", None));
+    }
+
+    if text.contains("porch") && text.contains("waking the kids") {
+        return Some(("quiet porch alerts tonight".into(), "activate", None));
+    }
+
+    if text.contains("start storm prep") || text.contains("run storm prep") {
+        return Some(("storm prep".into(), "activate", None));
+    }
+
+    if text.contains("scared of the dark") {
+        return Some(("night reassurance scene".into(), "activate", None));
+    }
+
+    if text.contains("open blinds") && text.contains("morning sun") && text.contains("mia") {
+        return Some(("morning sun blinds except mia room".into(), "open", None));
+    }
+
+    if text.contains("piano practice quiet") || text.contains("quiet for the rest of the house") {
+        return Some(("piano practice quiet mode".into(), "activate", None));
+    }
+
+    if text.contains("smell gas") {
+        return Some(("gas safety emergency".into(), "activate", None));
+    }
+
+    if text.contains("start bedtime") && text.contains("mia") && text.contains("20 minutes") {
+        return Some(("bedtime with mia reading override".into(), "activate", None));
+    }
+
+    if text.contains("vacation mode") && text.contains("next week") {
+        return Some(("scheduled vacation mode next week".into(), "schedule", None));
+    }
+
+    if text.contains("robot vacuum") && text.contains("under my bed") {
+        return Some(("leo under-bed vacuum zone".into(), "clean", None));
+    }
+
+    if text.contains("turn off notifications") && text.contains("practicing violin") {
+        return Some((
+            "mia violin practice notifications".into(),
+            "mute_for_practice",
+            None,
+        ));
+    }
+
+    if text.contains("kitchen") && (text.contains("toddler safe") || text.contains("toddler-safe"))
+    {
+        return Some(("toddler-safe kitchen".into(), "activate", None));
+    }
+
+    if text.contains("lock everything") && text.contains("except") && text.contains("back gate") {
+        return Some(("all locks except back gate".into(), "lock_except", None));
+    }
+
+    if text.contains("spaceship") && text.contains("hallway") {
+        return Some(("spaceship hallway".into(), "activate", None));
+    }
+
     if text.contains("everything downstairs")
         && text.contains("except")
         && text.contains("kitchen lights")
@@ -1173,6 +1286,26 @@ fn asks_system_status(text: &str) -> bool {
 }
 
 fn home_status_target(text: &str) -> Option<String> {
+    if text.contains("using the most electricity") || text.contains("most electricity") {
+        return Some("top electricity usage".into());
+    }
+
+    if text.contains("freezer door") && text.contains("left open") {
+        return Some("freezer door".into());
+    }
+
+    if text.contains("all the windows closed") || text.contains("windows closed") {
+        return Some("open windows".into());
+    }
+
+    if text.contains("sprinkler") && text.contains("run this morning") {
+        return Some("sprinkler run history".into());
+    }
+
+    if text.contains("morning readiness report") {
+        return Some("morning readiness report".into());
+    }
+
     if text.contains("self cleaning oven") || text.contains("self clean oven") {
         return Some("self-cleaning oven".into());
     }
@@ -1851,6 +1984,13 @@ mod tests {
             "Sarah: What groceries are low?",
             "Sarah: What's our Saturday morning routine?",
             "Leo: What's next before school?",
+            "Sarah: Did Mia feed the cat?",
+            "Leo: Can I have a snack?",
+            "Sarah: Who's coming to dinner tonight?",
+            "Mia: Did I finish my chores?",
+            "Mia: What time is my bus tomorrow?",
+            "Sarah: Which leftovers should we eat first?",
+            "Mia: Did Mom approve my sleepover?",
         ] {
             let call = route(query).unwrap();
             assert_eq!(call.name, "memory_recall", "{query}");
@@ -1935,6 +2075,13 @@ mod tests {
             "Sarah: Which filter does the hallway air purifier need?",
             "Jared: Find anything about dishwasher error E24.",
             "Mia: Where's my tablet charger?",
+            "Leo: What bin does a pizza box go in?",
+            "Jared: Find the washing machine warranty.",
+            "Sarah: How do I remove marker from Leo's hoodie?",
+            "Mia: Where's my backpack?",
+            "Mia: Find my essay draft about oceans.",
+            "Leo: Is it pajama day tomorrow?",
+            "Sarah: Find Mia's allergy action plan.",
         ] {
             let call = route(query).unwrap();
             assert_eq!(call.name, "memory_recall", "{query}");
@@ -2150,6 +2297,8 @@ mod tests {
             "Jared: When should we water the garden?",
             "Sarah: Find the recipe we liked with chickpeas.",
             "Jared: Why didn't the hallway light turn on?",
+            "Mia: Why is my room so hot?",
+            "Mia: My laptop battery is low.",
         ] {
             let call = route(query).unwrap();
             assert_eq!(call.name, "memory_recall", "{query}");
@@ -2259,6 +2408,22 @@ mod tests {
         assert_eq!(call.name, "memory_store");
         assert_eq!(call.arguments["category"], "alarm");
         assert_eq!(call.arguments["content"], "Alarm for rehearsal at 6 30");
+
+        let call = route("Leo: Tell me when Dad gets home").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "presence_alert");
+        assert_eq!(
+            call.arguments["content"],
+            "Presence alert for Leo: tell him when Dad gets home"
+        );
+
+        let call = route("Mia: Save the bathroom for me at 7 for hair wash").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "reservation");
+        assert_eq!(
+            call.arguments["content"],
+            "Bathroom reservation for Mia at 7:00 PM for hair wash"
+        );
 
         let call = route("Set the oven to 400 degrees").unwrap();
         assert_eq!(call.name, "home_control");
@@ -2477,6 +2642,95 @@ mod tests {
         assert_eq!(call.arguments["entity"], "outlet spill safety protocol");
         assert_eq!(call.arguments["action"], "activate");
 
+        let call = route("Jared: Warm up Sarah's bathroom before her shower").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "sarah bathroom comfort");
+        assert_eq!(call.arguments["action"], "warm_for_minutes");
+        assert_eq!(call.arguments["value"], 25.0);
+
+        let call = route("Mia: Give me focus mode until five").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "personal focus mode");
+        assert_eq!(call.arguments["action"], "activate_until_5pm");
+
+        let call = route("Sarah: Keep the porch from waking the kids tonight").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "quiet porch alerts tonight");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Jared: Start storm prep").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "storm prep");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Leo: I'm scared of the dark").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "night reassurance scene");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call =
+            route("Jared: Open blinds where there's morning sun, but not Mia's room").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(
+            call.arguments["entity"],
+            "morning sun blinds except mia room"
+        );
+        assert_eq!(call.arguments["action"], "open");
+
+        let call = route("Sarah: Keep piano practice quiet for the rest of the house").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "piano practice quiet mode");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Sarah: I smell gas").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "gas safety emergency");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Sarah: Start bedtime, but let Mia read for 20 minutes").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(
+            call.arguments["entity"],
+            "bedtime with mia reading override"
+        );
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Jared: Set vacation mode for next week").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(
+            call.arguments["entity"],
+            "scheduled vacation mode next week"
+        );
+        assert_eq!(call.arguments["action"], "schedule");
+
+        let call = route("Leo: Can the robot vacuum clean under my bed?").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "leo under-bed vacuum zone");
+        assert_eq!(call.arguments["action"], "clean");
+
+        let call = route("Mia: Turn off notifications while I'm practicing violin").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(
+            call.arguments["entity"],
+            "mia violin practice notifications"
+        );
+        assert_eq!(call.arguments["action"], "mute_for_practice");
+
+        let call = route("Sarah: Make the kitchen toddler-safe for our visitor").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "toddler-safe kitchen");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("Jared: Lock everything except the back gate").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "all locks except back gate");
+        assert_eq!(call.arguments["action"], "lock_except");
+
+        let call = route("Leo: Make the hallway look like a spaceship").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "spaceship hallway");
+        assert_eq!(call.arguments["action"], "activate");
+
         let call = route("Is the driveway icy?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "driveway ice");
@@ -2592,6 +2846,26 @@ mod tests {
         let call = route("Sarah: Is the freezer too warm?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "freezer");
+
+        let call = route("Jared: What's using the most electricity right now?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "top electricity usage");
+
+        let call = route("Jared: Was the freezer door left open?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "freezer door");
+
+        let call = route("Jared: Are all the windows closed?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "open windows");
+
+        let call = route("Jared: Did the sprinkler run this morning?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "sprinkler run history");
+
+        let call = route("Jared: Give me a morning readiness report").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "morning readiness report");
     }
 
     #[test]

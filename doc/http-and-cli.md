@@ -138,6 +138,8 @@ food-safety, substitutions, DIY, wardrobe, service booking, gift history,
 game-night context, media preferences, hobby, podcast, language-learning,
 creative/story/literature/photo recall, hiking/camping/cocktail/date-night/taco-bar planning,
 contextual comfort, kid screen-time, checklists, package/garden/recipe/automation recall,
+pet-care, bus pickup, snack permission, dinner-attendee, chores, leftovers,
+sleepover approval, allergy-plan, stain-removal, school-note, charger/backpack/document,
 wellness/anxiety, weather-report, social-logistics, and location questions; health
 hydration/weight logs; app-only credential references for
 Wi-Fi/password/bank-login/code/account/subscription/confirmation/spare-key questions;
@@ -154,9 +156,11 @@ generation, tire pressure, mailbox, car lock state, pool cleaner, printer ink,
 baby-monitor state, speed-limit lookup, stove status, package status,
 garage-door status, connected-car warmup/navigation, vacation/fall/smoke/working-late
 protocols, movie-night/away/dinner-prep/study/cozy/reading/night-hallway scenes,
-network pause, outlet-spill safety, self-cleaning oven, oven, water-pressure,
-sump-pump, sous-vide, camera motion, unlocked doors, nursery
-air-quality, and freezer telemetry. Those physical results still
+focus/quiet-porch/storm-prep/bedtime-override/piano-quiet/toddler-safe/spaceship scenes,
+network pause, robot vacuum, notification mute, lock-except, outlet-spill/gas safety,
+self-cleaning oven, oven, water-pressure, sump-pump, sous-vide, camera motion,
+unlocked doors/windows, electricity/sprinkler/morning-readiness status, nursery
+air-quality, and freezer/freezer-door telemetry. Those physical results still
 depend on the configured home provider and actuation policy.
 
 ### `POST /api/chat/stream`
