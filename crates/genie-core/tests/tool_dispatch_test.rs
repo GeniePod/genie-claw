@@ -18,9 +18,14 @@ fn core_binary_builds() {
 
 /// genie-core release-binary size ceiling. Raised from the alpha-era
 /// 5.0 MB budget after legitimate growth from the runtime backend,
-/// voice, runtime mode, and concurrent server work. Keep it tight enough
-/// that another large dependency or module forces a deliberate decision.
-const RELEASE_BINARY_SIZE_BUDGET_MB: f64 = 6.0;
+/// voice, runtime mode, and concurrent server work. Raised again to 6.2 MB
+/// to account for the atomic write-then-swap rebuild logic and structured
+/// tracing::warn! error paths added for namespace data-loss prevention.
+/// Raised to 6.4 MB after removing panic=abort from skill-sdk to restore
+/// catch_unwind fault isolation (unwind tables re-included, ~30 KB growth).
+/// Keep it tight enough that another large dependency or module forces a
+/// deliberate decision.
+const RELEASE_BINARY_SIZE_BUDGET_MB: f64 = 6.4;
 
 /// Verify release binary stays within the release size budget.
 #[test]
