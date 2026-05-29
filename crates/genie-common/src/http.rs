@@ -115,6 +115,10 @@ pub enum HttpReadError {
     HeadersTooLarge,
     /// The declared `Content-Length` exceeded `max_body_bytes`.
     BodyTooLarge,
+    /// `Content-Length` was malformed, duplicated, or otherwise invalid.
+    InvalidContentLength,
+    /// Inbound request used unsupported `Transfer-Encoding`.
+    UnsupportedTransferEncoding,
     /// A low-level I/O error (including a truncated body).
     Io(std::io::Error),
 }
@@ -129,6 +133,9 @@ impl HttpReadError {
             | HttpReadError::TooManyHeaders
             | HttpReadError::HeadersTooLarge => Some(431),
             HttpReadError::BodyTooLarge => Some(413),
+            HttpReadError::InvalidContentLength | HttpReadError::UnsupportedTransferEncoding => {
+                Some(400)
+            }
             // A read timeout, a vanished peer, garbage, or a socket error: there
             // is no point (or it is unsafe against a stalled peer) writing a
             // status line, so close the connection instead.
@@ -151,6 +158,10 @@ impl std::fmt::Display for HttpReadError {
             HttpReadError::TooManyHeaders => write!(f, "too many headers"),
             HttpReadError::HeadersTooLarge => write!(f, "headers too large"),
             HttpReadError::BodyTooLarge => write!(f, "request body too large"),
+            HttpReadError::InvalidContentLength => write!(f, "invalid content-length"),
+            HttpReadError::UnsupportedTransferEncoding => {
+                write!(f, "unsupported transfer-encoding")
+            }
             HttpReadError::Io(e) => write!(f, "io error: {e}"),
         }
     }
@@ -200,6 +211,7 @@ where
     // Headers.
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut content_length: usize = 0;
+    let mut saw_content_length = false;
     let mut total_header_bytes: usize = 0;
     loop {
         if headers.len() >= limits.max_header_count {
@@ -228,7 +240,17 @@ where
             let name = name.trim().to_ascii_lowercase();
             let value = value.trim().to_string();
             if name == "content-length" {
-                content_length = value.parse().unwrap_or(0);
+                if saw_content_length {
+                    return Err(HttpReadError::InvalidContentLength);
+                }
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| HttpReadError::InvalidContentLength)?;
+                content_length = parsed;
+                saw_content_length = true;
+            } else if name == "transfer-encoding" && !value.is_empty() {
+                // Inbound chunked/TE requests are not supported by this reader.
+                return Err(HttpReadError::UnsupportedTransferEncoding);
             }
             headers.push((name, value));
         }
@@ -668,6 +690,33 @@ mod tests {
         let err = read_request(&mut reader, &limits).await.unwrap_err();
         assert!(matches!(err, HttpReadError::BodyTooLarge));
         assert_eq!(err.status_code(), Some(413));
+    }
+
+    #[tokio::test]
+    async fn invalid_content_length_is_rejected_with_400() {
+        let raw = "POST /api/chat HTTP/1.1\r\nContent-Length: abc\r\n\r\n";
+        let mut reader = reader_for(raw.as_bytes());
+        let err = read_request(&mut reader, &test_limits()).await.unwrap_err();
+        assert!(matches!(err, HttpReadError::InvalidContentLength));
+        assert_eq!(err.status_code(), Some(400));
+    }
+
+    #[tokio::test]
+    async fn duplicate_content_length_is_rejected_with_400() {
+        let raw = "POST /api/chat HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\nhello";
+        let mut reader = reader_for(raw.as_bytes());
+        let err = read_request(&mut reader, &test_limits()).await.unwrap_err();
+        assert!(matches!(err, HttpReadError::InvalidContentLength));
+        assert_eq!(err.status_code(), Some(400));
+    }
+
+    #[tokio::test]
+    async fn transfer_encoding_request_is_rejected_with_400() {
+        let raw = "POST /api/chat HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut reader = reader_for(raw.as_bytes());
+        let err = read_request(&mut reader, &test_limits()).await.unwrap_err();
+        assert!(matches!(err, HttpReadError::UnsupportedTransferEncoding));
+        assert_eq!(err.status_code(), Some(400));
     }
 
     #[tokio::test]

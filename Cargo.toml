@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-alpha.9"
+version = "1.0.0-alpha.10"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/GeniePod/genie-claw"
@@ -30,6 +30,7 @@ libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "0.26"
+zeroize = { version = "1", features = ["derive", "serde"] }
 
 # Workspace crate references
 genie-common = { path = "crates/genie-common" }
@@ -39,4 +40,7 @@ opt-level = "z"     # Optimize for binary size
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# panic = "abort" was intentionally removed: skill cdylibs rely on catch_unwind
+# for fault isolation, and abort strategy silently voids that barrier at runtime.
+# Cargo does not allow panic to be overridden per-package, so the workspace must
+# use "unwind" (the Rust default) to keep skill fault containment functional.

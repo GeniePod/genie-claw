@@ -1,0 +1,21 @@
+{"id":"home-light-kitchen-on","category":"home_control","prompt":"Sarah: Turn on the kitchen lights.","expected_tool_calls":[{"tool":"home_control","arguments":{"entity":"kitchen lights","action":"turn_on"}}]}
+{"id":"timer-cookies","category":"timer","prompt":"Leo: Set a cookie timer for 12 minutes.","expected_tool_calls":[{"tool":"set_timer","arguments":{"seconds":720,"label":"cookies"}}]}
+{"id":"time-current","category":"time","prompt":"Mia: What time is it?","expected_tool_calls":[{"tool":"get_time","arguments":{}}]}
+{"id":"memory-grandma-wifi","category":"memory","prompt":"Sarah: Find Grandma's Wi-Fi note.","expected_tool_calls":[{"tool":"memory_recall","arguments":{"query":"Grandma Wi-Fi note","limit":3}}]}
+{"id":"weather-school-pickup","category":"weather","prompt":"Jared: Is it raining for school pickup?","expected_tool_calls":[{"tool":"get_weather","arguments":{"location":"home"}}],"allow_extra_arguments":true}
+{"id":"no-tool-reassurance","category":"no_tool","prompt":"Leo: Thanks, GenieClaw.","expected_tool_calls":[]}
+{"id":"openai-wrapper-office-standby","category":"home_control","prompt":"Jared: Turn off standby power in the office.","expected_tool_calls":[{"tool":"home_control","arguments":{"entity":"office standby power","action":"turn_off"}}]}
+{"id":"home-status-freezer","category":"home_status","prompt":"Sarah: Is the garage freezer too warm?","expected_tool_calls":[{"tool":"home_status","arguments":{"entity":"garage freezer"}}]}
+{"id":"home-undo-last-action","category":"home_undo","prompt":"Jared: Undo that last light change.","expected_tool_calls":[{"tool":"home_undo","arguments":{}}]}
+{"id":"action-history-away-delta","category":"action_history","prompt":"Jared: What changed since we left?","expected_tool_calls":[{"tool":"action_history","arguments":{}}]}
+{"id":"calculate-oven-conversion","category":"calculate","prompt":"Sarah: Convert 350 degrees Fahrenheit to Celsius.","expected_tool_calls":[{"tool":"calculate","arguments":{"expression":"(350 - 32) * 5 / 9"}}]}
+{"id":"system-info-jetson-memory","category":"system_info","prompt":"Jared: How is the Jetson memory pressure?","expected_tool_calls":[{"tool":"system_info","arguments":{}}]}
+{"id":"memory-store-night-light","category":"memory","prompt":"Leo: Remember that I like the green night-light better.","expected_tool_calls":[{"tool":"memory_store","arguments":{"content":"Leo likes the green night-light better.","category":"preference"}}]}
+{"id":"memory-forget-old-combo","category":"memory","prompt":"Mia: Forget my old locker combination.","expected_tool_calls":[{"tool":"memory_forget","arguments":{"query":"old locker combination"}}]}
+{"id":"play-media-study","category":"media","prompt":"Mia: Play my study playlist.","expected_tool_calls":[{"tool":"play_media","arguments":{"query":"Mia study playlist"}}]}
+{"id":"web-search-stock","category":"web_search","prompt":"Jared: What is the current stock price of Apple?","expected_tool_calls":[{"tool":"web_search","arguments":{"query":"AAPL stock price","limit":3,"fresh":true}}]}
+{"id":"home-thermostat-set","category":"home_control","prompt":"Sarah: Set the living room thermostat to 72.","expected_tool_calls":[{"tool":"home_control","arguments":{"entity":"living room thermostat","action":"set_temperature","value":72}}]}
+{"id":"home-status-back-burner","category":"home_status","prompt":"Sarah: Is the back burner off?","expected_tool_calls":[{"tool":"home_status","arguments":{"entity":"back burner"}}]}
+{"id":"multi-homework-timer","category":"multi_tool","prompt":"Sarah: Start homework mode and set a 45 minute focus timer.","expected_tool_calls":[{"tool":"home_control","arguments":{"entity":"homework mode","action":"activate"}},{"tool":"set_timer","arguments":{"seconds":2700,"label":"homework focus"}}]}
+{"id":"function-call-memory-status","category":"memory","prompt":"Jared: Check memory health.","expected_tool_calls":[{"tool":"memory_status","arguments":{}}]}
+{"id":"single-key-calculate","category":"calculate","prompt":"Leo: What is two plus two?","expected_tool_calls":[{"tool":"calculate","arguments":{"expression":"2 + 2"}}]}

@@ -5,6 +5,8 @@
 
 use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use genie_common::config::SkillPolicyConfig;
@@ -71,15 +73,21 @@ pub struct SkillLoadPolicy {
     /// Directory of trusted Ed25519 public keys used to verify skill
     /// signatures. Lives outside the (attacker-writable) skills directory.
     pub signature_key_dir: PathBuf,
+    /// Deadline for a single skill invocation, in milliseconds. Enforced by
+    /// [`LoadedSkill::execute_parsed`] / [`SkillInvocation::run`] so a hung
+    /// native call never starves the async executor.
+    pub skill_execution_timeout_ms: u64,
 }
 
 impl Default for SkillLoadPolicy {
     fn default() -> Self {
+        let defaults = SkillPolicyConfig::default();
         Self {
             require_manifest: false,
             require_signature: false,
             denied_permissions: Vec::new(),
-            signature_key_dir: SkillPolicyConfig::default().signature_key_dir,
+            signature_key_dir: defaults.signature_key_dir,
+            skill_execution_timeout_ms: defaults.skill_execution_timeout_ms,
         }
     }
 }
@@ -91,6 +99,7 @@ impl From<&SkillPolicyConfig> for SkillLoadPolicy {
             require_signature: config.require_signature,
             denied_permissions: config.denied_permissions.clone(),
             signature_key_dir: config.signature_key_dir.clone(),
+            skill_execution_timeout_ms: config.skill_execution_timeout_ms,
         }
     }
 }
@@ -197,70 +206,168 @@ pub struct LoadedSkill {
     pub manifest: SkillManifestAudit,
     /// Number of faults (panics/errors). Auto-unloaded after 3.
     pub fault_count: u32,
-    /// The vtable pointer (valid for lifetime of `_lib`).
+    /// Per-invocation execution deadline, derived from the load policy.
+    execution_timeout: Duration,
+    /// The vtable pointer (valid for lifetime of `lib`).
     vtable: *const SkillVTable,
-    /// Library handle — must stay alive as long as vtable is used.
-    _lib: Library,
+    /// Library handle — must stay alive as long as the vtable (and any function
+    /// pointer copied out of it) is used. An `Arc` so an in-flight blocking
+    /// call can keep the `.so` mapped even if the skill is unloaded meanwhile.
+    lib: Arc<Library>,
 }
 
-// Safety: LoadedSkill is only accessed from the single-threaded tokio runtime.
-// The Library and vtable pointer are valid for the lifetime of the LoadedSkill.
+// Safety: the `vtable` raw pointer makes LoadedSkill `!Send`/`!Sync` by default.
+// The pointer and the `Arc<Library>` are valid for the lifetime of the struct,
+// and skill invocations only copy out the C function pointers (themselves
+// `Send`) plus an `Arc<Library>` clone before crossing a thread boundary — see
+// `SkillInvocation`. The struct itself is only mutated from the single-threaded
+// runtime while held behind the dispatcher's mutex.
 unsafe impl Send for LoadedSkill {}
 unsafe impl Sync for LoadedSkill {}
 
-impl LoadedSkill {
-    /// Execute the skill with JSON arguments.
+/// C ABI entry points for one skill, copied out of the vtable. Bare function
+/// pointers are `Send`, so unlike the raw `*const SkillVTable` they can safely
+/// cross to a blocking-pool thread.
+type SkillExecuteFn = extern "C" fn(args_json: *const c_char) -> *mut c_char;
+type SkillDestroyFn = extern "C" fn(ptr: *mut c_char);
+
+/// A self-contained, `Send` handle that runs a single skill invocation off the
+/// async executor.
+///
+/// It carries an `Arc<Library>` clone so the native code stays mapped for the
+/// whole (possibly blocking) call — even if the originating [`LoadedSkill`] is
+/// unloaded from the [`SkillLoader`] while the blocking thread is still running.
+pub struct SkillInvocation {
+    name: String,
+    execute_fn: SkillExecuteFn,
+    destroy_fn: SkillDestroyFn,
+    args: CString,
+    timeout: Duration,
+    // Keeps the `.so` mapped for the duration of the call. Never dereferenced.
+    _lib: Arc<Library>,
+}
+
+/// Outcome of a skill invocation: the parsed success/output pair plus whether
+/// the call should count against the skill's fault budget.
+pub struct SkillOutcome {
+    pub success: bool,
+    pub output: String,
+    pub faulted: bool,
+}
+
+impl SkillInvocation {
+    /// Run the C ABI skill call on a blocking thread, bounded by `timeout`.
     ///
-    /// Wraps the C ABI call and handles string lifecycle.
-    /// Returns the result as a Rust String.
-    pub fn execute(&mut self, args_json: &str) -> Result<String> {
-        let vtable = unsafe { &*self.vtable };
+    /// The blocking offload keeps the single-threaded tokio runtime free to
+    /// poll `/api/health`, the voice pipeline, Telegram, and every other
+    /// `spawn_local` task while the skill runs. On timeout we stop awaiting and
+    /// return a fault to the caller; the abandoned blocking thread cannot be
+    /// force-cancelled (it owns a raw C call), but it no longer blocks the
+    /// executor and the auto-unload-after-3-faults policy reaps a skill that
+    /// keeps timing out.
+    pub async fn run(self) -> SkillOutcome {
+        let SkillInvocation {
+            name,
+            execute_fn,
+            destroy_fn,
+            args,
+            timeout,
+            _lib,
+        } = self;
 
-        let c_args = CString::new(args_json).unwrap_or_default();
-        let result_ptr = (vtable.execute)(c_args.as_ptr());
+        let join = tokio::task::spawn_blocking(move || {
+            // Hold the library mapped for the entire call.
+            let _lib = _lib;
+            let result_ptr = execute_fn(args.as_ptr());
+            if result_ptr.is_null() {
+                return None;
+            }
+            let result = unsafe { CStr::from_ptr(result_ptr) }
+                .to_string_lossy()
+                .to_string();
+            // Free the C string via the skill's destroy function.
+            destroy_fn(result_ptr);
+            Some(result)
+        });
 
-        if result_ptr.is_null() {
-            self.fault_count += 1;
-            anyhow::bail!("skill '{}' returned null", self.name);
+        match tokio::time::timeout(timeout, join).await {
+            Ok(Ok(Some(json))) => Self::parse(json),
+            Ok(Ok(None)) => SkillOutcome {
+                success: false,
+                output: format!("skill '{name}' returned null"),
+                faulted: true,
+            },
+            Ok(Err(join_err)) => SkillOutcome {
+                success: false,
+                output: format!("skill '{name}' panicked: {join_err}"),
+                faulted: true,
+            },
+            Err(_elapsed) => SkillOutcome {
+                success: false,
+                output: format!(
+                    "skill '{name}' exceeded execution timeout of {} ms",
+                    timeout.as_millis()
+                ),
+                faulted: true,
+            },
         }
-
-        let result_str = unsafe { CStr::from_ptr(result_ptr) }
-            .to_string_lossy()
-            .to_string();
-
-        // Free the C string via the skill's destroy function.
-        (vtable.destroy)(result_ptr);
-
-        Ok(result_str)
     }
 
-    /// Execute and parse the JSON result into success/output.
-    pub fn execute_parsed(&mut self, args_json: &str) -> (bool, String) {
-        match self.execute(args_json) {
-            Ok(json) => {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
-                    let success = parsed
-                        .get("success")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let output = parsed
-                        .get("output")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&json)
-                        .to_string();
-                    if !success {
-                        self.fault_count += 1;
-                    }
-                    (success, output)
-                } else {
-                    (true, json)
+    fn parse(json: String) -> SkillOutcome {
+        match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(parsed) => {
+                let success = parsed
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let output = parsed
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&json)
+                    .to_string();
+                SkillOutcome {
+                    success,
+                    output,
+                    faulted: !success,
                 }
             }
-            Err(e) => {
-                self.fault_count += 1;
-                (false, e.to_string())
-            }
+            // Non-JSON output is treated as opaque success, matching prior behavior.
+            Err(_) => SkillOutcome {
+                success: true,
+                output: json,
+                faulted: false,
+            },
         }
+    }
+}
+
+impl LoadedSkill {
+    /// Build a `Send` invocation handle for this skill. Synchronous and cheap:
+    /// callers can hold the skill-loader lock across this, then drop it before
+    /// `await`-ing [`SkillInvocation::run`] so the lock is never held across the
+    /// blocking call.
+    pub fn prepare(&self, args_json: &str) -> SkillInvocation {
+        let vtable = unsafe { &*self.vtable };
+        SkillInvocation {
+            name: self.name.clone(),
+            execute_fn: vtable.execute,
+            destroy_fn: vtable.destroy,
+            args: CString::new(args_json).unwrap_or_default(),
+            timeout: self.execution_timeout,
+            _lib: Arc::clone(&self.lib),
+        }
+    }
+
+    /// Execute the skill and parse the JSON result into success/output.
+    ///
+    /// The C ABI call runs on a blocking thread under the configured deadline
+    /// (see [`SkillInvocation::run`]), so it never freezes the async executor.
+    pub async fn execute_parsed(&mut self, args_json: &str) -> (bool, String) {
+        let outcome = self.prepare(args_json).run().await;
+        if outcome.faulted {
+            self.fault_count += 1;
+        }
+        (outcome.success, outcome.output)
     }
 
     /// Check if the skill should be auto-unloaded due to repeated faults.
@@ -549,8 +656,9 @@ impl SkillLoader {
             path: path.to_path_buf(),
             manifest,
             fault_count: 0,
+            execution_timeout: Duration::from_millis(self.policy.skill_execution_timeout_ms),
             vtable: vtable_ptr,
-            _lib: lib,
+            lib: Arc::new(lib),
         };
 
         self.loaded.push(skill);
@@ -621,6 +729,28 @@ mod tests {
         manifest.parent().unwrap().parent().unwrap().to_path_buf()
     }
 
+    /// A skill `execute` that blocks well past any reasonable test deadline,
+    /// standing in for a hung native skill.
+    extern "C" fn slow_execute(_args: *const c_char) -> *mut c_char {
+        std::thread::sleep(Duration::from_millis(200));
+        CString::new(r#"{"success":true,"output":"late"}"#)
+            .unwrap()
+            .into_raw()
+    }
+
+    extern "C" fn noop_destroy(ptr: *mut c_char) {
+        if !ptr.is_null() {
+            unsafe { drop(CString::from_raw(ptr)) };
+        }
+    }
+
+    /// Load the sample skill purely to obtain a valid `Library` to keep an
+    /// invocation's `_lib` Arc populated in tests that drive synthetic
+    /// function pointers.
+    fn load_self_as_library() -> Library {
+        unsafe { Library::new(sample_skill_path()) }.expect("load sample skill as library")
+    }
+
     fn sample_skill_path() -> &'static Path {
         static SAMPLE_SKILL_PATH: OnceLock<PathBuf> = OnceLock::new();
         SAMPLE_SKILL_PATH.get_or_init(|| {
@@ -685,8 +815,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn loader_loads_and_executes_real_skill() {
+    #[tokio::test]
+    async fn loader_loads_and_executes_real_skill() {
         let skill_path = sample_skill_path();
         let dir = std::env::temp_dir().join("geniepod-skills-test-real");
         let _ = std::fs::remove_dir_all(&dir);
@@ -702,10 +832,65 @@ mod tests {
 
         let skill = loader.get_mut("hello_world").unwrap();
         assert_eq!(skill.manifest.status, "missing");
-        let (success, output) = skill.execute_parsed(r#"{"name":"Jared"}"#);
+        let (success, output) = skill.execute_parsed(r#"{"name":"Jared"}"#).await;
         assert!(success);
         assert!(output.contains("Jared"));
         assert!(output.contains("loadable skill module"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A skill that runs longer than the configured deadline is reported as a
+    /// fault rather than freezing the caller. We drive this through a real
+    /// invocation whose C call sleeps past a deliberately tiny timeout.
+    #[tokio::test]
+    async fn execution_times_out_and_counts_as_fault() {
+        let invocation = SkillInvocation {
+            name: "slow".into(),
+            execute_fn: slow_execute,
+            destroy_fn: noop_destroy,
+            args: CString::new("{}").unwrap(),
+            timeout: Duration::from_millis(20),
+            _lib: Arc::new(load_self_as_library()),
+        };
+
+        let outcome = invocation.run().await;
+        assert!(!outcome.success);
+        assert!(outcome.faulted);
+        assert!(
+            outcome.output.contains("execution timeout"),
+            "unexpected output: {}",
+            outcome.output
+        );
+    }
+
+    /// The timeout deadline is sourced from the load policy and stamped onto
+    /// each loaded skill, so an operator's `skill_execution_timeout_ms` actually
+    /// reaches the invocation path.
+    #[test]
+    fn policy_timeout_is_applied_to_loaded_skill() {
+        let skill_path = sample_skill_path();
+        let dir = std::env::temp_dir().join(format!(
+            "geniepod-skills-test-timeout-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let installed_path = dir.join("hello.so");
+        std::fs::copy(skill_path, &installed_path).unwrap();
+
+        let mut loader = SkillLoader::new_with_policy(
+            &dir,
+            SkillLoadPolicy {
+                skill_execution_timeout_ms: 1234,
+                ..SkillLoadPolicy::default()
+            },
+        );
+        loader.load_skill(&installed_path).unwrap();
+        let skill = loader.loaded().first().unwrap();
+        assert_eq!(skill.execution_timeout, Duration::from_millis(1234));
+        assert_eq!(skill.prepare("{}").timeout, Duration::from_millis(1234));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

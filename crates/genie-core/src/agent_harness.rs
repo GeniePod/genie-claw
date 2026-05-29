@@ -138,7 +138,7 @@ mod tests {
         ];
 
         let report = validate_limited_context_agent(
-            "You are GeniePod Home. Use tools only when needed.",
+            "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB. Use tools only when needed.",
             &tools,
             "Household context: kitchen light is in the kitchen.",
             &agent,
@@ -157,7 +157,7 @@ mod tests {
         let memory_context = "remembered household detail. ".repeat(500);
 
         let report = validate_limited_context_agent(
-            "You are GeniePod Home.",
+            "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB.",
             &[sample_tool("memory_recall")],
             &memory_context,
             &agent,
@@ -188,7 +188,7 @@ mod tests {
         };
 
         let report = validate_limited_context_agent(
-            "You are GeniePod Home.",
+            "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB.",
             &[sample_tool("get_time")],
             "",
             &agent,

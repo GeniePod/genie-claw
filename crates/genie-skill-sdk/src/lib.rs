@@ -104,6 +104,19 @@ macro_rules! skill {
             $body
         }
 
+        // Abort panic strategy silently voids catch_unwind — skill panics would
+        // kill the daemon instead of being isolated. Enforce unwind at build time.
+        // Note: Cargo does not allow `panic` in per-package profile overrides, so
+        // the only fix is to remove `panic = "abort"` from [profile.release] in
+        // the workspace Cargo.toml.
+        #[cfg(panic = "abort")]
+        compile_error!(
+            "skill! requires `panic = \"unwind\"` — catch_unwind is inert under \
+             the abort panic strategy, so skill panics will crash genie-core. \
+             Remove `panic = \"abort\"` from [profile.release] in the workspace Cargo.toml \
+             (Cargo does not support per-package panic overrides)."
+        );
+
         // C ABI wrapper for execute.
         extern "C" fn __c_execute(args_json: *const std::ffi::c_char) -> *mut std::ffi::c_char {
             let json_str = if args_json.is_null() {
