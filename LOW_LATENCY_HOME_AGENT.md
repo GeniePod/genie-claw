@@ -9,7 +9,7 @@ prompts to a bigger remote model.
 
 ## Product Target
 
-The flagship target is GeniePod Home on Jetson-class hardware.
+The flagship target is NVIDIA Jetson Orin 8GB hardware.
 
 Raspberry Pi and generic portable SBC profiles are maintained as smaller
 deployment and validation targets. They do not need to expose every

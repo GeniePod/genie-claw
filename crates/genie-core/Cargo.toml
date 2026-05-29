@@ -3,7 +3,7 @@ name = "genie-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Local home AI runtime for GeniePod Home — prompt engine, tools, memory, voice loop, and local APIs."
+description = "Local home AI runtime native to NVIDIA Jetson Orin 8GB — prompt engine, tools, memory, voice loop, and local APIs."
 
 [lib]
 name = "genie_core"
@@ -54,6 +54,7 @@ base64 = "0.22"
 # CSPRNG for actuation confirmation tokens (see crates/genie-core/src/tools/actuation.rs).
 # Already in the resolved graph via rustls/quinn, so this adds no new third-party crate.
 getrandom = "0.3"
+zeroize = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }

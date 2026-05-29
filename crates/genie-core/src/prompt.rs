@@ -125,7 +125,7 @@ impl PromptBuilder {
         };
 
         format!(
-            r#"You are GeniePod Home, a local home AI for a shared living space.
+            r#"You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB for a shared living space.
 {role_summary}
 Your tone should be calm, concise, and natural for spoken replies.
 
@@ -215,7 +215,7 @@ You: {"tool": "action_history", "arguments": {}}
         };
 
         format!(
-            r#"You are GeniePod Home, a local home AI for a shared household.
+            r#"You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB for a shared household.
 Keep your tone concise and natural for voice.
 
 IMPORTANT: When the user asks you to do something, check if a tool can help.

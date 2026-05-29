@@ -62,6 +62,8 @@ memory as product data with visibility rules:
 - password/code memories may be represented as app-only references, but the
   shared-room assistant should point users to the local dashboard or credential
   store instead of speaking values
+- account numbers and travel confirmation numbers are also app-only references;
+  they are not indexed as speakable household notes
 
 Speaker recognition improves routing; it is not a hard security boundary unless
 the deployment explicitly adds biometric enrollment, local profile storage,
@@ -79,20 +81,71 @@ GenieClaw keeps these decisions separate:
   local household-profile index for exact role questions such as "who is the
   dad?", and safe device-alias memories feed exact Home Assistant target
   resolution before fuzzy matching; safe profile attributes and household rules
-  answer low-latency questions about age, allergies, homework, and screen-time
-  constraints before FTS fallback; safe household notes, reminders, manuals,
-  and watch notes are indexed in a typed local FTS table for direct note recall
+  answer low-latency questions about age, shoe sizes, allergies, homework, and
+  screen-time constraints before FTS fallback; safe calendar, access,
+  chore/task-log, schedule/channel-guide/subscription/TV/community-meeting,
+  appliance-state, environment,
+  location/presence, access, waste-collection, finance/market/payment-event,
+  fitness/health-reading, security-event, pet-care, school-transport, device-audit,
+  device-health, laundry, and pantry inventory memories answer local exact-match
+  questions before fuzzy fallback;
+  safe household notes, reminders, manuals, warranties, receipts, utility notes,
+  first-aid notes, education notes, dictionary notes, story/media notes,
+  inventory notes, storage notes, meal history, commute notes, pantry notes,
+  travel notes, contact/contractor notes, delivery notes, location notes,
+  shopping notes, tool notes, DIY notes, fitness notes, food-safety notes,
+  safety-equipment notes, school documents, recipe notes, gift history, tax and
+  vehicle documents, cooking references, TV manuals, network-device notes,
+  hobby, podcast, language-learning, creative/story/literature/photo recall,
+  wardrobe/DIY/service, hiking/camping/cocktail/date-night/taco-bar planning,
+  school checklists, appliance filters/manuals, contextual comfort, garden
+  watering, recipe feedback, routine steps, automation troubleshooting,
+  sleep/night-safety, porch quieting, stain/laundry guides, leftovers,
+  backpack/key/package/document locations, allergy action plans, school-task
+  state, project/electrical-panel notes, trash-day prep, pest-history,
+  homework-connectivity, plant-care, alarm-failure, side-gate-away, guest-device,
+  end-of-day summaries, school/project forms, debate/poem/project documents,
+  filter changes, camera/privacy reports, guest-network device reports,
+  garage-change reports, air-quality causes, appliance-noise causes, and final
+  safety sweeps, guest/babysitter notes, outlet/gas/water-leak/glass-break
+  safety, wellness/anxiety, weather-report, and social-logistics context, and
+  protected account, lock-code, or key-location references are indexed in
+  typed local tables for direct note recall or app-only disclosure
 - classification layer: each memory is scoped and tagged by sensitivity before
   it is injected, spoken, or shown; policy decisions expose a stable disclosure
   class such as household, person, sensitive, private, or restricted
 - policy layer: the current origin, room context, speaker confidence, and
   memory metadata decide whether disclosure is allowed, confirm-required,
   app-only, or denied
-- action layer: device control, media, purchases, security, network, and other
-  side effects pass through tool policy and actuation safety even if memory
-  retrieval found the right target; tool results and audit events carry an
-  action class such as `read_only`, `memory_write`, `home_actuation`,
-  `network`, `media`, `timer`, or `diagnostic`
+- action layer: device control, media, purchases, security, network, phone
+  finder, sprinklers, locks/gates, freezer telemetry, and other side effects
+  pass through tool policy and actuation safety even if memory retrieval found
+  the right target; work-from-home/all-off scenes, fireplace/ventilation,
+  tire-pressure, mailbox, robot-mower, pool-cleaner, upstairs-light,
+  smoke-detector, TV/alarm, nap-mode, baby-monitor, printer-ink, speed-limit,
+  connected-car warmup/navigation, vacation-mode, fall-alert, smoke-ventilation,
+  working-late, movie-night/away/dinner-prep/study/focus/cozy/reading/night-hallway
+  scenes, network-pause, bedtime reading overrides, quiet porch/piano modes,
+  toddler-safe kitchen, robot vacuum, lock-except rules, homework mode, rainy pickup,
+  sleepover guest mode, babysitter mode, work-call quiet, pollen/allergy-day modes,
+  after-dinner cleanup, board-game, quiet-drawing, school-night reset, guest-breakfast,
+  low-power, workshop-dust, video-call and reading-with-parent scenes,
+  driveway-arrival lighting, dishwasher deferred start, guest-info display,
+  sunlight/rainy-day alarm scheduling, contractor/temporary-family garage or lock
+  access, YouTube task blocking, family-dinner screen pauses, quiet security,
+  shower comfort, star projector, mirror-light, stairwell, grilling-light and
+  sleepover-light scenes, cookie-done/cookie-cooling alerts, garage paint ventilation,
+  freezer-threshold and laundry-leak automations, hallway-camera privacy, outlet-spill,
+  toaster-smoke, dripping/water-leak, glass-break, and gas safety,
+  self-cleaning-oven, water-pressure, sump-pump, sous-vide, camera-motion,
+  unlocked-door/window, electricity, draft/offline-device, sprinkler-history,
+  fridge-door, plant, sensor-battery, bathroom-availability, privacy, safety-sweep,
+  end-of-day, and morning-readiness,
+  nursery-air-quality, iron, water-heater, garage-door, and
+  locked-out flows still resolve through this action layer;
+  tool results and audit events carry an action class such as
+  `read_only`, `memory_write`, `home_actuation`, `network`, `media`, `timer`,
+  or `diagnostic`
 - audit layer: tool execution records the tool name, origin, success state, and
   argument keys without logging secret values
 
@@ -119,9 +172,17 @@ treated as ordinary recall.
 - Use separate hosts or OS users for people who should not share authority.
 - Keep fuzzy household recall local-first: embedded-memory rows are metadata in
   the local SQLite store, not a remote vector service dependency.
-- Store playlists as provider targets instead of secrets. Credential and access
-  code memories should remain app-only references and are not spoken in
-  shared-room chat.
+- Keep household indexes typed and inspectable. Calendar events, shopping-list
+  items, access permissions, chore/task logs, household schedules, event logs,
+  finance/allowance/payment logs, device aliases, and media targets are local
+  SQLite rows derived from safe memory records, not remote profile data.
+- Store playlists and media preferences as provider targets instead of secrets.
+  Credential, bank-login, subscription, account, and access-code memories should
+  remain app-only references and are not spoken in shared-room chat.
+- Do not store router, Wi-Fi, access-code, lock-combination, account-number,
+  confirmation-number, spare-key, or sensitive document-location values as
+  speakable notes. They are either rejected by memory-write policy or reduced
+  to app-only references for local-dashboard viewing.
 
 ## Runtime Contract
 
