@@ -142,6 +142,8 @@ boundary owned below GenieClaw.
 
 ## Memory System
 
+Deep dive: [memory-system.md](memory-system.md).
+
 Source:
 
 - `crates/genie-core/src/memory/mod.rs`

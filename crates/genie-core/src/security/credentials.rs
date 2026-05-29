@@ -17,6 +17,7 @@
 ///
 /// RAM cost: ~0 (a few strings in memory, wiped on drop)
 use std::collections::HashMap;
+use zeroize::Zeroizing;
 
 /// Opaque credential handle — tools use this, never the raw secret.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -59,28 +60,18 @@ pub enum InjectionMethod {
 
 /// A string that wipes itself from memory on drop.
 struct SecureString {
-    inner: String,
+    inner: Zeroizing<String>,
 }
 
 impl SecureString {
     fn new(s: &str) -> Self {
         Self {
-            inner: s.to_string(),
+            inner: Zeroizing::new(s.to_string()),
         }
     }
 
     fn as_str(&self) -> &str {
         &self.inner
-    }
-}
-
-impl Drop for SecureString {
-    fn drop(&mut self) {
-        // Overwrite memory before deallocation.
-        let bytes = unsafe { self.inner.as_bytes_mut() };
-        for byte in bytes.iter_mut() {
-            *byte = 0;
-        }
     }
 }
 

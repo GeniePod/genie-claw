@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Nothing yet.
+
+## 1.0.0-alpha.10 - 2026-05-29
+
+Alpha 10 is the **Jetson-context harness + BFCL measurement** release. It
+keeps GenieClaw focused on the 4096-token NVIDIA Jetson Orin 8GB contract,
+records the current Home Assistant Intents BFCL quick-router baseline, and
+continues hardening local memory, tool routing, HTTP safety, and voice-facing
+runtime behavior.
+
+Current measured BFCL baseline for the Home Assistant Intents English import:
+208 cases, 208 generated quick-router predictions, 0 missing predictions, and
+5.77% strict tool-call accuracy. This is intentionally tracked as a baseline,
+not as a product-quality target; the next accuracy work is deterministic
+intent routing, entity/slot normalization, and typed-tool argument accuracy
+for high-signal home commands.
+
 - **CORS lockdown + local API token** (#228): the hand-rolled HTTP servers in
   both `genie-core` (`:3000`) and `genie-api` (`:3080`) previously answered
   every request with a wildcard `Access-Control-Allow-Origin: *` and did no

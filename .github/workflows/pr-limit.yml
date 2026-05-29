@@ -1,0 +1,69 @@
+# Per-author open PR limit.
+#
+# This workflow intentionally uses `pull_request_target` and does not check out
+# PR code. It only reads GitHub PR metadata, posts a comment, and closes the PR
+# when one author has more than the configured number of open PRs in this repo.
+name: PR Limit
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  enforce-open-pr-limit:
+    name: Enforce per-author open PR limit
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      MAX_OPEN_PRS: "3"
+    steps:
+      - name: Close PR when author has too many open PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HTML_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+
+          open_numbers="$(
+              gh pr list \
+                  --repo "${REPO}" \
+                  --state open \
+                  --author "${AUTHOR}" \
+                  --json number \
+                  --jq '.[].number' \
+              | sort -n
+          )"
+
+          open_count="$(printf '%s\n' "${open_numbers}" | grep -Ec '^[0-9]+$' || true)"
+
+          echo "author=${AUTHOR}"
+          echo "open_pr_count=${open_count}"
+          echo "max_open_prs=${MAX_OPEN_PRS}"
+
+          if [ "${open_count}" -le "${MAX_OPEN_PRS}" ]; then
+              echo "OK: @${AUTHOR} has ${open_count} open PR(s), within the limit."
+              exit 0
+          fi
+
+          body="$(printf '%s\n\n%s\n\n%s\n' \
+              "Closing this PR automatically because @${AUTHOR} currently has ${open_count} open PRs in this repository." \
+              "The current limit is ${MAX_OPEN_PRS} open PRs per contributor. Please keep only the highest-signal PRs open, finish or close existing work, then reopen this PR if it is still needed." \
+              "Current PR: ${PR_HTML_URL}")"
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -f body="${body}" >/dev/null
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+              -X PATCH \
+              -f state=closed >/dev/null
+
+          echo "::error::Closed PR #${PR_NUMBER}: @${AUTHOR} has ${open_count} open PRs, exceeding limit ${MAX_OPEN_PRS}."
+          exit 1

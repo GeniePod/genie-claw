@@ -40,16 +40,10 @@ body:
       label: Which milestone is this aimed at?
       description: See the [Roadmap](../blob/main/README.md#roadmap).
       options:
-        - M1 — Stable Voice Loop on genie-ai-runtime v1
-        - M2 — Native Telegram, Stable Memory, Clarified Agent Harness
-        - M3 — Smart Home Native (HA + genie-home-runtime + first skill + security)
-        - M4 — Community Buildout (Discord / X / Reddit / GitHub)
-        - M5 — Hardware / OS / Mobile App bring-up
-        - M6 — Ship V1 + genie-hub + premium audio
-        - M7 — Model optimization + public dataset + home LoRA
-        - M8 — Satellite devices (sleep tracker + satellite speaker)
-        - M9 — Product line (Home / Pro / Max)
-        - Post-M9 / unscheduled
+        - M1 — Jetson 4096-token BFCL agent harness
+        - M2 — Portable providers and channel boundaries
+        - M3 — Home runtime boundary and skill safety
+        - Post-M3 / unscheduled
         - Not sure
     validations:
       required: true

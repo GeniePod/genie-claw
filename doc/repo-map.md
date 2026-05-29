@@ -14,6 +14,7 @@
 | Local-only `ROADMAP.md` | Private product roadmap, ignored by git when present |
 | `doc/` | Current documentation entry point |
 | `doc/implementation-status.md` | Source of truth for implemented, partial, external, and planned work |
+| `doc/memory-system.md` | Implemented memory storage, recall, policy, and extension design |
 | `crates/` | Workspace crates |
 | `deploy/` | Configs, scripts, systemd units, Docker assets |
 | `skills/` | Native skill examples and guide |
@@ -86,6 +87,14 @@ should point at the external home boundary later.
 - `tools/calc.rs`
 - `tools/weather.rs`
 - `tools/web_search.rs`
+
+### Evaluation
+
+- `eval/mod.rs`
+- `eval/bfcl.rs`
+- `tests/bfcl/*`
+
+Side-effect-free tool-call scoring for BFCL-style JSONL fixtures.
 
 ### Memory
 
@@ -187,6 +196,7 @@ from the runtime skills directory used by `genie-core`.
 | --- | --- |
 | Chat/API behavior | `crates/genie-core/src/server.rs` |
 | Prompt/tool selection | `crates/genie-core/src/prompt.rs` and `tools/dispatch.rs` |
+| BFCL tool-call scoring | `crates/genie-core/src/eval/bfcl.rs` and `tests/bfcl/` |
 | Memory bugs | `crates/genie-core/src/memory/mod.rs` |
 | Voice bugs | `crates/genie-core/src/voice_loop.rs` and `voice/` |
 | Home Assistant behavior | `crates/genie-core/src/ha/provider.rs` |

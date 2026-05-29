@@ -30,6 +30,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -215,6 +221,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -253,6 +268,12 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
@@ -308,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "genie-api"
-version = "1.0.0-alpha.9"
+version = "1.0.0-alpha.10"
 dependencies = [
  "anyhow",
  "genie-common",
@@ -323,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "genie-common"
-version = "1.0.0-alpha.9"
+version = "1.0.0-alpha.10"
 dependencies = [
  "anyhow",
  "rustls",
@@ -334,11 +355,12 @@ dependencies = [
  "toml",
  "tracing",
  "webpki-roots 0.26.11",
+ "zeroize",
 ]
 
 [[package]]
 name = "genie-core"
-version = "1.0.0-alpha.9"
+version = "1.0.0-alpha.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -357,11 +379,12 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
 name = "genie-ctl"
-version = "1.0.0-alpha.9"
+version = "1.0.0-alpha.10"
 dependencies = [
  "anyhow",
  "genie-common",
@@ -370,11 +393,12 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "yaml-rust2",
 ]
 
 [[package]]
 name = "genie-governor"
-version = "1.0.0-alpha.9"
+version = "1.0.0-alpha.10"
 dependencies = [
  "anyhow",
  "genie-common",
@@ -389,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "genie-health"
-version = "1.0.0-alpha.9"
+version = "1.0.0-alpha.10"
 dependencies = [
  "anyhow",
  "genie-common",
@@ -411,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "genie-skill-sdk"
-version = "1.0.0-alpha.9"
+version = "1.0.0-alpha.10"
 dependencies = [
  "serde_json",
 ]
@@ -457,6 +481,9 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+dependencies = [
+ "foldhash",
+]
 
 [[package]]
 name = "hashlink"
@@ -465,6 +492,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea0b22561a9c04a7cb1a302c013e0259cd3b4bb619f145b32f72b8b4bcbed230"
+dependencies = [
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -1063,7 +1099,7 @@ dependencies = [
  "bitflags",
  "fallible-iterator",
  "fallible-streaming-iterator",
- "hashlink",
+ "hashlink 0.9.1",
  "libsqlite3-sys",
  "smallvec",
 ]
@@ -1938,6 +1974,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
+name = "yaml-rust2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "631a50d867fafb7093e709d75aaee9e0e0d5deb934021fcea25ac2fe09edc51e"
+dependencies = [
+ "arraydeque",
+ "encoding_rs",
+ "hashlink 0.11.0",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2006,6 +2053,21 @@ name = "zeroize"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+dependencies = [
+ "serde",
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85a5b4158499876c763cb03bc4e49185d3cccbabb15b33c627f7884f43db852e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "zerotrie"
