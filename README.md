@@ -37,22 +37,25 @@ first.
   `nvext.agent_hints`, and system-prompt prefix cache metadata for KV reuse
 - system-prompt SHA exposed in boot logs, `/api/health`, and `genie-ctl status`
   to prove deterministic prompt assembly across restarts
-- BFCL-style local tool-call scoring through `genie-ctl bfcl-score`
+- BFCL-style local tool-call scoring through `genie-ctl bfcl-score`,
+  `genie-ctl bfcl-predict-quick`, and `genie-ctl bfcl-predict-llm`
 - Jetson aarch64 cross-compile CI
 
 Current workspace version: `v1.0.0-alpha.10`.
 
 ## Current Focus
 
+- BFCL scoring for quick-router and local-LLM tool-call accuracy is the
+  immediate product gate
 - keep the agent fast and reliable inside a 4096-token Jetson context
 - tune the AI harness around high-signal home context, family memory, and typed tools
 - improve accuracy through deterministic device state and memory retrieval, not larger prompts
-- expand BFCL-based scoring for tool-call accuracy and regressions
 - validate hardware-facing and performance-sensitive changes on Jetson Orin Nano 8GB whenever possible
 - reject broad changes that make the agent less native, slower, less deterministic, or harder to test
 
-Everything else is secondary until the local home agent is fast, accurate, and
-measurable under the Jetson 4096-token constraint.
+Everything else is noise until the local home agent is fast, accurate, and
+measurable under the Jetson 4096-token constraint. Routing, memory retrieval,
+typed tools, BFCL score, and Jetson behavior are the work.
 
 ## Product Quality Bar
 
@@ -77,12 +80,14 @@ gap directly and keep the change small enough to review and reproduce.
 
 ## Immediate Engineering Plan
 
-1. Expand BFCL fixtures for home state, family memory, and typed tools.
-2. Score expected tool names and arguments, not just natural-language answers.
-3. Add the BFCL score to CI as a required regression signal.
-4. Keep a Jetson Orin Nano 8GB validation path for
+1. Run BFCL quick-router and local-LLM suites for tool routing, memory retrieval,
+   and typed-tool changes.
+2. Expand BFCL fixtures for home state, family memory, STT-like noise, and typed tools.
+3. Score expected tool names and arguments, not just natural-language answers.
+4. Add BFCL score thresholds to CI as a required regression signal.
+5. Keep a Jetson Orin Nano 8GB validation path for
    latency, memory pressure, and native runtime behavior.
-5. Use the scores to improve routing, memory retrieval, and typed-tool accuracy
+6. Use the scores to improve routing, memory retrieval, and typed-tool accuracy
    before expanding prompts or adding broader features.
 
 ## Agent Harness Contract

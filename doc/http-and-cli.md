@@ -387,6 +387,9 @@ Implemented in `crates/genie-ctl/src/main.rs`.
 | `genie-ctl history` | Show current conversation history |
 | `genie-ctl tools` | List available tools |
 | `genie-ctl bfcl-score --cases C --predictions P [--json]` | Score BFCL-style tool-call fixtures |
+| `genie-ctl bfcl-predict-quick --cases C --out P` | Generate deterministic quick-router BFCL predictions |
+| `genie-ctl bfcl-predict-llm --cases C --out P [--max-tokens N] [--limit N]` | Generate local LLM BFCL predictions |
+| `genie-ctl bfcl-import-ha-intents --source DIR --out C [--language en] [--limit N]` | Convert Home Assistant Intents into attributed BFCL cases |
 | `genie-ctl connectivity` | Show coprocessor boundary status |
 | `genie-ctl skill ...` | Manage loadable skills |
 | `genie-ctl speaker ...` | Manage local speaker identity profiles |
@@ -410,6 +413,39 @@ cargo run -p genie-ctl -- bfcl-score \
 The scorer parses raw JSON, fenced JSON, embedded JSON, and OpenAI-compatible
 `tool_calls` wrappers. It reports parse, tool-name, argument, and strict exact
 accuracy. Use `--json` for machine-readable output suitable for CI.
+
+### `genie-ctl bfcl-predict-quick`
+
+Generates a side-effect-free prediction file from GenieClaw's deterministic
+quick router:
+
+```bash
+cargo run -p genie-ctl -- bfcl-predict-quick \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_home_predictions.jsonl
+```
+
+Use this as the baseline for fast-path home intent coverage. Low scores here
+mean deterministic routing, entity normalization, or typed-tool argument
+construction need work.
+
+### `genie-ctl bfcl-predict-llm`
+
+Generates a side-effect-free prediction file from the configured local LLM:
+
+```bash
+GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml \
+cargo run -p genie-ctl -- bfcl-predict-llm \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_home_llm_predictions.jsonl \
+  --max-tokens 160
+```
+
+This command calls `[services.llm]` directly, asks for compact JSON tool calls,
+and writes raw model responses for `bfcl-score`. It does not execute tools or
+touch the home backend. Use `--limit N` for Jetson smoke tests and
+`--no-json-mode` when a runtime does not support OpenAI-compatible JSON
+response mode.
 
 ### `genie-ctl support-bundle`
 

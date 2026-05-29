@@ -5,13 +5,22 @@ tool-call accuracy. They are designed to run on the NVIDIA Jetson Orin 8GB path
 without a live home backend: the scorer parses model responses and checks tool
 names plus JSON arguments, but never executes tools.
 
-Run:
+This is the current focus. BFCL is the measurable gate for quick-router and
+local-LLM tool-call accuracy. Everything else is noise until GenieClaw reliably
+chooses the right typed tool with the right compact arguments inside the Jetson
+4096-token constraint.
+
+## Committed Fixture Smoke Test
+
+Run the committed fixture and prediction files:
 
 ```bash
 cargo run -p genie-ctl -- bfcl-score \
   --cases tests/bfcl/home_tool_cases.jsonl \
   --predictions tests/bfcl/home_tool_predictions.jsonl
 ```
+
+## Generate Home Assistant Intents Cases
 
 To generate a local Home Assistant Intents-derived suite without committing raw
 public data:
@@ -27,8 +36,10 @@ cargo run -p genie-ctl -- bfcl-import-ha-intents \
 
 Use `--language all` for a larger multilingual suite.
 
-To create a deterministic baseline prediction file from GenieClaw's current
-quick router:
+## Quick-Router BFCL
+
+The quick-router path is deterministic and does not call a model. This isolates
+GenieClaw's rule-based fast path for common home commands.
 
 ```bash
 cargo run -p genie-ctl -- bfcl-predict-quick \
@@ -43,6 +54,42 @@ cargo run -p genie-ctl -- bfcl-score \
   --cases tests/bfcl/local/ha_home_cases.jsonl \
   --predictions tests/bfcl/local/ha_home_predictions.jsonl
 ```
+
+## Local-LLM BFCL
+
+The local-LLM path calls the configured `[services.llm]` backend directly and
+writes raw model responses as BFCL predictions. It does not execute tools and
+does not require a live home backend. Use it to measure how the local model,
+prompt, runtime, and typed-tool schema behave together.
+
+Start or verify the local LLM runtime first, then run:
+
+```bash
+GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml \
+cargo run -p genie-ctl -- bfcl-predict-llm \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_home_llm_predictions.jsonl \
+  --max-tokens 160
+
+cargo run -p genie-ctl -- bfcl-score \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --predictions tests/bfcl/local/ha_home_llm_predictions.jsonl
+```
+
+For a short Jetson smoke test before a longer run:
+
+```bash
+GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml \
+cargo run -p genie-ctl -- bfcl-predict-llm \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_home_llm_smoke_predictions.jsonl \
+  --limit 25 \
+  --max-tokens 160
+```
+
+`bfcl-predict-llm` defaults to JSON response mode. If a local runtime rejects
+OpenAI-compatible `response_format`, add `--no-json-mode` and score the raw
+responses anyway.
 
 ## Current Progress Baseline
 
