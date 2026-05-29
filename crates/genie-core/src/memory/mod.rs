@@ -124,6 +124,24 @@ pub struct DeviceAlias {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceAliasConflictEntry {
+    pub source_memory_id: i64,
+    pub alias: String,
+    pub target_id: String,
+    pub kind: String,
+    pub evergreen: bool,
+    pub promoted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceAliasConflict {
+    pub normalized_alias: String,
+    pub entries: Vec<DeviceAliasConflictEntry>,
+    pub winning_source_memory_id: i64,
+    pub winning_target_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HouseholdProfileAttribute {
     pub source_memory_id: i64,
     pub name: String,
@@ -1127,10 +1145,11 @@ impl Memory {
         }
 
         let mut stmt = self.conn.prepare(
-            "SELECT source_memory_id, alias, target_id, kind
-             FROM device_aliases
-             WHERE normalized_alias = ?1
-             ORDER BY updated_ms DESC, source_memory_id DESC
+            "SELECT da.source_memory_id, da.alias, da.target_id, da.kind
+             FROM device_aliases da
+             JOIN memories m ON m.id = da.source_memory_id
+             WHERE da.normalized_alias = ?1
+             ORDER BY m.evergreen DESC, m.promoted DESC, da.source_memory_id ASC
              LIMIT 1",
         )?;
         let mut rows = stmt.query([normalized])?;
@@ -1144,6 +1163,68 @@ impl Memory {
             target_id: row.get(2)?,
             kind: row.get(3)?,
         }))
+    }
+
+    /// List aliases that map to more than one Home Assistant target.
+    ///
+    /// Resolution precedence is deterministic: evergreen memories beat promoted
+    /// memories, promoted beat normal household memories, then lowest
+    /// `source_memory_id` wins.
+    pub fn device_alias_conflicts(&self) -> Result<Vec<DeviceAliasConflict>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT da.normalized_alias, da.source_memory_id, da.alias, da.target_id, da.kind,
+                    m.evergreen, m.promoted
+             FROM device_aliases da
+             JOIN memories m ON m.id = da.source_memory_id
+             WHERE da.normalized_alias IN (
+                 SELECT normalized_alias
+                 FROM device_aliases
+                 GROUP BY normalized_alias
+                 HAVING COUNT(DISTINCT target_id) > 1
+             )
+             ORDER BY da.normalized_alias, m.evergreen DESC, m.promoted DESC, da.source_memory_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    DeviceAliasConflictEntry {
+                        source_memory_id: row.get(1)?,
+                        alias: row.get(2)?,
+                        target_id: row.get(3)?,
+                        kind: row.get(4)?,
+                        evergreen: row.get::<_, i64>(5)? != 0,
+                        promoted: row.get::<_, i64>(6)? != 0,
+                    },
+                ))
+            })?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+
+        let mut conflicts = Vec::new();
+        let mut current_alias: Option<String> = None;
+        let mut current_entries: Vec<DeviceAliasConflictEntry> = Vec::new();
+
+        for (normalized_alias, entry) in rows {
+            if current_alias.as_deref() != Some(normalized_alias.as_str()) {
+                if let Some(alias) = current_alias.take()
+                    && !current_entries.is_empty()
+                {
+                    conflicts.push(build_device_alias_conflict(alias, current_entries));
+                    current_entries = Vec::new();
+                }
+                current_alias = Some(normalized_alias.clone());
+            }
+            current_entries.push(entry);
+        }
+
+        if let Some(alias) = current_alias
+            && !current_entries.is_empty()
+        {
+            conflicts.push(build_device_alias_conflict(alias, current_entries));
+        }
+
+        Ok(conflicts)
     }
 
     pub fn profile_attributes(
@@ -3491,6 +3572,38 @@ fn upsert_device_alias_from_memory(
             updated_ms
         ],
     )?;
+    warn_if_device_alias_conflict(conn, &normalized_alias)?;
+    Ok(())
+}
+
+fn build_device_alias_conflict(
+    normalized_alias: String,
+    entries: Vec<DeviceAliasConflictEntry>,
+) -> DeviceAliasConflict {
+    let winner = entries.first().expect("conflict entries must not be empty");
+    DeviceAliasConflict {
+        normalized_alias,
+        winning_source_memory_id: winner.source_memory_id,
+        winning_target_id: winner.target_id.clone(),
+        entries,
+    }
+}
+
+fn warn_if_device_alias_conflict(conn: &Connection, normalized_alias: &str) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT COUNT(DISTINCT target_id)
+         FROM device_aliases
+         WHERE normalized_alias = ?1",
+    )?;
+    let distinct_targets: i64 = stmt.query_row([normalized_alias], |row| row.get(0))?;
+    if distinct_targets > 1 {
+        tracing::warn!(
+            normalized_alias = normalized_alias,
+            distinct_targets = distinct_targets,
+            "device alias conflict: multiple Home Assistant targets share this alias; \
+             using deterministic precedence (evergreen > promoted > lowest memory id)"
+        );
+    }
     Ok(())
 }
 
@@ -11161,6 +11274,55 @@ mod tests {
         let mem = Memory::open(&path).unwrap();
         let alias = mem.device_alias("movie night scene").unwrap().unwrap();
         assert_eq!(alias.target_id, "scene.movie_night");
+    }
+
+    #[test]
+    fn device_alias_collision_uses_stable_precedence_not_updated_ms() {
+        let mem = temp_memory();
+        let first_id = mem
+            .store("fact", "Living room lights maps to light.living_room_a")
+            .unwrap();
+        mem.store("fact", "Living room lights maps to light.living_room_b")
+            .unwrap();
+
+        let alias = mem.device_alias("living room lights").unwrap().unwrap();
+        assert_eq!(alias.source_memory_id, first_id);
+        assert_eq!(alias.target_id, "light.living_room_a");
+
+        let conflicts = mem.device_alias_conflicts().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].normalized_alias, "living room lights");
+        assert_eq!(conflicts[0].winning_target_id, "light.living_room_a");
+        assert_eq!(conflicts[0].entries.len(), 2);
+    }
+
+    #[test]
+    fn device_alias_collision_prefers_promoted_memory() {
+        let mem = temp_memory();
+        mem.store("fact", "Living room lights maps to light.living_room_a")
+            .unwrap();
+        let promoted_id = mem
+            .store("fact", "Living room lights maps to light.living_room_b")
+            .unwrap();
+        mem.mark_promoted(promoted_id).unwrap();
+
+        let alias = mem.device_alias("living room lights").unwrap().unwrap();
+        assert_eq!(alias.source_memory_id, promoted_id);
+        assert_eq!(alias.target_id, "light.living_room_b");
+    }
+
+    #[test]
+    fn device_alias_collision_prefers_evergreen_over_promoted() {
+        let mem = temp_memory();
+        let promoted_id = mem
+            .store("fact", "Living room lights maps to light.living_room_a")
+            .unwrap();
+        mem.mark_promoted(promoted_id).unwrap();
+        mem.store_evergreen("fact", "Living room lights maps to light.living_room_b")
+            .unwrap();
+
+        let alias = mem.device_alias("living room lights").unwrap().unwrap();
+        assert_eq!(alias.target_id, "light.living_room_b");
     }
 
     #[test]
