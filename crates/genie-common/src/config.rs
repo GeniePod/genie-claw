@@ -261,13 +261,15 @@ impl Default for CoreConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
-    /// Primary deployment profile. Jetson stays the flagship default, but the
-    /// agent contract must also run on portable dev hosts and SBCs.
+    /// Primary deployment profile. Jetson stays the flagship default, while
+    /// Raspberry Pi and generic portable SBCs remain maintained headless agent
+    /// profiles.
     #[serde(default)]
     pub runtime_profile: AgentRuntimeProfile,
 
-    /// Non-negotiable context budget for the Jetson baseline. Stronger models
-    /// may adapt upward later, but production paths must pass this budget first.
+    /// Non-negotiable context budget for the Jetson baseline. Low latency and
+    /// accuracy should come from high-signal home context, family memory, and
+    /// typed tools before any path adapts upward.
     #[serde(default = "defaults::agent_context_window_tokens")]
     pub context_window_tokens: u32,
 
@@ -321,8 +323,9 @@ pub enum RuntimeBoundaryMode {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct OptionalAiProviderConfig {
-    /// API-key provider support is opt-in and must not change the default
-    /// Jetson local binary path.
+    /// API/OAuth provider support is opt-in for development, testing, and
+    /// transitional validation. It must not change the default Jetson local
+    /// product path.
     #[serde(default)]
     pub enabled: bool,
 
@@ -351,8 +354,8 @@ pub struct OptionalAiProviderConfig {
     #[serde(default = "defaults::optional_ai_provider_oauth_token_env")]
     pub oauth_token_env: String,
 
-    /// Provider path must pass the same limited-context harness before it is
-    /// promoted. Keep this at or below [agent].context_window_tokens.
+    /// Provider path must pass the same limited-context harness before serious
+    /// validation. Keep this at or below [agent].context_window_tokens.
     #[serde(default = "defaults::agent_context_window_tokens")]
     pub context_window_tokens: u32,
 
@@ -366,7 +369,7 @@ impl OptionalAiProviderConfig {
         !self.enabled || self.context_window_tokens <= agent.context_window_tokens
     }
 
-    pub fn production_candidate(&self, agent: &AgentConfig) -> bool {
+    pub fn transitional_test_candidate(&self, agent: &AgentConfig) -> bool {
         self.enabled
             && self.limited_context_compatible(agent)
             && !self.credential_env().trim().is_empty()
@@ -1742,7 +1745,7 @@ home_runtime_boundary = "external_runtime"
         assert!(
             !config
                 .optional_ai_provider
-                .production_candidate(&config.agent)
+                .transitional_test_candidate(&config.agent)
         );
     }
 
@@ -1762,7 +1765,7 @@ allow_remote_base_url = true
         .unwrap();
 
         assert!(!provider.limited_context_compatible(&agent));
-        assert!(!provider.production_candidate(&agent));
+        assert!(!provider.transitional_test_candidate(&agent));
     }
 
     #[test]
@@ -1783,7 +1786,7 @@ allow_remote_base_url = true
 
         assert_eq!(provider.auth_mode, OptionalAiProviderAuthMode::OAuthBearer);
         assert_eq!(provider.credential_env(), "OPENAI_OAUTH_ACCESS_TOKEN");
-        assert!(provider.production_candidate(&agent));
+        assert!(provider.transitional_test_candidate(&agent));
     }
 
     #[test]
@@ -1802,7 +1805,7 @@ allow_remote_base_url = false
         .unwrap();
 
         assert!(provider.limited_context_compatible(&agent));
-        assert!(!provider.production_candidate(&agent));
+        assert!(!provider.transitional_test_candidate(&agent));
     }
 
     #[test]

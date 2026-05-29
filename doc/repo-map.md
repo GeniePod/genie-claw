@@ -6,6 +6,7 @@
 | --- | --- |
 | `README.md` | Product summary and quick start |
 | `GETTING_STARTED.md` | Bring-up guide |
+| `LOW_LATENCY_HOME_AGENT.md` | Canonical low-latency private home-agent goal |
 | `ARCHITECTURE.md` | Genie ecosystem and repo-boundary architecture |
 | `CODEBASE.md` | Narrative code walkthrough |
 | `CONNECTIVITY.md` | ESP32-C6 boundary and ownership split |
@@ -13,6 +14,7 @@
 | Local-only `ROADMAP.md` | Private product roadmap, ignored by git when present |
 | `doc/` | Current documentation entry point |
 | `doc/implementation-status.md` | Source of truth for implemented, partial, external, and planned work |
+| `doc/memory-system.md` | Implemented memory storage, recall, policy, and extension design |
 | `crates/` | Workspace crates |
 | `deploy/` | Configs, scripts, systemd units, Docker assets |
 | `skills/` | Native skill examples and guide |
@@ -56,7 +58,7 @@
 This is the LLM backend facade. Jetson deploys default to the external
 `genie-ai-runtime`; `llama.cpp` remains selectable as a legacy fallback and
 development backend. Optional OpenAI-compatible providers are disabled by
-default and must pass the same limited-context harness before use.
+default and exist only for development, testing, and transitional validation.
 
 ### Prompt And Reasoning
 
@@ -71,7 +73,7 @@ default and must pass the same limited-context harness before use.
 - `ha/policy.rs`
 
 This is the current home-runtime adapter. It points at Home Assistant today and
-should point at `genie-home-runtime` later.
+should point at the external home boundary later.
 
 ### Tools
 
@@ -85,6 +87,14 @@ should point at `genie-home-runtime` later.
 - `tools/calc.rs`
 - `tools/weather.rs`
 - `tools/web_search.rs`
+
+### Evaluation
+
+- `eval/mod.rs`
+- `eval/bfcl.rs`
+- `tests/bfcl/*`
+
+Side-effect-free tool-call scoring for BFCL-style JSONL fixtures.
 
 ### Memory
 
@@ -186,6 +196,7 @@ from the runtime skills directory used by `genie-core`.
 | --- | --- |
 | Chat/API behavior | `crates/genie-core/src/server.rs` |
 | Prompt/tool selection | `crates/genie-core/src/prompt.rs` and `tools/dispatch.rs` |
+| BFCL tool-call scoring | `crates/genie-core/src/eval/bfcl.rs` and `tests/bfcl/` |
 | Memory bugs | `crates/genie-core/src/memory/mod.rs` |
 | Voice bugs | `crates/genie-core/src/voice_loop.rs` and `voice/` |
 | Home Assistant behavior | `crates/genie-core/src/ha/provider.rs` |

@@ -5,14 +5,20 @@ data_dir = "/opt/geniepod/data"
 
 [agent]
 runtime_profile = "jetson"        # "jetson", "raspberry_pi", "portable_sbc", "laptop", or "mac".
+                                  # Jetson is flagship; raspberry_pi and
+                                  # portable_sbc are maintained headless/SBC
+                                  # profiles for agent, memory, tools, and
+                                  # home-provider boundaries.
 context_window_tokens = 4096      # Non-negotiable Jetson baseline before any adaptive larger context.
 ai_runtime_boundary = "external_runtime"       # genie-ai-runtime owns inference.
-voice_runtime_boundary = "transitional_adapter" # In-repo voice path is temporary; target is genie-voice-runtime.
-home_runtime_boundary = "transitional_adapter"  # HA provider today; target is genie-home-runtime.
+voice_runtime_boundary = "transitional_adapter" # In-repo voice path is temporary; target is the external voice boundary.
+home_runtime_boundary = "transitional_adapter"  # HA provider today; target is the external home boundary.
 
-# Optional API-key provider path. Disabled by default so the local Jetson image
-# and binary stay focused on genie-ai-runtime. Enable only after the provider
-# passes the same 4096-token home-agent harness.
+# Optional API/OAuth provider path. Disabled by default so the local Jetson
+# image and binary stay focused on genie-ai-runtime. This exists for better
+# testing, development portability, and transitional validation only; it is not
+# the product runtime. Enable only after the provider passes the same
+# 4096-token home-agent harness.
 [optional_ai_provider]
 enabled = false
 provider = "open_ai_compatible"   # "open_ai_compatible", "open_ai", "anthropic", "gemini", or "custom".

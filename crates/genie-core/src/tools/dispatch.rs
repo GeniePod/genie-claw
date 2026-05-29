@@ -36,8 +36,39 @@ pub struct ToolDef {
 #[derive(Debug, Serialize)]
 pub struct ToolResult {
     pub tool: String,
+    pub action_class: ToolActionClass,
     pub success: bool,
     pub output: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActionClass {
+    ReadOnly,
+    Diagnostic,
+    MemoryRead,
+    MemoryWrite,
+    HomeActuation,
+    Media,
+    Network,
+    Timer,
+    Skill,
+}
+
+impl ToolActionClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Diagnostic => "diagnostic",
+            Self::MemoryRead => "memory_read",
+            Self::MemoryWrite => "memory_write",
+            Self::HomeActuation => "home_actuation",
+            Self::Media => "media",
+            Self::Network => "network",
+            Self::Timer => "timer",
+            Self::Skill => "skill",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -49,7 +80,7 @@ pub struct ToolExecutionContext {
 
 /// LLM-generated tool call (parsed from model output).
 /// Accepts both `{"tool": "..."}` and `{"name": "..."}` formats.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     #[serde(alias = "tool")]
     pub name: String,
@@ -82,6 +113,7 @@ struct ActuationRateLimiter {
 struct ToolAuditEvent {
     ts_ms: u64,
     tool: String,
+    action_class: ToolActionClass,
     origin: RequestOrigin,
     success: bool,
     duration_ms: u64,
@@ -465,7 +497,7 @@ impl ToolDispatcher {
 
         defs.push(ToolDef {
             name: "memory_store".into(),
-            description: "Explicitly store a safe household fact or preference. Use when the user says 'remember that...' or asks you to save something. Do not store passwords, one-time codes, payment details, keys, tokens, or private secrets.".into(),
+            description: "Explicitly store a safe household fact or preference. Use when the user says 'remember that...' or asks you to save something. Do not store passwords, one-time codes, payment details, keys, tokens, household access codes, lock combinations, sensitive document/key locations, or private secrets.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -495,11 +527,13 @@ impl ToolDispatcher {
         exec_ctx: ToolExecutionContext,
     ) -> ToolResult {
         let started = Instant::now();
+        let action_class = tool_action_class(&call.name);
         if let Err(err) =
             tool_origin_allowed(&self.tool_policy, exec_ctx.request_origin, &call.name)
         {
             let tool_result = ToolResult {
                 tool: call.name.clone(),
+                action_class,
                 success: false,
                 output: format!("Tool blocked by origin policy: {err}"),
             };
@@ -529,11 +563,13 @@ impl ToolDispatcher {
         let tool_result = match result {
             Ok(output) => ToolResult {
                 tool: call.name.clone(),
+                action_class,
                 success: true,
                 output,
             },
             Err(e) => ToolResult {
                 tool: call.name.clone(),
+                action_class,
                 success: false,
                 output: e.to_string(),
             },
@@ -554,6 +590,7 @@ impl ToolDispatcher {
         self.tool_audit_logger.append(ToolAuditEvent {
             ts_ms: now_ms(),
             tool: call.name.clone(),
+            action_class: result.action_class,
             origin: exec_ctx.request_origin,
             success: result.success,
             duration_ms: started.elapsed().as_millis() as u64,
@@ -581,6 +618,7 @@ impl ToolDispatcher {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
         let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let resolved_entity = self.resolve_device_alias(entity_name);
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -595,7 +633,7 @@ impl ToolDispatcher {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedPolicy,
                 origin: exec_ctx.request_origin,
-                entity: entity_name.to_string(),
+                entity: resolved_entity.clone(),
                 action: action.to_string(),
                 value,
                 reason: reason.clone(),
@@ -620,7 +658,7 @@ impl ToolDispatcher {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedRuntime,
                 origin: exec_ctx.request_origin,
-                entity: entity_name.to_string(),
+                entity: resolved_entity.clone(),
                 action: action.to_string(),
                 value,
                 reason: reason.clone(),
@@ -633,7 +671,7 @@ impl ToolDispatcher {
         }
         match home::control(
             ha.as_ref(),
-            entity_name,
+            &resolved_entity,
             action,
             value,
             &self.actuation_safety,
@@ -646,7 +684,7 @@ impl ToolDispatcher {
                 let recorded = if let Some(original_id) = undo_of {
                     self.action_ledger.record_undo(
                         original_id,
-                        entity_name,
+                        &resolved_entity,
                         action,
                         value,
                         exec_ctx.request_origin,
@@ -655,7 +693,7 @@ impl ToolDispatcher {
                     )
                 } else {
                     self.action_ledger.record(
-                        entity_name,
+                        &resolved_entity,
                         action,
                         value,
                         exec_ctx.request_origin,
@@ -667,7 +705,7 @@ impl ToolDispatcher {
                     ts_ms: now_ms(),
                     status: AuditStatus::Executed,
                     origin: exec_ctx.request_origin,
-                    entity: entity_name.to_string(),
+                    entity: resolved_entity.clone(),
                     action: action.to_string(),
                     value,
                     reason: "home action executed".into(),
@@ -680,7 +718,7 @@ impl ToolDispatcher {
             }
             Ok(home::ControlOutcome::ConfirmationRequired { reason, .. }) => {
                 let pending = self.confirmations.issue(
-                    entity_name,
+                    &resolved_entity,
                     action,
                     value,
                     &reason,
@@ -690,7 +728,7 @@ impl ToolDispatcher {
                     ts_ms: now_ms(),
                     status: AuditStatus::ConfirmationIssued,
                     origin: exec_ctx.request_origin,
-                    entity: entity_name.to_string(),
+                    entity: resolved_entity.clone(),
                     action: action.to_string(),
                     value,
                     reason: reason.clone(),
@@ -723,7 +761,7 @@ impl ToolDispatcher {
                     ts_ms: now_ms(),
                     status,
                     origin: exec_ctx.request_origin,
-                    entity: entity_name.to_string(),
+                    entity: resolved_entity,
                     action: action.to_string(),
                     value,
                     reason: error.clone(),
@@ -840,8 +878,24 @@ impl ToolDispatcher {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
         let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let entity_name = self.resolve_device_alias(entity_name);
 
-        home::status(ha.as_ref(), entity_name).await
+        home::status(ha.as_ref(), &entity_name).await
+    }
+
+    fn resolve_device_alias(&self, query: &str) -> String {
+        let Some(memory) = &self.memory else {
+            return query.to_string();
+        };
+        let Ok(memory) = memory.lock() else {
+            return query.to_string();
+        };
+        memory
+            .device_alias(query)
+            .ok()
+            .flatten()
+            .map(|alias| alias.target_id)
+            .unwrap_or_else(|| query.to_string())
     }
 
     fn exec_set_timer(&self, args: &serde_json::Value) -> Result<String> {
@@ -870,6 +924,17 @@ impl ToolDispatcher {
         let read_context = exec_ctx
             .memory_read_context
             .unwrap_or_else(|| memory_read_context(args));
+
+        if let Some(answer) = mem.structured_household_answer(query)? {
+            return Ok(answer);
+        }
+
+        if let Some(role) = household_role_query(query) {
+            let profiles = mem.household_profiles_by_role(role)?;
+            if !profiles.is_empty() {
+                return Ok(format_household_role_answer(role, &profiles));
+            }
+        }
 
         let results = crate::memory::recall::recall_with_context(&mem, query, 10, read_context)?;
         if results.is_empty() {
@@ -990,6 +1055,7 @@ impl ToolDispatcher {
         }
 
         let mut stored = Vec::new();
+        let mut stored_categories = Vec::new();
         let mut rejected = Vec::new();
         let mut replaced = 0;
         for (category, content) in memories {
@@ -1000,6 +1066,7 @@ impl ToolDispatcher {
             }
             let outcome = mem.store_resolved(&category, &content)?;
             replaced += outcome.replaced;
+            stored_categories.push(category);
             stored.push(content);
         }
 
@@ -1009,6 +1076,38 @@ impl ToolDispatcher {
                 .copied()
                 .unwrap_or("I could not store that memory.")
                 .to_string());
+        }
+
+        if stored_categories
+            .iter()
+            .any(|category| category == "shopping")
+        {
+            let count = mem.shopping_list_pending_count().unwrap_or(0);
+            let removed = stored.iter().any(|content| {
+                content
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("shopping list removed:")
+            });
+            let added = stored
+                .iter()
+                .map(|content| {
+                    content
+                        .trim_start_matches("shopping list pending:")
+                        .trim_start_matches("shopping list removed:")
+                        .trim()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if removed {
+                return Ok(format!(
+                    "Removed {added} from the shopping list. You have {count} item(s) total."
+                ));
+            }
+            return Ok(format!(
+                "Added {added} to the shopping list. You have {count} item(s) total."
+            ));
         }
 
         if stored.len() == 1 {
@@ -1083,7 +1182,14 @@ impl ToolDispatcher {
 
     async fn exec_play_media(&self, args: &serde_json::Value) -> Result<String> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        tracing::info!(query, "triggering media mode via governor control socket");
+        let resolved = self.resolve_media_query(query);
+        tracing::info!(
+            query,
+            resolved_query = resolved.query.as_str(),
+            provider = resolved.provider.as_deref().unwrap_or("unknown"),
+            "triggering media mode via governor control socket"
+        );
+        write_media_request(&resolved).await;
 
         // Send media_start command to the governor via its Unix control socket.
         let response = governor_command(r#"{"cmd":"media_start"}"#).await;
@@ -1094,7 +1200,7 @@ impl ToolDispatcher {
                 if ok {
                     Ok(format!(
                         "Playing: {}. Switched to media mode — LLM unloaded, HDMI ready.",
-                        query
+                        resolved.display()
                     ))
                 } else {
                     let err = resp
@@ -1110,10 +1216,76 @@ impl ToolDispatcher {
                 tokio::fs::write("/run/geniepod/media_mode", b"1").await?;
                 Ok(format!(
                     "Playing: {}. Media mode triggered (file fallback).",
-                    query
+                    resolved.display()
                 ))
             }
         }
+    }
+
+    fn resolve_media_query(&self, query: &str) -> ResolvedMediaQuery {
+        let Some(memory) = &self.memory else {
+            return ResolvedMediaQuery::unresolved(query);
+        };
+        let Ok(memory) = memory.lock() else {
+            return ResolvedMediaQuery::unresolved(query);
+        };
+        match memory.media_playlist_for_query(query).ok().flatten() {
+            Some(item) => ResolvedMediaQuery {
+                query: item.name,
+                provider: item.provider,
+                target: Some(item.target),
+                source: "memory".into(),
+            },
+            None => ResolvedMediaQuery::unresolved(query),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ResolvedMediaQuery {
+    query: String,
+    provider: Option<String>,
+    target: Option<String>,
+    source: String,
+}
+
+impl ResolvedMediaQuery {
+    fn unresolved(query: &str) -> Self {
+        Self {
+            query: query.trim().to_string(),
+            provider: None,
+            target: None,
+            source: "query".into(),
+        }
+    }
+
+    fn display(&self) -> String {
+        match (&self.provider, &self.target) {
+            (Some(provider), Some(target))
+                if target
+                    .to_ascii_lowercase()
+                    .starts_with(&format!("{provider}:")) =>
+            {
+                format!("{} ({target})", self.query)
+            }
+            (Some(provider), Some(target)) => format!("{} ({provider}: {target})", self.query),
+            (_, Some(target)) => format!("{} ({target})", self.query),
+            _ => self.query.clone(),
+        }
+    }
+}
+
+pub fn tool_action_class(name: &str) -> ToolActionClass {
+    match name {
+        "home_control" | "home_undo" => ToolActionClass::HomeActuation,
+        "play_media" => ToolActionClass::Media,
+        "memory_recall" => ToolActionClass::MemoryRead,
+        "memory_forget" | "memory_store" => ToolActionClass::MemoryWrite,
+        "memory_status" | "system_info" | "action_history" => ToolActionClass::Diagnostic,
+        "web_search" | "get_weather" => ToolActionClass::Network,
+        "set_timer" => ToolActionClass::Timer,
+        "home_status" | "get_time" | "calculate" => ToolActionClass::ReadOnly,
+        _ => ToolActionClass::Skill,
     }
 }
 
@@ -1182,6 +1354,75 @@ fn memory_query(args: &serde_json::Value) -> &str {
     } else {
         raw
     }
+}
+
+fn household_role_query(query: &str) -> Option<&'static str> {
+    let normalized = query
+        .trim()
+        .to_ascii_lowercase()
+        .replace(
+            |ch: char| !ch.is_ascii_alphanumeric() && !ch.is_whitespace(),
+            " ",
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let role = tokens
+        .iter()
+        .find_map(|token| normalize_household_role_query_token(token))?;
+
+    let is_role_question = normalized.starts_with("who is ")
+        || normalized.starts_with("who are ")
+        || normalized.starts_with("whos ")
+        || normalized.starts_with("who s ")
+        || normalized.contains(" in this house")
+        || normalized.contains(" in our house")
+        || normalized.contains(" household");
+    let is_direct_role_topic = tokens.len() == 1
+        || (tokens.len() == 2
+            && normalize_household_role_query_token(tokens[0]).is_some()
+            && matches!(tokens[1], "name" | "names"));
+
+    if is_role_question || is_direct_role_topic {
+        Some(role)
+    } else {
+        None
+    }
+}
+
+fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
+    match token {
+        "dad" | "father" => Some("dad"),
+        "mom" | "mother" | "mum" => Some("mom"),
+        "son" | "sons" => Some("son"),
+        "daughter" | "daughters" => Some("daughter"),
+        "child" | "children" | "kid" | "kids" => Some("child"),
+        "wife" => Some("wife"),
+        "husband" => Some("husband"),
+        "partner" => Some("partner"),
+        "dog" | "dogs" => Some("dog"),
+        "cat" | "cats" => Some("cat"),
+        "pet" | "pets" => Some("pet"),
+        _ => None,
+    }
+}
+
+fn format_household_role_answer(
+    role: &str,
+    profiles: &[crate::memory::HouseholdProfile],
+) -> String {
+    if profiles.len() == 1 {
+        return format!("{} is the {}.", profiles[0].name, role);
+    }
+
+    let names = profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{names} are the {role}s.")
 }
 
 fn memory_read_context(args: &serde_json::Value) -> crate::memory::policy::MemoryReadContext {
@@ -1432,6 +1673,19 @@ async fn governor_command(json_cmd: &str) -> Option<serde_json::Value> {
         .ok()?;
 
     line.and_then(|l| serde_json::from_str(&l).ok())
+}
+
+async fn write_media_request(request: &ResolvedMediaQuery) {
+    let result: Result<()> = async {
+        tokio::fs::create_dir_all("/run/geniepod").await?;
+        let json = serde_json::to_vec(request)?;
+        tokio::fs::write("/run/geniepod/media_request.json", json).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::debug!(error = %error, "media request sidecar write skipped");
+    }
 }
 
 #[cfg(test)]
@@ -1746,7 +2000,34 @@ mod tests {
         };
         let result = dispatcher.execute(&call).await;
         assert!(result.success);
+        assert_eq!(result.action_class, ToolActionClass::ReadOnly);
         assert!(!result.output.is_empty());
+    }
+
+    #[test]
+    fn tool_action_class_maps_side_effecting_tools() {
+        assert_eq!(
+            tool_action_class("home_control"),
+            ToolActionClass::HomeActuation
+        );
+        assert_eq!(
+            tool_action_class("memory_store"),
+            ToolActionClass::MemoryWrite
+        );
+        assert_eq!(
+            tool_action_class("memory_recall"),
+            ToolActionClass::MemoryRead
+        );
+        assert_eq!(tool_action_class("web_search"), ToolActionClass::Network);
+        assert_eq!(tool_action_class("custom_skill"), ToolActionClass::Skill);
+        assert_eq!(ToolActionClass::HomeActuation.as_str(), "home_actuation");
+    }
+
+    #[test]
+    fn household_role_query_ignores_non_role_topics() {
+        assert_eq!(household_role_query("who is the dad"), Some("dad"));
+        assert_eq!(household_role_query("dog name"), Some("dog"));
+        assert_eq!(household_role_query("hot dog recipe"), None);
     }
 
     #[tokio::test]
@@ -1775,6 +2056,7 @@ mod tests {
         let line = std::fs::read_to_string(&path).unwrap();
         let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(event["tool"], "calculate");
+        assert_eq!(event["action_class"], "read_only");
         assert_eq!(event["origin"], "api");
         assert_eq!(event["success"], false);
         assert_eq!(event["argument_keys"], serde_json::json!(["expression"]));
@@ -1832,6 +2114,52 @@ mod tests {
         assert!(history.success);
         assert!(history.output.contains("turn_on kitchen light"));
         assert!(history.output.contains("undo: turn_off"));
+    }
+
+    #[tokio::test]
+    async fn home_control_resolves_structured_device_alias() {
+        let db = std::env::temp_dir().join(format!(
+            "home-control-device-alias-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("fact", "Playroom lights maps to light.playroom")
+            .unwrap();
+
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
+            executed: executed.clone(),
+        })))
+        .with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: serde_json::json!({
+                        "entity": "playroom lights",
+                        "action": "turn_on"
+                    }),
+                },
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Dashboard,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::TurnOn]);
+
+        let history = dispatcher
+            .execute(&ToolCall {
+                name: "action_history".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await;
+        assert!(history.output.contains("turn_on light.playroom"));
     }
 
     #[tokio::test]
@@ -2110,6 +2438,45 @@ mod tests {
     }
 
     #[test]
+    fn memory_store_adds_shopping_list_items_with_count() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-store-shopping-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "shopping list pending: milk, eggs",
+                "category": "shopping"
+            }))
+            .unwrap();
+
+        assert!(result.contains("Added milk, eggs"));
+        assert!(result.contains("2 item"));
+
+        {
+            let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+            assert_eq!(mem.shopping_list_pending_count().unwrap(), 2);
+        }
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "shopping list removed: milk",
+                "category": "shopping"
+            }))
+            .unwrap();
+        assert!(result.contains("Removed milk"));
+        assert!(result.contains("1 item"));
+
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert_eq!(mem.shopping_list_pending_count().unwrap(), 1);
+    }
+
+    #[test]
     fn memory_store_rejects_high_risk_secret() {
         let db = std::env::temp_dir().join(format!(
             "memory-store-secret-test-{}.db",
@@ -2134,6 +2501,30 @@ mod tests {
     }
 
     #[test]
+    fn memory_store_rejects_household_access_code() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-store-access-code-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "remember that the gate code is 5829",
+                "category": "fact"
+            }))
+            .unwrap();
+
+        assert!(result.contains("should not store household access codes"));
+
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert!(mem.search("gate", 5).unwrap().is_empty());
+    }
+
+    #[test]
     fn memory_recall_formats_name_answers_naturally() {
         let db = std::env::temp_dir().join(format!("memory-recall-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&db);
@@ -2150,6 +2541,259 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "Your name is Jared");
+    }
+
+    #[test]
+    fn memory_recall_answers_household_role_from_structured_profile() {
+        let db =
+            std::env::temp_dir().join(format!("memory-recall-role-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("relationship", "Jared is the dad").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "who is the father in this house"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert_eq!(output, "Jared is the dad.");
+    }
+
+    #[test]
+    fn memory_recall_answers_structured_household_rule() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-structured-rule-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("fact", "Leo is not allowed to play video games after 8 PM")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "is Leo allowed to play video games after 8 PM"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.starts_with("No."));
+        assert!(output.contains("Leo is not allowed"));
+    }
+
+    #[test]
+    fn memory_recall_answers_calendar_and_access_permission() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-calendar-access-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "calendar",
+                "Mia has piano lessons today at 4:00 PM with Mrs. Higgins",
+            )
+            .unwrap();
+        memory
+            .store(
+                "access_permission",
+                "Leo is not authorized to unlock the front door. He can only unlock the side door",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let calendar = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "does Mia have piano lessons today"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+        assert!(calendar.contains("Mia"));
+        assert!(calendar.contains("piano"));
+
+        let access = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "can Leo unlock the front door"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+        assert!(access.starts_with("No."));
+        assert!(access.contains("front door"));
+    }
+
+    #[test]
+    fn memory_recall_answers_typed_household_note() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-household-note-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("note", "Bike lock hangs on the garage hook")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "find my note about bicycle lock"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("garage hook"));
+    }
+
+    #[test]
+    fn memory_recall_answers_app_only_secret_reference_without_value() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-secret-ref-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "credential_reference",
+                "Guest Wi-Fi password is stored in credential:guest_wifi",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "what is our wifi password for guests"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("app-only reference"));
+        assert!(!output.contains("credential:guest_wifi"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_home_comfort_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-comfort-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "preference",
+                "Jared prefers the living room thermostat at 72F.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "I'm feeling cold"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("thermostat"));
+        assert!(output.contains("72F"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_lunchbox_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-lunchbox-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "shopping",
+                "Leo's lunchbox snacks include granola bars and fruit snacks.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "We need more snacks for Leo's lunchbox"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("granola bars"));
+        assert!(output.contains("fruit snacks"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_movie_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-movie-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "note",
+                "Watched The Iron Giant with the kids - they loved it.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "what was the movie about a robot that wanted to be a real boy"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("Iron Giant"));
+    }
+
+    #[test]
+    fn play_media_resolves_playlist_from_memory() {
+        let db = std::env::temp_dir().join(format!(
+            "media-profile-dispatch-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "media_profile",
+                "Jared's Morning Boost playlist is spotify:playlist:morning_boost",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let resolved = dispatcher.resolve_media_query("play my Morning Boost playlist");
+
+        assert_eq!(resolved.query, "Morning Boost");
+        assert_eq!(resolved.provider.as_deref(), Some("spotify"));
+        assert_eq!(
+            resolved.target.as_deref(),
+            Some("spotify:playlist:morning_boost")
+        );
+        assert_eq!(
+            resolved.display(),
+            "Morning Boost (spotify:playlist:morning_boost)"
+        );
     }
 
     #[test]

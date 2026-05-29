@@ -19,7 +19,8 @@ Responsibilities:
 - OpenAI-compatible HTTP calls to the configured model server
 - Jetson-default `genie-ai-runtime` request shaping and hint metadata
 - legacy/development `llama.cpp` fallback support
-- optional OpenAI-compatible provider auth/readiness planning
+- optional OpenAI-compatible provider auth/readiness planning for development,
+  testing, and transitional validation only
 - health checking
 - request serialization and response parsing
 - bounded connect/read/request timeouts for blocking and streaming calls
@@ -135,10 +136,13 @@ Responsibilities:
 - hydrate recent action history from the append-only actuation audit log on startup
 - separate "home control available" from "home control required for core usefulness"
 
-This repo treats Home Assistant as optional integration, not as the product's
-entire identity.
+This repo treats Home Assistant as optional transitional integration, not as the
+product's entire identity. The target is a native local device graph and IoT
+boundary owned below GenieClaw.
 
 ## Memory System
+
+Deep dive: [memory-system.md](memory-system.md).
 
 Source:
 
@@ -158,6 +162,7 @@ Responsibilities:
 - auto-capture from user facts
 - memory-policy filtering for sensitive content
 - recency/recall-aware ranking and decay
+- low-token, high-signal context injection for the home harness
 
 Current practical behavior:
 
@@ -178,6 +183,8 @@ Current practical behavior:
 - explicit "remember" requests can store structured facts
 - high-risk secrets are blocked
 - query-time memory injection reads the persisted policy metadata before adding memory to prompts
+- query-time memory injection should select only the relevant family/household
+  facts for the current turn rather than dumping all memory
 - memory recall also respects persisted policy metadata, with shared-room voice as the conservative default
 - static prompt and voice bootstrap context now use the same shared-room-safe memory filtering
 - promotion to `memory/MEMORY.md` is limited to memories that are safe for shared household disclosure
@@ -206,7 +213,7 @@ Current transitional source:
 
 Long-term owner:
 
-- [`genie-voice-runtime`](https://github.com/GeniePod/genie-voice-runtime)
+- external voice boundary
 
 GenieClaw should own:
 
@@ -216,7 +223,7 @@ GenieClaw should own:
 - memory/tool/home-intent policy for voice-origin requests
 - shared-room safety policy
 
-`genie-voice-runtime` should own:
+The external voice boundary should own:
 
 - wake word
 - VAD
@@ -240,9 +247,9 @@ Notable modules:
 - `aec.rs`
 - `vad.rs`
 
-These modules remain a Jetson alpha bring-up path until the external runtime is
-production-ready. New voice-pipeline implementation should target
-`genie-voice-runtime` unless it is strictly an agent-layer behavior change.
+These modules remain a Jetson alpha bring-up path until the external voice
+boundary is production-ready. New voice-pipeline implementation should target
+that boundary unless it is strictly an agent-layer behavior change.
 
 ## Security And Guardrails
 

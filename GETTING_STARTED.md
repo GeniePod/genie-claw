@@ -4,6 +4,11 @@ This guide covers the current development and Jetson bring-up paths. The
 production Jetson default is `genie-ai-runtime`; the development config still
 uses any local OpenAI-compatible `llama.cpp` server on `:8080`.
 
+OpenAI-compatible API providers and other remote/alternate providers are for
+testing, development portability, and transitional validation only. The product
+path remains a private, low-latency, on-device home agent with limited context,
+family memory, typed tools, and local IoT/home-runtime boundaries.
+
 ## Option A: Development Machine
 
 Prerequisites:

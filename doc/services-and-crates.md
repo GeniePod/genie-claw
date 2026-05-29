@@ -13,8 +13,10 @@ Jetson appliance deployment, but the long-term boundary is clear:
 - Home Assistant is the current transitional home-runtime adapter.
 - `genie-ai-runtime` is the default external Jetson LLM runtime; `llama.cpp`
   remains a selectable fallback and development backend.
-- Future `genie-home-runtime` should replace the Home Assistant lower-runtime adapter.
-- `genie-voice-runtime` is the new external owner for wake/VAD/STT/TTS/audio behavior.
+- Optional OpenAI-compatible/API providers are for development portability,
+  testing, and transitional validation only.
+- A future external home boundary should replace the Home Assistant lower-runtime adapter.
+- An external voice boundary should own wake/VAD/STT/TTS/audio behavior.
 
 For the current truth matrix, see
 [implementation-status.md](implementation-status.md).
@@ -44,7 +46,7 @@ Primary responsibilities:
 - select and execute built-in tools
 - load and execute native skills
 - integrate Home Assistant through a provider boundary
-- run the transitional voice adapter until `genie-voice-runtime` is the production voice path
+- run the transitional voice adapter until the external voice boundary is the production voice path
 - expose connectivity health from the coprocessor boundary
 - optionally run the Telegram adapter
 
@@ -141,8 +143,8 @@ Key files:
 - `genie-core`: `:3000`
 - LLM backend: `:8080`; Jetson default is `genie-ai-runtime`, fallback/dev is
   `llama.cpp` `llama-server`
-- Home Assistant: commonly `:8123` today; future replacement is `genie-home-runtime`
-- `genie-voice-runtime`: external voice runtime; protocol and port are still stabilizing
+- Home Assistant: commonly `:8123` today; future replacement is the external home boundary
+- external voice runtime: protocol and port are still stabilizing
 - `genie-api`: separate dashboard service port, depending on deploy setup
 
 ### Local IPC
@@ -182,6 +184,8 @@ Not every unit is always active. Some are optional or deployment-specific.
 ## Optional Integration Boundaries
 
 - Home Assistant: transitional provider boundary in `crates/genie-core/src/ha/`
+- Optional AI providers: disabled-by-default development/test boundary under
+  `[optional_ai_provider]`
 - Telegram: feature-gated adapter in `crates/genie-core/src/telegram.rs`
 - ESP32-C6 connectivity sidecar: boundary in `crates/genie-core/src/connectivity/`
 - Web search providers: DuckDuckGo default, optional local SearXNG

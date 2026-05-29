@@ -1,7 +1,7 @@
 # Milestone 1 Portable Home Agent Architecture
 
-Milestone 1 should keep GenieClaw focused on GeniePod Home while making the
-project easier to validate without Jetson hardware.
+Milestone 1 should keep GenieClaw focused on NVIDIA Jetson Orin 8GB while making
+the project easier to validate without Jetson hardware.
 
 The goal is not to turn GenieClaw into a generic hosted assistant. The goal is
 to keep the Jetson-first home AI agent intact and make most contribution paths
@@ -11,10 +11,10 @@ portable, deterministic, and reviewable by CI.
 
 The original target remains specific:
 
-- GeniePod Home on Jetson-class hardware
+- NVIDIA Jetson Orin 8GB hardware
 - local-first voice interaction
 - `genie-ai-runtime` as the flagship local LLM runtime
-- Home Assistant today, `genie-home-runtime` as the longer-term home boundary
+- Home Assistant today, external home boundary as the longer-term direction
 - private memory, safety gates, audit trails, and bounded physical actuation
 - small context windows because VRAM and latency are tight on edge hardware
 
@@ -29,16 +29,19 @@ machines while preserving the final Jetson appliance shape.
 
 - GenieClaw remains a home automation AI agent, not a broad chatbot shell.
 - Jetson remains the default flagship target.
+- Raspberry Pi and generic portable SBC profiles remain maintained targets for
+  the headless agent, memory, tools, HTTP/CLI, and home-provider boundaries.
 - The full default-feature build must continue to represent the original
-  GeniePod Home goal: local runtime, voice, home control, memory, safety, audit,
-  and `genie-ai-runtime` integration.
+  NVIDIA Jetson Orin 8GB goal: local runtime, voice, home control, family
+  memory, safety, audit, and `genie-ai-runtime` integration.
 - Small context is a product constraint. The baseline target is currently 4096
   tokens.
 - Every provider path must work correctly under the small-context contract before
   larger adaptive context is treated as an optimization.
-- API-key providers must be optional and must not materially bloat the final
-  device image. Small config/type overhead is acceptable; heavy provider
-  dependencies should be feature-gated.
+- API-key, OAuth, and OpenAI-compatible providers must be optional development
+  and transitional validation paths. They must not materially bloat the final
+  device image or redefine the local on-device product path. Small config/type
+  overhead is acceptable; heavy provider dependencies should be feature-gated.
 - Voice remains optional for headless devices, laptops, CI, and remote
   development.
 
@@ -48,9 +51,9 @@ The project should name and test distinct runtime profiles.
 
 | Profile | Purpose |
 | --- | --- |
-| `geniepod-full` | Flagship deployment: Jetson, `genie-ai-runtime`, voice, home automation, memory, safety, and audit. |
-| `portable-home` | Development and non-Jetson installs: Home Assistant or fake home runtime, optional API-compatible LLM provider, headless or local UI. |
-| `headless-agent` | No audio stack. Runs HTTP/chat/tool APIs and agent behavior for servers, laptops, CI, and SBCs. |
+| `geniepod-full` | Flagship deployment: Jetson, `genie-ai-runtime`, voice, home automation, family memory, safety, and audit. |
+| `portable-home` | Maintained non-Jetson installs: Home Assistant or fake home runtime, optional API-compatible LLM provider for validation only, headless or local UI. |
+| `headless-agent` | No audio stack. Runs HTTP/chat/tool APIs and agent behavior for servers, laptops, CI, Raspberry Pi, and generic SBCs. |
 | `contributor-ci` | Deterministic validation profile: mock LLM, fake home automation, fixed memory fixtures, no hardware or API keys. |
 
 These profiles are validation and packaging tools. They do not change the
@@ -148,7 +151,8 @@ validation is needed.
 4. Introduce a mock LLM provider for deterministic agent tests.
 5. Introduce a fake home automation provider for tool and safety tests.
 6. Formalize provider capabilities and compliance tests.
-7. Add optional API-compatible provider support behind features.
+7. Add optional API-compatible provider support behind features for development
+   and transitional validation only.
 8. Keep `geniepod-full` as the flagship release target.
 
 ## Principle

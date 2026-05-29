@@ -1,6 +1,12 @@
 # ESP32-C6 Connectivity Boundary
 
-Design note for how `genie-core` should talk to an ESP32-C6 without turning the assistant runtime into a Linux network driver stack.
+Design note for how `genie-core` should talk to an ESP32-C6 without turning the
+assistant runtime into a Linux network driver stack.
+
+The product goal is still direct local wireless/IoT integration for a private
+home agent. The boundary here says where that work belongs: GenieClaw should
+see typed local capabilities, health, and device/control surfaces; lower layers
+should own radios, Linux interfaces, and protocol stacks.
 
 This document replaces the earlier SPI-first draft.
 
@@ -37,6 +43,10 @@ That split keeps `genie-core` focused on product behavior instead of bus bring-u
 
 If the Jetson should see a normal Wi-Fi or Bluetooth adapter, that is an OS concern, not a chat-runtime concern.
 
+If the user intent should become a safe home action, that should flow through
+GenieClaw's tool/policy/audit layer and then a typed home-runtime boundary, not
+raw wireless commands inside a prompt path.
+
 ## Current `genie-core` Scope
 
 In this repository, connectivity means:
@@ -44,6 +54,8 @@ In this repository, connectivity means:
 - optional ESP32-C6 sidecar over UART
 - health and diagnostics surface in `genie-core`
 - future small control-plane RPCs if product features need them
+- future typed IoT capability summaries that help the home-agent harness choose
+  safe tools without exposing raw radio internals
 
 It does not mean:
 
@@ -161,6 +173,8 @@ Bad candidates:
 - Linux interface creation
 - Bluetooth host stack ownership
 - large streaming payloads better handled by OS services
+- raw Matter/Thread/Zigbee/BLE actuation paths that should belong to
+  `genie-home-runtime` or lower connectivity services
 
 ## What Not To Do
 

@@ -31,9 +31,11 @@ Runtime load path:
 
 ## `[optional_ai_provider]`
 
-This path is disabled by default. It records whether a remote or alternate
-OpenAI-compatible provider is eligible for future wiring without changing the
-local Jetson `genie-ai-runtime` default.
+This path is disabled by default. It exists for better testing, development
+portability, and transitional validation while preserving the local Jetson
+`genie-ai-runtime` default. Remote or alternate OpenAI-compatible providers are
+not the product runtime and must not become a shortcut around the small-context
+home harness.
 
 | Key | Purpose |
 | --- | --- |
@@ -47,7 +49,7 @@ local Jetson `genie-ai-runtime` default.
 | `allow_remote_base_url` | Required opt-in for non-loopback provider URLs |
 
 OAuth bearer mode never stores the token in TOML. For an OpenAI OAuth-token
-deployment, use a secret env var and point config at it:
+development/test deployment, use a secret env var and point config at it:
 
 ```toml
 [optional_ai_provider]
@@ -59,6 +61,11 @@ oauth_token_env = "OPENAI_OAUTH_ACCESS_TOKEN"
 context_window_tokens = 4096
 allow_remote_base_url = true
 ```
+
+Do not enable this path for household production by default. If a provider is
+used for validation, keep `context_window_tokens` at or below
+`[agent].context_window_tokens` and avoid sending household memory unless the
+operator has explicitly accepted that privacy tradeoff.
 
 ## `[core]`
 
@@ -326,7 +333,7 @@ Behavior notes:
 | `response_timeout_ms` | UART response timeout |
 
 Legacy alias support exists for `esp32c6_spi`, but the current boundary is
-UART-oriented and the detailed SPI hosted work belongs in `genie-os`.
+UART-oriented and the detailed SPI hosted work belongs in the platform/OS layer.
 
 ## Environment Overrides And Related Runtime Variables
 

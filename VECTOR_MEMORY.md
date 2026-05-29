@@ -1,6 +1,7 @@
 # Vector Memory Design
 
-Design note for adding semantic retrieval to GenieClaw without breaking the current Jetson-first architecture.
+Design note for adding semantic retrieval to GenieClaw without breaking the
+current Jetson-first, low-latency home-agent architecture.
 
 This document answers a specific question:
 
@@ -19,6 +20,7 @@ GenieClaw should instead:
 3. treat GPU vector search as an optional backend
 4. prefer borrowing ideas and interface patterns before copying code
 5. only reuse code in small, auditable pieces with preserved license notices
+6. inject fewer, better family/household facts instead of increasing prompt size
 
 This keeps the appliance path stable on Jetson while still allowing higher-end vector retrieval later.
 
@@ -40,12 +42,22 @@ Today, GenieClaw memory is:
   - `memory/YYYY-MM-DD.md`
   - `memory/events/YYYY-MM-DD.jsonl`
   - `memory/MEMORY.md` for promoted durable entries that are safe for shared household disclosure
+- typed household projection tables for exact recall
+- lightweight local semantic recall using deterministic hash embeddings stored
+  in SQLite
 
-That means the memory system is already useful, but it is not yet semantic retrieval. There is no embedding pipeline, no vector index, and no hybrid scoring between keyword and vector similarity.
+That means the memory system is already useful and has a small local semantic
+layer. It is not yet a neural embedding pipeline, ANN index, or external vector
+backend. There is no sqlite-vec, pgvector, Qdrant, cuVS, or remote embedding
+service in the default runtime.
+
+For the implemented runtime design, read `doc/memory-system.md`. This document
+focuses on optional future vector backends.
 
 Relevant files:
 
 - `crates/genie-core/src/memory/mod.rs`
+- `crates/genie-core/src/memory/embedding.rs`
 - `crates/genie-core/src/memory/extract.rs`
 - `crates/genie-core/src/memory/inject.rs`
 - `crates/genie-core/src/memory/recall.rs`
@@ -173,6 +185,8 @@ Suggested shape:
   - promoted memories
   - imported profile/doc facts
   - high-signal notes
+- skip memories that policy marks restricted, app-only, or not safe for the
+  target disclosure class
 
 Do not embed every turn by default.
 
@@ -264,6 +278,8 @@ If semantic memory is added on Jetson, these rules should stay in force:
 - the default deployment must not require a vector backend
 - semantic indexing must be opt-in
 - embeddings should be computed selectively, not for every utterance
+- restricted memories, credentials, access codes, and sensitive document/key
+  locations must not be embedded
 - vector memory must not reduce LLM reliability
 - if GPU memory is tight, semantic search must disable itself automatically
 
@@ -316,6 +332,10 @@ For a semantic-enabled memory query:
 8. inject only the short, high-signal results into prompt context
 
 The core design point is that vector search returns candidates. GenieClaw still owns the final ranking.
+
+Semantic retrieval must serve the low-latency home harness. It is successful
+only if it improves the quality of the few facts injected into context; it
+should not become an excuse to send more memory to the model.
 
 ## Code Reuse Policy
 
