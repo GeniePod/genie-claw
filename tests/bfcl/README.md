@@ -27,6 +27,23 @@ cargo run -p genie-ctl -- bfcl-import-ha-intents \
 
 Use `--language all` for a larger multilingual suite.
 
+To create a deterministic baseline prediction file from GenieClaw's current
+quick router:
+
+```bash
+cargo run -p genie-ctl -- bfcl-predict-quick \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_home_predictions.jsonl
+```
+
+Then score it:
+
+```bash
+cargo run -p genie-ctl -- bfcl-score \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --predictions tests/bfcl/local/ha_home_predictions.jsonl
+```
+
 The fixture format is intentionally plain:
 
 - `home_tool_cases.jsonl`: one case per line with `id`, `prompt`,

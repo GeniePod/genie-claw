@@ -148,14 +148,21 @@ pub fn import_ha_intents(args: &HaIntentsImportArgs) -> Result<HaIntentsImportRe
     let mut cases = Vec::new();
     let mut read_sentences = 0;
     let mut read_files = 0;
+    let mut next_case_index = 1usize;
     for (language, sentence_dir) in &sentence_dirs {
         let mut files = yaml_files(sentence_dir)?;
         files.sort();
 
         for path in &files {
             read_files += 1;
-            let file_cases = cases_from_file(&args.source, sentence_dir, path, language)
-                .with_context(|| format!("convert {}", path.display()))?;
+            let file_cases = cases_from_file(
+                &args.source,
+                sentence_dir,
+                path,
+                language,
+                &mut next_case_index,
+            )
+            .with_context(|| format!("convert {}", path.display()))?;
             read_sentences += file_cases.0;
             cases.extend(file_cases.1);
             if cases.len() >= args.limit {
@@ -189,6 +196,7 @@ fn cases_from_file(
     sentence_dir: &Path,
     path: &Path,
     language: &str,
+    next_case_index: &mut usize,
 ) -> Result<(usize, Vec<BfclCase>)> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let parsed =
@@ -239,8 +247,9 @@ fn cases_from_file(
                 "ha-{}-{}-{:05}",
                 language,
                 slug(&intent_name),
-                cases.len() + 1
+                *next_case_index
             );
+            *next_case_index += 1;
             cases.push(BfclCase {
                 id,
                 category: Some(format!("ha_intents/{}", tool_call.name)),
@@ -1021,7 +1030,66 @@ intents:
         assert_eq!(report.generated_cases, 2);
         let cases = fs::read_to_string(out).unwrap();
         assert!(cases.contains("\"id\":\"ha-en-hassgetcurrenttime-00001\""));
-        assert!(cases.contains("\"id\":\"ha-es-hassgetcurrenttime-00001\""));
+        assert!(cases.contains("\"id\":\"ha-es-hassgetcurrenttime-00002\""));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_assigns_unique_case_ids_across_files() {
+        let root = unique_temp_dir("ha-intents-unique-ids");
+        fs::create_dir_all(root.join("sentences/en")).unwrap();
+        fs::write(
+            root.join("LICENSE.md"),
+            "Creative Commons Attribution 4.0 International Public License",
+        )
+        .unwrap();
+        let turn_on_yaml = |sentence: &str| {
+            format!(
+                r#"language: "en"
+intents:
+  HassTurnOn:
+    data:
+      - sentences:
+          - "{sentence}"
+        slots:
+          domain: "light"
+"#
+            )
+        };
+        fs::write(
+            root.join("sentences/en/light_HassTurnOn.yaml"),
+            turn_on_yaml("<turn> on [<the>] {name}"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("sentences/en/switch_HassTurnOn.yaml"),
+            turn_on_yaml("<turn> on [<the>] {name} please"),
+        )
+        .unwrap();
+
+        let out = root.join("cases.jsonl");
+        let report = import_ha_intents(&HaIntentsImportArgs {
+            source: root.clone(),
+            out: out.clone(),
+            language: "en".to_string(),
+            limit: 10,
+        })
+        .unwrap();
+
+        assert_eq!(report.generated_cases, 2);
+        let cases = fs::read_to_string(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<BfclCase>(line).unwrap())
+            .collect::<Vec<_>>();
+        let ids = cases
+            .iter()
+            .map(|case| case.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), cases.len());
+        assert!(ids.contains("ha-en-hassturnon-00001"));
+        assert!(ids.contains("ha-en-hassturnon-00002"));
 
         fs::remove_dir_all(root).unwrap();
     }

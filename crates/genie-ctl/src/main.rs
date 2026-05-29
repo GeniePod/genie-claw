@@ -10,6 +10,8 @@
 //!   genie-ctl tools           List available tools
 //!   genie-ctl bfcl-score --cases CASES.jsonl --predictions PREDS.jsonl [--json]
 //!                              Score tool-call accuracy from JSONL fixtures
+//!   genie-ctl bfcl-predict-quick --cases CASES.jsonl --out PREDS.jsonl
+//!                              Generate deterministic quick-router predictions
 //!   genie-ctl bfcl-import-ha-intents --source INTENTS_DIR --out CASES.jsonl
 //!                              Convert Home Assistant Intents into BFCL cases
 //!   genie-ctl skill ...       Manage loadable skill modules
@@ -35,6 +37,7 @@ use genie_core::voice::identity::{
 use std::path::{Path, PathBuf};
 #[cfg(feature = "voice")]
 use std::process::Command;
+use std::{fs, io::Write};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 mod bfcl_import;
@@ -137,6 +140,16 @@ async fn main() -> Result<()> {
             let score_args = parse_bfcl_score_args(&args[2..])?;
             cmd_bfcl_score(&score_args)?;
         }
+        "bfcl-predict-quick" => {
+            let predict_args = parse_bfcl_predict_quick_args(&args[2..])?;
+            let generated = cmd_bfcl_predict_quick(&predict_args)?;
+            println!(
+                "generated {} quick-router BFCL predictions",
+                generated.total_cases
+            );
+            println!("tool calls: {}", generated.tool_calls);
+            println!("output: {}", predict_args.out.display());
+        }
         "bfcl-import-ha-intents" => {
             let import_args = bfcl_import::parse_ha_intents_import_args(&args[2..])?;
             let report = bfcl_import::import_ha_intents(&import_args)?;
@@ -221,6 +234,8 @@ COMMANDS:
     tools               List available tools
     bfcl-score --cases C --predictions P [--json]
                         Score tool-call accuracy from JSONL fixtures
+    bfcl-predict-quick --cases C --out P
+                        Generate deterministic quick-router predictions
     bfcl-import-ha-intents --source DIR --out CASES.jsonl [--language en] [--limit N]
                         Convert Home Assistant Intents into attributed BFCL cases
     connectivity        Inspect ESP32-C6 Thread/Matter sidecar status
@@ -945,6 +960,18 @@ struct BfclScoreArgs {
     json: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BfclPredictQuickArgs {
+    cases: PathBuf,
+    out: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BfclPredictQuickReport {
+    total_cases: usize,
+    tool_calls: usize,
+}
+
 fn parse_search_args(args: &[String]) -> Result<SearchArgs> {
     let mut fresh = false;
     let mut limit = 3;
@@ -1044,6 +1071,62 @@ fn parse_bfcl_score_args(args: &[String]) -> Result<BfclScoreArgs> {
     })
 }
 
+fn parse_bfcl_predict_quick_args(args: &[String]) -> Result<BfclPredictQuickArgs> {
+    let mut cases = None;
+    let mut out = None;
+    let mut idx = 0;
+
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--cases" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--cases requires a JSONL path");
+                };
+                cases = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--out" | "--predictions" | "--preds" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--out requires a JSONL output path");
+                };
+                out = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            _ if arg.starts_with("--cases=") => {
+                cases = Some(PathBuf::from(arg.trim_start_matches("--cases=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--out=") => {
+                out = Some(PathBuf::from(arg.trim_start_matches("--out=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--predictions=") => {
+                out = Some(PathBuf::from(arg.trim_start_matches("--predictions=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--preds=") => {
+                out = Some(PathBuf::from(arg.trim_start_matches("--preds=")));
+                idx += 1;
+            }
+            other => anyhow::bail!("unknown bfcl-predict-quick option: {}", other),
+        }
+    }
+
+    let Some(cases) = cases else {
+        anyhow::bail!(
+            "Usage: genie-ctl bfcl-predict-quick --cases CASES.jsonl --out PREDICTIONS.jsonl"
+        );
+    };
+    let Some(out) = out else {
+        anyhow::bail!(
+            "Usage: genie-ctl bfcl-predict-quick --cases CASES.jsonl --out PREDICTIONS.jsonl"
+        );
+    };
+
+    Ok(BfclPredictQuickArgs { cases, out })
+}
+
 fn parse_search_limit(value: &str) -> Result<u64> {
     let limit = value
         .parse::<u64>()
@@ -1129,6 +1212,44 @@ fn cmd_bfcl_score(args: &BfclScoreArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_bfcl_predict_quick(args: &BfclPredictQuickArgs) -> Result<BfclPredictQuickReport> {
+    let cases = genie_core::eval::bfcl::load_cases_jsonl(&args.cases)?;
+    if let Some(parent) = args.out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut writer = std::io::BufWriter::new(fs::File::create(&args.out)?);
+    let mut tool_calls = 0;
+    for case in &cases {
+        let response = if let Some(call) =
+            genie_core::tools::quick::route_for_available_tools(&case.prompt, true, true)
+        {
+            tool_calls += 1;
+            serde_json::json!({
+                "tool": call.name,
+                "arguments": call.arguments,
+            })
+            .to_string()
+        } else {
+            String::new()
+        };
+        let prediction = genie_core::eval::bfcl::BfclPrediction {
+            id: case.id.clone(),
+            response,
+        };
+        serde_json::to_writer(&mut writer, &prediction)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+
+    Ok(BfclPredictQuickReport {
+        total_cases: cases.len(),
+        tool_calls,
+    })
 }
 
 fn format_score_rate(rate: f64) -> String {
@@ -2301,6 +2422,67 @@ mod tests {
         ];
 
         assert!(parse_bfcl_score_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_bfcl_predict_quick_args_supports_output_aliases() {
+        let args = vec![
+            "--cases=tests/bfcl/local/ha_home_cases.jsonl".to_string(),
+            "--preds=tests/bfcl/local/ha_home_predictions.jsonl".to_string(),
+        ];
+
+        let parsed = parse_bfcl_predict_quick_args(&args).unwrap();
+
+        assert_eq!(
+            parsed.cases,
+            PathBuf::from("tests/bfcl/local/ha_home_cases.jsonl")
+        );
+        assert_eq!(
+            parsed.out,
+            PathBuf::from("tests/bfcl/local/ha_home_predictions.jsonl")
+        );
+    }
+
+    #[test]
+    fn bfcl_predict_quick_writes_prediction_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "genie-claw-bfcl-predict-test-{}-{}",
+            std::process::id(),
+            unix_time_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cases_path = dir.join("cases.jsonl");
+        let predictions_path = dir.join("predictions.jsonl");
+        std::fs::write(
+            &cases_path,
+            concat!(
+                "{\"id\":\"time-1\",\"prompt\":\"what time is it\",",
+                "\"expected_tool_calls\":[{\"name\":\"get_time\",\"arguments\":{}}]}\n"
+            ),
+        )
+        .unwrap();
+
+        let report = cmd_bfcl_predict_quick(&BfclPredictQuickArgs {
+            cases: cases_path.clone(),
+            out: predictions_path.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(report.total_cases, 1);
+        assert_eq!(report.tool_calls, 1);
+
+        let predictions =
+            genie_core::eval::bfcl::load_predictions_jsonl(&predictions_path).unwrap();
+        assert_eq!(predictions.len(), 1);
+        assert_eq!(predictions[0].id, "time-1");
+
+        let cases = genie_core::eval::bfcl::load_cases_jsonl(&cases_path).unwrap();
+        let score = genie_core::eval::bfcl::score_cases(&cases, &predictions);
+        assert_eq!(score.strict_matches, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "voice")]
