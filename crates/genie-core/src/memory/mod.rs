@@ -2101,7 +2101,10 @@ mod tests {
         let namespaces_bak = mem.canonical_dir.join("namespaces.bak");
 
         // Confirm the live dir was created by the initial rebuild.
-        assert!(namespaces_dir.exists(), "namespaces/ must exist after first rebuild");
+        assert!(
+            namespaces_dir.exists(),
+            "namespaces/ must exist after first rebuild"
+        );
 
         // Simulate the mid-crash state: the live dir was sidelined to .bak
         // (step 1 of the swap) but the staging→live rename never happened
