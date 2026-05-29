@@ -9,7 +9,13 @@ prompts to a bigger remote model.
 
 ## Product Target
 
-The flagship target is GeniePod Home on Jetson-class hardware.
+The flagship target is NVIDIA Jetson Orin 8GB hardware.
+
+Raspberry Pi and generic portable SBC profiles are maintained as smaller
+deployment and validation targets. They do not need to expose every
+Jetson-specific voice, CUDA, or model-runtime feature, but they should keep the
+headless agent, family memory, tools, HTTP/CLI surfaces, and home-runtime
+boundaries usable.
 
 The agent should:
 
@@ -20,6 +26,7 @@ The agent should:
 - control IoT devices through typed local interfaces
 - degrade gracefully without the internet
 - expose audit, confirmation, and memory-management surfaces to the household
+- preserve the same limited-context contract across maintained SBC profiles
 
 Cloud or remote model providers are not the product default. OpenAI-compatible
 API providers, OpenAI, Anthropic, Gemini, custom providers, and similar adapters
@@ -101,9 +108,10 @@ GenieClaw should not become a wireless driver stack, but it should integrate
 with a first-party local device graph and actuation boundary. The target split
 is:
 
-- `genie-os` owns radios, Linux interfaces, drivers, and service supervision.
-- `genie-home-runtime` owns device graph, Matter/Thread/Zigbee/BLE adapters,
-  automations, and final physical actuation safety.
+- The platform/OS layer owns radios, Linux interfaces, drivers, and service
+  supervision.
+- The external home boundary owns device graph, Matter/Thread/Zigbee/BLE
+  adapters, automations, and final physical actuation safety.
 - `genie-claw` owns user intent, memory, policy, confirmations, audit, and
   tool routing.
 

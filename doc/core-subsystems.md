@@ -142,6 +142,8 @@ boundary owned below GenieClaw.
 
 ## Memory System
 
+Deep dive: [memory-system.md](memory-system.md).
+
 Source:
 
 - `crates/genie-core/src/memory/mod.rs`
@@ -211,7 +213,7 @@ Current transitional source:
 
 Long-term owner:
 
-- [`genie-voice-runtime`](https://github.com/GeniePod/genie-voice-runtime)
+- external voice boundary
 
 GenieClaw should own:
 
@@ -221,7 +223,7 @@ GenieClaw should own:
 - memory/tool/home-intent policy for voice-origin requests
 - shared-room safety policy
 
-`genie-voice-runtime` should own:
+The external voice boundary should own:
 
 - wake word
 - VAD
@@ -245,9 +247,9 @@ Notable modules:
 - `aec.rs`
 - `vad.rs`
 
-These modules remain a Jetson alpha bring-up path until the external runtime is
-production-ready. New voice-pipeline implementation should target
-`genie-voice-runtime` unless it is strictly an agent-layer behavior change.
+These modules remain a Jetson alpha bring-up path until the external voice
+boundary is production-ready. New voice-pipeline implementation should target
+that boundary unless it is strictly an agent-layer behavior change.
 
 ## Security And Guardrails
 

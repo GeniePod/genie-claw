@@ -5,9 +5,9 @@ GenieClaw is the agent layer of the broader Genie ecosystem.
 This repository should be understood as the Rust agent runtime that sits above:
 
 - custom Jetson hardware
-- GenieOS, the custom L4T and system image layer
-- `genie-voice-runtime`, the external voice runtime for wake/VAD/STT/TTS/audio
-- `genie-home-runtime`, the future AI-native home automation runtime
+- the platform/OS layer for custom L4T, system image, drivers, and supervision
+- an external voice boundary for wake/VAD/STT/TTS/audio
+- an external home boundary for AI-native home automation and final actuation
 - `genie-ai-runtime`, the external Jetson-first LLM inference runtime
 
 It sits below:
@@ -44,11 +44,11 @@ GenieClaw Agent Layer
   Agent policy, memory, tools, skills, channel adapters, spoken behavior
 
 Runtime Layer
-  genie-voice-runtime: wake, VAD, STT, TTS, audio streaming
-  genie-home-runtime: local device graph, IoT adapters, automations, actuation safety, MCP
+  voice boundary: wake, VAD, STT, TTS, audio streaming
+  home boundary: local device graph, IoT adapters, automations, actuation safety, MCP
   genie-ai-runtime: Jetson-only LLM inference, CUDA kernels, model serving
 
-GenieOS Layer
+Platform/OS Layer
   Custom L4T image, drivers, services, OTA, diagnostics
 
 Hardware Layer
@@ -81,11 +81,11 @@ The repo should optimize for repeated daily usefulness:
 
 These responsibilities belong in lower or upper layers:
 
-- Jetson board support, kernel/device-tree work, OTA base image ownership: `genie-os`
-- Matter/Thread/Zigbee/BLE device graph and automation engine: `genie-home-runtime`
-- final physical actuation safety checks: `genie-home-runtime`
+- Jetson board support, kernel/device-tree work, OTA base image ownership: platform/OS layer
+- Matter/Thread/Zigbee/BLE device graph and automation engine: external home boundary
+- final physical actuation safety checks: external home boundary
 - llama.cpp fork, CUDA kernels, model memory planner: `genie-ai-runtime`
-- wake word, VAD, STT, TTS, ALSA/audio-device handling, denoise, and AEC: `genie-voice-runtime`
+- wake word, VAD, STT, TTS, ALSA/audio-device handling, denoise, and AEC: external voice boundary
 - full product app, account UX, mobile push, installer workflows: application layer
 
 This repo can keep transitional implementations while those layers are still forming, but the code should be structured so those boundaries can be replaced by stable clients.
@@ -97,12 +97,12 @@ The current repo still contains pragmatic adapters used to ship on Jetson now.
 | Current adapter | Target boundary | Notes |
 | --- | --- | --- |
 | `genie-ai-runtime` OpenAI-compatible client (default on Jetson) | external `genie-ai-runtime` service | `llama.cpp` remains a selectable fallback/development backend. Both local backends ship behind the `LlmClient` facade; per-deployment selection is via `[services.llm].backend` in `geniepod.toml`. Backend identity surfaces in `/api/health`, startup logs, and `genie-ctl status`. |
-| In-repo voice pipeline under `crates/genie-core/src/voice/` and `voice_loop.rs` | [`genie-voice-runtime`](https://github.com/GeniePod/genie-voice-runtime) | Keep current code as a transitional Jetson bring-up path. New wake/VAD/STT/TTS/audio ownership should move to the external runtime. GenieClaw should consume transcripts and issue speak commands. |
-| Home Assistant provider | `genie-home-runtime` MCP/API client | Keep HA-specific behavior behind `ha/` and tools/home boundaries. Home Assistant is a transitional provider while the native local device graph and IoT boundary mature. |
-| Actuation safety in `genie-core` | final safety in `genie-home-runtime` | Keep current safety as an agent-side guard and confirmation layer. |
+| In-repo voice pipeline under `crates/genie-core/src/voice/` and `voice_loop.rs` | external voice boundary | Keep current code as a transitional Jetson bring-up path. New wake/VAD/STT/TTS/audio ownership should move behind the external boundary. GenieClaw should consume transcripts and issue speak commands. |
+| Home Assistant provider | external home boundary | Keep HA-specific behavior behind `ha/` and tools/home boundaries. Home Assistant is a transitional provider while the native local device graph and IoT boundary mature. |
+| Actuation safety in `genie-core` | final safety in the external home boundary | Keep current safety as an agent-side guard and confirmation layer. |
 | `genie-api` dashboard | application layer | Keep it operational and lightweight; avoid making it the long-term product app. |
-| `genie-governor` service lifecycle | GenieOS/system supervisor | Keep it useful for Jetson bring-up while OS ownership matures. |
-| ESP32-C6 UART boundary | GenieOS connectivity service | Agent sees health/capabilities, not raw radio/device-driver internals. |
+| `genie-governor` service lifecycle | platform/system supervisor | Keep it useful for Jetson bring-up while OS ownership matures. |
+| ESP32-C6 UART boundary | platform connectivity service | Agent sees health/capabilities, not raw radio/device-driver internals. |
 
 ## Desired Internal Shape
 
@@ -113,7 +113,7 @@ The repo should trend toward these conceptual modules, even if existing file nam
 | Agent orchestration | `crates/genie-core/src/server.rs`, `repl.rs`, `voice_loop.rs`, `reasoning.rs`, `prompt.rs` |
 | AI runtime client | `crates/genie-core/src/llm/` |
 | Home runtime client | `crates/genie-core/src/ha/`, `tools/home.rs` |
-| Voice runtime client | transitional `crates/genie-core/src/voice/`, `voice_loop.rs`; target external client for `genie-voice-runtime` |
+| Voice runtime client | transitional `crates/genie-core/src/voice/`, `voice_loop.rs`; target external voice-boundary client |
 | Memory system | `crates/genie-core/src/memory/`, `conversation.rs` |
 | Tool and skill routing | `crates/genie-core/src/tools/`, `skills/` |
 | Channel adapters | `server.rs`, `repl.rs`, `telegram.rs`, `genie-ctl` |
@@ -133,7 +133,7 @@ Code in memory, voice, prompt, and channels should not learn Home Assistant inte
 Voice code has one additional rule: GenieClaw may own spoken agent behavior,
 but it should not own the long-term audio pipeline. Wake word, VAD, STT, TTS,
 audio-device handling, denoise, AEC, and streaming voice events belong in
-`genie-voice-runtime`.
+the external voice boundary.
 
 ## Process Topology Today
 
@@ -162,7 +162,7 @@ Target deployment:
 genie-ai-runtime
         ^
         |
-genie-voice-runtime ---- transcript/speak events
+external voice boundary ---- transcript/speak events
         ^                         |
         |                         v
 genie-claw
@@ -170,10 +170,10 @@ genie-claw
         +---- web/mobile apps
         +---- skills and channels
         v
-genie-home-runtime
+external home boundary
         |
         v
-GenieOS + hardware
+platform/OS + hardware
 ```
 
 ## Safety Ownership
@@ -189,7 +189,7 @@ Current safety responsibilities in this repo:
 - write actuation audit events
 - avoid relying on the model prompt as a safety boundary
 
-Long-term safety responsibilities in `genie-home-runtime`:
+Long-term safety responsibilities in the external home boundary:
 
 - final deterministic actuation checks
 - device availability and state checks
@@ -202,20 +202,23 @@ The agent may propose or request actions. The home runtime decides whether physi
 
 ## Portable Profiles
 
-GenieClaw supports portable development without changing the native product
+GenieClaw supports maintained SBC profiles without changing the native product
 shape. `[agent].runtime_profile` describes where the same agent harness is
 running:
 
 | Profile | Purpose |
 | --- | --- |
-| `jetson` | Flagship GeniePod Home path; 4096-token baseline and local runtime default |
-| `raspberry_pi` | SBC development profile for headless agent and provider work |
-| `portable_sbc` | Generic SBC profile where voice/home runtimes may be absent |
+| `jetson` | Flagship NVIDIA Jetson Orin 8GB path; 4096-token baseline and local runtime default |
+| `raspberry_pi` | Maintained SBC profile for the headless agent, memory, tools, HTTP/CLI, and home-provider boundaries |
+| `portable_sbc` | Maintained generic SBC profile where voice, CUDA, and full home runtimes may be absent |
 | `laptop` | Developer profile for local tests, docs, and provider integration |
 | `mac` | macOS developer profile; no Jetson-specific runtime assumptions |
 
-Profiles do not change ownership. They only make the same limited-context agent
-contract portable enough for development and review on non-Jetson hardware.
+Profiles do not change ownership. They keep the same limited-context agent
+contract portable enough for development, review, and maintained non-Jetson SBC
+deployments. Jetson-only acceleration and voice/audio behavior may degrade or
+be disabled, but prompt, memory, tools, safety policy, and home-runtime
+boundaries should keep working.
 
 ## Optional Providers
 
@@ -292,10 +295,10 @@ Short-term rule:
 Long-term direction:
 
 - `genie-claw`: agent layer repository and product brain
-- `genie-voice-runtime`: voice I/O runtime for wake, VAD, STT, TTS, and audio streaming
-- `genie-home-runtime`: home automation and physical actuation runtime
+- external voice boundary: voice I/O runtime for wake, VAD, STT, TTS, and audio streaming
+- external home boundary: home automation and physical actuation runtime
 - `genie-ai-runtime`: Jetson-only inference runtime
-- `genie-os`: custom L4T image and hardware bring-up layer
+- platform/OS layer: custom L4T image and hardware bring-up layer
 
 ## Refactor Direction
 
@@ -304,9 +307,9 @@ The clean architecture path is incremental:
 1. Make boundary language consistent in docs and config.
 2. Keep Home Assistant and LLM backends behind narrow adapter traits (LLM side resolved via the `LlmClient` facade in `crates/genie-core/src/llm/`).
 3. Tune the prompt/memory/tool harness for low-latency household context.
-4. Move physical actuation authority and direct local IoT/device graph ownership downward into `genie-home-runtime` when it exists.
+4. Move physical actuation authority and direct local IoT/device graph ownership downward into the external home boundary when it is ready.
 5. Keep Jetson model-server specialization in `genie-ai-runtime`.
-6. Move voice/audio pipeline ownership downward into `genie-voice-runtime`.
+6. Move voice/audio pipeline ownership downward into the external voice boundary.
 7. Keep GenieClaw focused on agent policy, memory, skills, tools, channels, and household interaction.
 
 This prevents the agent repo from becoming a single large mixed runtime while still allowing today’s Jetson appliance to keep working.

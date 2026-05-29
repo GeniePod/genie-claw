@@ -5,10 +5,14 @@ data_dir = "/opt/geniepod/data"
 
 [agent]
 runtime_profile = "jetson"        # "jetson", "raspberry_pi", "portable_sbc", "laptop", or "mac".
+                                  # Jetson is flagship; raspberry_pi and
+                                  # portable_sbc are maintained headless/SBC
+                                  # profiles for agent, memory, tools, and
+                                  # home-provider boundaries.
 context_window_tokens = 4096      # Non-negotiable Jetson baseline before any adaptive larger context.
 ai_runtime_boundary = "external_runtime"       # genie-ai-runtime owns inference.
-voice_runtime_boundary = "transitional_adapter" # In-repo voice path is temporary; target is genie-voice-runtime.
-home_runtime_boundary = "transitional_adapter"  # HA provider today; target is genie-home-runtime.
+voice_runtime_boundary = "transitional_adapter" # In-repo voice path is temporary; target is the external voice boundary.
+home_runtime_boundary = "transitional_adapter"  # HA provider today; target is the external home boundary.
 
 # Optional API/OAuth provider path. Disabled by default so the local Jetson
 # image and binary stay focused on genie-ai-runtime. This exists for better
@@ -164,6 +168,11 @@ wakeword_script = ""              # Empty = push-to-talk.
 #                             # not enough. Fails closed with no trusted keys.
 # signature_key_dir = "/etc/geniepod/skill-keys"  # holds <key_id>.pub keys
 # denied_permissions = ["network.raw", "filesystem.write"]
+# skill_execution_timeout_ms = 30000   # deadline for one native skill call.
+#                             # The C ABI call runs on a blocking thread; if it
+#                             # overruns this budget the call is abandoned and a
+#                             # timeout fault is returned, so a hung skill can't
+#                             # freeze the async executor (health, voice, etc.).
 
 # Optional per-origin tool policy. Defaults are allow unless a rule exists.
 # Use "*" as a wildcard origin or tool name. Deny rules override allow rules.

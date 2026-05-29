@@ -333,7 +333,7 @@ Behavior notes:
 | `response_timeout_ms` | UART response timeout |
 
 Legacy alias support exists for `esp32c6_spi`, but the current boundary is
-UART-oriented and the detailed SPI hosted work belongs in `genie-os`.
+UART-oriented and the detailed SPI hosted work belongs in the platform/OS layer.
 
 ## Environment Overrides And Related Runtime Variables
 
