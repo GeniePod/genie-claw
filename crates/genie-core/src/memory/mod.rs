@@ -4057,6 +4057,9 @@ fn household_note_from_memory(kind: &str, content: &str) -> Option<(String, Stri
             | "pet_care_routines"
             | "pet_device_events"
             | "household_guides_fts"
+            | "household_notes_fts"
+            | "family_notes_fts"
+            | "family_rules"
             | "family_preference_embeddings"
             | "notification_rules"
             | "vent_states"
@@ -4095,6 +4098,47 @@ fn household_note_from_memory(kind: &str, content: &str) -> Option<(String, Stri
             | "weather_context"
             | "calendar_events"
             | "reservation"
+            | "ble_tag_events"
+            | "vacuum_events"
+            | "room_map_zones"
+            | "obstacle_reports"
+            | "device_audit_log"
+            | "control_source"
+            | "family_calendar"
+            | "fan_states"
+            | "water_leak_sensors"
+            | "health_routines"
+            | "medicine_cabinet_events"
+            | "activity_notes_fts"
+            | "learning_history"
+            | "device_metadata"
+            | "audio_event_classifications"
+            | "device_alerts"
+            | "battery_status"
+            | "network_access_rules"
+            | "school_tasks"
+            | "trusted_contacts"
+            | "security_audit_log"
+            | "guest_profiles"
+            | "door_open_events"
+            | "daily_checklists"
+            | "user_preferences"
+            | "floor_plan_graph"
+            | "safety_routes"
+            | "smoke_detector_locations"
+            | "door_window_sensor_states"
+            | "project_notes_fts"
+            | "home_project_records"
+            | "glass_break_sensors"
+            | "camera_events"
+            | "child_contact_rules"
+            | "device_health"
+            | "child_profiles"
+            | "laundry_events"
+            | "hvac_runtime"
+            | "window_sensor_states"
+            | "appliance_events"
+            | "notification_log"
     ) {
         (note_type_from_kind(&kind_lower, &lower), trimmed)
     } else if let Some(rest) = lower
@@ -4355,6 +4399,8 @@ fn note_type_from_kind<'a>(kind: &'a str, lower_content: &str) -> &'a str {
         "recipes_fts" | "recipe_embeddings" => "recipe",
         "meal_ratings" | "meal_notes" | "food_inventory" => "meal",
         "household_guides_fts" => "recycling",
+        "household_notes_fts" => "home_maintenance",
+        "family_notes_fts" | "family_rules" => "family",
         "chore_assignments" | "chore_checkins" => "family",
         "automation_runs" | "sensor_health" | "vent_states" | "blind_positions" => {
             "troubleshooting"
@@ -4366,6 +4412,27 @@ fn note_type_from_kind<'a>(kind: &'a str, lower_content: &str) -> &'a str {
         | "energy_meter_readings"
         | "smart_plug_states" => "device",
         "room_assignments" | "vacuum_zones" | "restricted_zones" => "location",
+        "ble_tag_events" => "location",
+        "vacuum_events" | "room_map_zones" | "obstacle_reports" => "device",
+        "device_audit_log" | "control_source" | "security_audit_log" => "security",
+        "family_calendar" | "daily_checklists" => "schedule",
+        "fan_states" | "device_metadata" | "device_health" => "device",
+        "water_leak_sensors" | "glass_break_sensors" | "camera_events" => "safety",
+        "health_routines" | "medicine_cabinet_events" => "health",
+        "activity_notes_fts" | "learning_history" => "education",
+        "audio_event_classifications" | "device_alerts" | "battery_status" => "troubleshooting",
+        "network_access_rules" | "school_tasks" => "education",
+        "trusted_contacts" | "guest_profiles" | "child_profiles" => "family",
+        "door_open_events" => "delivery",
+        "user_preferences" => "home_comfort",
+        "floor_plan_graph"
+        | "safety_routes"
+        | "smoke_detector_locations"
+        | "door_window_sensor_states" => "safety",
+        "project_notes_fts" | "home_project_records" => "home_maintenance",
+        "child_contact_rules" => "family",
+        "laundry_events" | "appliance_events" | "notification_log" => "device",
+        "hvac_runtime" | "window_sensor_states" => "home_comfort",
         "notification_rules" | "do_not_disturb_rule" => "home_comfort",
         "gas_sensors" | "stove_state" | "safety_profiles" => "safety",
         "shopping_list_items" => "shopping",
@@ -4693,6 +4760,9 @@ fn should_embed_memory(kind: &str, content: &str, metadata: policy::MemoryPolicy
             | "pet_care_routines"
             | "pet_device_events"
             | "household_guides_fts"
+            | "household_notes_fts"
+            | "family_notes_fts"
+            | "family_rules"
             | "family_preference_embeddings"
             | "notification_rules"
             | "vent_states"
@@ -4731,6 +4801,47 @@ fn should_embed_memory(kind: &str, content: &str, metadata: policy::MemoryPolicy
             | "weather_context"
             | "calendar_events"
             | "reservation"
+            | "ble_tag_events"
+            | "vacuum_events"
+            | "room_map_zones"
+            | "obstacle_reports"
+            | "device_audit_log"
+            | "control_source"
+            | "family_calendar"
+            | "fan_states"
+            | "water_leak_sensors"
+            | "health_routines"
+            | "medicine_cabinet_events"
+            | "activity_notes_fts"
+            | "learning_history"
+            | "device_metadata"
+            | "audio_event_classifications"
+            | "device_alerts"
+            | "battery_status"
+            | "network_access_rules"
+            | "school_tasks"
+            | "trusted_contacts"
+            | "security_audit_log"
+            | "guest_profiles"
+            | "door_open_events"
+            | "daily_checklists"
+            | "user_preferences"
+            | "floor_plan_graph"
+            | "safety_routes"
+            | "smoke_detector_locations"
+            | "door_window_sensor_states"
+            | "project_notes_fts"
+            | "home_project_records"
+            | "glass_break_sensors"
+            | "camera_events"
+            | "child_contact_rules"
+            | "device_health"
+            | "child_profiles"
+            | "laundry_events"
+            | "hvac_runtime"
+            | "window_sensor_states"
+            | "appliance_events"
+            | "notification_log"
     ) || content.len() >= 48
         || lower.contains("thermostat")
         || lower.contains("lunchbox")
@@ -5092,6 +5203,11 @@ fn semantic_memory_type(kind: &str, content: &str) -> String {
         && (lower.contains("unchecked") || lower.contains("finished"))
     {
         "chores_status".into()
+    } else if lower.contains("this week")
+        && lower.contains("last week")
+        && lower.contains("electricity")
+    {
+        "electricity_week_compare".into()
     } else if lower.contains("electricity") || lower.contains("watts") {
         "electricity_usage".into()
     } else if lower.contains("marker") && lower.contains("hoodie") {
@@ -5146,6 +5262,91 @@ fn semantic_memory_type(kind: &str, content: &str) -> String {
         "spaceship_hallway".into()
     } else if lower.contains("morning readiness") || lower.contains("morning status") {
         "morning_readiness".into()
+    } else if lower.contains("homework mode") && (lower.contains("leo") || lower.contains("mia")) {
+        "kids_homework_mode".into()
+    } else if lower.contains("car keys") || lower.contains("key tag") {
+        "car_keys_location".into()
+    } else if lower.contains("bake cookies") && lower.contains("waking leo") {
+        "quiet_baking".into()
+    } else if lower.contains("robot vacuum") && lower.contains("stuck") {
+        "robot_vacuum_stuck".into()
+    } else if lower.contains("thermostat") && lower.contains("changed") {
+        "thermostat_audit".into()
+    } else if lower.contains("ladder safety") {
+        "ladder_safety_note".into()
+    } else if lower.contains("bathroom mirror") && lower.contains("schedule") {
+        "bathroom_mirror_schedule".into()
+    } else if lower.contains("too hot in bed")
+        || (lower.contains("bed cooling") && lower.contains("leo"))
+    {
+        "bed_cooling_comfort".into()
+    } else if lower.contains("package") && lower.contains("still on") {
+        "porch_package_present".into()
+    } else if lower.contains("water under the sink") || lower.contains("sink leak safety") {
+        "sink_leak_safety".into()
+    } else if lower.contains("art time lighting") {
+        "art_lighting_scene".into()
+    } else if lower.contains("allergy medicine") {
+        "allergy_medicine_status".into()
+    } else if lower.contains("dinosaur fact") {
+        "dinosaur_fact".into()
+    } else if lower.contains("standby power") && lower.contains("office") {
+        "office_standby_power".into()
+    } else if lower.contains("beeping") || lower.contains("low-battery alert") {
+        "beeping_device_alert".into()
+    } else if lower.contains("youtube") && lower.contains("math") {
+        "youtube_math_block".into()
+    } else if lower.contains("contractor") && lower.contains("garage") {
+        "contractor_garage_access".into()
+    } else if lower.contains("sleepover guest mode") {
+        "sleepover_guest_mode".into()
+    } else if lower.contains("stars") && lower.contains("closet") {
+        "stars_closet_dark".into()
+    } else if lower.contains("printer") && lower.contains("wi-fi reset") {
+        "printer_wifi_reset".into()
+    } else if lower.contains("porch light") && lower.contains("motion") {
+        "porch_light_motion".into()
+    } else if lower.contains("grandma") && lower.contains("wi-fi note") {
+        "grandma_wifi_note".into()
+    } else if lower.contains("play outside") && lower.contains("backyard") {
+        "outdoor_play_permission".into()
+    } else if lower.contains("school-morning") && lower.contains("blinds") {
+        "school_morning_blinds".into()
+    } else if lower.contains("this week")
+        && lower.contains("last week")
+        && lower.contains("electricity")
+    {
+        "electricity_week_compare".into()
+    } else if lower.contains("back burner") {
+        "back_burner_status".into()
+    } else if lower.contains("wet soccer shoes") {
+        "wet_soccer_shoes".into()
+    } else if lower.contains("warm-not-steamy") || lower.contains("not steamy") {
+        "warm_not_steamy_shower".into()
+    } else if lower.contains("quiet armed security") {
+        "quiet_security".into()
+    } else if lower.contains("laundry") && lower.contains("finished") {
+        "laundry_finish_status".into()
+    } else if lower.contains("tomorrow checklist") {
+        "tomorrow_checklist".into()
+    } else if lower.contains("green") && lower.contains("night-light") {
+        "green_night_light_preference".into()
+    } else if lower.contains("draftiest") || lower.contains("drafty") {
+        "drafty_room_report".into()
+    } else if lower.contains("blue") && lower.contains("mia") && lower.contains("paint") {
+        "mia_blue_paint".into()
+    } else if lower.contains("glass break") {
+        "glass_break_safety".into()
+    } else if lower.contains("call mom") && lower.contains("kitchen screen") {
+        "call_mom_kitchen_screen".into()
+    } else if lower.contains("offline") && lower.contains("devices") {
+        "offline_devices".into()
+    } else if lower.contains("babysitter mode") {
+        "babysitter_mode".into()
+    } else if lower.contains("laundry") && lower.contains("moved") {
+        "laundry_moved_status".into()
+    } else if lower.contains("kitchen alarm") && lower.contains("front door") {
+        "kitchen_alarm_exit_route".into()
     } else if lower.contains("paint")
         && (lower.contains("acrylic") || lower.contains("canvas") || lower.contains("tutorial"))
     {
@@ -5620,6 +5821,13 @@ fn embedding_text_for_query(query: &str) -> String {
         format!("night_reassurance dark scared night-light ocean sounds notify parents {query}")
     } else if lower.contains("finish my chores") || lower.contains("finished my chores") {
         format!("chores_status chore assignments checkins dishwasher laundry desk cleanup {query}")
+    } else if lower.contains("this week")
+        && lower.contains("last week")
+        && lower.contains("electricity")
+    {
+        format!(
+            "electricity_week_compare energy meter readings this week last week percent change kwh delta hvac dryer {query}"
+        )
     } else if lower.contains("electricity") {
         format!("electricity_usage energy meter watts current device dryer oven hvac {query}")
     } else if lower.contains("marker") && lower.contains("hoodie") {
@@ -5697,6 +5905,146 @@ fn embedding_text_for_query(query: &str) -> String {
     } else if lower.contains("morning readiness") {
         format!(
             "morning_readiness morning report doors coffee lunchbox bus rain school pickup {query}"
+        )
+    } else if lower.contains("homework mode") && lower.contains("kids") {
+        format!(
+            "kids_homework_mode homework mode leo mia study lights router focus rules quiet noise {query}"
+        )
+    } else if lower.contains("car keys") {
+        format!(
+            "car_keys_location car keys key tag ble ping entryway table recent location {query}"
+        )
+    } else if lower.contains("bake cookies") && lower.contains("waking leo") {
+        format!(
+            "quiet_baking bake cookies waking leo sleep state kitchen notifications range hood low {query}"
+        )
+    } else if lower.contains("robot vacuum") && lower.contains("stuck") {
+        format!(
+            "robot_vacuum_stuck vacuum stuck obstacle report toy bin left wheel room map {query}"
+        )
+    } else if lower.contains("changed the thermostat") {
+        format!(
+            "thermostat_audit thermostat target temperature changed user phone app audit log {query}"
+        )
+    } else if lower.contains("ladder safety") {
+        format!(
+            "ladder_safety_note ladder safety extension ladder stabilizer feet top rungs {query}"
+        )
+    } else if lower.contains("bathroom mirror") {
+        format!(
+            "bathroom_mirror_schedule mia schedule bathroom mirror agenda calendar events {query}"
+        )
+    } else if lower.contains("too hot in bed") {
+        format!(
+            "bed_cooling_comfort leo too hot in bed fan low lower room temperature sleep preference {query}"
+        )
+    } else if lower.contains("package still on the porch") {
+        format!(
+            "porch_package_present package still porch mat camera object delivery events door opens {query}"
+        )
+    } else if lower.contains("water under the sink") {
+        format!(
+            "sink_leak_safety water under sink leak sensor shut water valve alert household {query}"
+        )
+    } else if lower.contains("art time") {
+        format!(
+            "art_lighting_scene art time lighting room lights desk lamp blinds saved scene {query}"
+        )
+    } else if lower.contains("allergy medicine") {
+        format!(
+            "allergy_medicine_status allergy medicine routine checkin medicine cabinet opened {query}"
+        )
+    } else if lower.contains("dinosaur fact") {
+        format!("dinosaur_fact dinosaur fact yesterday leo activity notes learning history {query}")
+    } else if lower.contains("standby power") && lower.contains("office") {
+        format!(
+            "office_standby_power office standby safe plugs exclude router backup security hub {query}"
+        )
+    } else if lower.contains("beeping sound") || lower.contains("beeping") {
+        format!(
+            "beeping_device_alert beeping sound leak sensor low battery audio classification alert {query}"
+        )
+    } else if lower.contains("youtube") && lower.contains("math") {
+        format!(
+            "youtube_math_block youtube blocked devices math task completion network rule {query}"
+        )
+    } else if lower.contains("contractor") && lower.contains("garage") {
+        format!(
+            "contractor_garage_access contractor garage temporary access ten to ten twenty notify audit {query}"
+        )
+    } else if lower.contains("sleepover guest mode") {
+        format!(
+            "sleepover_guest_mode guest wifi hallway night lights quiet hours child safe {query}"
+        )
+    } else if lower.contains("stars") && lower.contains("closet") {
+        format!("stars_closet_dark ceiling projector stars closet light stays off {query}")
+    } else if lower.contains("printer")
+        && (lower.contains("wi fi") || lower.contains("wi-fi") || lower.contains("wifi"))
+    {
+        format!(
+            "printer_wifi_reset printer wi-fi reset wireless button reconnect printer app {query}"
+        )
+    } else if lower.contains("porch light") && lower.contains("still on") {
+        format!(
+            "porch_light_motion porch light still on camera repeated motion automation runs {query}"
+        )
+    } else if lower.contains("grandma")
+        && (lower.contains("wi fi") || lower.contains("wi-fi") || lower.contains("wifi"))
+    {
+        format!("grandma_wifi_note grandma elaine wifi note family contacts allowed access {query}")
+    } else if lower.contains("play outside") && !lower.contains("air quality") {
+        format!(
+            "outdoor_play_permission leo play outside backyard fence parent present weather {query}"
+        )
+    } else if lower.contains("open my blinds slowly") || lower.contains("school morning") {
+        format!(
+            "school_morning_blinds mia blinds gradual open school mornings skip holidays {query}"
+        )
+    } else if lower.contains("back burner") {
+        format!("back_burner_status stove back burner off residual heat cooling normally {query}")
+    } else if lower.contains("wet soccer shoes") {
+        format!("wet_soccer_shoes wet soccer shoes mudroom drying tray not bedroom {query}")
+    } else if lower.contains("not steamy") {
+        format!("warm_not_steamy_shower shower warm not steamy bathroom fan high humidity {query}")
+    } else if lower.contains("security on") && lower.contains("kids") {
+        format!(
+            "quiet_security security armed kids asleep noncritical chimes muted urgent alerts {query}"
+        )
+    } else if lower.contains("laundry finish") || lower.contains("laundry finished") {
+        format!("laundry_finish_status dryer finished time opened notification log {query}")
+    } else if lower.contains("tomorrow") && lower.contains("checklist") {
+        format!(
+            "tomorrow_checklist daily checklist calendar school tasks reminders ordered {query}"
+        )
+    } else if lower.contains("green") && lower.contains("night") {
+        format!(
+            "green_night_light_preference leo favorite night-light color green preference {query}"
+        )
+    } else if lower.contains("drafty") {
+        format!(
+            "drafty_room_report temperature sensors hvac runtime window sensors drafty room {query}"
+        )
+    } else if lower.contains("blue paint") || (lower.contains("mia") && lower.contains("paint")) {
+        format!("mia_blue_paint mia room blue paint harbor mist eggshell project notes {query}")
+    } else if lower.contains("glass break") {
+        format!(
+            "glass_break_safety glass break downstairs sensors camera events alert parents lights {query}"
+        )
+    } else if lower.contains("call mom") && lower.contains("kitchen screen") {
+        format!(
+            "call_mom_kitchen_screen child contact rules mom sarah kitchen display video call {query}"
+        )
+    } else if lower.contains("devices are offline") || lower.contains("offline devices") {
+        format!("offline_devices device health last seen heartbeat offline by room {query}")
+    } else if lower.contains("babysitter") {
+        format!(
+            "babysitter_mode babysitter guest code care notes kitchen display guest wifi child rules {query}"
+        )
+    } else if lower.contains("laundry get moved") || lower.contains("laundry moved") {
+        format!("laundry_moved_status mia laundry moved dryer basket weight sensor time {query}")
+    } else if lower.contains("safest way out") || lower.contains("kitchen alarm") {
+        format!(
+            "kitchen_alarm_exit_route floor plan safety route smoke detector front door clear avoid kitchen hallway {query}"
         )
     } else if lower.contains("bedtime story") {
         format!("bedtime_story leo short adventure story library ten minutes {query}")
@@ -6055,6 +6403,11 @@ fn semantic_query_type(query: &str) -> Option<String> {
         Some("night_reassurance".into())
     } else if lower.contains("finish my chores") || lower.contains("finished my chores") {
         Some("chores_status".into())
+    } else if lower.contains("this week")
+        && lower.contains("last week")
+        && lower.contains("electricity")
+    {
+        Some("electricity_week_compare".into())
     } else if lower.contains("electricity") {
         Some("electricity_usage".into())
     } else if lower.contains("marker") && lower.contains("hoodie") {
@@ -6107,6 +6460,88 @@ fn semantic_query_type(query: &str) -> Option<String> {
         Some("spaceship_hallway".into())
     } else if lower.contains("morning readiness") {
         Some("morning_readiness".into())
+    } else if lower.contains("homework mode") && lower.contains("kids") {
+        Some("kids_homework_mode".into())
+    } else if lower.contains("car keys") {
+        Some("car_keys_location".into())
+    } else if lower.contains("bake cookies") && lower.contains("waking leo") {
+        Some("quiet_baking".into())
+    } else if lower.contains("robot vacuum") && lower.contains("stuck") {
+        Some("robot_vacuum_stuck".into())
+    } else if lower.contains("changed the thermostat") {
+        Some("thermostat_audit".into())
+    } else if lower.contains("ladder safety") {
+        Some("ladder_safety_note".into())
+    } else if lower.contains("bathroom mirror") {
+        Some("bathroom_mirror_schedule".into())
+    } else if lower.contains("too hot in bed") {
+        Some("bed_cooling_comfort".into())
+    } else if lower.contains("package still on the porch") {
+        Some("porch_package_present".into())
+    } else if lower.contains("water under the sink") {
+        Some("sink_leak_safety".into())
+    } else if lower.contains("art time") {
+        Some("art_lighting_scene".into())
+    } else if lower.contains("allergy medicine") {
+        Some("allergy_medicine_status".into())
+    } else if lower.contains("dinosaur fact") {
+        Some("dinosaur_fact".into())
+    } else if lower.contains("standby power") && lower.contains("office") {
+        Some("office_standby_power".into())
+    } else if lower.contains("beeping") {
+        Some("beeping_device_alert".into())
+    } else if lower.contains("youtube") && lower.contains("math") {
+        Some("youtube_math_block".into())
+    } else if lower.contains("contractor") && lower.contains("garage") {
+        Some("contractor_garage_access".into())
+    } else if lower.contains("sleepover guest mode") {
+        Some("sleepover_guest_mode".into())
+    } else if lower.contains("stars") && lower.contains("closet") {
+        Some("stars_closet_dark".into())
+    } else if lower.contains("printer")
+        && (lower.contains("wi fi") || lower.contains("wi-fi") || lower.contains("wifi"))
+    {
+        Some("printer_wifi_reset".into())
+    } else if lower.contains("porch light") && lower.contains("still on") {
+        Some("porch_light_motion".into())
+    } else if lower.contains("grandma")
+        && (lower.contains("wi fi") || lower.contains("wi-fi") || lower.contains("wifi"))
+    {
+        Some("grandma_wifi_note".into())
+    } else if lower.contains("play outside") && !lower.contains("air quality") {
+        Some("outdoor_play_permission".into())
+    } else if lower.contains("open my blinds slowly") || lower.contains("school morning") {
+        Some("school_morning_blinds".into())
+    } else if lower.contains("back burner") {
+        Some("back_burner_status".into())
+    } else if lower.contains("wet soccer shoes") {
+        Some("wet_soccer_shoes".into())
+    } else if lower.contains("not steamy") {
+        Some("warm_not_steamy_shower".into())
+    } else if lower.contains("security on") && lower.contains("kids") {
+        Some("quiet_security".into())
+    } else if lower.contains("laundry finish") || lower.contains("laundry finished") {
+        Some("laundry_finish_status".into())
+    } else if lower.contains("tomorrow") && lower.contains("checklist") {
+        Some("tomorrow_checklist".into())
+    } else if lower.contains("green") && lower.contains("night") {
+        Some("green_night_light_preference".into())
+    } else if lower.contains("drafty") {
+        Some("drafty_room_report".into())
+    } else if lower.contains("blue paint") || (lower.contains("mia") && lower.contains("paint")) {
+        Some("mia_blue_paint".into())
+    } else if lower.contains("glass break") {
+        Some("glass_break_safety".into())
+    } else if lower.contains("call mom") && lower.contains("kitchen screen") {
+        Some("call_mom_kitchen_screen".into())
+    } else if lower.contains("devices are offline") || lower.contains("offline devices") {
+        Some("offline_devices".into())
+    } else if lower.contains("babysitter") {
+        Some("babysitter_mode".into())
+    } else if lower.contains("laundry get moved") || lower.contains("laundry moved") {
+        Some("laundry_moved_status".into())
+    } else if lower.contains("safest way out") || lower.contains("kitchen alarm") {
+        Some("kitchen_alarm_exit_route".into())
     } else if lower.contains("bedtime story") {
         Some("bedtime_story".into())
     } else if lower.contains("romantic poem")
@@ -8729,6 +9164,7 @@ fn household_note_query(query: &str) -> Option<String> {
         || lower.starts_with("how long do i boil ")
         || lower.starts_with("how long should i boil ")
         || lower.starts_with("what bin does ")
+        || lower.starts_with("tell me the dinosaur fact")
         || lower.starts_with("what did we have for dinner ")
         || lower.starts_with("find the recipe for ")
         || lower.starts_with("what is the school")
@@ -8773,6 +9209,27 @@ fn household_note_query(query: &str) -> Option<String> {
         || lower.contains("did mom approve my sleepover")
         || lower.contains("pajama day")
         || lower.contains("allergy action plan")
+        || lower.contains("car keys")
+        || lower.contains("robot vacuum stuck")
+        || lower.contains("who changed the thermostat")
+        || lower.contains("ladder safety")
+        || lower.contains("bathroom mirror")
+        || lower.contains("package still on the porch")
+        || lower.contains("allergy medicine")
+        || lower.contains("dinosaur fact")
+        || lower.contains("what s making that beeping sound")
+        || lower.contains("what's making that beeping sound")
+        || lower.contains("porch light still on")
+        || lower.contains("grandma")
+            && (lower.contains("wi fi note")
+                || lower.contains("wi-fi note")
+                || lower.contains("wifi note"))
+        || lower.contains("allowed to play outside")
+        || lower.contains("wet soccer shoes")
+        || lower.contains("when did the laundry finish")
+        || lower.contains("blue paint")
+        || lower.contains("did my laundry get moved")
+        || lower.contains("safest way out")
     {
         return Some(query.to_string());
     }
@@ -11499,6 +11956,117 @@ mod tests {
     }
 
     #[test]
+    fn contextual_family_routines_third_batch_answer_exact_and_fts_questions() {
+        let mem = temp_memory();
+        mem.store(
+            "ble_tag_events",
+            "Jared car keys location: car keys are on the entryway table; key tag last pinged there 6 minutes ago",
+        )
+        .unwrap();
+        mem.store(
+            "device_audit_log",
+            "Thermostat audit: Jared changed the thermostat to 70F from his phone at 6:12 PM",
+        )
+        .unwrap();
+        mem.store(
+            "household_notes_fts",
+            "Ladder safety note in garage maintenance checklist: use stabilizer feet and avoid the top two rungs",
+        )
+        .unwrap();
+        mem.store(
+            "delivery_events",
+            "Package still on porch: porch camera still detects the package by the front mat",
+        )
+        .unwrap();
+        mem.store(
+            "health_routines",
+            "Mia allergy medicine: marked done at 7:41 AM; medicine cabinet opened at the same time",
+        )
+        .unwrap();
+        mem.store(
+            "activity_notes_fts",
+            "Leo dinosaur fact from yesterday: some sauropods swallowed stones to help grind food in their stomachs",
+        )
+        .unwrap();
+        mem.store(
+            "audio_event_classifications",
+            "Beeping sound source: laundry-room leak sensor has a low battery alert",
+        )
+        .unwrap();
+        mem.store(
+            "manuals_fts",
+            "Printer Wi-Fi reset: hold the printer wireless button for 5 seconds, then reconnect it from the printer app",
+        )
+        .unwrap();
+        mem.store(
+            "family_notes_fts",
+            "Grandma Elaine Wi-Fi note is saved in Family Contacts",
+        )
+        .unwrap();
+        mem.store(
+            "family_rules",
+            "Leo outdoor play permission: he can play in the backyard, stay inside the fence, and Mom is in the kitchen",
+        )
+        .unwrap();
+        mem.store(
+            "appliance_events",
+            "Laundry finish status: dryer finished at 4:47 PM and has not been opened yet",
+        )
+        .unwrap();
+        mem.store(
+            "household_guides_fts",
+            "Wet soccer shoes guide: put wet soccer shoes on the mudroom drying tray, not in the bedroom",
+        )
+        .unwrap();
+        mem.store(
+            "project_notes_fts",
+            "Mia room blue paint: Harbor Mist, eggshell finish",
+        )
+        .unwrap();
+        mem.store(
+            "laundry_events",
+            "Mia laundry moved: dryer door opened and Mia basket weight increased at 5:22 PM",
+        )
+        .unwrap();
+        mem.store(
+            "safety_routes",
+            "Kitchen alarm safest route: use the front door route from the living room; avoid the kitchen hallway",
+        )
+        .unwrap();
+
+        for (query, expected) in [
+            ("Where are my car keys?", "entryway table"),
+            ("Who changed the thermostat?", "Jared"),
+            ("Find the ladder safety note", "stabilizer feet"),
+            ("Is the package still on the porch?", "front mat"),
+            ("Did Mia take her allergy medicine?", "7:41 AM"),
+            ("Tell me the dinosaur fact from yesterday", "sauropods"),
+            ("What's making that beeping sound?", "leak sensor"),
+            ("How do I reset the printer Wi-Fi?", "wireless button"),
+            ("Find Grandma's Wi-Fi note", "Family Contacts"),
+            ("Am I allowed to play outside?", "backyard"),
+            ("When did the laundry finish?", "4:47 PM"),
+            ("Where do my wet soccer shoes go?", "mudroom drying tray"),
+            (
+                "What was the blue paint color in Mia's room?",
+                "Harbor Mist",
+            ),
+            ("Did my laundry get moved?", "5:22 PM"),
+            (
+                "What's the safest way out if the kitchen alarm goes off?",
+                "front door",
+            ),
+        ] {
+            let answer = mem.structured_household_answer(query).unwrap();
+            assert!(answer.is_some(), "query {query:?} should have an answer");
+            assert!(
+                answer.unwrap().contains(expected),
+                "query {query:?} should include {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn semantic_search_links_cold_to_thermostat_preference() {
         let mem = temp_memory();
         mem.store(
@@ -12893,6 +13461,292 @@ mod tests {
                 "blue and white",
             ),
             ("Jared: Give me a morning readiness report", "lunchbox"),
+        ] {
+            assert!(
+                mem.semantic_search(query, 3)
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit.entry.content.contains(expected)),
+                "query {query:?} should recall {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_search_links_contextual_household_controls_and_reports_third_batch() {
+        let mem = temp_memory();
+        mem.store(
+            "scenes",
+            "Kids homework mode: Leo and Mia study lights bright, router focus rules active, and quiet background sound playing",
+        )
+        .unwrap();
+        mem.store(
+            "ble_tag_events",
+            "Jared car keys location: key tag last pinged on the entryway table 6 minutes ago",
+        )
+        .unwrap();
+        mem.store(
+            "family_preference_embeddings",
+            "Quiet baking without waking Leo: keep kitchen notifications quiet and use the range hood on low",
+        )
+        .unwrap();
+        mem.store(
+            "vacuum_events",
+            "Robot vacuum stuck: blocked near Leo's toy bin with something blocking the left wheel",
+        )
+        .unwrap();
+        mem.store(
+            "device_audit_log",
+            "Thermostat audit: Jared changed the thermostat to 70F from his phone at 6:12 PM",
+        )
+        .unwrap();
+        mem.store(
+            "household_notes_fts",
+            "Ladder safety note: use stabilizer feet and avoid the top two rungs",
+        )
+        .unwrap();
+        mem.store(
+            "family_calendar",
+            "Mia bathroom mirror schedule: school, violin practice, and math homework",
+        )
+        .unwrap();
+        mem.store(
+            "sleep_preference_embeddings",
+            "Leo too hot in bed comfort: turn fan to low and lower his room by 2 degrees",
+        )
+        .unwrap();
+        mem.store(
+            "delivery_events",
+            "Porch package present: package is still on the front porch by the mat",
+        )
+        .unwrap();
+        mem.store(
+            "safety_intent_embeddings",
+            "Kitchen sink leak safety: shut off water to the kitchen sink and alert Sarah",
+        )
+        .unwrap();
+        mem.store(
+            "scene_embeddings",
+            "Art time lighting scene: restore Mia's saved room lights, desk lamp, and blinds",
+        )
+        .unwrap();
+        mem.store(
+            "health_routines",
+            "Mia allergy medicine status: marked done at 7:41 AM with medicine cabinet opening",
+        )
+        .unwrap();
+        mem.store(
+            "learning_history",
+            "Dinosaur fact from yesterday: some sauropods swallowed stones to grind food",
+        )
+        .unwrap();
+        mem.store(
+            "device_states",
+            "Office standby power: monitors, speakers, and printer are standby-safe; router, backup drive, and security hub are excluded",
+        )
+        .unwrap();
+        mem.store(
+            "audio_event_classifications",
+            "Beeping sound source: laundry-room leak sensor low battery alert",
+        )
+        .unwrap();
+        mem.store(
+            "network_access_rules",
+            "YouTube math block: YouTube is blocked on Mia's devices until the math task is marked finished",
+        )
+        .unwrap();
+        mem.store(
+            "access_permissions",
+            "Contractor garage access: contractor can open the garage between 10:00 and 10:20 with notification",
+        )
+        .unwrap();
+        mem.store(
+            "routines",
+            "Sleepover guest mode: guest Wi-Fi on, hallway night lights enabled, and quiet hours set",
+        )
+        .unwrap();
+        mem.store(
+            "device_aliases",
+            "Leo stars except closet: ceiling projector stars on and closet light stays off",
+        )
+        .unwrap();
+        mem.store(
+            "manuals_fts",
+            "Printer Wi-Fi reset: hold wireless button for 5 seconds and reconnect from printer app",
+        )
+        .unwrap();
+        mem.store(
+            "automation_runs",
+            "Porch light still on because the camera saw repeated motion twice in the last 10 minutes",
+        )
+        .unwrap();
+        mem.store(
+            "family_notes_fts",
+            "Grandma Elaine Wi-Fi note is in Family Contacts",
+        )
+        .unwrap();
+        mem.store(
+            "family_rules",
+            "Leo play outside permission: backyard is allowed, stay inside the fence, and Mom is in the kitchen",
+        )
+        .unwrap();
+        mem.store(
+            "automation_rules",
+            "Mia school-morning gradual blinds: open slowly on school mornings and skip school holidays",
+        )
+        .unwrap();
+        mem.store(
+            "energy_meter_readings",
+            "Electricity week comparison: this week is 12 percent higher, mainly upstairs HVAC and clothes dryer",
+        )
+        .unwrap();
+        mem.store(
+            "device_states",
+            "Back burner status: back burner is off, still warm, and cooling normally",
+        )
+        .unwrap();
+        mem.store(
+            "household_guides_fts",
+            "Wet soccer shoes guide: put wet soccer shoes on the mudroom drying tray, not in the bedroom",
+        )
+        .unwrap();
+        mem.store(
+            "comfort_preference_embeddings",
+            "Warm-not-steamy shower: warm the shower and run the bathroom fan high",
+        )
+        .unwrap();
+        mem.store(
+            "notification_rules",
+            "Quiet armed security: security stays armed, noncritical chimes muted, loud alerts only for urgent events",
+        )
+        .unwrap();
+        mem.store(
+            "appliance_events",
+            "Laundry finish status: dryer finished at 4:47 PM and has not been opened yet",
+        )
+        .unwrap();
+        mem.store(
+            "daily_checklists",
+            "Tomorrow checklist for Mia: pack gym clothes, bring math notebook, violin practice at 4:30, and charge laptop",
+        )
+        .unwrap();
+        mem.store(
+            "user_preferences",
+            "Leo green night-light preference: green is his favorite night-light color",
+        )
+        .unwrap();
+        mem.store(
+            "hvac_runtime",
+            "Drafty room report: dining room seems draftiest because temperature drops fastest after heat cycles off",
+        )
+        .unwrap();
+        mem.store(
+            "project_notes_fts",
+            "Mia room blue paint: Harbor Mist, eggshell finish",
+        )
+        .unwrap();
+        mem.store(
+            "glass_break_sensors",
+            "Glass break safety: check downstairs, keep Mia in place, alert Mom and Dad, and turn hallway lights on",
+        )
+        .unwrap();
+        mem.store(
+            "child_contact_rules",
+            "Kitchen screen call Mom: Leo may call Sarah on the kitchen display",
+        )
+        .unwrap();
+        mem.store(
+            "device_health",
+            "Offline devices: garage temperature sensor, guest room plug, and side-yard camera are offline",
+        )
+        .unwrap();
+        mem.store(
+            "routines",
+            "Babysitter mode: guest code active, care notes on kitchen display, and guest Wi-Fi enabled",
+        )
+        .unwrap();
+        mem.store(
+            "laundry_events",
+            "Mia laundry moved: dryer door opened and Mia basket weight increased at 5:22 PM",
+        )
+        .unwrap();
+        mem.store(
+            "safety_routes",
+            "Kitchen alarm exit route: use the front door route from the living room and avoid the kitchen hallway",
+        )
+        .unwrap();
+
+        for (query, expected) in [
+            ("Sarah: Start homework mode for both kids", "study lights"),
+            ("Jared: Where are my car keys?", "entryway table"),
+            (
+                "Mia: Can I bake cookies without waking Leo?",
+                "range hood on low",
+            ),
+            ("Leo: Why is the robot vacuum stuck?", "left wheel"),
+            ("Sarah: Who changed the thermostat?", "6:12 PM"),
+            ("Jared: Find the ladder safety note", "stabilizer feet"),
+            (
+                "Mia: Put my schedule on the bathroom mirror",
+                "violin practice",
+            ),
+            ("Leo: I'm too hot in bed", "2 degrees"),
+            ("Sarah: Is the package still on the porch?", "front porch"),
+            ("Jared: There's water under the sink", "shut off water"),
+            ("Mia: Save this lighting for art time", "desk lamp"),
+            ("Sarah: Did Mia take her allergy medicine?", "7:41 AM"),
+            ("Leo: Tell me the dinosaur fact from yesterday", "sauropods"),
+            ("Jared: Turn off standby power in the office", "router"),
+            ("Sarah: What's making that beeping sound?", "leak sensor"),
+            ("Mia: Block YouTube until I finish math", "math task"),
+            ("Jared: Let the contractor into the garage at 10", "10:20"),
+            ("Sarah: Set up sleepover guest mode", "quiet hours"),
+            (
+                "Leo: Turn on stars but keep the closet dark",
+                "closet light",
+            ),
+            ("Mia: How do I reset the printer Wi-Fi?", "wireless button"),
+            ("Jared: Why is the porch light still on?", "repeated motion"),
+            ("Sarah: Find Grandma's Wi-Fi note", "Family Contacts"),
+            ("Leo: Am I allowed to play outside?", "backyard"),
+            (
+                "Mia: Open my blinds slowly every school morning",
+                "school mornings",
+            ),
+            (
+                "Jared: Compare this week's electricity use to last week",
+                "12 percent",
+            ),
+            ("Sarah: Is the back burner off?", "cooling normally"),
+            (
+                "Leo: Where do my wet soccer shoes go?",
+                "mudroom drying tray",
+            ),
+            ("Mia: Make the shower warm but not steamy", "fan high"),
+            (
+                "Jared: Keep security on, but don't wake the kids",
+                "noncritical chimes",
+            ),
+            ("Sarah: When did the laundry finish?", "4:47 PM"),
+            ("Mia: Make tomorrow into a checklist", "math notebook"),
+            (
+                "Leo: Remember that I like the green night-light better",
+                "green",
+            ),
+            ("Jared: Which room seems drafty?", "dining room"),
+            (
+                "Sarah: What was the blue paint color in Mia's room?",
+                "Harbor Mist",
+            ),
+            ("Mia: I heard glass break downstairs", "alert Mom and Dad"),
+            ("Leo: Call Mom on the kitchen screen", "Sarah"),
+            ("Jared: Which devices are offline?", "side-yard camera"),
+            ("Sarah: Prep the house for the babysitter", "guest code"),
+            ("Mia: Did my laundry get moved?", "5:22 PM"),
+            (
+                "Jared: What's the safest way out if the kitchen alarm goes off?",
+                "front door",
+            ),
         ] {
             assert!(
                 mem.semantic_search(query, 3)

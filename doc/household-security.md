@@ -86,7 +86,8 @@ GenieClaw keeps these decisions separate:
   chore/task-log, schedule/channel-guide/subscription/TV/community-meeting,
   appliance-state, environment,
   location/presence, access, waste-collection, finance/market/payment-event,
-  fitness/health-reading, security-event, pet-care, school-transport, and pantry inventory memories answer local exact-match
+  fitness/health-reading, security-event, pet-care, school-transport, device-audit,
+  device-health, laundry, and pantry inventory memories answer local exact-match
   questions before fuzzy fallback;
   safe household notes, reminders, manuals, warranties, receipts, utility notes,
   first-aid notes, education notes, dictionary notes, story/media notes,
@@ -99,8 +100,10 @@ GenieClaw keeps these decisions separate:
   wardrobe/DIY/service, hiking/camping/cocktail/date-night/taco-bar planning,
   school checklists, appliance filters/manuals, contextual comfort, garden
   watering, recipe feedback, routine steps, automation troubleshooting,
-  sleep/night-safety, porch quieting, stain/laundry guides, leftovers, backpack/document locations,
-  allergy action plans, outlet/gas safety, wellness/anxiety, weather-report, and social-logistics context, and
+  sleep/night-safety, porch quieting, stain/laundry guides, leftovers,
+  backpack/key/package/document locations, allergy action plans, school-task
+  state, project notes, guest/babysitter notes, outlet/gas/water-leak/glass-break
+  safety, wellness/anxiety, weather-report, and social-logistics context, and
   protected account, lock-code, or key-location references are indexed in
   typed local tables for direct note recall or app-only disclosure
 - classification layer: each memory is scoped and tagged by sensitivity before
@@ -118,9 +121,13 @@ GenieClaw keeps these decisions separate:
   connected-car warmup/navigation, vacation-mode, fall-alert, smoke-ventilation,
   working-late, movie-night/away/dinner-prep/study/focus/cozy/reading/night-hallway
   scenes, network-pause, bedtime reading overrides, quiet porch/piano modes,
-  toddler-safe kitchen, robot vacuum, lock-except rules, outlet-spill and gas safety,
+  toddler-safe kitchen, robot vacuum, lock-except rules, homework mode, sleepover
+  guest mode, babysitter mode, contractor garage access, YouTube task blocking,
+  quiet security, shower comfort, star projector scenes, outlet-spill, water-leak,
+  glass-break, and gas safety,
   self-cleaning-oven, water-pressure, sump-pump, sous-vide, camera-motion,
-  unlocked-door/window, electricity, sprinkler-history, morning-readiness,
+  unlocked-door/window, electricity, draft/offline-device, sprinkler-history,
+  morning-readiness,
   nursery-air-quality, iron, water-heater, garage-door, and
   locked-out flows still resolve through this action layer;
   tool results and audit events carry an action class such as
