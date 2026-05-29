@@ -372,6 +372,7 @@ async fn main() -> Result<()> {
                     },
                     origin_token: telegram_origin_token,
                     max_parallel_updates: config.telegram.max_parallel_updates,
+                    origin_token: telegram_origin_token.map(zeroize::Zeroizing::new),
                 };
 
                 tracing::info!(

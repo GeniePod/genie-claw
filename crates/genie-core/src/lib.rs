@@ -1,8 +1,8 @@
 //! # genie-core
 //!
-//! Core runtime for GeniePod Home.
+//! Core runtime for the NVIDIA Jetson Orin 8GB-native home agent.
 //!
-//! Built for the GeniePod Home appliance, but exposed as modular Rust components.
+//! Built for the NVIDIA Jetson Orin 8GB appliance path, but exposed as modular Rust components.
 //! Any Rust project can use these modules independently:
 //!
 //! ```rust,no_run
@@ -20,6 +20,7 @@
 //! | [`llm`] | OpenAI-compatible LLM facade (`genie-ai-runtime`, llama.cpp, optional providers) |
 //! | [`ha`] | Home Assistant provider boundary, structure cache, and REST client |
 //! | [`tools`] | Compiled tool dispatch + parser for LLM JSON output |
+//! | [`eval`] | BFCL-style side-effect-free tool-call scoring |
 //! | [`memory`] | SQLite + FTS5 persistent memory with confidence decay |
 //! | [`conversation`] | Multi-session persistent conversation store |
 //! | [`connectivity`] | Boundary for an ESP32-C6 UART Thread/Matter coprocessor |
@@ -46,6 +47,7 @@ pub mod agent_harness;
 pub mod connectivity;
 pub mod context;
 pub mod conversation;
+pub mod eval;
 pub mod ha;
 pub mod llm;
 pub mod memory;

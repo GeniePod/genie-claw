@@ -80,7 +80,7 @@ pub struct ToolExecutionContext {
 
 /// LLM-generated tool call (parsed from model output).
 /// Accepts both `{"tool": "..."}` and `{"name": "..."}` formats.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     #[serde(alias = "tool")]
     pub name: String,
@@ -557,7 +557,7 @@ impl ToolDispatcher {
             "memory_status" => self.exec_memory_status(),
             "memory_forget" => self.exec_memory_forget(&call.arguments),
             "memory_store" => self.exec_memory_store(&call.arguments),
-            other => self.exec_skill(other, &call.arguments),
+            other => self.exec_skill(other, &call.arguments).await,
         };
 
         let tool_result = match result {
@@ -1055,6 +1055,7 @@ impl ToolDispatcher {
         }
 
         let mut stored = Vec::new();
+        let mut stored_categories = Vec::new();
         let mut rejected = Vec::new();
         let mut replaced = 0;
         for (category, content) in memories {
@@ -1065,6 +1066,7 @@ impl ToolDispatcher {
             }
             let outcome = mem.store_resolved(&category, &content)?;
             replaced += outcome.replaced;
+            stored_categories.push(category);
             stored.push(content);
         }
 
@@ -1074,6 +1076,38 @@ impl ToolDispatcher {
                 .copied()
                 .unwrap_or("I could not store that memory.")
                 .to_string());
+        }
+
+        if stored_categories
+            .iter()
+            .any(|category| category == "shopping")
+        {
+            let count = mem.shopping_list_pending_count().unwrap_or(0);
+            let removed = stored.iter().any(|content| {
+                content
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("shopping list removed:")
+            });
+            let added = stored
+                .iter()
+                .map(|content| {
+                    content
+                        .trim_start_matches("shopping list pending:")
+                        .trim_start_matches("shopping list removed:")
+                        .trim()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if removed {
+                return Ok(format!(
+                    "Removed {added} from the shopping list. You have {count} item(s) total."
+                ));
+            }
+            return Ok(format!(
+                "Added {added} to the shopping list. You have {count} item(s) total."
+            ));
         }
 
         if stored.len() == 1 {
@@ -1117,38 +1151,69 @@ impl ToolDispatcher {
         )
     }
 
-    fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
+    async fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
         let skills = self
             .skills
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
-        let mut loader = skills
-            .lock()
-            .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
 
         let args_json = serde_json::to_string(args)?;
-        let (success, output) = {
+
+        // Build a Send invocation handle under a short lock, then drop the lock
+        // BEFORE awaiting the (possibly blocking) C call. The invocation owns an
+        // Arc to the skill's library, so the native code stays mapped for the
+        // whole call even though the loader lock is released. Holding a
+        // std::sync::Mutex guard across the await would both serialize every
+        // other skill access and trip clippy's `await_holding_lock`.
+        let invocation = {
+            let loader = skills
+                .lock()
+                .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
             let skill = loader
-                .get_mut(name)
+                .loaded()
+                .iter()
+                .find(|s| s.name == name)
                 .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
-            skill.execute_parsed(&args_json)
+            skill.prepare(&args_json)
         };
 
-        let pruned = loader.prune_faulted();
-        if pruned.iter().any(|skill_name| skill_name == name) {
-            tracing::warn!(skill = name, "skill auto-unloaded after repeated faults");
+        let outcome = invocation.run().await;
+
+        // Re-acquire the lock to record the fault and reap a skill that has
+        // exceeded its fault budget. The skill may have been unloaded meanwhile;
+        // that is fine — the Arc kept its library alive for the call above.
+        {
+            let mut loader = skills
+                .lock()
+                .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
+            if outcome.faulted
+                && let Some(skill) = loader.get_mut(name)
+            {
+                skill.fault_count += 1;
+            }
+            let pruned = loader.prune_faulted();
+            if pruned.iter().any(|skill_name| skill_name == name) {
+                tracing::warn!(skill = name, "skill auto-unloaded after repeated faults");
+            }
         }
 
-        if success {
-            Ok(output)
+        if outcome.success {
+            Ok(outcome.output)
         } else {
-            Err(anyhow::anyhow!("{}", output))
+            Err(anyhow::anyhow!("{}", outcome.output))
         }
     }
 
     async fn exec_play_media(&self, args: &serde_json::Value) -> Result<String> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        tracing::info!(query, "triggering media mode via governor control socket");
+        let resolved = self.resolve_media_query(query);
+        tracing::info!(
+            query,
+            resolved_query = resolved.query.as_str(),
+            provider = resolved.provider.as_deref().unwrap_or("unknown"),
+            "triggering media mode via governor control socket"
+        );
+        write_media_request(&resolved).await;
 
         // Send media_start command to the governor via its Unix control socket.
         let response = governor_command(r#"{"cmd":"media_start"}"#).await;
@@ -1159,7 +1224,7 @@ impl ToolDispatcher {
                 if ok {
                     Ok(format!(
                         "Playing: {}. Switched to media mode — LLM unloaded, HDMI ready.",
-                        query
+                        resolved.display()
                     ))
                 } else {
                     let err = resp
@@ -1175,9 +1240,61 @@ impl ToolDispatcher {
                 tokio::fs::write("/run/geniepod/media_mode", b"1").await?;
                 Ok(format!(
                     "Playing: {}. Media mode triggered (file fallback).",
-                    query
+                    resolved.display()
                 ))
             }
+        }
+    }
+
+    fn resolve_media_query(&self, query: &str) -> ResolvedMediaQuery {
+        let Some(memory) = &self.memory else {
+            return ResolvedMediaQuery::unresolved(query);
+        };
+        let Ok(memory) = memory.lock() else {
+            return ResolvedMediaQuery::unresolved(query);
+        };
+        match memory.media_playlist_for_query(query).ok().flatten() {
+            Some(item) => ResolvedMediaQuery {
+                query: item.name,
+                provider: item.provider,
+                target: Some(item.target),
+                source: "memory".into(),
+            },
+            None => ResolvedMediaQuery::unresolved(query),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ResolvedMediaQuery {
+    query: String,
+    provider: Option<String>,
+    target: Option<String>,
+    source: String,
+}
+
+impl ResolvedMediaQuery {
+    fn unresolved(query: &str) -> Self {
+        Self {
+            query: query.trim().to_string(),
+            provider: None,
+            target: None,
+            source: "query".into(),
+        }
+    }
+
+    fn display(&self) -> String {
+        match (&self.provider, &self.target) {
+            (Some(provider), Some(target))
+                if target
+                    .to_ascii_lowercase()
+                    .starts_with(&format!("{provider}:")) =>
+            {
+                format!("{} ({target})", self.query)
+            }
+            (Some(provider), Some(target)) => format!("{} ({provider}: {target})", self.query),
+            (_, Some(target)) => format!("{} ({target})", self.query),
+            _ => self.query.clone(),
         }
     }
 }
@@ -1580,6 +1697,19 @@ async fn governor_command(json_cmd: &str) -> Option<serde_json::Value> {
         .ok()?;
 
     line.and_then(|l| serde_json::from_str(&l).ok())
+}
+
+async fn write_media_request(request: &ResolvedMediaQuery) {
+    let result: Result<()> = async {
+        tokio::fs::create_dir_all("/run/geniepod").await?;
+        let json = serde_json::to_vec(request)?;
+        tokio::fs::write("/run/geniepod/media_request.json", json).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::debug!(error = %error, "media request sidecar write skipped");
+    }
 }
 
 #[cfg(test)]
@@ -2332,6 +2462,45 @@ mod tests {
     }
 
     #[test]
+    fn memory_store_adds_shopping_list_items_with_count() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-store-shopping-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "shopping list pending: milk, eggs",
+                "category": "shopping"
+            }))
+            .unwrap();
+
+        assert!(result.contains("Added milk, eggs"));
+        assert!(result.contains("2 item"));
+
+        {
+            let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+            assert_eq!(mem.shopping_list_pending_count().unwrap(), 2);
+        }
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "shopping list removed: milk",
+                "category": "shopping"
+            }))
+            .unwrap();
+        assert!(result.contains("Removed milk"));
+        assert!(result.contains("1 item"));
+
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert_eq!(mem.shopping_list_pending_count().unwrap(), 1);
+    }
+
+    #[test]
     fn memory_store_rejects_high_risk_secret() {
         let db = std::env::temp_dir().join(format!(
             "memory-store-secret-test-{}.db",
@@ -2441,6 +2610,214 @@ mod tests {
 
         assert!(output.starts_with("No."));
         assert!(output.contains("Leo is not allowed"));
+    }
+
+    #[test]
+    fn memory_recall_answers_calendar_and_access_permission() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-calendar-access-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "calendar",
+                "Mia has piano lessons today at 4:00 PM with Mrs. Higgins",
+            )
+            .unwrap();
+        memory
+            .store(
+                "access_permission",
+                "Leo is not authorized to unlock the front door. He can only unlock the side door",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let calendar = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "does Mia have piano lessons today"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+        assert!(calendar.contains("Mia"));
+        assert!(calendar.contains("piano"));
+
+        let access = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "can Leo unlock the front door"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+        assert!(access.starts_with("No."));
+        assert!(access.contains("front door"));
+    }
+
+    #[test]
+    fn memory_recall_answers_typed_household_note() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-household-note-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("note", "Bike lock hangs on the garage hook")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "find my note about bicycle lock"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("garage hook"));
+    }
+
+    #[test]
+    fn memory_recall_answers_app_only_secret_reference_without_value() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-secret-ref-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "credential_reference",
+                "Guest Wi-Fi password is stored in credential:guest_wifi",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "what is our wifi password for guests"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("app-only reference"));
+        assert!(!output.contains("credential:guest_wifi"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_home_comfort_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-comfort-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "preference",
+                "Jared prefers the living room thermostat at 72F.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "I'm feeling cold"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("thermostat"));
+        assert!(output.contains("72F"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_lunchbox_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-lunchbox-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "shopping",
+                "Leo's lunchbox snacks include granola bars and fruit snacks.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "We need more snacks for Leo's lunchbox"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("granola bars"));
+        assert!(output.contains("fruit snacks"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_movie_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-movie-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "note",
+                "Watched The Iron Giant with the kids - they loved it.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "what was the movie about a robot that wanted to be a real boy"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("Iron Giant"));
+    }
+
+    #[test]
+    fn play_media_resolves_playlist_from_memory() {
+        let db = std::env::temp_dir().join(format!(
+            "media-profile-dispatch-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "media_profile",
+                "Jared's Morning Boost playlist is spotify:playlist:morning_boost",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let resolved = dispatcher.resolve_media_query("play my Morning Boost playlist");
+
+        assert_eq!(resolved.query, "Morning Boost");
+        assert_eq!(resolved.provider.as_deref(), Some("spotify"));
+        assert_eq!(
+            resolved.target.as_deref(),
+            Some("spotify:playlist:morning_boost")
+        );
+        assert_eq!(
+            resolved.display(),
+            "Morning Boost (spotify:playlist:morning_boost)"
+        );
     }
 
     #[test]

@@ -2,6 +2,10 @@
 /ROADMAP.md
 /VISION.md
 
+# Local/generated BFCL stress datasets. These can be large and intentionally
+# imperfect, so keep them out of git.
+/tests/bfcl/local/
+
 # macOS metadata
 .DS_Store
 **/.DS_Store
