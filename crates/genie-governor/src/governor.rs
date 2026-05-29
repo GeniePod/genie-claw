@@ -333,19 +333,46 @@ impl Governor {
             }
         }
 
-        if transition_changes_llm_weights(from, target)
-            && let Some(model) = from.llm_model()
-        {
-            let unit = self.llm_service_unit();
-            let path = format!("/opt/geniepod/models/{}", model);
-            if let Err(e) = ServiceCtl::swap_llm_model(&unit, &path).await {
-                tracing::error!(
-                    unit = %unit,
-                    model = %path,
-                    error = %e,
-                    "rollback LLM model swap failed"
-                );
+        match media_marker_rollback_action(from, target) {
+            MediaMarkerRollback::Restore => {
+                if let Err(e) = tokio::fs::create_dir_all("/run/geniepod").await {
+                    tracing::error!(error = %e, "rollback media marker directory restore failed");
+                } else if let Err(e) = tokio::fs::write("/run/geniepod/media_mode", b"1").await {
+                    tracing::error!(error = %e, "rollback media marker restore failed");
+                }
             }
+            MediaMarkerRollback::Remove => {
+                if let Err(e) = tokio::fs::remove_file("/run/geniepod/media_mode").await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::error!(error = %e, "rollback media marker removal failed");
+                }
+            }
+            MediaMarkerRollback::Unchanged => {}
+        }
+
+        match llm_rollback_action(from, target) {
+            LlmRollback::RestoreModel(model) => {
+                let unit = self.llm_service_unit();
+                let path = format!("/opt/geniepod/models/{}", model);
+                if let Err(e) = ServiceCtl::swap_llm_model(&unit, &path).await {
+                    tracing::error!(
+                        unit = %unit,
+                        model = %path,
+                        error = %e,
+                        "rollback LLM model swap failed"
+                    );
+                }
+            }
+            LlmRollback::StopService => {
+                let unit = self.llm_service_unit();
+                if ServiceCtl::is_active(&unit).await
+                    && let Err(e) = ServiceCtl::stop(&unit).await
+                {
+                    tracing::error!(unit = %unit, error = %e, "rollback LLM stop failed");
+                }
+            }
+            LlmRollback::Unchanged => {}
         }
     }
 }
@@ -378,6 +405,39 @@ fn transition_changes_llm_weights(from: Mode, target: Mode) -> bool {
         (Some(from_model), Some(to_model)) => from_model != to_model,
         (Some(_), None) | (None, Some(_)) => true,
         (None, None) => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaMarkerRollback {
+    Restore,
+    Remove,
+    Unchanged,
+}
+
+fn media_marker_rollback_action(from: Mode, target: Mode) -> MediaMarkerRollback {
+    match (from == Mode::Media, target == Mode::Media) {
+        (true, false) => MediaMarkerRollback::Restore,
+        (false, true) => MediaMarkerRollback::Remove,
+        _ => MediaMarkerRollback::Unchanged,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmRollback {
+    RestoreModel(&'static str),
+    StopService,
+    Unchanged,
+}
+
+fn llm_rollback_action(from: Mode, target: Mode) -> LlmRollback {
+    if !transition_changes_llm_weights(from, target) {
+        return LlmRollback::Unchanged;
+    }
+
+    match from.llm_model() {
+        Some(model) => LlmRollback::RestoreModel(model),
+        None => LlmRollback::StopService,
     }
 }
 
@@ -626,5 +686,37 @@ mod tests {
     fn rollback_restores_source_llm_weights_after_failed_swap() {
         assert!(transition_changes_llm_weights(Mode::Day, Mode::NightB));
         assert_eq!(Mode::Day.llm_model(), Some("nemotron-4b-q4_k_m.gguf"));
+    }
+
+    #[test]
+    fn rollback_restores_media_marker_when_media_stop_fails() {
+        assert_eq!(
+            media_marker_rollback_action(Mode::Media, Mode::Day),
+            MediaMarkerRollback::Restore
+        );
+        assert_eq!(
+            media_marker_rollback_action(Mode::Day, Mode::Media),
+            MediaMarkerRollback::Remove
+        );
+        assert_eq!(
+            media_marker_rollback_action(Mode::Day, Mode::NightB),
+            MediaMarkerRollback::Unchanged
+        );
+    }
+
+    #[test]
+    fn rollback_stops_llm_when_returning_to_media_mode() {
+        assert_eq!(
+            llm_rollback_action(Mode::Media, Mode::Day),
+            LlmRollback::StopService
+        );
+        assert_eq!(
+            llm_rollback_action(Mode::Day, Mode::Media),
+            LlmRollback::RestoreModel("nemotron-4b-q4_k_m.gguf")
+        );
+        assert_eq!(
+            llm_rollback_action(Mode::Day, Mode::NightA),
+            LlmRollback::Unchanged
+        );
     }
 }
