@@ -74,7 +74,7 @@ body:
     id: version
     attributes:
       label: GenieClaw version / commit
-      placeholder: "v1.0.0-alpha.9 or commit SHA"
+      placeholder: "v1.0.0-alpha.10 or commit SHA"
     validations:
       required: true
 

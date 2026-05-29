@@ -334,6 +334,10 @@ impl HomeAssistantProvider {
     ) -> Option<HomeTarget> {
         let query_lower = normalize(query);
 
+        if let Some(target) = Self::resolve_exact_entity_id(graph, query, action_hint) {
+            return Some(target);
+        }
+
         let area_match = best_area_match(&graph.areas, &query_lower);
         let domain_match = infer_domain(&query_lower);
 
@@ -361,6 +365,57 @@ impl HomeAssistantProvider {
         }
 
         Self::resolve_named_entity(graph, query, action_hint)
+    }
+
+    fn resolve_exact_entity_id(
+        graph: &HomeGraph,
+        query: &str,
+        action_hint: Option<HomeActionKind>,
+    ) -> Option<HomeTarget> {
+        let query = query.trim();
+        let entity = graph
+            .entities
+            .iter()
+            .find(|entity| entity.entity_id.eq_ignore_ascii_case(query))?;
+
+        match entity.domain.as_str() {
+            "scene" if !matches!(action_hint, Some(HomeActionKind::Activate) | None) => None,
+            "script" if !matches!(action_hint, Some(HomeActionKind::Activate) | None) => None,
+            "scene" => Some(HomeTarget {
+                kind: HomeTargetKind::Scene,
+                query: query.to_string(),
+                display_name: entity.name.clone(),
+                entity_ids: vec![entity.entity_id.clone()],
+                domain: Some(entity.domain.clone()),
+                area: entity.area.clone(),
+                confidence: 1.0,
+                voice_safe: true,
+            }),
+            "script" => graph
+                .scripts
+                .iter()
+                .find(|script| script.entity_id.eq_ignore_ascii_case(query))
+                .map(|script| HomeTarget {
+                    kind: HomeTargetKind::Script,
+                    query: query.to_string(),
+                    display_name: script.name.clone(),
+                    entity_ids: vec![script.entity_id.clone()],
+                    domain: Some("script".into()),
+                    area: script.area.clone(),
+                    confidence: 1.0,
+                    voice_safe: script.voice_safe,
+                }),
+            _ => Some(HomeTarget {
+                kind: HomeTargetKind::Entity,
+                query: query.to_string(),
+                display_name: entity.name.clone(),
+                entity_ids: vec![entity.entity_id.clone()],
+                domain: Some(entity.domain.clone()),
+                area: entity.area.clone(),
+                confidence: 1.0,
+                voice_safe: entity.domain != "lock",
+            }),
+        }
     }
 
     fn resolve_domain_target(graph: &HomeGraph, query: &str, domain: &str) -> Option<HomeTarget> {
@@ -1187,6 +1242,19 @@ mod tests {
         assert_eq!(target.kind, HomeTargetKind::Group);
         assert_eq!(target.display_name, "All lights");
         assert_eq!(target.domain.as_deref(), Some("light"));
+        assert_eq!(target.entity_ids, vec!["light.living_room_lamp"]);
+    }
+
+    #[test]
+    fn resolve_exact_entity_id_before_fuzzy_matching() {
+        let graph = sample_graph();
+        let target =
+            HomeAssistantProvider::resolve_target_in_graph(&graph, "light.living_room_lamp", None)
+                .unwrap();
+
+        assert_eq!(target.kind, HomeTargetKind::Entity);
+        assert_eq!(target.display_name, "Living Room Lamp");
+        assert_eq!(target.confidence, 1.0);
         assert_eq!(target.entity_ids, vec!["light.living_room_lamp"]);
     }
 

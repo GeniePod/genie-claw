@@ -13,8 +13,8 @@ use std::path::Path;
 /// The current target is an ESP32-C6 connected to Jetson over UART for
 /// Thread/Matter sidecar work.
 ///
-/// OS-level networking such as `esp-hosted-ng` belongs in `genie-os`, not in
-/// the core assistant runtime.
+/// OS-level networking such as `esp-hosted-ng` belongs in the platform/OS
+/// layer, not in the core assistant runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectivityState {

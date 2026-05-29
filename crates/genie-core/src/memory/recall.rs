@@ -160,7 +160,14 @@ pub fn recall_with_context(
     limit: usize,
     context: policy::MemoryReadContext,
 ) -> Result<Vec<RecallableMemory>> {
-    let results = memory.search(query, limit)?;
+    let mut results = memory.search(query, limit)?;
+    let semantic_hits = memory.semantic_search(query, limit)?;
+    for hit in semantic_hits {
+        if !results.iter().any(|entry| entry.id == hit.entry.id) {
+            results.push(hit.entry);
+        }
+    }
+    results.truncate(limit.max(1));
     let raw_hits = results.len();
     let recalled = filter_recall_results(results, context);
 
@@ -325,5 +332,35 @@ mod tests {
             identified[0].decision.disclosure,
             policy::MemoryDisclosure::Speak
         );
+    }
+
+    #[test]
+    fn recall_with_context_uses_semantic_hits_when_lexical_query_misses() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-recall-semantic-{}-{}.db",
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mem = Memory::open(&path).unwrap();
+        mem.store(
+            "preference",
+            "Jared prefers the living room thermostat at 72F.",
+        )
+        .unwrap();
+
+        let recalled = recall_with_context(
+            &mem,
+            "I'm feeling cold",
+            10,
+            policy::MemoryReadContext::shared_room_voice(),
+        )
+        .unwrap();
+
+        assert_eq!(recalled.len(), 1);
+        assert!(recalled[0].entry.content.contains("thermostat"));
     }
 }

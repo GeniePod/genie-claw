@@ -48,7 +48,7 @@ pub fn runtime_boundaries(agent: &AgentConfig) -> Vec<RuntimeBoundaryContract> {
         },
         RuntimeBoundaryContract {
             layer: "voice_runtime",
-            owner: "genie-voice-runtime",
+            owner: "external_voice_boundary",
             mode: format!("{:?}", agent.voice_runtime_boundary),
             contract: "transcript-in and speak-out session protocol",
             local_default: matches!(
@@ -58,7 +58,7 @@ pub fn runtime_boundaries(agent: &AgentConfig) -> Vec<RuntimeBoundaryContract> {
         },
         RuntimeBoundaryContract {
             layer: "home_runtime",
-            owner: "genie-home-runtime",
+            owner: "external_home_boundary",
             mode: format!("{:?}", agent.home_runtime_boundary),
             contract: "intent handoff plus final physical actuation gate",
             local_default: matches!(
@@ -112,8 +112,8 @@ mod tests {
 
         assert_eq!(boundaries.len(), 3);
         assert_eq!(boundaries[0].owner, "genie-ai-runtime");
-        assert_eq!(boundaries[1].owner, "genie-voice-runtime");
-        assert_eq!(boundaries[2].owner, "genie-home-runtime");
+        assert_eq!(boundaries[1].owner, "external_voice_boundary");
+        assert_eq!(boundaries[2].owner, "external_home_boundary");
         assert!(boundaries.iter().all(|boundary| !boundary.layer.is_empty()));
     }
 
