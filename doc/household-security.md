@@ -83,8 +83,9 @@ GenieClaw keeps these decisions separate:
   resolution before fuzzy matching; safe profile attributes and household rules
   answer low-latency questions about age, shoe sizes, allergies, homework, and
   screen-time constraints before FTS fallback; safe calendar, access,
-  chore/task-log, schedule/channel-guide/subscription, appliance-state, environment,
-  location, waste-collection, finance/market/payment-event, health-reading,
+  chore/task-log, schedule/channel-guide/subscription/TV/community-meeting,
+  appliance-state, environment,
+  location, waste-collection, finance/market/payment-event, fitness/health-reading,
   security-event, and pantry inventory memories answer local exact-match
   questions before fuzzy fallback;
   safe household notes, reminders, manuals, warranties, receipts, utility notes,
@@ -93,8 +94,10 @@ GenieClaw keeps these decisions separate:
   travel notes, contact/contractor notes, delivery notes, location notes,
   shopping notes, tool notes, DIY notes, fitness notes, food-safety notes,
   safety-equipment notes, school documents, recipe notes, gift history, tax and
-  vehicle documents, cooking references, hobby, podcast, language-learning,
-  wardrobe/DIY/service, weather-report, and social-logistics context, and
+  vehicle documents, cooking references, TV manuals, network-device notes,
+  hobby, podcast, language-learning, creative/story/literature/photo recall,
+  wardrobe/DIY/service, hiking/camping/cocktail/date-night/taco-bar planning,
+  wellness/anxiety, weather-report, and social-logistics context, and
   protected account, lock-code, or key-location references are indexed in
   typed local tables for direct note recall or app-only disclosure
 - classification layer: each memory is scoped and tagged by sensitivity before
@@ -109,7 +112,9 @@ GenieClaw keeps these decisions separate:
   the right target; work-from-home/all-off scenes, fireplace/ventilation,
   tire-pressure, mailbox, robot-mower, pool-cleaner, upstairs-light,
   smoke-detector, TV/alarm, nap-mode, baby-monitor, printer-ink, speed-limit,
-  iron, water-heater, garage-door, and
+  connected-car warmup/navigation, vacation-mode, fall-alert, smoke-ventilation,
+  working-late, self-cleaning-oven, water-pressure, sump-pump, sous-vide,
+  nursery-air-quality, iron, water-heater, garage-door, and
   locked-out flows still resolve through this action layer;
   tool results and audit events carry an action class such as
   `read_only`, `memory_write`, `home_actuation`, `network`, `media`, `timer`,
@@ -145,8 +150,8 @@ treated as ordinary recall.
   finance/allowance/payment logs, device aliases, and media targets are local
   SQLite rows derived from safe memory records, not remote profile data.
 - Store playlists and media preferences as provider targets instead of secrets.
-  Credential, subscription, account, and access-code memories should remain
-  app-only references and are not spoken in shared-room chat.
+  Credential, bank-login, subscription, account, and access-code memories should
+  remain app-only references and are not spoken in shared-room chat.
 - Do not store router, Wi-Fi, access-code, lock-combination, account-number,
   confirmation-number, spare-key, or sensitive document-location values as
   speakable notes. They are either rejected by memory-write policy or reduced
