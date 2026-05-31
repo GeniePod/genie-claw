@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use super::decay;
 use super::policy;
-use super::{Memory, MemoryEntry};
+use super::{Memory, MemoryEntry, SemanticMemoryHit};
 
 /// Dreaming-inspired memory consolidation.
 ///
@@ -160,14 +160,9 @@ pub fn recall_with_context(
     limit: usize,
     context: policy::MemoryReadContext,
 ) -> Result<Vec<RecallableMemory>> {
-    let mut results = memory.search(query, limit)?;
-    let semantic_hits = memory.semantic_search(query, limit)?;
-    for hit in semantic_hits {
-        if !results.iter().any(|entry| entry.id == hit.entry.id) {
-            results.push(hit.entry);
-        }
-    }
-    results.truncate(limit.max(1));
+    let lexical = memory.search(query, limit)?;
+    let semantic = memory.semantic_search(query, limit)?;
+    let results = fuse_recall_candidates(lexical, semantic, limit);
     let raw_hits = results.len();
     let recalled = filter_recall_results(results, context);
 
@@ -195,6 +190,73 @@ pub fn recall_with_context(
     }
 
     Ok(recalled)
+}
+
+/// Reciprocal-Rank-Fusion constant. The standard value from the original RRF
+/// paper (Cormack et al.); larger `k` flattens the contribution of top ranks,
+/// smaller `k` sharpens it. 60 is the widely-used default.
+const RRF_K: f64 = 60.0;
+
+/// Fuse the lexical (BM25/LIKE) and semantic (cosine) recall rankings into a
+/// single relevance-ordered list using Reciprocal Rank Fusion.
+///
+/// Previously the two result sets were concatenated (lexical first, semantic
+/// appended) and then truncated to `limit`, which silently discarded every
+/// semantic hit whenever lexical search already filled the limit, and never
+/// ranked the combined set by relevance. RRF fixes both: each list contributes
+/// `1 / (RRF_K + rank)` per item (rank is 1-based), contributions for an id
+/// present in both lists are summed (agreement boosts it), and the merged set
+/// is sorted by the fused score before truncation.
+///
+/// RRF is rank-based, so it sidesteps the fact that BM25-derived scores and
+/// cosine similarities live on different, non-comparable scales. Ties are
+/// broken by first-seen order (lexical before semantic, then original rank),
+/// giving a deterministic result.
+fn fuse_recall_candidates(
+    lexical: Vec<MemoryEntry>,
+    semantic: Vec<SemanticMemoryHit>,
+    limit: usize,
+) -> Vec<MemoryEntry> {
+    use std::collections::HashMap;
+    use std::collections::hash_map::Entry as MapEntry;
+
+    let mut score_by_id: HashMap<i64, f64> = HashMap::new();
+    let mut entry_by_id: HashMap<i64, MemoryEntry> = HashMap::new();
+    // First-seen order, used as a stable tie-breaker.
+    let mut seen_order: Vec<i64> = Vec::new();
+
+    let mut accumulate = |id: i64, rank: usize, entry: MemoryEntry| {
+        // `rank` is 0-based here; RRF uses 1-based ranks.
+        let contribution = 1.0 / (RRF_K + (rank as f64) + 1.0);
+        *score_by_id.entry(id).or_insert(0.0) += contribution;
+        if let MapEntry::Vacant(slot) = entry_by_id.entry(id) {
+            slot.insert(entry);
+            seen_order.push(id);
+        }
+    };
+
+    // Lexical hits arrive already ordered best-first (decayed BM25).
+    for (rank, entry) in lexical.into_iter().enumerate() {
+        accumulate(entry.id, rank, entry);
+    }
+    // Semantic hits arrive already ordered best-first (cosine similarity).
+    for (rank, hit) in semantic.into_iter().enumerate() {
+        accumulate(hit.entry.id, rank, hit.entry);
+    }
+
+    // Stable sort by fused score (desc); equal scores keep first-seen order.
+    let mut ranked = seen_order;
+    ranked.sort_by(|a, b| {
+        let sa = score_by_id.get(a).copied().unwrap_or(0.0);
+        let sb = score_by_id.get(b).copied().unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    ranked
+        .into_iter()
+        .take(limit.max(1))
+        .filter_map(|id| entry_by_id.remove(&id))
+        .collect()
 }
 
 pub fn filter_recall_results(
@@ -241,6 +303,82 @@ fn diversity_from_unique_queries(unique_queries: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_entry(id: i64, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id,
+            kind: "fact".to_string(),
+            content: content.to_string(),
+            created_ms: 0,
+            accessed_ms: 0,
+            recall_count: 0,
+            max_score: 0.0,
+            promoted: false,
+            metadata: policy::MemoryPolicyMetadata {
+                scope: policy::MemoryScope::Household,
+                sensitivity: policy::MemorySensitivity::Normal,
+                spoken_policy: policy::SpokenMemoryPolicy::Allow,
+            },
+        }
+    }
+
+    fn test_hit(id: i64, content: &str, score: f64) -> SemanticMemoryHit {
+        SemanticMemoryHit {
+            entry: test_entry(id, content),
+            score,
+            embedding_model: "test".to_string(),
+        }
+    }
+
+    /// The regression for the core bug: when lexical search already fills the
+    /// limit, the top semantic hit must still survive (RRF), not be truncated.
+    #[test]
+    fn fusion_keeps_semantic_hit_when_lexical_fills_the_limit() {
+        let lexical: Vec<MemoryEntry> = (1..=10).map(|i| test_entry(i, "common token")).collect();
+        let semantic = vec![test_hit(100, "semantically relevant", 0.95)];
+
+        let fused = fuse_recall_candidates(lexical, semantic, 10);
+
+        assert_eq!(fused.len(), 10);
+        assert!(
+            fused.iter().any(|e| e.id == 100),
+            "the top semantic hit must survive fusion, got ids {:?}",
+            fused.iter().map(|e| e.id).collect::<Vec<_>>()
+        );
+        assert!(
+            !fused.iter().any(|e| e.id == 10),
+            "the weakest lexical hit should be displaced by the semantic hit"
+        );
+    }
+
+    /// An id present in BOTH rankings has its contributions summed, so it
+    /// outranks items that appear in only one list.
+    #[test]
+    fn fusion_boosts_ids_present_in_both_rankings() {
+        let lexical = vec![test_entry(1, "a"), test_entry(2, "b"), test_entry(3, "c")];
+        let semantic = vec![test_hit(3, "c", 0.9)];
+
+        let fused = fuse_recall_candidates(lexical, semantic, 10);
+        let ids: Vec<i64> = fused.iter().map(|e| e.id).collect();
+
+        // id 3: lexical rank 3 (1/63) + semantic rank 1 (1/61) — highest fused.
+        // id 1: 1/61; id 2: 1/62.
+        assert_eq!(ids, vec![3, 1, 2]);
+    }
+
+    /// The same memory appearing in both lists must be de-duplicated.
+    #[test]
+    fn fusion_deduplicates_ids() {
+        let lexical = vec![test_entry(1, "a"), test_entry(2, "b")];
+        let semantic = vec![test_hit(1, "a", 0.9), test_hit(2, "b", 0.8)];
+
+        let fused = fuse_recall_candidates(lexical, semantic, 10);
+
+        assert_eq!(fused.len(), 2);
+        let mut ids: Vec<i64> = fused.iter().map(|e| e.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2]);
+    }
 
     #[test]
     fn default_weights_sum_to_one() {

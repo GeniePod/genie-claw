@@ -58,6 +58,25 @@ Everything else is noise until the local home agent is fast, accurate, and
 measurable under the Jetson 4096-token constraint. Routing, memory retrieval,
 typed tools, BFCL score, and Jetson behavior are the work.
 
+## Active Contribution Gate
+
+GenieClaw is not optimizing for broad user deployment yet. The current work is
+to make the agent materially faster, more accurate, and more reliable inside
+the Jetson 4096-token home-agent harness.
+
+Generic bug-fix PRs, cleanup PRs, broad refactors, dashboard polish, provider
+churn, and speculative feature work are not welcome unless they directly move
+the M1 scorecard: BFCL tool-call accuracy, deterministic family/home memory,
+typed-tool reliability, compact prompt assembly, or Jetson-native runtime
+behavior. A fix that is technically correct but outside that path is still
+noise for this phase.
+
+Valuable contributions are the ones that help this repository become what it is
+intended to be: a private, local, deterministic household agent that can run
+well on NVIDIA Jetson Orin 8GB hardware. Spam-like PRs, AI-generated issue
+churn, duplicate reports, unplanned bug-fix batches, or changes without real
+behavior proof will be closed immediately to protect review quality.
+
 ## Product Quality Bar
 
 PRs must improve the product behavior or make it easier to measure product
