@@ -38,6 +38,18 @@ pub enum TaintSink {
     ToolExec,
 }
 
+/// Where a piece of data came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataOrigin {
+    /// Generated locally (calculations, internal state).
+    Local,
+    /// Fetched from an external network (weather, web search).
+    ExternalNetwork,
+    /// Produced by an LLM.
+    Llm,
+    // Additional origins can be added later (e.g., Memory, UserInput).
+}
+
 /// A value with taint labels attached.
 #[derive(Debug, Clone)]
 pub struct Tainted<T> {
@@ -58,6 +70,15 @@ impl<T> Tainted<T> {
         Self {
             value,
             labels: HashSet::new(),
+        }
+    }
+
+        /// Create a `Tainted` value from a tool result, inferring the label from the data origin.
+    pub fn from_tool_result(value: T, origin: DataOrigin) -> Self {
+        match origin {
+            DataOrigin::ExternalNetwork => Tainted::new(value, TaintLabel::ExternalNetwork),
+            DataOrigin::Llm => Tainted::new(value, TaintLabel::LlmOutput),
+            DataOrigin::Local => Tainted::clean(value),
         }
     }
 
