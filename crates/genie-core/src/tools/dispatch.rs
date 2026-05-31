@@ -57,6 +57,14 @@ fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Opti
     Ok((entity, action, args.get("value").and_then(|v| v.as_f64())))
 }
 
+fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
+    args.get("entity")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("home_status requires non-empty string argument 'entity'"))
+}
+
 /// Tool definition for LLM function calling.
 ///
 /// These are sent to the configured LLM backend as part of the system prompt or
@@ -912,7 +920,7 @@ impl ToolDispatcher {
             .ha
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let entity_name = parse_home_status_args(args)?;
         let entity_name = self.resolve_device_alias(entity_name);
 
         home::status(ha.as_ref(), &entity_name).await
