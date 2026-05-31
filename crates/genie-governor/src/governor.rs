@@ -202,58 +202,42 @@ impl Governor {
         let reason = format!("{} -> {}", from, target);
         tracing::info!(from = %from, to = %target, "mode transition");
 
-        // Stop services not needed in target mode.
+        let mut stopped = Vec::new();
+        let mut started = Vec::new();
+
         for alias in target.stopped_services() {
             let Some(unit) = self.service_unit_for_alias(alias) else {
                 continue;
             };
-            ServiceCtl::stop(&unit).await?;
-        }
-
-        // Handle LLM model swap.
-        match (from, target) {
-            (_, Mode::Media) => {
-                let unit = self.llm_service_unit();
+            if ServiceCtl::is_active(&unit).await {
                 ServiceCtl::stop(&unit).await?;
+                stopped.push(StoppedService {
+                    alias,
+                    unit: unit.clone(),
+                });
             }
-            (Mode::Media, _) => {
-                if let Some(model) = target.llm_model() {
-                    let path = format!("/opt/geniepod/models/{}", model);
-                    let unit = self.llm_service_unit();
-                    if let Err(e) = ServiceCtl::swap_llm_model(&unit, &path).await {
-                        tracing::error!(error = %e, unit = %unit, model = %path, "LLM model swap failed");
-                    }
-                }
-                let _ = tokio::fs::remove_file("/run/geniepod/media_mode").await;
-            }
-            (Mode::Day | Mode::NightA, Mode::NightB) => {
-                if let Some(model) = Mode::NightB.llm_model() {
-                    let path = format!("/opt/geniepod/models/{}", model);
-                    let unit = self.llm_service_unit();
-                    if let Err(e) = ServiceCtl::swap_llm_model(&unit, &path).await {
-                        tracing::error!(error = %e, unit = %unit, model = %path, "LLM model swap failed");
-                    }
-                }
-            }
-            (Mode::NightB, Mode::Day) => {
-                if let Some(model) = Mode::Day.llm_model() {
-                    let path = format!("/opt/geniepod/models/{}", model);
-                    let unit = self.llm_service_unit();
-                    if let Err(e) = ServiceCtl::swap_llm_model(&unit, &path).await {
-                        tracing::error!(error = %e, unit = %unit, model = %path, "LLM model swap failed");
-                    }
-                }
-            }
-            _ => {}
         }
 
-        // Start services required by target mode.
+        if let Err(e) = self.apply_llm_swaps(from, target, &mut stopped).await {
+            self.rollback_transition(from, target, &stopped, &started)
+                .await;
+            return Err(e);
+        }
+        if matches!((from, target), (Mode::Media, _)) {
+            let _ = tokio::fs::remove_file("/run/geniepod/media_mode").await;
+        }
+
         for alias in target.required_services() {
             let Some(unit) = self.service_unit_for_alias(alias) else {
                 continue;
             };
             if !ServiceCtl::is_active(&unit).await {
-                ServiceCtl::start(&unit).await?;
+                if let Err(e) = ServiceCtl::start(&unit).await {
+                    self.rollback_transition(from, target, &stopped, &started)
+                        .await;
+                    return Err(e);
+                }
+                started.push(unit);
             }
         }
 
@@ -296,6 +280,164 @@ impl Governor {
         self.config
             .service_unit_for_alias("llm")
             .unwrap_or_else(|| "genie-ai-runtime.service".into())
+    }
+
+    async fn apply_llm_swaps(
+        &self,
+        from: Mode,
+        target: Mode,
+        stopped: &mut Vec<StoppedService>,
+    ) -> Result<()> {
+        match (from, target) {
+            (_, Mode::Media) => {
+                let unit = self.llm_service_unit();
+                if ServiceCtl::is_active(&unit).await {
+                    ServiceCtl::stop(&unit).await?;
+                    stopped.push(StoppedService { alias: "llm", unit });
+                }
+            }
+            (Mode::Media, _)
+            | (Mode::Day | Mode::NightA, Mode::NightB)
+            | (Mode::NightB, Mode::Day) => {
+                if let Some(model) = llm_model_for_transition(from, target) {
+                    let path = format!("/opt/geniepod/models/{}", model);
+                    let unit = self.llm_service_unit();
+                    ServiceCtl::swap_llm_model(&unit, &path).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Best-effort undo of partial transition work before returning the original error.
+    async fn rollback_transition(
+        &self,
+        from: Mode,
+        target: Mode,
+        stopped: &[StoppedService],
+        started: &[String],
+    ) {
+        for unit in started.iter().rev() {
+            if let Err(e) = ServiceCtl::stop(unit).await {
+                tracing::error!(unit = %unit, error = %e, "rollback stop failed");
+            }
+        }
+
+        for alias in service_aliases_to_restore(from, stopped) {
+            let Some(unit) = self.service_unit_for_alias(alias) else {
+                continue;
+            };
+            if let Err(e) = ServiceCtl::start(&unit).await {
+                tracing::error!(unit = %unit, alias, error = %e, "rollback start failed");
+            }
+        }
+
+        match media_marker_rollback_action(from, target) {
+            MediaMarkerRollback::Restore => {
+                if let Err(e) = tokio::fs::create_dir_all("/run/geniepod").await {
+                    tracing::error!(error = %e, "rollback media marker directory restore failed");
+                } else if let Err(e) = tokio::fs::write("/run/geniepod/media_mode", b"1").await {
+                    tracing::error!(error = %e, "rollback media marker restore failed");
+                }
+            }
+            MediaMarkerRollback::Remove => {
+                if let Err(e) = tokio::fs::remove_file("/run/geniepod/media_mode").await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::error!(error = %e, "rollback media marker removal failed");
+                }
+            }
+            MediaMarkerRollback::Unchanged => {}
+        }
+
+        match llm_rollback_action(from, target) {
+            LlmRollback::RestoreModel(model) => {
+                let unit = self.llm_service_unit();
+                let path = format!("/opt/geniepod/models/{}", model);
+                if let Err(e) = ServiceCtl::swap_llm_model(&unit, &path).await {
+                    tracing::error!(
+                        unit = %unit,
+                        model = %path,
+                        error = %e,
+                        "rollback LLM model swap failed"
+                    );
+                }
+            }
+            LlmRollback::StopService => {
+                let unit = self.llm_service_unit();
+                if ServiceCtl::is_active(&unit).await
+                    && let Err(e) = ServiceCtl::stop(&unit).await
+                {
+                    tracing::error!(unit = %unit, error = %e, "rollback LLM stop failed");
+                }
+            }
+            LlmRollback::Unchanged => {}
+        }
+    }
+}
+
+fn llm_model_for_transition(from: Mode, target: Mode) -> Option<&'static str> {
+    match (from, target) {
+        (Mode::Media, _) => target.llm_model(),
+        (Mode::Day | Mode::NightA, Mode::NightB) => Mode::NightB.llm_model(),
+        (Mode::NightB, Mode::Day) => Mode::Day.llm_model(),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoppedService {
+    alias: &'static str,
+    unit: String,
+}
+
+fn service_aliases_to_restore(from: Mode, stopped: &[StoppedService]) -> Vec<&'static str> {
+    stopped
+        .iter()
+        .map(|svc| svc.alias)
+        .filter(|alias| from.required_services().contains(alias))
+        .collect()
+}
+
+fn transition_changes_llm_weights(from: Mode, target: Mode) -> bool {
+    match (from.llm_model(), target.llm_model()) {
+        (Some(from_model), Some(to_model)) => from_model != to_model,
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaMarkerRollback {
+    Restore,
+    Remove,
+    Unchanged,
+}
+
+fn media_marker_rollback_action(from: Mode, target: Mode) -> MediaMarkerRollback {
+    match (from == Mode::Media, target == Mode::Media) {
+        (true, false) => MediaMarkerRollback::Restore,
+        (false, true) => MediaMarkerRollback::Remove,
+        _ => MediaMarkerRollback::Unchanged,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmRollback {
+    RestoreModel(&'static str),
+    StopService,
+    Unchanged,
+}
+
+fn llm_rollback_action(from: Mode, target: Mode) -> LlmRollback {
+    if !transition_changes_llm_weights(from, target) {
+        return LlmRollback::Unchanged;
+    }
+
+    match from.llm_model() {
+        Some(model) => LlmRollback::RestoreModel(model),
+        None => LlmRollback::StopService,
     }
 }
 
@@ -495,5 +637,86 @@ mod tests {
             Some("genie-ai-runtime.service")
         );
         assert_eq!(gov.llm_service_unit(), "genie-ai-runtime.service");
+    }
+
+    #[test]
+    fn llm_model_for_transition_selects_target_mode_weights() {
+        assert_eq!(
+            llm_model_for_transition(Mode::Day, Mode::NightB),
+            Mode::NightB.llm_model()
+        );
+        assert_eq!(
+            llm_model_for_transition(Mode::NightB, Mode::Day),
+            Mode::Day.llm_model()
+        );
+        assert_eq!(
+            llm_model_for_transition(Mode::Media, Mode::Day),
+            Mode::Day.llm_model()
+        );
+        assert!(llm_model_for_transition(Mode::Day, Mode::NightA).is_none());
+    }
+
+    #[test]
+    fn rollback_restores_services_required_by_source_mode_after_stop() {
+        let stopped = vec![
+            StoppedService {
+                alias: "homeassistant",
+                unit: "home-assistant.service".into(),
+            },
+            StoppedService {
+                alias: "nextcloud",
+                unit: "nextcloud.service".into(),
+            },
+        ];
+
+        assert_eq!(
+            service_aliases_to_restore(Mode::Day, &stopped),
+            vec!["homeassistant"]
+        );
+    }
+
+    #[test]
+    fn day_to_night_b_stops_ha_before_llm_swap_attempt() {
+        assert!(Mode::NightB.stopped_services().contains(&"homeassistant"));
+        assert!(llm_model_for_transition(Mode::Day, Mode::NightB).is_some());
+        assert!(transition_changes_llm_weights(Mode::Day, Mode::NightB));
+    }
+
+    #[test]
+    fn rollback_restores_source_llm_weights_after_failed_swap() {
+        assert!(transition_changes_llm_weights(Mode::Day, Mode::NightB));
+        assert_eq!(Mode::Day.llm_model(), Some("nemotron-4b-q4_k_m.gguf"));
+    }
+
+    #[test]
+    fn rollback_restores_media_marker_when_media_stop_fails() {
+        assert_eq!(
+            media_marker_rollback_action(Mode::Media, Mode::Day),
+            MediaMarkerRollback::Restore
+        );
+        assert_eq!(
+            media_marker_rollback_action(Mode::Day, Mode::Media),
+            MediaMarkerRollback::Remove
+        );
+        assert_eq!(
+            media_marker_rollback_action(Mode::Day, Mode::NightB),
+            MediaMarkerRollback::Unchanged
+        );
+    }
+
+    #[test]
+    fn rollback_stops_llm_when_returning_to_media_mode() {
+        assert_eq!(
+            llm_rollback_action(Mode::Media, Mode::Day),
+            LlmRollback::StopService
+        );
+        assert_eq!(
+            llm_rollback_action(Mode::Day, Mode::Media),
+            LlmRollback::RestoreModel("nemotron-4b-q4_k_m.gguf")
+        );
+        assert_eq!(
+            llm_rollback_action(Mode::Day, Mode::NightA),
+            LlmRollback::Unchanged
+        );
     }
 }
