@@ -119,3 +119,7 @@ backend = "llama_cpp"              # Dev default (x86/macOS): local llama.cpp `-
 # [services.homeassistant]
 # url = "http://127.0.0.1:8123/"
 # systemd_unit = "homeassistant.service"
+
+[sandbox]
+enforcement = "warn"
+require_landlock = false

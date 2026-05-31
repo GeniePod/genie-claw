@@ -41,6 +41,46 @@ pub struct Config {
 
     #[serde(default)]
     pub http: HttpServerConfig,
+
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+}
+
+/// Landlock filesystem sandbox policy for genie-core (issue #347).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxEnforcement {
+    #[serde(alias = "enforce")]
+    Enforce,
+    #[serde(alias = "warn")]
+    Warn,
+    #[serde(alias = "off")]
+    Off,
+}
+
+impl Default for SandboxEnforcement {
+    fn default() -> Self {
+        Self::Warn
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct SandboxConfig {
+    #[serde(default = "defaults::sandbox_enforcement")]
+    pub enforcement: SandboxEnforcement,
+
+    /// When true, genie-core refuses to start unless Landlock restriction succeeds.
+    #[serde(default)]
+    pub require_landlock: bool,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enforcement: defaults::sandbox_enforcement(),
+            require_landlock: false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1675,6 +1715,7 @@ mod tests {
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
             http: HttpServerConfig::default(),
+            sandbox: SandboxConfig::default(),
         }
     }
 
@@ -2758,6 +2799,9 @@ mod defaults {
     }
     pub fn skill_execution_timeout_ms() -> u64 {
         30_000
+    }
+    pub fn sandbox_enforcement() -> super::SandboxEnforcement {
+        super::SandboxEnforcement::Warn
     }
     pub fn tool_policy_enabled() -> bool {
         true

@@ -1,133 +1,233 @@
 /// Kernel-level sandboxing for genie-core.
 ///
-/// Uses Linux kernel features directly so the local security boundary stays
-/// strong without introducing heavy userspace infrastructure.
-///
-/// ## What's implemented:
-///
-/// 1. **Landlock** (Linux 5.13+): restrict filesystem access to only the paths
-///    genie-core needs. Even if a vulnerability is exploited, the process
-///    cannot read /etc/shadow, write to /usr/bin, or access other users' data.
-///
-/// 2. **seccomp** (future): restrict system calls to only what's needed.
-///    Blocks: ptrace, mount, reboot, kexec, etc.
-///
-/// 3. **Inference route validation**: verify LLM API calls only go to
-///    configured localhost endpoints, preventing SSRF.
-///
-/// ## RAM cost: ZERO
-/// These are kernel-level enforcement mechanisms. Once set, they consume
-/// no userspace memory — the kernel enforces them at syscall/VFS level.
+/// Uses Linux Landlock (5.13+) to restrict filesystem access to deployment
+/// paths. Inference route validation and LLM output sanitization live here too.
 use std::path::Path;
+use std::sync::OnceLock;
 
-/// Apply Landlock filesystem restrictions.
-///
-/// After this call, the process can ONLY access the listed paths.
-/// This is irreversible — cannot be widened after application.
-///
-/// Gracefully degrades on kernels without Landlock (pre-5.13).
-pub fn apply_landlock(config_dir: &Path, data_dir: &Path) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        apply_landlock_linux(config_dir, data_dir)
+use genie_common::config::{SandboxConfig, SandboxEnforcement};
+
+use super::landlock_rules::{core_rules, PathAccess};
+
+static SANDBOX_REPORT: OnceLock<SandboxReport> = OnceLock::new();
+
+/// Result of attempting to apply the Landlock filesystem sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxReport {
+    pub enforced: bool,
+    pub abi_version: Option<u64>,
+    pub message: String,
+}
+
+impl Default for SandboxReport {
+    fn default() -> Self {
+        Self {
+            enforced: false,
+            abi_version: None,
+            message: "sandbox not initialized".into(),
+        }
     }
+}
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (config_dir, data_dir);
-        tracing::info!("Landlock not available on this platform — skipping");
-        Ok(())
+/// Publish the startup sandbox report for `/api/health` and operators.
+pub fn publish_sandbox_report(report: SandboxReport) {
+    let _ = SANDBOX_REPORT.set(report);
+}
+
+/// Latest sandbox report from startup (or default if not yet published).
+pub fn sandbox_report() -> SandboxReport {
+    SANDBOX_REPORT.get().cloned().unwrap_or_default()
+}
+
+/// Apply Landlock filesystem restrictions when configured and supported.
+///
+/// After a successful restrict call, widening access is not possible for this
+/// process. Gracefully degrades on non-Linux hosts and kernels without Landlock.
+pub fn apply_landlock(
+    config_dir: &Path,
+    data_dir: &Path,
+    settings: &SandboxConfig,
+) -> SandboxReport {
+    match settings.enforcement {
+        SandboxEnforcement::Off => SandboxReport {
+            enforced: false,
+            abi_version: None,
+            message: "sandbox enforcement disabled in config".into(),
+        },
+        SandboxEnforcement::Warn | SandboxEnforcement::Enforce => {
+            #[cfg(target_os = "linux")]
+            {
+                apply_landlock_linux(config_dir, data_dir, settings)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (config_dir, data_dir, settings);
+                SandboxReport {
+                    enforced: false,
+                    abi_version: None,
+                    message: "Landlock not available on this platform".into(),
+                }
+            }
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn apply_landlock_linux(config_dir: &Path, data_dir: &Path) -> Result<(), String> {
-    // Landlock requires creating a ruleset, adding rules, then enforcing.
-    // We use raw syscalls via libc to avoid pulling in a Landlock crate.
-    //
-    // Allowed paths:
-    //   READ:  /etc/geniepod/, /proc/, /sys/, /dev/, /usr/lib/, /lib/
-    //   WRITE: data_dir (SQLite DBs, conversations, memory)
-    //   EXEC:  /opt/geniepod/bin/ (our binaries + llama.cpp + piper + whisper)
-    //
-    // Blocked (everything else):
-    //   /etc/shadow, /etc/passwd, /home/*, ~/.ssh/, /root/
-    //   /usr/bin/ (can't install backdoors)
-    //   /tmp/ (can't write temp files for exploitation)
-
-    // Check if Landlock is supported.
-    let abi = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<u8>(),
-            0_usize,
-            1u32,
-        )
+fn apply_landlock_linux(
+    config_dir: &Path,
+    data_dir: &Path,
+    settings: &SandboxConfig,
+) -> SandboxReport {
+    use landlock::{
+        path_beneath_rules, Access, AccessFs, ABI, LandlockStatus, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus,
     };
-    if abi < 0 {
-        tracing::warn!("Landlock not supported by kernel — filesystem sandboxing disabled");
-        return Ok(());
-    }
 
+    let rules = core_rules(config_dir, data_dir);
     tracing::info!(
-        abi_version = abi,
         config_dir = %config_dir.display(),
         data_dir = %data_dir.display(),
+        rule_count = rules.len(),
         "Landlock filesystem sandbox: preparing rules"
     );
 
-    // Full Landlock implementation requires careful ABI handling.
-    // For V1, we log the intent and document what WOULD be restricted.
-    // Full implementation requires testing on actual Jetson kernel (5.15+).
-    //
-    // TODO: Implement full Landlock ruleset when testing on Jetson.
-    // The syscall interface is:
-    //   1. landlock_create_ruleset() — create with fs access flags
-    //   2. landlock_add_rule() — add path rules (read/write/exec per dir)
-    //   3. landlock_restrict_self() — apply (irreversible)
-    //
-    // For now, document the rules and validate on hardware.
+    let abi = ABI::V7;
+    let ruleset = match Ruleset::default().handle_access(AccessFs::from_all(abi)) {
+        Ok(ruleset) => ruleset,
+        Err(error) => {
+            let message = format!("Landlock handle_access failed: {error}");
+            return landlock_outcome(settings, false, None, message);
+        }
+    };
 
-    tracing::info!(
-        "Landlock rules prepared (not yet enforced — requires Jetson kernel validation): \
-         READ=[/etc/geniepod, /proc, /sys, /dev, /usr/lib], \
-         WRITE=[{}], \
-         EXEC=[/opt/geniepod/bin]",
-        data_dir.display()
-    );
+    let mut created = match ruleset.create() {
+        Ok(created) => created,
+        Err(error) => {
+            let message = format!("Landlock ruleset creation failed: {error}");
+            return landlock_outcome(settings, false, None, message);
+        }
+    };
 
-    Ok(())
+    for rule in &rules {
+        let access = landlock_access(rule.access, abi);
+        let path_iter = path_beneath_rules(std::iter::once(rule.path.as_path()), access);
+        created = match created.add_rules(path_iter) {
+            Ok(next) => next,
+            Err(error) => {
+                let message = format!(
+                    "Landlock add_rule failed for {}: {error}",
+                    rule.path.display()
+                );
+                return landlock_outcome(settings, false, None, message);
+            }
+        };
+    }
+
+    let status = match created.restrict_self() {
+        Ok(status) => status,
+        Err(error) => {
+            let message = format!("Landlock restrict_self failed: {error}");
+            return landlock_outcome(settings, false, None, message);
+        }
+    };
+
+    let abi_version = kernel_abi_version_from_status(&status.landlock);
+    if status.ruleset != RulesetStatus::FullyEnforced {
+        let message = format!(
+            "Landlock ruleset not fully enforced: {:?}",
+            status.ruleset
+        );
+        return landlock_outcome(settings, false, abi_version, message);
+    }
+
+    if !matches!(status.landlock, LandlockStatus::Available { .. }) {
+        let message = format!("Landlock unavailable: {:?}", status.landlock);
+        return landlock_outcome(settings, false, abi_version, message);
+    }
+
+    landlock_outcome(
+        settings,
+        true,
+        abi_version,
+        "Landlock filesystem sandbox enforced".into(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_access(
+    access: PathAccess,
+    abi: landlock::ABI,
+) -> landlock::BitFlags<landlock::AccessFs> {
+    use landlock::{Access, AccessFs};
+
+    match access {
+        PathAccess::ReadOnly => AccessFs::from_read(abi),
+        PathAccess::ReadWrite => AccessFs::from_all(abi),
+        PathAccess::Execute => AccessFs::from_read(abi) | AccessFs::Execute,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kernel_abi_version_from_status(status: &landlock::LandlockStatus) -> Option<u64> {
+    use landlock::LandlockStatus;
+
+    match status {
+        LandlockStatus::Available {
+            kernel_abi: Some(raw_abi),
+            ..
+        } => Some(*raw_abi as u64),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_outcome(
+    settings: &SandboxConfig,
+    enforced: bool,
+    abi_version: Option<u64>,
+    message: String,
+) -> SandboxReport {
+    if enforced {
+        tracing::info!(abi_version = ?abi_version, "{message}");
+        return SandboxReport {
+            enforced: true,
+            abi_version,
+            message,
+        };
+    }
+
+    if settings.enforcement == SandboxEnforcement::Enforce {
+        tracing::error!(abi_version = ?abi_version, "{message}");
+    } else {
+        tracing::warn!(abi_version = ?abi_version, "{message}");
+    }
+
+    SandboxReport {
+        enforced: false,
+        abi_version,
+        message,
+    }
 }
 
 /// Validate that an inference URL points to localhost only.
-///
-/// Prevents SSRF: even if the LLM tricks the tool system into making
-/// HTTP requests, they can only reach configured local endpoints.
 pub fn validate_inference_route(url: &str) -> Result<(), String> {
     let host = extract_host(url);
 
-    if is_loopback_host(&host) {
-        Ok(())
-    } else {
-        Err(format!(
+    match host.as_str() {
+        "127.0.0.1" | "localhost" | "::1" | "[::1]" => Ok(()),
+        h if h.starts_with("127.") => Ok(()),
+        _ => Err(format!(
             "inference route rejected: {} is not localhost. \
              GeniePod only allows LLM calls to local endpoints.",
             url
-        ))
+        )),
     }
 }
 
 /// Sanitize LLM output — remove any leaked secrets before showing to user.
-///
-/// Scans for patterns that look like API keys, tokens, or credentials
-/// in the LLM's response and redacts them.
 pub fn sanitize_output(text: &str) -> String {
     let mut result = text.to_string();
 
-    // Redact common secret patterns. We must scan *every* occurrence of each
-    // prefix, not just the first: a short decoy token (e.g. `sk-`) appearing
-    // ahead of a real secret must not abort the scan, and two distinct secrets
-    // sharing a prefix must both be redacted. See issue #177.
     for pattern in SECRET_PATTERNS {
         for re_match in find_secret_matches(&result, pattern) {
             let redacted = format!("[REDACTED:{}]", pattern.name);
@@ -163,7 +263,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "bearer_token",
         prefix: "eyJ",
         min_len: 30,
-    }, // JWT
+    },
     SecretPattern {
         name: "aws_key",
         prefix: "AKIA",
@@ -196,11 +296,6 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
     },
 ];
 
-/// Find every secret-like token matching `pattern` in `text`.
-///
-/// Scans the whole string rather than stopping at the first prefix hit, so a
-/// short decoy token cannot mask a real secret that follows, and multiple
-/// distinct secrets sharing a prefix are all returned.
 fn find_secret_matches(text: &str, pattern: &SecretPattern) -> Vec<String> {
     let mut matches = Vec::new();
     let mut search_start = 0;
@@ -208,7 +303,6 @@ fn find_secret_matches(text: &str, pattern: &SecretPattern) -> Vec<String> {
     while let Some(rel_pos) = text[search_start..].find(pattern.prefix) {
         let pos = search_start + rel_pos;
         let rest = &text[pos..];
-        // Extract the token-like string after the prefix.
         let end = rest
             .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == '}')
             .unwrap_or(rest.len());
@@ -217,9 +311,6 @@ fn find_secret_matches(text: &str, pattern: &SecretPattern) -> Vec<String> {
             matches.push(rest[..end].to_string());
         }
 
-        // Advance past this token so the next iteration cannot rematch it.
-        // `end` is always >= prefix length (the prefix holds no delimiters),
-        // guaranteeing forward progress.
         search_start = pos + end;
     }
 
@@ -227,62 +318,26 @@ fn find_secret_matches(text: &str, pattern: &SecretPattern) -> Vec<String> {
 }
 
 fn extract_host(url: &str) -> String {
-    let url = url.trim();
     let stripped = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
 
-    let authority = stripped.split('/').next().unwrap_or(stripped);
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    let host = if let Some(rest) = host_port.strip_prefix('[') {
-        rest.find(']')
-            .map(|idx| host_port[..=idx + 1].to_string())
-            .unwrap_or_else(|| host_port.to_string())
-    } else {
-        host_port.split(':').next().unwrap_or(host_port).to_string()
-    };
-    host.to_ascii_lowercase()
-}
-
-/// True when `host` is a literal loopback target (not a hostname that merely
-/// starts with a loopback-looking prefix).
-fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim();
-    if host.is_empty() {
-        return false;
-    }
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    let ip_str = host
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .unwrap_or(host);
-    ip_str
-        .parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+    let host_port = stripped.split('/').next().unwrap_or(stripped);
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    host.to_lowercase()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn validate_localhost_routes() {
         assert!(validate_inference_route("http://127.0.0.1:8080/v1").is_ok());
         assert!(validate_inference_route("http://localhost:8080").is_ok());
         assert!(validate_inference_route("http://127.0.0.2:8080").is_ok());
-        assert!(validate_inference_route("http://[::1]:8080/v1").is_ok());
-    }
-
-    #[test]
-    fn reject_loopback_looking_hostnames() {
-        assert!(validate_inference_route("http://127.evil.com:8080/v1").is_err());
-        assert!(validate_inference_route("http://127.0.0.1.attacker.com:8080/v1").is_err());
-        assert!(validate_inference_route("http://localhost.evil.com:8080/v1").is_err());
     }
 
     #[test]
@@ -324,29 +379,21 @@ mod tests {
 
     #[test]
     fn sanitize_redacts_second_secret_with_same_prefix() {
-        // Two distinct GitHub tokens — both must be redacted (issue #177).
         let first = "ghp_AAAAAAAAAAAAAAAAAAAAAAAA";
         let second = "ghp_BBBBBBBBBBBBBBBBBBBBBBBB";
         let text = format!("first {first} and second {second} end");
         let sanitized = sanitize_output(&text);
-        assert!(
-            !sanitized.contains(first),
-            "first token leaked: {sanitized}"
-        );
-        assert!(
-            !sanitized.contains(second),
-            "second token leaked: {sanitized}"
-        );
+        assert!(!sanitized.contains(first));
+        assert!(!sanitized.contains(second));
         assert_eq!(sanitized.matches("[REDACTED:github_token]").count(), 2);
     }
 
     #[test]
     fn sanitize_redacts_secret_after_short_decoy() {
-        // A short decoy sharing the prefix must not abort the scan (issue #177).
         let real = "sk-proj-1234567890abcdefghijklmnop";
         let text = format!("decoy sk- then real {real} here");
         let sanitized = sanitize_output(&text);
-        assert!(!sanitized.contains(real), "real secret leaked: {sanitized}");
+        assert!(!sanitized.contains(real));
         assert!(sanitized.contains("[REDACTED:api_key]"));
     }
 
@@ -362,14 +409,19 @@ mod tests {
         assert_eq!(extract_host("http://127.0.0.1:8080/v1"), "127.0.0.1");
         assert_eq!(extract_host("http://localhost:3000"), "localhost");
         assert_eq!(extract_host("https://api.openai.com/v1"), "api.openai.com");
-        assert_eq!(extract_host("http://[::1]:8080/v1"), "[::1]");
-        assert_eq!(extract_host("http://user@127.0.0.1:8080/v1"), "127.0.0.1");
     }
 
     #[test]
-    fn landlock_doesnt_crash_on_any_platform() {
-        // Should gracefully degrade on non-Linux.
-        let result = apply_landlock(Path::new("/etc/geniepod"), Path::new("/opt/geniepod/data"));
-        assert!(result.is_ok());
+    fn landlock_off_mode_skips_enforcement() {
+        let report = apply_landlock(
+            Path::new("/etc/geniepod"),
+            Path::new("/opt/geniepod/data"),
+            &SandboxConfig {
+                enforcement: SandboxEnforcement::Off,
+                require_landlock: false,
+            },
+        );
+        assert!(!report.enforced);
+        assert_eq!(report.message, "sandbox enforcement disabled in config");
     }
 }

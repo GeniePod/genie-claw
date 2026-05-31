@@ -42,6 +42,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
 libc = { workspace = true }
+landlock = { workspace = true }
 libloading = "0.8"
 toml = { workspace = true }
 genie-skill-sdk = { path = "../genie-skill-sdk" }

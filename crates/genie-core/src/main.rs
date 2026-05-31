@@ -28,10 +28,25 @@ async fn main() -> Result<()> {
     let bind_host = config.core.bind_host.clone();
     tracing::info!("GeniePod core starting");
 
-    // Security audit on startup.
     let config_path = std::env::var("GENIEPOD_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("/etc/geniepod/geniepod.toml"));
+    let config_dir = config_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("/etc/geniepod"));
+
+    let sandbox_report =
+        genie_core::security::apply_landlock(&config_dir, &config.data_dir, &config.sandbox);
+    genie_core::security::publish_sandbox_report(sandbox_report.clone());
+    if config.sandbox.require_landlock && !sandbox_report.enforced {
+        anyhow::bail!(
+            "Landlock sandbox required but not enforced: {}",
+            sandbox_report.message
+        );
+    }
+
+    // Security audit on startup.
     genie_core::security::audit::run_audit(&config_path, &config.data_dir);
 
     let blocked_env = genie_core::security::env_sanitize::count_blocked();

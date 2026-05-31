@@ -1525,10 +1525,14 @@ async fn handle_health(
 
     let status = overall_health_status(llm_ok, connectivity_health.state, chat.wedged);
 
+    let sandbox = crate::security::sandbox_report();
     let resp = serde_json::json!({
         "status": status,
         "llm": if llm_ok { "connected" } else { "offline" },
         "llm_backend": llm.backend_name(),
+        "sandbox_enforced": sandbox.enforced,
+        "sandbox_abi_version": sandbox.abi_version,
+        "sandbox_message": sandbox.message,
         "memories": mem_count,
         "memory": {
             "count": mem_count,
