@@ -44,6 +44,17 @@ pub async fn get_status(_config: &Config) -> Response {
     }
 }
 
+/// Classify a SQLite error string and return an HTTP status code + error message.
+fn classify_sqlite_error(err: &str) -> (u16, String) {
+    let lower = err.to_lowercase();
+    let is_transient = lower.contains("database is locked") || lower.contains("database is busy");
+    if is_transient {
+        (503, "tegrastats data temporarily unavailable".into())
+    } else {
+        (500, "failed to read tegrastats data".into())
+    }
+}
+
 /// GET /api/tegrastats — recent history from governor's SQLite.
 pub async fn get_tegrastats(config: &Config) -> Response {
     let db_path = config.data_dir.join("governor.db");
@@ -89,25 +100,18 @@ pub async fn get_tegrastats(config: &Config) -> Response {
             body: json,
         },
         Ok(Err(e)) => {
-            // Distinguish transient errors (locked DB) from permanent ones.
-            let is_transient = e.to_lowercase().contains("database is locked")
-                || e.to_lowercase().contains("database is busy");
-            let status = if is_transient { 503 } else { 500 };
+            let (status, error_msg) = classify_sqlite_error(&e);
             tracing::error!(%e, "failed to read tegrastats from governor.db");
             Response {
                 status,
                 content_type: "application/json",
                 body: serde_json::json!({
-                    "error": if is_transient {
-                        "tegrastats data temporarily unavailable"
-                    } else {
-                        "failed to read tegrastats data"
-                    },
+                    "error": error_msg,
                     "detail": e
                 })
                 .to_string(),
             }
-        },
+        }
         Err(e) => {
             tracing::error!(%e, "tegrastats spawn_blocking panicked or was cancelled");
             Response {
@@ -118,7 +122,7 @@ pub async fn get_tegrastats(config: &Config) -> Response {
                 })
                 .to_string(),
             }
-        },
+        }
     }
 }
 
