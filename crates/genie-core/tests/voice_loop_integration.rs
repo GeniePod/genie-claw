@@ -163,8 +163,8 @@ async fn tool_dispatch_via_try_tool_call_writes_audit_log_event() {
         try_tool_call_with_context(llm_output, &dispatcher, ToolExecutionContext::default())
             .await
             .expect("get_time should be dispatchable");
-    assert_eq!(result.tool, "get_time");
-    assert!(result.success, "get_time should succeed");
+    assert_eq!(result.tool(), "get_time");
+    assert!(result.success(), "get_time should succeed");
 
     // The dispatcher's tool-audit logger appends one JSON line per dispatch.
     let log_contents = std::fs::read_to_string(&audit_path).expect("audit log file should exist");
@@ -264,17 +264,17 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
         try_tool_call_with_context(&llm_output, &dispatcher, ToolExecutionContext::default())
             .await
             .expect("LLM output should parse as a tool call");
-    assert_eq!(tool_result.tool, "get_time");
-    assert!(tool_result.success);
+    assert_eq!(tool_result.tool(), "get_time");
+    assert!(tool_result.success());
 
     store
-        .append(conv_id, "assistant", &llm_output, Some(&tool_result.tool))
+        .append(conv_id, "assistant", &llm_output, Some(tool_result.tool()))
         .unwrap();
     store
         .append(
             conv_id,
             "system",
-            &format!("Tool: {}", tool_result.output),
+            &format!("Tool: {}", tool_result.output()),
             None,
         )
         .unwrap();

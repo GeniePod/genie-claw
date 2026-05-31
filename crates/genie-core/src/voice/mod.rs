@@ -16,6 +16,7 @@ use genie_common::config::Config;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{Duration, interval};
 
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use crate::llm::{self, LlmClient};
 use crate::memory::Memory;
 use crate::tools::{ToolDispatcher, ToolResult};
@@ -265,7 +266,8 @@ impl VoiceOrchestrator {
                 name: call.tool,
                 arguments: call.arguments,
             };
-            return Some(self.tools.execute(&tc).await);
+            let mut guard = LoopGuard::new(LoopGuardConfig::default());
+            return Some(self.tools.execute(&tc, &mut guard).await.into_inner());
         }
 
         // Try finding JSON embedded in the response.
@@ -280,7 +282,8 @@ impl VoiceOrchestrator {
                     name: call.tool,
                     arguments: call.arguments,
                 };
-                return Some(self.tools.execute(&tc).await);
+                let mut guard = LoopGuard::new(LoopGuardConfig::default());
+                return Some(self.tools.execute(&tc, &mut guard).await.into_inner());
             }
         }
 

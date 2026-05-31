@@ -18,6 +18,7 @@ use tokio::process::Command;
 /// cycles only emit the normal one-liner.
 static FIRST_REPLY_BANNER_PRINTED: AtomicBool = AtomicBool::new(false);
 
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, LlmRequestHints};
 use crate::memory::{SharedMemory, with_shared_memory};
@@ -753,6 +754,7 @@ async fn handle_quick_tool_for_voice(
         return Some(response);
     }
 
+    let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
     let tool_result = tools
         .execute_with_context(
             &call,
@@ -761,12 +763,13 @@ async fn handle_quick_tool_for_voice(
                 request_origin: crate::tools::RequestOrigin::Voice,
                 confirmed: false,
             },
+            &mut loop_guard,   // <-- add this argument too
         )
         .await;
-    let response = if tool_result.success {
-        tool_result.output.clone()
+    let response = if tool_result.success() {
+        tool_result.output().to_string()
     } else {
-        format!("{} failed: {}", tool_result.tool, tool_result.output)
+        format!("{} failed: {}", tool_result.tool(), tool_result.output())
     };
     let response = crate::security::sandbox::sanitize_output(&response);
     let tool_json = serde_json::json!({
@@ -775,11 +778,11 @@ async fn handle_quick_tool_for_voice(
     })
     .to_string();
 
-    conversations.append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+    conversations.append_or_log(conv_id, "assistant", &tool_json, Some(tool_result.tool()));
     conversations.append_or_log(
         conv_id,
         "system",
-        &format!("Tool: {}", tool_result.output),
+        &format!("Tool: {}", tool_result.output()),
         None,
     );
     conversations.append_or_log(conv_id, "assistant", &response, None);
@@ -1163,13 +1166,13 @@ pub async fn process_transcript(
     {
         eprintln!(
             "[voice] Tool: {} → {}",
-            tool_result.tool, tool_result.output
+            tool_result.tool(), tool_result.output()
         );
-        conversations.append_or_log(conv_id, "assistant", &response, Some(&tool_result.tool));
+        conversations.append_or_log(conv_id, "assistant", &response, Some(tool_result.tool()));
         conversations.append_or_log(
             conv_id,
             "system",
-            &format!("Tool: {}", tool_result.output),
+            &format!("Tool: {}", tool_result.output()),
             None,
         );
 
@@ -1216,7 +1219,7 @@ pub async fn process_transcript(
                 let s = llm
                     .chat_with_hints(&summary_msgs, Some(128), &summary_hints)
                     .await
-                    .unwrap_or_else(|_| tool_result.output.clone());
+                    .unwrap_or_else(|_| tool_result.output().to_string());
                 let voice_text = format::for_voice(&s);
                 if !voice_text.is_empty() {
                     let _ = tts_engine.speak(&voice_text).await;
@@ -1226,7 +1229,7 @@ pub async fn process_transcript(
         };
 
         conversations.append_or_log(conv_id, "assistant", &summary, None);
-        (summary, Some(tool_result.tool))
+        (summary, Some(tool_result.tool().to_string()))
     } else {
         conversations.append_or_log(conv_id, "assistant", &response, None);
         (response, None)

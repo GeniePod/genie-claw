@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, LlmRequestHints, Message};
@@ -896,6 +897,7 @@ async fn handle_chat_stream(
         )
         .await?;
 
+        let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
         let tool_result = tools
             .execute_with_context(
                 &call,
@@ -903,25 +905,17 @@ async fn handle_chat_stream(
                     request_origin,
                     ..ToolExecutionContext::default()
                 },
+                &mut loop_guard,
             )
             .await;
         let final_response =
-            finalize_direct_tool_turn(conversations, &conv_id, &call, &tool_result);
-        write_stream_event(
-            writer,
-            &serde_json::json!({"type":"replace","content": final_response.clone(), "tool": tool_result.tool.clone()}),
-        )
-        .await?;
-        with_shared_memory(memory, |memory| {
-            crate::memory::extract::extract_and_store(memory, user_text);
-        });
+            finalize_direct_tool_turn(conversations, &conv_id, &call, tool_result.as_inner());
         write_stream_event(
             writer,
             &serde_json::json!({
-                "type":"done",
-                "response": final_response,
-                "tool": tool_result.tool.clone(),
-                "conversation_id": conv_id
+                "type": "replace",
+                "content": final_response.clone(),
+                "tool": tool_result.tool().to_string()
             }),
         )
         .await?;
@@ -1046,13 +1040,13 @@ async fn handle_chat_stream(
     )
     .await
     {
-        tool_name = Some(tool_result.tool.clone());
+        tool_name = Some(tool_result.tool().to_string());
         let summary = finalize_tool_turn(
             llm,
             conversations,
             &conv_id,
             &llm_response,
-            &tool_result,
+            tool_result.as_inner(),
             model_family,
         )
         .await;
@@ -1119,6 +1113,7 @@ pub async fn process_chat_turn(
         tools.has_home_automation(),
         tools.has_web_search(),
     ) {
+        let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
         let tool_result = tools
             .execute_with_context(
                 &call,
@@ -1126,15 +1121,16 @@ pub async fn process_chat_turn(
                     request_origin,
                     ..ToolExecutionContext::default()
                 },
+                &mut loop_guard,
             )
             .await;
-        let final_response = finalize_direct_tool_turn(conversations, conv_id, &call, &tool_result);
+        let final_response = finalize_direct_tool_turn(conversations, conv_id, &call, tool_result.as_inner());
         with_shared_memory(memory, |memory| {
             crate::memory::extract::extract_and_store(memory, user_text);
         });
         return Ok(ChatTurnResult {
             response: final_response,
-            tool: Some(tool_result.tool),
+            tool: Some(tool_result.tool().to_string()),
             conversation_id: conv_id.to_string(),
         });
     }
@@ -1181,13 +1177,13 @@ pub async fn process_chat_turn(
     )
     .await
     {
-        tool_name = Some(tool_result.tool.clone());
+        tool_name = Some(tool_result.tool().to_string());
         finalize_tool_turn(
             llm,
             conversations,
             conv_id,
             &llm_response,
-            &tool_result,
+            tool_result.as_inner(),
             model_family,
         )
         .await
@@ -2101,6 +2097,7 @@ async fn handle_openai_chat(
         tools.has_home_automation(),
         tools.has_web_search(),
     ) {
+        let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
         let tool_result = tools
             .execute_with_context(
                 &call,
@@ -2108,12 +2105,13 @@ async fn handle_openai_chat(
                     request_origin,
                     ..ToolExecutionContext::default()
                 },
+                &mut loop_guard,
             )
             .await;
-        let response = if tool_result.success {
-            tool_result.output
+        let response = if tool_result.success() {
+            tool_result.output().to_string()
         } else {
-            format!("{} failed: {}", tool_result.tool, tool_result.output)
+            format!("{} failed: {}", tool_result.tool(), tool_result.output())
         };
         let sanitized = crate::security::sandbox::sanitize_output(&response);
         with_shared_memory(memory, |memory| {
@@ -2184,12 +2182,12 @@ async fn handle_openai_chat(
     .await
     {
         tracing::info!(
-            tool = %tool_result.tool,
-            success = tool_result.success,
+            tool = %tool_result.tool(),
+            success = tool_result.success(),
             "tool executed via OpenAI bridge"
         );
 
-        if should_summarize_tool_result(&tool_result.tool) {
+        if should_summarize_tool_result(tool_result.tool()) {
             let mut summary_msgs = llm_messages.clone();
             summary_msgs.push(Message {
                 role: "assistant".into(),
@@ -2197,7 +2195,7 @@ async fn handle_openai_chat(
             });
             summary_msgs.push(Message {
                 role: "system".into(),
-                content: format!("Tool result: {}", tool_result.output),
+                content: format!("Tool result: {}", tool_result.output()),
             });
             summary_msgs.push(Message {
                 role: "system".into(),
@@ -2218,14 +2216,14 @@ async fn handle_openai_chat(
                 );
                 llm.chat_with_hints(&summary_msgs, Some(128), &summary_hints)
                     .await
-                    .unwrap_or_else(|_| tool_result.output.clone())
+                    .unwrap_or_else(|_| tool_result.output().to_string())
             } else {
                 llm.chat(&summary_msgs, Some(128))
                     .await
-                    .unwrap_or_else(|_| tool_result.output.clone())
+                    .unwrap_or_else(|_| tool_result.output().to_string())
             }
         } else {
-            tool_result.output
+            tool_result.output().to_string()
         }
     } else {
         llm_response

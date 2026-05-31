@@ -1,3 +1,5 @@
+use crate::security::loop_guard::{LoopGuard, LoopCheck, LoopGuardConfig};
+use crate::security::taint::{Tainted, DataOrigin};
 use anyhow::Result;
 use genie_common::config::{
     ActuationSafetyConfig, ToolPolicyConfig, WebSearchConfig, WebSearchProvider,
@@ -552,8 +554,12 @@ impl ToolDispatcher {
     }
 
     /// Execute a tool call from the LLM.
-    pub async fn execute(&self, call: &ToolCall) -> ToolResult {
-        self.execute_with_context(call, ToolExecutionContext::default())
+    pub async fn execute(
+        &self,
+        call: &ToolCall,
+        loop_guard: &mut LoopGuard,
+    ) -> Tainted<ToolResult> {
+        self.execute_with_context(call, ToolExecutionContext::default(), loop_guard)
             .await
     }
 
@@ -561,9 +567,22 @@ impl ToolDispatcher {
         &self,
         call: &ToolCall,
         exec_ctx: ToolExecutionContext,
-    ) -> ToolResult {
+        loop_guard: &mut LoopGuard,
+    ) -> Tainted<ToolResult> {
         let started = Instant::now();
         let action_class = tool_action_class(&call.name);
+        let args_str = call.arguments.to_string();
+        let check = loop_guard.check(&call.name, &args_str);
+        if let LoopCheck::Block(reason) = check {
+            let tool_result = ToolResult {
+                tool: call.name.clone(),
+                action_class,
+                success: false,
+                output: format!("Tool blocked by circuit‑breaker: {reason}"),
+            };
+            self.audit_tool_call(call, exec_ctx, started, &tool_result);
+            return Tainted::from_tool_result(tool_result, DataOrigin::Local);
+        }
         if let Err(err) =
             tool_origin_allowed(&self.tool_policy, exec_ctx.request_origin, &call.name)
         {
@@ -574,7 +593,7 @@ impl ToolDispatcher {
                 output: format!("Tool blocked by origin policy: {err}"),
             };
             self.audit_tool_call(call, exec_ctx, started, &tool_result);
-            return tool_result;
+            return Tainted::from_tool_result(tool_result, DataOrigin::Local);
         }
 
         let result = match call.name.as_str() {
@@ -613,7 +632,14 @@ impl ToolDispatcher {
 
         self.audit_tool_call(call, exec_ctx, started, &tool_result);
 
-        tool_result
+        let origin = match action_class {
+            // We'll map ToolActionClass::Network → ExternalNetwork
+            // For now assume the enum variant is called Network; we'll adjust if needed.
+            crate::tools::ToolActionClass::Network => DataOrigin::ExternalNetwork,
+            _ => DataOrigin::Local,
+        };
+
+        Tainted::from_tool_result(tool_result, origin)
     }
 
     fn audit_tool_call(
@@ -890,6 +916,7 @@ impl ToolDispatcher {
         // `"confirmation"`. The original-bucket already paid one slot when
         // the request returned `ConfirmationRequired`, so the limiter skips
         // re-charging here (see `confirmed`-guard in `exec_home_control_inner`).
+        let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
         let result = self
             .execute_with_context(
                 &call,
@@ -898,12 +925,13 @@ impl ToolDispatcher {
                     confirmed: true,
                     ..ToolExecutionContext::default()
                 },
+                &mut loop_guard,
             )
             .await;
-        if result.success {
-            Ok(result.output)
+        if result.success() {
+        Ok(result.output().to_string())
         } else {
-            Err(anyhow::anyhow!(result.output))
+            Err(anyhow::anyhow!(result.output().to_string()))
         }
     }
 
@@ -1984,9 +2012,10 @@ mod tests {
             name: "nonexistent".into(),
             arguments: serde_json::json!({}),
         };
-        let result = dispatcher.execute(&call).await;
-        assert!(!result.success);
-        assert!(result.output.contains("unknown tool"));
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
+        let result = dispatcher.execute(&call, &mut guard).await;
+        assert!(!result.success());
+        assert!(result.output().contains("unknown tool"));
     }
 
     #[tokio::test]
@@ -1997,6 +2026,7 @@ mod tests {
             .insert("telegram".into(), vec!["web_search".into()]);
         let dispatcher = ToolDispatcher::new(None).with_tool_policy_config(policy);
 
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let result = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -2007,11 +2037,12 @@ mod tests {
                     request_origin: RequestOrigin::Telegram,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard,
             )
             .await;
 
-        assert!(!result.success);
-        assert!(result.output.contains("origin policy"));
+        assert!(!result.success());
+        assert!(result.output().contains("origin policy"));
     }
 
     #[tokio::test]
@@ -2022,6 +2053,7 @@ mod tests {
             .insert("voice".into(), vec!["get_time".into()]);
         let dispatcher = ToolDispatcher::new(None).with_tool_policy_config(policy);
 
+        let mut guard1 = LoopGuard::new(LoopGuardConfig::default());
         let allowed = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -2032,8 +2064,10 @@ mod tests {
                     request_origin: RequestOrigin::Voice,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard1,
             )
             .await;
+        let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
         let blocked = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -2044,12 +2078,13 @@ mod tests {
                     request_origin: RequestOrigin::Voice,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard2,
             )
             .await;
 
-        assert!(allowed.success);
-        assert!(!blocked.success);
-        assert!(blocked.output.contains("allowlist"));
+        assert!(allowed.success());
+        assert!(!blocked.success());
+        assert!(blocked.output().contains("allowlist"));
     }
 
     #[tokio::test]
@@ -2059,10 +2094,11 @@ mod tests {
             name: "get_time".into(),
             arguments: serde_json::json!({}),
         };
-        let result = dispatcher.execute(&call).await;
-        assert!(result.success);
-        assert_eq!(result.action_class, ToolActionClass::ReadOnly);
-        assert!(!result.output.is_empty());
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
+        let result = dispatcher.execute(&call, &mut guard).await;
+        assert!(result.success());
+        assert_eq!(result.as_inner().action_class, ToolActionClass::ReadOnly);
+        assert!(!result.output().is_empty());
     }
 
     #[test]
@@ -2100,6 +2136,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let dispatcher = ToolDispatcher::new(None).with_tool_audit_path(path.clone());
 
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let result = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -2110,10 +2147,11 @@ mod tests {
                     request_origin: RequestOrigin::Api,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard,
             )
             .await;
 
-        assert!(!result.success);
+        assert!(!result.success());
         let line = std::fs::read_to_string(&path).unwrap();
         let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(event["tool"], "calculate");
@@ -2135,9 +2173,10 @@ mod tests {
             arguments: serde_json::json!({}),
         };
 
-        let result = dispatcher.execute(&call).await;
-        assert!(result.success);
-        assert!(result.output.contains("Home Assistant: connected"));
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
+        let result = dispatcher.execute(&call, &mut guard).await;
+        assert!(result.success());
+        assert!(result.output().contains("Home Assistant: connected"));
     }
 
     #[tokio::test]
@@ -2147,6 +2186,7 @@ mod tests {
             executed: executed.clone(),
         })));
 
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let result = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -2160,21 +2200,23 @@ mod tests {
                     request_origin: RequestOrigin::Dashboard,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard,
             )
             .await;
 
-        assert!(result.success);
+        assert!(result.success());
         assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::TurnOn]);
 
+        let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
         let history = dispatcher
             .execute(&ToolCall {
                 name: "action_history".into(),
                 arguments: serde_json::json!({}),
-            })
+            }, &mut guard2)
             .await;
-        assert!(history.success);
-        assert!(history.output.contains("turn_on kitchen light"));
-        assert!(history.output.contains("undo: turn_off"));
+        assert!(history.success());
+        assert!(history.output().contains("turn_on kitchen light"));
+        assert!(history.output().contains("undo: turn_off"));
     }
 
     #[tokio::test]
@@ -2195,6 +2237,7 @@ mod tests {
         })))
         .with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let result = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -2208,19 +2251,21 @@ mod tests {
                     request_origin: RequestOrigin::Dashboard,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard,
             )
             .await;
 
-        assert!(result.success, "{}", result.output);
+        assert!(result.success(), "{}", result.output());
         assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::TurnOn]);
 
+        let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
         let history = dispatcher
             .execute(&ToolCall {
                 name: "action_history".into(),
                 arguments: serde_json::json!({}),
-            })
+            }, &mut guard2)
             .await;
-        assert!(history.output.contains("turn_on light.playroom"));
+        assert!(history.output().contains("turn_on light.playroom"));
     }
 
     #[tokio::test]
@@ -2230,6 +2275,7 @@ mod tests {
             executed: executed.clone(),
         })));
 
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let result = dispatcher
             .execute(&ToolCall {
                 name: "home_control".into(),
@@ -2237,11 +2283,11 @@ mod tests {
                     "entity": "kitchen light",
                     "action": "turn_on"
                 }),
-            })
+            }, &mut guard)
             .await;
 
-        assert!(!result.success);
-        assert!(result.output.contains("channel policy"));
+        assert!(!result.success());
+        assert!(result.output().contains("channel policy"));
         assert!(executed.lock().unwrap().is_empty());
     }
 
@@ -2257,6 +2303,7 @@ mod tests {
         })))
         .with_actuation_safety_config(safety);
 
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let result = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -2270,11 +2317,12 @@ mod tests {
                     request_origin: RequestOrigin::Telegram,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard,
             )
             .await;
 
-        assert!(!result.success);
-        assert!(result.output.contains("telegram"));
+        assert!(!result.success());
+        assert!(result.output().contains("telegram"));
         assert!(executed.lock().unwrap().is_empty());
     }
 
@@ -2301,12 +2349,14 @@ mod tests {
             ..ToolExecutionContext::default()
         };
 
-        let first = dispatcher.execute_with_context(&call, ctx).await;
-        let second = dispatcher.execute_with_context(&call, ctx).await;
+        let mut guard1 = LoopGuard::new(LoopGuardConfig::default());
+        let first = dispatcher.execute_with_context(&call, ctx, &mut guard1).await;
+        let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
+        let second = dispatcher.execute_with_context(&call, ctx, &mut guard2).await;
 
-        assert!(first.success);
-        assert!(!second.success);
-        assert!(second.output.contains("rate limit"));
+        assert!(first.success());
+        assert!(!second.success());
+        assert!(second.output().contains("rate limit"));
         assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::TurnOn]);
     }
 
@@ -2324,6 +2374,7 @@ mod tests {
                 "action": "turn_on"
             }),
         };
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         assert!(
             dispatcher
                 .execute_with_context(
@@ -2332,11 +2383,13 @@ mod tests {
                         request_origin: RequestOrigin::Dashboard,
                         ..ToolExecutionContext::default()
                     },
+                    &mut guard,
                 )
                 .await
-                .success
+                .success()
         );
 
+        let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
         let undo = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -2347,16 +2400,18 @@ mod tests {
                     request_origin: RequestOrigin::Dashboard,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard2,
             )
             .await;
 
-        assert!(undo.success);
-        assert!(undo.output.contains("Undid the last home action"));
+        assert!(undo.success());
+        assert!(undo.output().contains("Undid the last home action"));
         assert_eq!(
             *executed.lock().unwrap(),
             vec![HomeActionKind::TurnOn, HomeActionKind::TurnOff]
         );
 
+        let mut guard3 = LoopGuard::new(LoopGuardConfig::default());
         let second_undo = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -2367,10 +2422,11 @@ mod tests {
                     request_origin: RequestOrigin::Dashboard,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard3,
             )
             .await;
-        assert!(!second_undo.success);
-        assert!(second_undo.output.contains("No recent reversible"));
+        assert!(!second_undo.success());
+        assert!(second_undo.output().contains("No recent reversible"));
     }
 
     #[tokio::test]
@@ -2385,6 +2441,7 @@ mod tests {
             executed: Arc::new(std::sync::Mutex::new(Vec::new())),
         })))
         .with_actuation_audit_path(path.clone());
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         assert!(
             dispatcher
                 .execute_with_context(
@@ -2399,25 +2456,27 @@ mod tests {
                         request_origin: RequestOrigin::Dashboard,
                         ..ToolExecutionContext::default()
                     },
+                    &mut guard,
                 )
                 .await
-                .success
+                .success()
         );
 
         let restarted = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
             executed: Arc::new(std::sync::Mutex::new(Vec::new())),
         })))
         .with_actuation_audit_path(path.clone());
+        let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
         let history = restarted
             .execute(&ToolCall {
                 name: "action_history".into(),
                 arguments: serde_json::json!({}),
-            })
+            }, &mut guard2)
             .await;
 
-        assert!(history.success);
-        assert!(history.output.contains("turn_on kitchen light"));
-        assert!(history.output.contains("undo: turn_off"));
+        assert!(history.success());
+        assert!(history.output().contains("turn_on kitchen light"));
+        assert!(history.output().contains("undo: turn_off"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2443,10 +2502,11 @@ mod tests {
             arguments: serde_json::json!({"name": "Jared"}),
         };
 
-        let result = dispatcher.execute(&call).await;
-        assert!(result.success);
-        assert!(result.output.contains("Jared"));
-        assert!(result.output.contains("loadable skill module"));
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
+        let result = dispatcher.execute(&call, &mut guard).await;
+        assert!(result.success());
+        assert!(result.output().contains("Jared"));
+        assert!(result.output().contains("loadable skill module"));
     }
 
     #[test]
@@ -2926,6 +2986,7 @@ mod tests {
             name: "memory_recall".into(),
             arguments: serde_json::json!({"query": "oat milk"}),
         };
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let output = dispatcher
             .execute_with_context(
                 &call,
@@ -2939,11 +3000,12 @@ mod tests {
                     request_origin: RequestOrigin::Dashboard,
                     confirmed: false,
                 },
+                &mut guard,
             )
             .await;
 
-        assert!(output.success);
-        assert_eq!(output.output, "I remember: Maya likes oat milk");
+        assert!(output.success());
+        assert_eq!(output.output(), "I remember: Maya likes oat milk");
     }
 
     #[test]
@@ -3102,6 +3164,7 @@ mod tests {
                 "action": "lock"
             }),
         };
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let issued = dispatcher
             .execute_with_context(
                 &lock_call,
@@ -3109,13 +3172,14 @@ mod tests {
                     request_origin: RequestOrigin::Telegram,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard,
             )
             .await;
-        assert!(issued.success, "issuing confirmation must succeed");
+        assert!(issued.success(), "issuing confirmation must succeed");
         assert!(
-            !issued.output.contains("act-"),
+            !issued.output().contains("act-"),
             "raw bearer token must not be echoed into tool output: {:?}",
-            issued.output
+            issued.output()
         );
         let token = latest_confirmation_token(&dispatcher);
         let executed_output = dispatcher
@@ -3163,6 +3227,7 @@ mod tests {
 
         // First Telegram request → returns ConfirmationRequired and charges
         // the telegram bucket once.
+        let mut guard1 = LoopGuard::new(LoopGuardConfig::default());
         let first_issue = dispatcher
             .execute_with_context(
                 &lock_call,
@@ -3170,9 +3235,10 @@ mod tests {
                     request_origin: RequestOrigin::Telegram,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard1,
             )
             .await;
-        assert!(first_issue.success);
+        assert!(first_issue.success());
         let first_token = latest_confirmation_token(&dispatcher);
 
         // Confirming that first request must succeed: the bucket already paid
@@ -3188,6 +3254,7 @@ mod tests {
         // A second Telegram-initiated sensitive request inside the same window
         // must now be rate-limited at the issue step, instead of getting
         // through by routing through the confirmation bucket.
+        let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
         let second_issue = dispatcher
             .execute_with_context(
                 &lock_call,
@@ -3195,16 +3262,17 @@ mod tests {
                     request_origin: RequestOrigin::Telegram,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard2,
             )
             .await;
         assert!(
-            !second_issue.success,
+            !second_issue.success(),
             "second telegram-initiated sensitive request must be rate-limited"
         );
         assert!(
-            second_issue.output.to_lowercase().contains("rate limit"),
+            second_issue.output().to_lowercase().contains("rate limit"),
             "expected a rate-limit message, got: {:?}",
-            second_issue.output
+            second_issue.output()
         );
         assert_eq!(
             executed.lock().unwrap().len(),
@@ -3240,6 +3308,7 @@ mod tests {
             }),
         };
 
+        let mut guard1 = LoopGuard::new(LoopGuardConfig::default());
         let first_issue = dispatcher
             .execute_with_context(
                 &lock_call,
@@ -3247,9 +3316,10 @@ mod tests {
                     request_origin: RequestOrigin::Telegram,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard1,
             )
             .await;
-        assert!(first_issue.success);
+        assert!(first_issue.success());
         let first_token = latest_confirmation_token(&dispatcher);
         dispatcher
             .confirm_pending_home_action(&first_token)
@@ -3260,6 +3330,7 @@ mod tests {
         // so far: 1 (request) + 0 (confirm doesn't recharge) = 1. With limit
         // = 2, this issue must still be accepted (returns
         // ConfirmationRequired again, charging slot #2).
+        let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
         let second_issue = dispatcher
             .execute_with_context(
                 &lock_call,
@@ -3267,10 +3338,11 @@ mod tests {
                     request_origin: RequestOrigin::Telegram,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard2,
             )
             .await;
         assert!(
-            second_issue.success,
+            second_issue.success(),
             "second issue must succeed: confirm of #1 must not double-charge the telegram bucket"
         );
     }

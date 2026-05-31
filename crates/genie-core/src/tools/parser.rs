@@ -1,3 +1,5 @@
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
+use crate::security::taint::Tainted;
 use super::dispatch::{ToolCall, ToolDispatcher, ToolExecutionContext, ToolResult};
 
 /// Parse a tool call from LLM output and execute it.
@@ -7,7 +9,7 @@ use super::dispatch::{ToolCall, ToolDispatcher, ToolExecutionContext, ToolResult
 /// 2. Markdown code block: ````json\n{"tool": "get_time"}\n````
 /// 3. Embedded in text: `I'll check that. {"tool": "get_weather", "arguments": {"location": "Denver"}}`
 /// 4. With extra fields: `{"tool": "set_timer", "arguments": {"seconds": 300}, "reasoning": "..."}`
-pub async fn try_tool_call(response: &str, tools: &ToolDispatcher) -> Option<ToolResult> {
+pub async fn try_tool_call(response: &str, tools: &ToolDispatcher) -> Option<Tainted<ToolResult>> {
     try_tool_call_with_context(response, tools, ToolExecutionContext::default()).await
 }
 
@@ -15,7 +17,7 @@ pub async fn try_tool_call_with_context(
     response: &str,
     tools: &ToolDispatcher,
     exec_ctx: ToolExecutionContext,
-) -> Option<ToolResult> {
+) -> Option<Tainted<ToolResult>> {
     let json_str = extract_json(response)?;
     let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
     let call = parse_tool_call_value(value, tools)?;
@@ -24,7 +26,8 @@ pub async fn try_tool_call_with_context(
         return None;
     }
 
-    Some(tools.execute_with_context(&call, exec_ctx).await)
+    let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
+    Some(tools.execute_with_context(&call, exec_ctx, &mut loop_guard).await)
 }
 
 /// Parse tool calls from model output without executing them.
@@ -426,8 +429,8 @@ mod tests {
         let input = r#"{"system_info":{"uptime":100,"memory":1024,"governor_mode":"user","load_average":0.0}}"#;
 
         let result = try_tool_call(input, &dispatcher).await.unwrap();
-        assert_eq!(result.tool, "system_info");
-        assert!(result.success);
-        assert!(result.output.contains("Memory available:"));
+        assert_eq!(result.tool(), "system_info");
+        assert!(result.success());
+        assert!(result.output().contains("Memory available:"));
     }
 }

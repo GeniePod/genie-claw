@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use crate::llm::{LlmClient, Message};
 use crate::tools::ToolDispatcher;
 
@@ -218,7 +219,9 @@ impl VoicePipeline {
             name: call.tool,
             arguments: call.arguments,
         };
-        Some(self.tools.execute(&tc).await)
+
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
+        Some(self.tools.execute(&tc, &mut guard).await.into_inner())
     }
 
     /// Clear conversation history.

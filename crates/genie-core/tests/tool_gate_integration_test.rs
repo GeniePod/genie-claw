@@ -10,6 +10,7 @@ use genie_core::ha::{
     ActionResult, DeviceRef, HomeAction, HomeActionKind, HomeAutomationProvider, HomeGraph,
     HomeState, HomeTarget, HomeTargetKind, IntegrationHealth, SceneRef,
 };
+use genie_core::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use genie_core::tools::{RequestOrigin, ToolCall, ToolDispatcher, ToolExecutionContext};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -182,6 +183,7 @@ async fn tool_gate_acl_denies_disallowed_origin_and_audits() {
         .insert("telegram".into(), vec!["get_time".into()]);
 
     let dispatcher = paths.dispatcher(None, policy, ActuationSafetyConfig::default());
+    let mut guard = LoopGuard::new(LoopGuardConfig::default());
     let result = dispatcher
         .execute_with_context(
             &ToolCall {
@@ -192,14 +194,15 @@ async fn tool_gate_acl_denies_disallowed_origin_and_audits() {
                 request_origin: RequestOrigin::Telegram,
                 ..ToolExecutionContext::default()
             },
+            &mut guard,
         )
         .await;
 
-    assert!(!result.success);
+    assert!(!result.success());
     assert!(
-        result.output.contains("origin policy"),
+        result.output().contains("origin policy"),
         "expected ACL refusal, got: {}",
-        result.output
+        result.output()
     );
 
     let events = read_jsonl(&paths.tool_audit);
@@ -236,16 +239,18 @@ async fn tool_gate_rate_limit_allows_n_then_denies_and_audits() {
         ..ToolExecutionContext::default()
     };
 
-    let first = dispatcher.execute_with_context(&call, ctx).await;
-    let second = dispatcher.execute_with_context(&call, ctx).await;
+    let mut guard1 = LoopGuard::new(LoopGuardConfig::default());
+    let first = dispatcher.execute_with_context(&call, ctx, &mut guard1).await;
+    let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
+    let second = dispatcher.execute_with_context(&call, ctx, &mut guard2).await;
 
     assert!(
-        first.success,
+        first.success(),
         "first call should be inside the rate limit: {}",
-        first.output
+        first.output()
     );
-    assert!(!second.success, "second call must be rate-limited");
-    assert!(second.output.contains("rate limit"));
+    assert!(!second.success(), "second call must be rate-limited");
+    assert!(second.output().contains("rate limit"));
     assert_eq!(
         *executed.lock().unwrap(),
         vec![HomeActionKind::TurnOn],
@@ -308,6 +313,7 @@ async fn tool_gate_confirmable_home_action_requires_token_and_audits() {
         ActuationSafetyConfig::default(),
     );
 
+    let mut guard = LoopGuard::new(LoopGuardConfig::default());
     let result = dispatcher
         .execute_with_context(
             &ToolCall {
@@ -321,29 +327,30 @@ async fn tool_gate_confirmable_home_action_requires_token_and_audits() {
                 request_origin: RequestOrigin::Dashboard,
                 ..ToolExecutionContext::default()
             },
+            &mut guard,
         )
         .await;
 
     assert!(
-        result.success,
+        result.success(),
         "confirmation-required path returns guidance: {}",
-        result.output
+        result.output()
     );
-    assert!(result.output.contains("Confirmation required"));
+    assert!(result.output().contains("Confirmation required"));
     // The confirmation token is a bearer secret and must NOT be echoed into
     // tool output (transcripts/logs/voice). The user confirms from the local
     // dashboard, which reads the token from /api/actuation/pending.
     assert!(
-        !result.output.contains("Pending token:"),
+        !result.output().contains("Pending token:"),
         "tool output must not echo the raw token: {}",
-        result.output
+        result.output()
     );
     assert!(
-        !result.output.contains("act-"),
+        !result.output().contains("act-"),
         "tool output must not contain a raw act- token: {}",
-        result.output
+        result.output()
     );
-    assert!(result.output.contains("local dashboard"));
+    assert!(result.output().contains("local dashboard"));
     assert!(
         executed.lock().unwrap().is_empty(),
         "sensitive action must not execute before confirmation"
@@ -381,6 +388,7 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
         safety,
     );
 
+    let mut guard1 = LoopGuard::new(LoopGuardConfig::default());
     let denied = dispatcher
         .execute_with_context(
             &ToolCall {
@@ -391,12 +399,14 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
                 request_origin: RequestOrigin::Api,
                 ..ToolExecutionContext::default()
             },
+            &mut guard1,
         )
         .await;
-    assert!(!denied.success);
+    assert!(!denied.success());
     let tool_len_1 = read_jsonl(&paths.tool_audit).len();
     assert_eq!(tool_len_1, 1);
 
+    let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
     let allowed = dispatcher
         .execute_with_context(
             &ToolCall {
@@ -407,9 +417,10 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
                 request_origin: RequestOrigin::Api,
                 ..ToolExecutionContext::default()
             },
+            &mut guard2,
         )
         .await;
-    assert!(allowed.success);
+    assert!(allowed.success());
     assert_append_only(&paths.tool_audit, tool_len_1);
     let tool_len_2 = read_jsonl(&paths.tool_audit).len();
     assert_eq!(tool_len_2, 2);
@@ -425,17 +436,19 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
         request_origin: RequestOrigin::Dashboard,
         ..ToolExecutionContext::default()
     };
+    let mut guard3 = LoopGuard::new(LoopGuardConfig::default());
     assert!(
         dispatcher
-            .execute_with_context(&home_call, dash_ctx)
+            .execute_with_context(&home_call, dash_ctx, &mut guard3)
             .await
-            .success
+            .success()
     );
+    let mut guard4 = LoopGuard::new(LoopGuardConfig::default());
     assert!(
         !dispatcher
-            .execute_with_context(&home_call, dash_ctx)
+            .execute_with_context(&home_call, dash_ctx, &mut guard4)
             .await
-            .success
+            .success()
     );
     assert_append_only(&paths.tool_audit, tool_len_2);
 
@@ -496,6 +509,7 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
     let expected_audit_count = invalid_calls.len();
 
     for (arguments, expected_snippet) in &invalid_calls {
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let result = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -503,18 +517,19 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
                     arguments: arguments.clone(),
                 },
                 ctx,
+                &mut guard,
             )
             .await;
 
         assert!(
-            !result.success,
+            !result.success(),
             "expected schema rejection, got: {}",
-            result.output
+            result.output()
         );
         assert!(
-            result.output.contains(expected_snippet),
+            result.output().contains(expected_snippet),
             "expected output to contain {expected_snippet:?}, got: {}",
-            result.output
+            result.output()
         );
     }
 

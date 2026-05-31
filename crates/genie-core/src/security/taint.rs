@@ -136,6 +136,23 @@ impl<T> Tainted<T> {
     }
 }
 
+impl Tainted<crate::tools::ToolResult> {
+    /// Convenience: was the tool call successful?
+    pub fn success(&self) -> bool {
+        self.as_inner().success
+    }
+
+    /// Convenience: the tool's output string.
+    pub fn output(&self) -> &str {
+        &self.as_inner().output
+    }
+
+    /// Convenience: the tool name.
+    pub fn tool(&self) -> &str {
+        &self.as_inner().tool
+    }
+}
+
 /// Which taint labels are blocked for each sink.
 fn blocked_labels(sink: TaintSink) -> HashSet<TaintLabel> {
     let mut blocked = HashSet::new();

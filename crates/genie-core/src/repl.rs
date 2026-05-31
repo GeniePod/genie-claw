@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, LlmRequestHints, Message};
 use crate::memory::{self, SharedMemory, with_shared_memory};
@@ -47,6 +48,7 @@ pub async fn run(
         };
 
         let text = line.trim();
+        let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
         if text.is_empty() {
             continue;
         }
@@ -76,12 +78,13 @@ pub async fn run(
                         request_origin: tools::RequestOrigin::Repl,
                         ..tools::ToolExecutionContext::default()
                     },
+                    &mut loop_guard,   // <-- new
                 )
                 .await;
-            let response = if tool_result.success {
-                tool_result.output.clone()
+            let response = if tool_result.success() {
+                tool_result.output().to_string()
             } else {
-                format!("{} failed: {}", tool_result.tool, tool_result.output)
+                format!("{} failed: {}", tool_result.tool(), tool_result.output())
             };
             let response = crate::security::sandbox::sanitize_output(&response);
             let tool_json = serde_json::json!({
@@ -91,11 +94,11 @@ pub async fn run(
             .to_string();
 
             eprintln!("\nGeniePod: {}", response);
-            conversations.append_or_log(&conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+            conversations.append_or_log(&conv_id, "assistant", &tool_json, Some(&tool_result.tool()));
             conversations.append_or_log(
                 &conv_id,
                 "system",
-                &format!("Tool: {}", tool_result.output),
+                &format!("Tool: {}", tool_result.output()),
                 None,
             );
             conversations.append_or_log(&conv_id, "assistant", &response, None);
@@ -161,22 +164,22 @@ pub async fn run(
                 )
                 .await
                 {
-                    eprintln!("[TOOL: {}] {}", tool_result.tool, tool_result.output);
+                    eprintln!("[TOOL: {}] {}", tool_result.tool(), tool_result.output());
                     conversations.append_or_log(
                         &conv_id,
                         "assistant",
                         &response,
-                        Some(&tool_result.tool),
+                        Some(&tool_result.tool()),
                     );
                     conversations.append_or_log(
                         &conv_id,
                         "system",
-                        &format!("Tool: {}", tool_result.output),
+                        &format!("Tool: {}", tool_result.output()),
                         None,
                     );
 
                     let preserve_raw = matches!(
-                        tool_result.tool.as_str(),
+                        tool_result.tool(),
                         "system_info"
                             | "web_search"
                             | "memory_recall"
@@ -189,7 +192,7 @@ pub async fn run(
                         conversations.append_or_log(
                             &conv_id,
                             "assistant",
-                            &tool_result.output,
+                            &tool_result.output(),
                             None,
                         );
                     } else {
