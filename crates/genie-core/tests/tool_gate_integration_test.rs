@@ -10,6 +10,7 @@ use genie_core::ha::{
     ActionResult, DeviceRef, HomeAction, HomeActionKind, HomeAutomationProvider, HomeGraph,
     HomeState, HomeTarget, HomeTargetKind, IntegrationHealth, SceneRef,
 };
+use genie_core::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use genie_core::tools::{RequestOrigin, ToolCall, ToolDispatcher, ToolExecutionContext};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -182,6 +183,7 @@ async fn tool_gate_acl_denies_disallowed_origin_and_audits() {
         .insert("telegram".into(), vec!["get_time".into()]);
 
     let dispatcher = paths.dispatcher(None, policy, ActuationSafetyConfig::default());
+    let mut guard = LoopGuard::new(LoopGuardConfig::default());
     let result = dispatcher
         .execute_with_context(
             &ToolCall {
@@ -192,6 +194,7 @@ async fn tool_gate_acl_denies_disallowed_origin_and_audits() {
                 request_origin: RequestOrigin::Telegram,
                 ..ToolExecutionContext::default()
             },
+            &mut guard,
         )
         .await;
 
@@ -236,8 +239,10 @@ async fn tool_gate_rate_limit_allows_n_then_denies_and_audits() {
         ..ToolExecutionContext::default()
     };
 
-    let first = dispatcher.execute_with_context(&call, ctx).await;
-    let second = dispatcher.execute_with_context(&call, ctx).await;
+    let mut guard1 = LoopGuard::new(LoopGuardConfig::default());
+    let first = dispatcher.execute_with_context(&call, ctx, &mut guard1).await;
+    let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
+    let second = dispatcher.execute_with_context(&call, ctx, &mut guard2).await;
 
     assert!(
         first.success,
@@ -308,6 +313,7 @@ async fn tool_gate_confirmable_home_action_requires_token_and_audits() {
         ActuationSafetyConfig::default(),
     );
 
+    let mut guard = LoopGuard::new(LoopGuardConfig::default());
     let result = dispatcher
         .execute_with_context(
             &ToolCall {
@@ -321,6 +327,7 @@ async fn tool_gate_confirmable_home_action_requires_token_and_audits() {
                 request_origin: RequestOrigin::Dashboard,
                 ..ToolExecutionContext::default()
             },
+            &mut guard,
         )
         .await;
 
@@ -381,6 +388,7 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
         safety,
     );
 
+    let mut guard = LoopGuard::new(LoopGuardConfig::default());
     let denied = dispatcher
         .execute_with_context(
             &ToolCall {
@@ -391,12 +399,14 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
                 request_origin: RequestOrigin::Api,
                 ..ToolExecutionContext::default()
             },
+            &mut guard,
         )
         .await;
     assert!(!denied.success);
     let tool_len_1 = read_jsonl(&paths.tool_audit).len();
     assert_eq!(tool_len_1, 1);
 
+    let mut guard = LoopGuard::new(LoopGuardConfig::default());
     let allowed = dispatcher
         .execute_with_context(
             &ToolCall {
@@ -407,6 +417,7 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
                 request_origin: RequestOrigin::Api,
                 ..ToolExecutionContext::default()
             },
+            &mut guard,
         )
         .await;
     assert!(allowed.success);
@@ -425,15 +436,17 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
         request_origin: RequestOrigin::Dashboard,
         ..ToolExecutionContext::default()
     };
+    let mut guard1 = LoopGuard::new(LoopGuardConfig::default());
     assert!(
         dispatcher
-            .execute_with_context(&home_call, dash_ctx)
+            .execute_with_context(&home_call, dash_ctx, &mut guard1)
             .await
             .success
     );
+    let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
     assert!(
         !dispatcher
-            .execute_with_context(&home_call, dash_ctx)
+            .execute_with_context(&home_call, dash_ctx, &mut guard2)
             .await
             .success
     );

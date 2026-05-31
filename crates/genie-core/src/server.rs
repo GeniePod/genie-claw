@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use crate::llm::{LlmClient, LlmRequestHints, Message};
 use crate::memory::{Memory, SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
@@ -884,6 +885,10 @@ async fn handle_chat_stream(
     conversations.ensure(&conv_id, "New conversation")?;
     conversations.append(&conv_id, "user", user_text, None)?;
 
+    // One LoopGuard per HTTP turn — shared across the quick-tool fast path
+    // and the LLM-driven tool dispatch so call counts accumulate correctly.
+    let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
+
     if let Some(call) = crate::tools::quick::route_for_available_tools(
         user_text,
         tools.has_home_automation(),
@@ -903,6 +908,7 @@ async fn handle_chat_stream(
                     request_origin,
                     ..ToolExecutionContext::default()
                 },
+                &mut loop_guard,
             )
             .await;
         let final_response =
@@ -1043,6 +1049,7 @@ async fn handle_chat_stream(
             request_origin,
             ..ToolExecutionContext::default()
         },
+        &mut loop_guard,
     )
     .await
     {
@@ -1114,6 +1121,8 @@ pub async fn process_chat_turn(
     conversations.ensure(conv_id, "New conversation")?;
     conversations.append(conv_id, "user", user_text, None)?;
 
+    let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
+
     if let Some(call) = crate::tools::quick::route_for_available_tools(
         user_text,
         tools.has_home_automation(),
@@ -1126,6 +1135,7 @@ pub async fn process_chat_turn(
                     request_origin,
                     ..ToolExecutionContext::default()
                 },
+                &mut loop_guard,
             )
             .await;
         let final_response = finalize_direct_tool_turn(conversations, conv_id, &call, &tool_result);
@@ -1178,6 +1188,7 @@ pub async fn process_chat_turn(
             request_origin,
             ..ToolExecutionContext::default()
         },
+        &mut loop_guard,
     )
     .await
     {
@@ -2096,6 +2107,8 @@ async fn handle_openai_chat(
         crate::security::injection::source::OPENAI_BRIDGE,
     );
 
+    let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
+
     if let Some(call) = crate::tools::quick::route_for_available_tools(
         &user_text,
         tools.has_home_automation(),
@@ -2108,6 +2121,7 @@ async fn handle_openai_chat(
                     request_origin,
                     ..ToolExecutionContext::default()
                 },
+                &mut loop_guard,
             )
             .await;
         let response = if tool_result.success {
@@ -2180,6 +2194,7 @@ async fn handle_openai_chat(
             request_origin,
             ..ToolExecutionContext::default()
         },
+        &mut loop_guard,
     )
     .await
     {

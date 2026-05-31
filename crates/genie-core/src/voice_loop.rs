@@ -24,6 +24,7 @@ use crate::memory::{SharedMemory, with_shared_memory};
 use crate::memory::{extract, inject};
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use crate::tools::ToolDispatcher;
 use crate::voice::identity::{self, SpeakerIdentityProvider};
 use crate::voice::intent::{self, VoiceIntentDecision};
@@ -385,6 +386,7 @@ async fn run_with_wakeword(
                             // (we already have the text).
                             conversations.append_or_log(conv_id, "user", &text, None);
 
+                            let mut followup_guard = LoopGuard::new(LoopGuardConfig::default());
                             if handle_quick_tool_for_voice(
                                 tools,
                                 conversations,
@@ -394,6 +396,7 @@ async fn run_with_wakeword(
                                 voice_cfg,
                                 audio_device,
                                 response_language.as_deref(),
+                                &mut followup_guard,
                             )
                             .await
                             .is_some()
@@ -698,6 +701,7 @@ async fn handle_quick_tool_for_voice(
     voice_cfg: &VoiceConfig,
     audio_device: &str,
     response_language: Option<&str>,
+    guard: &mut LoopGuard,
 ) -> Option<String> {
     let call = crate::tools::quick::route_for_available_tools(
         text,
@@ -761,6 +765,7 @@ async fn handle_quick_tool_for_voice(
                 request_origin: crate::tools::RequestOrigin::Voice,
                 confirmed: false,
             },
+            guard,
         )
         .await;
     let response = if tool_result.success {
@@ -1011,6 +1016,10 @@ pub async fn process_transcript(
     }
     // Security: scan for prompt injection (issue #196).
     crate::security::injection::scan_and_warn(&text, crate::security::injection::source::VOICE);
+
+    // One LoopGuard per voice cycle — shared across the quick-tool fast path
+    // and the LLM-driven tool dispatch so call counts accumulate correctly.
+    let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
     if let VoiceIntentDecision::Reject(reason) = intent::assess_transcript(&text) {
         if let Some(path) = wav_path {
             let _ = tokio::fs::remove_file(path).await;
@@ -1055,6 +1064,7 @@ pub async fn process_transcript(
         voice_cfg,
         audio_device,
         response_language.as_deref(),
+        &mut loop_guard,
     )
     .await
     {
@@ -1158,6 +1168,7 @@ pub async fn process_transcript(
                 request_origin: crate::tools::RequestOrigin::Voice,
                 confirmed: false,
             },
+            &mut loop_guard,
         )
         .await
     {

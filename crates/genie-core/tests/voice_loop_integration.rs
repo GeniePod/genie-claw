@@ -47,6 +47,7 @@ use genie_core::conversation::ConversationStore;
 use genie_core::llm::{LlmClient, Message};
 use genie_core::memory::{Memory, SharedMemory};
 use genie_core::prompt::ModelFamily;
+use genie_core::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use genie_core::tools::{ToolDispatcher, ToolExecutionContext, try_tool_call_with_context};
 use genie_core::voice::identity::SpeakerIdentityProvider;
 use genie_core::voice::streaming::stream_and_speak;
@@ -159,8 +160,9 @@ async fn tool_dispatch_via_try_tool_call_writes_audit_log_event() {
     let dispatcher = ToolDispatcher::new(None).with_tool_audit_path(audit_path.clone());
 
     let llm_output = r#"{"tool": "get_time", "arguments": {}}"#;
+    let mut guard = LoopGuard::new(LoopGuardConfig::default());
     let result =
-        try_tool_call_with_context(llm_output, &dispatcher, ToolExecutionContext::default())
+        try_tool_call_with_context(llm_output, &dispatcher, ToolExecutionContext::default(), &mut guard)
             .await
             .expect("get_time should be dispatchable");
     assert_eq!(result.tool, "get_time");
@@ -260,8 +262,9 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
     assert!(llm_output.contains("get_time"));
 
     // Tool dispatch — exactly what voice_cycle does on the LLM output.
+    let mut guard = LoopGuard::new(LoopGuardConfig::default());
     let tool_result =
-        try_tool_call_with_context(&llm_output, &dispatcher, ToolExecutionContext::default())
+        try_tool_call_with_context(&llm_output, &dispatcher, ToolExecutionContext::default(), &mut guard)
             .await
             .expect("LLM output should parse as a tool call");
     assert_eq!(tool_result.tool, "get_time");

@@ -17,6 +17,8 @@ use super::actuation::{
 use super::home;
 use super::timer;
 use crate::ha::HomeAutomationProvider;
+use crate::security::loop_guard::{LoopCheck, LoopGuard, LoopGuardConfig};
+use crate::security::taint::{TaintLabel, TaintSink, Tainted};
 use crate::skills::SkillLoader;
 
 const ACTUATION_RATE_WINDOW_MS: u64 = 60_000;
@@ -517,7 +519,8 @@ impl ToolDispatcher {
 
     /// Execute a tool call from the LLM.
     pub async fn execute(&self, call: &ToolCall) -> ToolResult {
-        self.execute_with_context(call, ToolExecutionContext::default())
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
+        self.execute_with_context(call, ToolExecutionContext::default(), &mut guard)
             .await
     }
 
@@ -525,9 +528,32 @@ impl ToolDispatcher {
         &self,
         call: &ToolCall,
         exec_ctx: ToolExecutionContext,
+        guard: &mut LoopGuard,
     ) -> ToolResult {
         let started = Instant::now();
         let action_class = tool_action_class(&call.name);
+
+        // Circuit-breaker: check before any dispatch so a looping LLM is
+        // blocked regardless of which tool it keeps calling.
+        let args_json = call.arguments.to_string();
+        match guard.check(&call.name, &args_json) {
+            LoopCheck::Block(reason) => {
+                tracing::warn!(tool = %call.name, %reason, "loop_guard: blocked tool call");
+                let tool_result = ToolResult {
+                    tool: call.name.clone(),
+                    action_class,
+                    success: false,
+                    output: format!("Tool call blocked by loop guard: {reason}"),
+                };
+                self.audit_tool_call(call, exec_ctx, started, &tool_result);
+                return tool_result;
+            }
+            LoopCheck::Warn(reason) => {
+                tracing::warn!(tool = %call.name, %reason, "loop_guard: repeated tool call warning");
+            }
+            LoopCheck::Allow => {}
+        }
+
         if let Err(err) =
             tool_origin_allowed(&self.tool_policy, exec_ctx.request_origin, &call.name)
         {
@@ -574,6 +600,22 @@ impl ToolDispatcher {
                 output: e.to_string(),
             },
         };
+
+        // IFC: tag Network tool outputs with ExternalNetwork and verify the
+        // DisplayToUser sink policy. Currently ExternalNetwork is not blocked
+        // at DisplayToUser (only Secret is), so this is a no-op today but
+        // establishes the wire-up so future Secret-carrying network results
+        // are caught at the boundary rather than leaking to the user.
+        if tool_result.action_class == ToolActionClass::Network && tool_result.success {
+            let tainted = Tainted::new(tool_result.output.clone(), TaintLabel::ExternalNetwork);
+            if let Err(violation) = tainted.check_sink(TaintSink::DisplayToUser) {
+                tracing::warn!(
+                    tool = %call.name,
+                    %violation,
+                    "taint: network tool output violates DisplayToUser policy"
+                );
+            }
+        }
 
         self.audit_tool_call(call, exec_ctx, started, &tool_result);
 
@@ -859,6 +901,9 @@ impl ToolDispatcher {
         // `"confirmation"`. The original-bucket already paid one slot when
         // the request returned `ConfirmationRequired`, so the limiter skips
         // re-charging here (see `confirmed`-guard in `exec_home_control_inner`).
+        // Confirmation re-entries are single, already-approved actions.
+        // A fresh guard is correct here: this is not an LLM-driven turn.
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let result = self
             .execute_with_context(
                 &call,
@@ -867,6 +912,7 @@ impl ToolDispatcher {
                     confirmed: true,
                     ..ToolExecutionContext::default()
                 },
+                &mut guard,
             )
             .await;
         if result.success {
@@ -1731,6 +1777,19 @@ mod tests {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Convenience wrapper used by tests that don't care about loop-guard
+    /// state: creates a fresh default LoopGuard for each call so the
+    /// test exercises the same code path as production without needing to
+    /// thread a guard through every assertion.
+    async fn exec_ctx(
+        dispatcher: &ToolDispatcher,
+        call: &ToolCall,
+        ctx: ToolExecutionContext,
+    ) -> ToolResult {
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
+        dispatcher.execute_with_context(call, ctx, &mut guard).await
+    }
+
     struct StubHomeProvider;
 
     struct RecordingHomeProvider {
@@ -1966,18 +2025,18 @@ mod tests {
             .insert("telegram".into(), vec!["web_search".into()]);
         let dispatcher = ToolDispatcher::new(None).with_tool_policy_config(policy);
 
-        let result = dispatcher
-            .execute_with_context(
-                &ToolCall {
-                    name: "web_search".into(),
-                    arguments: serde_json::json!({"query": "test"}),
-                },
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Telegram,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let result = exec_ctx(
+            &dispatcher,
+            &ToolCall {
+                name: "web_search".into(),
+                arguments: serde_json::json!({"query": "test"}),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Telegram,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
 
         assert!(!result.success);
         assert!(result.output.contains("origin policy"));
@@ -1991,30 +2050,30 @@ mod tests {
             .insert("voice".into(), vec!["get_time".into()]);
         let dispatcher = ToolDispatcher::new(None).with_tool_policy_config(policy);
 
-        let allowed = dispatcher
-            .execute_with_context(
-                &ToolCall {
-                    name: "get_time".into(),
-                    arguments: serde_json::json!({}),
-                },
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Voice,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
-        let blocked = dispatcher
-            .execute_with_context(
-                &ToolCall {
-                    name: "calculate".into(),
-                    arguments: serde_json::json!({"expression": "1 + 1"}),
-                },
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Voice,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let allowed = exec_ctx(
+            &dispatcher,
+            &ToolCall {
+                name: "get_time".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Voice,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
+        let blocked = exec_ctx(
+            &dispatcher,
+            &ToolCall {
+                name: "calculate".into(),
+                arguments: serde_json::json!({"expression": "1 + 1"}),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Voice,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
 
         assert!(allowed.success);
         assert!(!blocked.success);
@@ -2069,18 +2128,18 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let dispatcher = ToolDispatcher::new(None).with_tool_audit_path(path.clone());
 
-        let result = dispatcher
-            .execute_with_context(
-                &ToolCall {
-                    name: "calculate".into(),
-                    arguments: serde_json::json!({"expression": "secret-token-value"}),
-                },
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Api,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let result = exec_ctx(
+            &dispatcher,
+            &ToolCall {
+                name: "calculate".into(),
+                arguments: serde_json::json!({"expression": "secret-token-value"}),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Api,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
 
         assert!(!result.success);
         let line = std::fs::read_to_string(&path).unwrap();
@@ -2116,21 +2175,21 @@ mod tests {
             executed: executed.clone(),
         })));
 
-        let result = dispatcher
-            .execute_with_context(
-                &ToolCall {
-                    name: "home_control".into(),
-                    arguments: serde_json::json!({
-                        "entity": "kitchen light",
-                        "action": "turn_on"
-                    }),
-                },
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Dashboard,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let result = exec_ctx(
+            &dispatcher,
+            &ToolCall {
+                name: "home_control".into(),
+                arguments: serde_json::json!({
+                    "entity": "kitchen light",
+                    "action": "turn_on"
+                }),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Dashboard,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
 
         assert!(result.success);
         assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::TurnOn]);
@@ -2164,21 +2223,21 @@ mod tests {
         })))
         .with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
-        let result = dispatcher
-            .execute_with_context(
-                &ToolCall {
-                    name: "home_control".into(),
-                    arguments: serde_json::json!({
-                        "entity": "playroom lights",
-                        "action": "turn_on"
-                    }),
-                },
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Dashboard,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let result = exec_ctx(
+            &dispatcher,
+            &ToolCall {
+                name: "home_control".into(),
+                arguments: serde_json::json!({
+                    "entity": "playroom lights",
+                    "action": "turn_on"
+                }),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Dashboard,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
 
         assert!(result.success, "{}", result.output);
         assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::TurnOn]);
@@ -2226,21 +2285,21 @@ mod tests {
         })))
         .with_actuation_safety_config(safety);
 
-        let result = dispatcher
-            .execute_with_context(
-                &ToolCall {
-                    name: "home_control".into(),
-                    arguments: serde_json::json!({
-                        "entity": "kitchen light",
-                        "action": "turn_on"
-                    }),
-                },
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Telegram,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let result = exec_ctx(
+            &dispatcher,
+            &ToolCall {
+                name: "home_control".into(),
+                arguments: serde_json::json!({
+                    "entity": "kitchen light",
+                    "action": "turn_on"
+                }),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Telegram,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
 
         assert!(!result.success);
         assert!(result.output.contains("telegram"));
@@ -2270,8 +2329,8 @@ mod tests {
             ..ToolExecutionContext::default()
         };
 
-        let first = dispatcher.execute_with_context(&call, ctx).await;
-        let second = dispatcher.execute_with_context(&call, ctx).await;
+        let first = exec_ctx(&dispatcher, &call, ctx).await;
+        let second = exec_ctx(&dispatcher, &call, ctx).await;
 
         assert!(first.success);
         assert!(!second.success);
@@ -2294,30 +2353,30 @@ mod tests {
             }),
         };
         assert!(
-            dispatcher
-                .execute_with_context(
-                    &control,
-                    ToolExecutionContext {
-                        request_origin: RequestOrigin::Dashboard,
-                        ..ToolExecutionContext::default()
-                    },
-                )
-                .await
-                .success
-        );
-
-        let undo = dispatcher
-            .execute_with_context(
-                &ToolCall {
-                    name: "home_undo".into(),
-                    arguments: serde_json::json!({}),
-                },
+            exec_ctx(
+                &dispatcher,
+                &control,
                 ToolExecutionContext {
                     request_origin: RequestOrigin::Dashboard,
                     ..ToolExecutionContext::default()
                 },
             )
-            .await;
+            .await
+            .success
+        );
+
+        let undo = exec_ctx(
+            &dispatcher,
+            &ToolCall {
+                name: "home_undo".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Dashboard,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
 
         assert!(undo.success);
         assert!(undo.output.contains("Undid the last home action"));
@@ -2326,18 +2385,18 @@ mod tests {
             vec![HomeActionKind::TurnOn, HomeActionKind::TurnOff]
         );
 
-        let second_undo = dispatcher
-            .execute_with_context(
-                &ToolCall {
-                    name: "home_undo".into(),
-                    arguments: serde_json::json!({}),
-                },
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Dashboard,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let second_undo = exec_ctx(
+            &dispatcher,
+            &ToolCall {
+                name: "home_undo".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Dashboard,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
         assert!(!second_undo.success);
         assert!(second_undo.output.contains("No recent reversible"));
     }
@@ -2355,22 +2414,22 @@ mod tests {
         })))
         .with_actuation_audit_path(path.clone());
         assert!(
-            dispatcher
-                .execute_with_context(
-                    &ToolCall {
-                        name: "home_control".into(),
-                        arguments: serde_json::json!({
-                            "entity": "kitchen light",
-                            "action": "turn_on"
-                        }),
-                    },
-                    ToolExecutionContext {
-                        request_origin: RequestOrigin::Dashboard,
-                        ..ToolExecutionContext::default()
-                    },
-                )
-                .await
-                .success
+            exec_ctx(
+                &dispatcher,
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: serde_json::json!({
+                        "entity": "kitchen light",
+                        "action": "turn_on"
+                    }),
+                },
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Dashboard,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await
+            .success
         );
 
         let restarted = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
@@ -2895,21 +2954,21 @@ mod tests {
             name: "memory_recall".into(),
             arguments: serde_json::json!({"query": "oat milk"}),
         };
-        let output = dispatcher
-            .execute_with_context(
-                &call,
-                ToolExecutionContext {
-                    memory_read_context: Some(crate::memory::policy::MemoryReadContext {
-                        identity_confidence: crate::memory::policy::IdentityConfidence::High,
-                        explicit_named_person: false,
-                        explicit_private_intent: false,
-                        shared_space_voice: true,
-                    }),
-                    request_origin: RequestOrigin::Dashboard,
-                    confirmed: false,
-                },
-            )
-            .await;
+        let output = exec_ctx(
+            &dispatcher,
+            &call,
+            ToolExecutionContext {
+                memory_read_context: Some(crate::memory::policy::MemoryReadContext {
+                    identity_confidence: crate::memory::policy::IdentityConfidence::High,
+                    explicit_named_person: false,
+                    explicit_private_intent: false,
+                    shared_space_voice: true,
+                }),
+                request_origin: RequestOrigin::Dashboard,
+                confirmed: false,
+            },
+        )
+        .await;
 
         assert!(output.success);
         assert_eq!(output.output, "I remember: Maya likes oat milk");
@@ -3071,15 +3130,15 @@ mod tests {
                 "action": "lock"
             }),
         };
-        let issued = dispatcher
-            .execute_with_context(
-                &lock_call,
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Telegram,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let issued = exec_ctx(
+            &dispatcher,
+            &lock_call,
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Telegram,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
         assert!(issued.success, "issuing confirmation must succeed");
         assert!(
             !issued.output.contains("act-"),
@@ -3132,15 +3191,15 @@ mod tests {
 
         // First Telegram request → returns ConfirmationRequired and charges
         // the telegram bucket once.
-        let first_issue = dispatcher
-            .execute_with_context(
-                &lock_call,
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Telegram,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let first_issue = exec_ctx(
+            &dispatcher,
+            &lock_call,
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Telegram,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
         assert!(first_issue.success);
         let first_token = latest_confirmation_token(&dispatcher);
 
@@ -3157,15 +3216,15 @@ mod tests {
         // A second Telegram-initiated sensitive request inside the same window
         // must now be rate-limited at the issue step, instead of getting
         // through by routing through the confirmation bucket.
-        let second_issue = dispatcher
-            .execute_with_context(
-                &lock_call,
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Telegram,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let second_issue = exec_ctx(
+            &dispatcher,
+            &lock_call,
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Telegram,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
         assert!(
             !second_issue.success,
             "second telegram-initiated sensitive request must be rate-limited"
@@ -3209,15 +3268,15 @@ mod tests {
             }),
         };
 
-        let first_issue = dispatcher
-            .execute_with_context(
-                &lock_call,
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Telegram,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let first_issue = exec_ctx(
+            &dispatcher,
+            &lock_call,
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Telegram,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
         assert!(first_issue.success);
         let first_token = latest_confirmation_token(&dispatcher);
         dispatcher
@@ -3229,15 +3288,15 @@ mod tests {
         // so far: 1 (request) + 0 (confirm doesn't recharge) = 1. With limit
         // = 2, this issue must still be accepted (returns
         // ConfirmationRequired again, charging slot #2).
-        let second_issue = dispatcher
-            .execute_with_context(
-                &lock_call,
-                ToolExecutionContext {
-                    request_origin: RequestOrigin::Telegram,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let second_issue = exec_ctx(
+            &dispatcher,
+            &lock_call,
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Telegram,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
         assert!(
             second_issue.success,
             "second issue must succeed: confirm of #1 must not double-charge the telegram bucket"

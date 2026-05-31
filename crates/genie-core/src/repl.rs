@@ -6,6 +6,7 @@ use crate::llm::{LlmClient, LlmRequestHints, Message};
 use crate::memory::{self, SharedMemory, with_shared_memory};
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use crate::tools;
 
 /// Interactive REPL for genie-core.
@@ -64,6 +65,9 @@ pub async fn run(
         // Persist user message.
         conversations.append_or_log(&conv_id, "user", text, None);
 
+        // One LoopGuard per REPL input — resets between turns automatically.
+        let mut loop_guard = LoopGuard::new(LoopGuardConfig::default());
+
         if let Some(call) = tools::quick::route_for_available_tools(
             text,
             tools_dispatch.has_home_automation(),
@@ -76,6 +80,7 @@ pub async fn run(
                         request_origin: tools::RequestOrigin::Repl,
                         ..tools::ToolExecutionContext::default()
                     },
+                    &mut loop_guard,
                 )
                 .await;
             let response = if tool_result.success {
@@ -158,6 +163,7 @@ pub async fn run(
                         request_origin: tools::RequestOrigin::Repl,
                         ..tools::ToolExecutionContext::default()
                     },
+                    &mut loop_guard,
                 )
                 .await
                 {

@@ -1,3 +1,5 @@
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
+
 use super::dispatch::{ToolCall, ToolDispatcher, ToolExecutionContext, ToolResult};
 
 /// Parse a tool call from LLM output and execute it.
@@ -8,13 +10,15 @@ use super::dispatch::{ToolCall, ToolDispatcher, ToolExecutionContext, ToolResult
 /// 3. Embedded in text: `I'll check that. {"tool": "get_weather", "arguments": {"location": "Denver"}}`
 /// 4. With extra fields: `{"tool": "set_timer", "arguments": {"seconds": 300}, "reasoning": "..."}`
 pub async fn try_tool_call(response: &str, tools: &ToolDispatcher) -> Option<ToolResult> {
-    try_tool_call_with_context(response, tools, ToolExecutionContext::default()).await
+    let mut guard = LoopGuard::new(LoopGuardConfig::default());
+    try_tool_call_with_context(response, tools, ToolExecutionContext::default(), &mut guard).await
 }
 
 pub async fn try_tool_call_with_context(
     response: &str,
     tools: &ToolDispatcher,
     exec_ctx: ToolExecutionContext,
+    guard: &mut LoopGuard,
 ) -> Option<ToolResult> {
     let json_str = extract_json(response)?;
     let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
@@ -24,7 +28,7 @@ pub async fn try_tool_call_with_context(
         return None;
     }
 
-    Some(tools.execute_with_context(&call, exec_ctx).await)
+    Some(tools.execute_with_context(&call, exec_ctx, guard).await)
 }
 
 /// Parse tool calls from model output without executing them.
