@@ -240,9 +240,13 @@ async fn tool_gate_rate_limit_allows_n_then_denies_and_audits() {
     };
 
     let mut guard1 = LoopGuard::new(LoopGuardConfig::default());
-    let first = dispatcher.execute_with_context(&call, ctx, &mut guard1).await;
+    let first = dispatcher
+        .execute_with_context(&call, ctx, &mut guard1)
+        .await;
     let mut guard2 = LoopGuard::new(LoopGuardConfig::default());
-    let second = dispatcher.execute_with_context(&call, ctx, &mut guard2).await;
+    let second = dispatcher
+        .execute_with_context(&call, ctx, &mut guard2)
+        .await;
 
     assert!(
         first.success,
@@ -509,6 +513,7 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
     let expected_audit_count = invalid_calls.len();
 
     for (arguments, expected_snippet) in &invalid_calls {
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let result = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -516,6 +521,7 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
                     arguments: arguments.clone(),
                 },
                 ctx,
+                &mut guard,
             )
             .await;
 

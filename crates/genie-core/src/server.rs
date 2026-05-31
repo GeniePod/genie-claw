@@ -12,12 +12,12 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
-use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use crate::llm::{LlmClient, LlmRequestHints, Message};
 use crate::memory::{Memory, SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
+use crate::security::loop_guard::{LoopGuard, LoopGuardConfig};
 use crate::tools::ToolDispatcher;
 use crate::tools::{RequestOrigin, ToolExecutionContext};
 
