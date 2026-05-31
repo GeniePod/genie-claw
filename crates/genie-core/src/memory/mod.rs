@@ -817,7 +817,10 @@ impl Memory {
                 let decay_mult = if evergreen {
                     1.0
                 } else {
-                    let age_days = (now as f64 - entry.created_ms as f64) / (86_400_000.0);
+                    // Recency-of-use: decay from last access, not creation, so a
+                    // frequently-recalled memory stays fresh. `accessed_ms` is
+                    // refreshed by update_recall_tracking on every recall.
+                    let age_days = (now as f64 - entry.accessed_ms as f64) / (86_400_000.0);
                     decay::exponential_decay(age_days, self.half_life_days)
                 };
                 let final_score = bm25_score * decay_mult;
@@ -1062,7 +1065,7 @@ impl Memory {
         let now = now_ms();
         let mut stmt = self
             .conn
-            .prepare("SELECT id, created_ms FROM memories WHERE evergreen = 0 AND promoted = 0")?;
+            .prepare("SELECT id, accessed_ms FROM memories WHERE evergreen = 0 AND promoted = 0")?;
 
         let candidates: Vec<(i64, i64)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -1070,8 +1073,11 @@ impl Memory {
             .collect();
 
         let mut deleted = 0;
-        for (id, created_ms) in candidates {
-            let age_days = (now as f64 - created_ms as f64) / 86_400_000.0;
+        for (id, accessed_ms) in candidates {
+            // Decay from last access (recency-of-use), consistent with search
+            // ranking — a long-unused memory decays and is pruned; a recently
+            // recalled one survives regardless of how long ago it was created.
+            let age_days = (now as f64 - accessed_ms as f64) / 86_400_000.0;
             let multiplier = decay::exponential_decay(age_days, self.half_life_days);
 
             if multiplier < min_decay_threshold {
@@ -11129,6 +11135,39 @@ mod tests {
         let deleted = mem.prune_decayed(0.5).unwrap();
         assert!(deleted <= 1); // temporary might be deleted
         assert!(mem.count().unwrap() >= 1); // evergreen survives
+    }
+
+    /// Decay (and the destructive prune it drives) must be measured from last
+    /// access, not creation — so a year-old but recently-recalled memory is
+    /// kept, while a long-unused one is pruned. Pre-fix this used `created_ms`
+    /// and deleted the actively-used memory.
+    #[test]
+    fn prune_decayed_uses_last_access_not_creation_time() {
+        let mem = Memory::open_with_half_life(&temp_memory_path("prune-recency"), 30.0).unwrap();
+        let id = mem.store("fact", "frequently used fact").unwrap();
+        let now = now_ms();
+        let a_year_ago = now - 365 * 86_400_000;
+
+        // Created a year ago, but accessed just now (a daily-used fact).
+        mem.conn
+            .execute(
+                "UPDATE memories SET created_ms = ?1, accessed_ms = ?2 WHERE id = ?3",
+                rusqlite::params![a_year_ago, now, id],
+            )
+            .unwrap();
+        let deleted = mem.prune_decayed(0.5).unwrap();
+        assert_eq!(deleted, 0, "a recently-accessed memory must survive prune");
+        assert_eq!(mem.count().unwrap(), 1);
+
+        // Now make it stale by last-access as well — it should be pruned.
+        mem.conn
+            .execute(
+                "UPDATE memories SET accessed_ms = ?1 WHERE id = ?2",
+                rusqlite::params![a_year_ago, id],
+            )
+            .unwrap();
+        let deleted = mem.prune_decayed(0.5).unwrap();
+        assert_eq!(deleted, 1, "a long-unused memory must be pruned");
     }
 
     #[test]
