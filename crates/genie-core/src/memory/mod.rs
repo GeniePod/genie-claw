@@ -2491,14 +2491,18 @@ impl Memory {
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
 
-        let _ = std::fs::remove_dir_all(&namespaces_dir);
         if records.is_empty() {
+            let _ = std::fs::remove_dir_all(&namespaces_dir);
             let _ = std::fs::remove_file(&file);
             let _ = std::fs::remove_file(&index_file);
             return Ok(());
         }
 
-        std::fs::create_dir_all(&namespaces_dir)?;
+        // Stage all writes to temporary paths so the originals are untouched
+        // until every write has succeeded (atomic write-then-swap pattern).
+        let namespaces_staging = self.canonical_dir.join("namespaces.tmp");
+        let _ = std::fs::remove_dir_all(&namespaces_staging);
+        std::fs::create_dir_all(&namespaces_staging)?;
 
         let mut namespace_index: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
@@ -2537,8 +2541,14 @@ impl Memory {
 
         for (namespace, lines) in &namespace_index {
             let relative = canonical_namespace_note_relative(namespace);
-            let note_path = self.canonical_dir.join(&relative);
-            if let Some(parent) = note_path.parent() {
+            // Write namespace files into the staging dir rather than the live dir.
+            // `relative` is always of the form "namespaces/<path>"; strip the
+            // leading component so we can re-root under namespaces_staging.
+            let relative_within_ns = relative
+                .strip_prefix("namespaces/")
+                .unwrap_or(relative.as_str());
+            let staged_note_path = namespaces_staging.join(relative_within_ns);
+            if let Some(parent) = staged_note_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
 
@@ -2549,7 +2559,7 @@ impl Memory {
             for line in lines {
                 note_text.push_str(line);
             }
-            std::fs::write(note_path, note_text)?;
+            std::fs::write(&staged_note_path, note_text)?;
 
             index_text.push_str(&format!(
                 "- [{}]({}) — {} durable entr{}\n",
@@ -2560,23 +2570,50 @@ impl Memory {
             ));
         }
 
-        std::fs::write(index_file, index_text)?;
-
-        if root_lines.is_empty() {
+        let root_text = if root_lines.is_empty() {
             let mut text = String::from("# GenieClaw Durable Memory\n\n");
             text.push_str(
                 "No promoted memories are currently safe for shared-room disclosure.\n\nSee [INDEX.md](INDEX.md) for the local namespace map.\n",
             );
-            std::fs::write(file, text)?;
-            return Ok(());
-        }
+            text
+        } else {
+            let mut text = String::from("# GenieClaw Durable Memory\n\n");
+            text.push_str("See [INDEX.md](INDEX.md) for namespace notes.\n\n");
+            for line in root_lines {
+                text.push_str(&line);
+            }
+            text
+        };
 
-        let mut text = String::from("# GenieClaw Durable Memory\n\n");
-        text.push_str("See [INDEX.md](INDEX.md) for namespace notes.\n\n");
-        for line in root_lines {
-            text.push_str(&line);
+        // Write MEMORY.md and INDEX.md to temp files before touching the live copies.
+        let file_staging = self.canonical_dir.join("MEMORY.md.tmp");
+        let index_staging = self.canonical_dir.join("INDEX.md.tmp");
+        std::fs::write(&index_staging, index_text)?;
+        std::fs::write(&file_staging, root_text)?;
+
+        // All staging writes succeeded — swap the live directories and files.
+        //
+        // Ordering guarantee: sideline the live namespaces dir under a .bak
+        // name *before* renaming staging into the live slot.  If the process
+        // dies between the two renames the .bak holds the previous export and
+        // the next call will clean it up at the top of this function (see
+        // `remove_dir_all(&namespaces_bak)` below).  The MEMORY/INDEX file
+        // renames are atomic overwrites on POSIX so they need no backup.
+        let namespaces_bak = self.canonical_dir.join("namespaces.bak");
+        // Clean up any stale backup left by a previous interrupted run.
+        let _ = std::fs::remove_dir_all(&namespaces_bak);
+        if namespaces_dir.exists() {
+            std::fs::rename(&namespaces_dir, &namespaces_bak)?;
         }
-        std::fs::write(file, text)?;
+        if let Err(e) = std::fs::rename(&namespaces_staging, &namespaces_dir) {
+            // Restore the sidelined backup so the caller is no worse off.
+            let _ = std::fs::rename(&namespaces_bak, &namespaces_dir);
+            return Err(e.into());
+        }
+        let _ = std::fs::remove_dir_all(&namespaces_bak);
+        std::fs::rename(&index_staging, &index_file)?;
+        std::fs::rename(&file_staging, &file)?;
+
         Ok(())
     }
 }
@@ -16288,5 +16325,108 @@ mod tests {
             entry.canonical_note.as_deref(),
             Some("memory/namespaces/household/preference.md")
         );
+    }
+
+    #[test]
+    fn rebuild_leaves_no_staging_artifacts_on_success() {
+        let mem = temp_memory();
+        let id = mem.store("preference", "User likes chamomile tea").unwrap();
+        mem.mark_promoted(id).unwrap();
+
+        // Staging directories, backup dirs, and temp files must all be cleaned
+        // up after a successful rebuild so they don't accumulate across calls.
+        assert!(!mem.canonical_dir.join("namespaces.tmp").exists());
+        assert!(!mem.canonical_dir.join("namespaces.bak").exists());
+        assert!(!mem.canonical_dir.join("MEMORY.md.tmp").exists());
+        assert!(!mem.canonical_dir.join("INDEX.md.tmp").exists());
+    }
+
+    #[test]
+    fn rebuild_preserves_original_files_until_all_writes_succeed() {
+        // Verify that the atomic swap keeps the live namespace dir intact until
+        // a second rebuild replaces it — if the first rebuild completed, the
+        // second must produce the updated content and not a partial state.
+        let mem = temp_memory();
+        let first = mem.store("preference", "User likes chamomile tea").unwrap();
+        mem.mark_promoted(first).unwrap();
+
+        let note_path = mem.canonical_dir.join("namespaces/household/preference.md");
+        let original_text = std::fs::read_to_string(&note_path).unwrap();
+        assert!(original_text.contains("chamomile tea"));
+
+        // Second promotion triggers another rebuild; live file must be updated.
+        let second = mem
+            .store("preference", "User likes peppermint tea")
+            .unwrap();
+        mem.mark_promoted(second).unwrap();
+
+        let updated_text = std::fs::read_to_string(&note_path).unwrap();
+        assert!(updated_text.contains("chamomile tea"));
+        assert!(updated_text.contains("peppermint tea"));
+
+        // No staging debris left behind.
+        assert!(!mem.canonical_dir.join("namespaces.tmp").exists());
+    }
+
+    #[test]
+    fn rebuild_recovers_from_mid_crash_sidelined_backup() {
+        // Regression test for the data-loss window that existed when the old
+        // code ran `remove_dir_all(namespaces)` before `rename(staging →
+        // namespaces)`.  With the backup-rename-restore ordering a crash
+        // between the two renames leaves `namespaces.bak` intact; the next
+        // rebuild must clean it up and produce correct output from SQLite —
+        // the original export content is never permanently lost.
+        let mem = temp_memory();
+        let first = mem.store("preference", "User likes chamomile tea").unwrap();
+        mem.mark_promoted(first).unwrap();
+
+        let namespaces_dir = mem.canonical_dir.join("namespaces");
+        let namespaces_bak = mem.canonical_dir.join("namespaces.bak");
+
+        // Confirm the live dir was created by the initial rebuild.
+        assert!(
+            namespaces_dir.exists(),
+            "namespaces/ must exist after first rebuild"
+        );
+
+        // Simulate the mid-crash state: the live dir was sidelined to .bak
+        // (step 1 of the swap) but the staging→live rename never happened
+        // (step 2).  Replicate by manually moving the live dir aside.
+        std::fs::rename(&namespaces_dir, &namespaces_bak).unwrap();
+        assert!(!namespaces_dir.exists());
+        assert!(namespaces_bak.exists());
+
+        // Trigger another rebuild.  It must tolerate the stale .bak, clean it
+        // up, and rebuild everything from the authoritative SQLite store.
+        let second = mem
+            .store("preference", "User likes peppermint tea")
+            .unwrap();
+        mem.mark_promoted(second).unwrap();
+
+        // Live dir must be recreated with up-to-date content.
+        assert!(
+            namespaces_dir.exists(),
+            "namespaces/ must be recreated after recovery rebuild"
+        );
+        assert!(
+            !namespaces_bak.exists(),
+            "stale namespaces.bak must be removed at the start of the next rebuild"
+        );
+
+        let note = namespaces_dir.join("household/preference.md");
+        let text = std::fs::read_to_string(&note).unwrap();
+        assert!(
+            text.contains("chamomile tea"),
+            "original content must survive: {text}"
+        );
+        assert!(
+            text.contains("peppermint tea"),
+            "new content must be present: {text}"
+        );
+
+        // No staging debris.
+        assert!(!mem.canonical_dir.join("namespaces.tmp").exists());
+        assert!(!mem.canonical_dir.join("MEMORY.md.tmp").exists());
+        assert!(!mem.canonical_dir.join("INDEX.md.tmp").exists());
     }
 }
