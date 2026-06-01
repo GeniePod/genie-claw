@@ -587,6 +587,7 @@ async fn home_status_rejects_invalid_arguments_and_audits() {
     let expected_audit_count = invalid_calls.len();
 
     for (arguments, expected_snippet) in &invalid_calls {
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
         let result = dispatcher
             .execute_with_context(
                 &ToolCall {
@@ -594,6 +595,7 @@ async fn home_status_rejects_invalid_arguments_and_audits() {
                     arguments: arguments.clone(),
                 },
                 ctx,
+                &mut guard,
             )
             .await;
 
