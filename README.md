@@ -58,24 +58,87 @@ Everything else is noise until the local home agent is fast, accurate, and
 measurable under the Jetson 4096-token constraint. Routing, memory retrieval,
 typed tools, BFCL score, and Jetson behavior are the work.
 
-## Active Contribution Gate
+## Milestones
 
-GenieClaw is not optimizing for broad user deployment yet. The current work is
-to make the agent materially faster, more accurate, and more reliable inside
-the Jetson 4096-token home-agent harness.
+GenieClaw tracks three open milestones. The text below is kept word-for-word
+identical to the GitHub milestone descriptions and the milestone cards on
+[genieclaw.org](https://genieclaw.org) — one source of truth. If you are
+opening an issue or PR, the milestone it belongs to (or doesn't) decides
+whether it lands.
 
-Generic bug-fix PRs, cleanup PRs, broad refactors, dashboard polish, provider
-churn, and speculative feature work are not welcome unless they directly move
-the M1 scorecard: BFCL tool-call accuracy, deterministic family/home memory,
-typed-tool reliability, compact prompt assembly, or Jetson-native runtime
-behavior. A fix that is technically correct but outside that path is still
-noise for this phase.
+### [M1 — Jetson 4096-token BFCL Agent Harness](https://github.com/GeniePod/genie-claw/milestone/1) · in progress
 
-Valuable contributions are the ones that help this repository become what it is
-intended to be: a private, local, deterministic household agent that can run
-well on NVIDIA Jetson Orin 8GB hardware. Spam-like PRs, AI-generated issue
-churn, duplicate reports, unplanned bug-fix batches, or changes without real
-behavior proof will be closed immediately to protect review quality.
+Keep GenieClaw fast, reliable, and measurable on NVIDIA Jetson Orin Nano 8 GB
+with a 4096-token local context.
+
+**In scope:**
+
+- BFCL quick-router and local-LLM tool-call scoring
+- High-signal home / family memory fixtures
+- Deterministic device state
+- Typed-tool routing
+- Memory retrieval accuracy
+- Compact prompt and tool budgeting
+- Jetson / aarch64 CI and Jetson hardware validation when possible
+
+**Out of scope:**
+
+- Broad prompt growth
+- Generic chatbot or provider churn
+- UI, product, community, or hardware work
+- Toy demos
+- Untested native or runtime changes
+- PRs that make the agent less native, slower, less deterministic, or harder to test
+
+### [M2 — Portable Providers and Channel Boundaries](https://github.com/GeniePod/genie-claw/milestone/2) · next
+
+Make GenieClaw portable without weakening the 4096-token Jetson baseline.
+
+**In scope:**
+
+- Channel and session adapters
+- Provider configuration
+- Optional API-key providers behind explicit gates
+- Memory and channel reliability
+
+**Out of scope:**
+
+- Voice-runtime internals
+- Hardware variants
+- Mobile apps
+- OS images
+- Community-growth goals
+
+### [M3 — Home Runtime Boundary and Skill Safety](https://github.com/GeniePod/genie-claw/milestone/3) · later
+
+Harden the smart-home agent boundary.
+
+**In scope:**
+
+- Home Assistant provider cleanup
+- Explicit handoff to the planned genie-home-runtime
+- Native skill policy
+- Sandbox and audit requirements
+- Final actuation safety contracts
+
+**Out of scope:**
+
+- Building hardware
+- OS images
+- Mobile apps
+- Marketplace or community campaigns
+- Voice and audio pipeline internals
+
+### Active Contribution Gate
+
+We are working M1 now. A PR that is technically correct but outside the M1
+in-scope list is noise for this phase and will be closed.
+
+Valuable contributions are the ones that help this repository become what it
+is intended to be: a private, local, deterministic household agent that can
+run well on NVIDIA Jetson Orin Nano 8 GB hardware. Spam-like PRs, AI-generated
+issue churn, duplicate reports, unplanned bug-fix batches, or changes without
+real behavior proof will be closed immediately to protect review quality.
 
 ## Product Quality Bar
 

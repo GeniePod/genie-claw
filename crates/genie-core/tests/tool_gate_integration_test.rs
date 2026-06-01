@@ -535,3 +535,70 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
         assert_eq!(event["success"], false);
     }
 }
+
+#[tokio::test]
+async fn home_status_rejects_invalid_arguments_and_audits() {
+    let paths = TestAuditPaths::new();
+    let dispatcher = paths.dispatcher(
+        Some(Arc::new(FakeHomeProvider::light(Arc::new(Mutex::new(
+            Vec::new(),
+        ))))),
+        ToolPolicyConfig::default(),
+        ActuationSafetyConfig::default(),
+    );
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Dashboard,
+        ..ToolExecutionContext::default()
+    };
+
+    let invalid_calls = [
+        (
+            serde_json::json!({}),
+            "home_status requires non-empty string argument 'entity'",
+        ),
+        (
+            serde_json::json!({"entity": ""}),
+            "home_status requires non-empty string argument 'entity'",
+        ),
+        (
+            serde_json::json!({"entity": 123}),
+            "home_status requires non-empty string argument 'entity'",
+        ),
+    ];
+    let expected_audit_count = invalid_calls.len();
+
+    for (arguments, expected_snippet) in &invalid_calls {
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_status".into(),
+                    arguments: arguments.clone(),
+                },
+                ctx,
+            )
+            .await;
+
+        assert!(
+            !result.success,
+            "expected schema rejection, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(expected_snippet),
+            "expected output to contain {expected_snippet:?}, got: {}",
+            result.output
+        );
+    }
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(
+        events.len(),
+        expected_audit_count,
+        "each rejected call must be tool-audited"
+    );
+    for event in &events {
+        assert_eq!(event["tool"], "home_status");
+        assert_eq!(event["origin"], "dashboard");
+        assert_eq!(event["success"], false);
+    }
+}
