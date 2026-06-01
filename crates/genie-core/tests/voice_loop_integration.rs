@@ -43,6 +43,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use genie_common;
 use genie_core::conversation::ConversationStore;
 use genie_core::llm::{LlmClient, Message};
 use genie_core::memory::{Memory, SharedMemory};
@@ -364,6 +365,7 @@ fn test_voice_config() -> VoiceConfig {
         voice_continuous: false,
         voice_continuous_secs: 0,
         speaker_identity: SpeakerIdentityProvider::None,
+        injection_policy: genie_common::config::InjectionPolicy::Warn,
     }
 }
 

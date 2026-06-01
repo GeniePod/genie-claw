@@ -20,6 +20,7 @@ pub async fn run(
     system_prompt: &str,
     max_history: usize,
     model_family: ModelFamily,
+    injection_policy: genie_common::config::InjectionPolicy,
 ) -> Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -58,8 +59,15 @@ pub async fn run(
             continue;
         }
 
-        // Security: scan for prompt injection (issue #196).
-        crate::security::injection::scan_and_warn(text, crate::security::injection::source::REPL);
+        // Security: gate on prompt injection policy (issue #196 + fix).
+        if let Err(blocked) = crate::security::injection::gate(
+            text,
+            crate::security::injection::source::REPL,
+            injection_policy,
+        ) {
+            eprintln!("[repl] Blocked: {}", blocked);
+            continue;
+        }
 
         // Persist user message.
         conversations.append_or_log(&conv_id, "user", text, None);

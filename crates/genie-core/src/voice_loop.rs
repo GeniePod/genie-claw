@@ -67,6 +67,8 @@ pub struct VoiceConfig {
     pub voice_continuous_secs: u32,
     /// Speaker identity provider for voice memory context.
     pub speaker_identity: SpeakerIdentityProvider,
+    /// Enforcement policy for the prompt-injection scanner.
+    pub injection_policy: genie_common::config::InjectionPolicy,
 }
 
 /// Run the voice interaction loop.
@@ -348,11 +350,19 @@ async fn run_with_wakeword(
                     if let Ok(transcript) = stt_engine.transcribe_file(&followup_path).await {
                         let text = transcript.text.trim().to_string();
                         if !text.is_empty() {
-                            // Security: scan for prompt injection (issue #196).
-                            crate::security::injection::scan_and_warn(
+                            // Security: gate on prompt injection policy (issue #196 + fix).
+                            if let Err(blocked) = crate::security::injection::gate(
                                 &text,
                                 crate::security::injection::source::VOICE_FOLLOWUP,
-                            );
+                                voice_cfg.injection_policy,
+                            ) {
+                                tracing::info!(
+                                    source = blocked.source,
+                                    "injection gate blocked voice follow-up"
+                                );
+                                eprintln!("[voice] Follow-up blocked: prompt injection pattern detected.");
+                                continue;
+                            }
                             let response_language = transcript.language.clone().or_else(|| {
                                 crate::voice::language::detect_language_from_text(&text)
                             });
@@ -663,6 +673,7 @@ fn clone_voice_config(cfg: &VoiceConfig) -> VoiceConfig {
         voice_continuous: cfg.voice_continuous,
         voice_continuous_secs: cfg.voice_continuous_secs,
         speaker_identity: cfg.speaker_identity.clone(),
+        injection_policy: cfg.injection_policy,
     }
 }
 
@@ -1009,8 +1020,16 @@ pub async fn process_transcript(
         eprintln!("[voice] No speech detected.");
         return true;
     }
-    // Security: scan for prompt injection (issue #196).
-    crate::security::injection::scan_and_warn(&text, crate::security::injection::source::VOICE);
+    // Security: gate on prompt injection policy (issue #196 + fix).
+    if let Err(blocked) = crate::security::injection::gate(
+        &text,
+        crate::security::injection::source::VOICE,
+        voice_cfg.injection_policy,
+    ) {
+        tracing::info!(source = blocked.source, "injection gate blocked voice turn");
+        eprintln!("[voice] Blocked: prompt injection pattern detected.");
+        return true;
+    }
     if let VoiceIntentDecision::Reject(reason) = intent::assess_transcript(&text) {
         if let Some(path) = wav_path {
             let _ = tokio::fs::remove_file(path).await;

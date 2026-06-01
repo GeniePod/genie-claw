@@ -41,6 +41,34 @@ pub struct Config {
 
     #[serde(default)]
     pub http: HttpServerConfig,
+
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+/// What to do when a prompt injection pattern is detected.
+///
+/// Configured via `[security] injection_policy` in `geniepod.toml`.
+/// Defaults to `warn` to preserve backward compatibility with existing
+/// deployments; `block` is recommended for any deployment with Home
+/// Assistant (or other physical-world actuators) connected.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InjectionPolicy {
+    /// Log a warning and forward the message to the LLM (current behaviour).
+    #[default]
+    Warn,
+    /// Reject the request with a 403 / rejection utterance before it reaches
+    /// the LLM or conversation store.
+    Block,
+}
+
+/// Security-related runtime configuration.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SecurityConfig {
+    /// Policy applied when the prompt-injection scanner fires.
+    #[serde(default)]
+    pub injection_policy: InjectionPolicy,
 }
 
 #[derive(Debug, Deserialize)]

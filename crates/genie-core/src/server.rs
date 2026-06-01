@@ -98,6 +98,8 @@ pub struct ChatServer {
     /// Trusted resolution of the request origin from the (forgeable) header,
     /// the peer transport, and any authenticated token (issue #232).
     origin_resolver: OriginResolver,
+    /// Enforcement policy for the prompt-injection scanner.
+    injection_policy: genie_common::config::InjectionPolicy,
 }
 
 pub struct ChatTurnResult {
@@ -140,6 +142,7 @@ impl ChatServer {
             boot_harness,
             http_config: HttpServerConfig::default(),
             origin_resolver: OriginResolver::default(),
+            injection_policy: genie_common::config::InjectionPolicy::default(),
         })
     }
 
@@ -156,6 +159,18 @@ impl ChatServer {
     /// non-loopback peer to `api` (issue #232).
     pub fn with_origin_auth(mut self, origin_resolver: OriginResolver) -> Self {
         self.origin_resolver = origin_resolver;
+        self
+    }
+
+    /// Override the prompt-injection enforcement policy. Defaults to
+    /// [`InjectionPolicy::Warn`] (log-only) to preserve backward compatibility.
+    /// Set to [`InjectionPolicy::Block`] for deployments with Home Assistant or
+    /// other physical-world actuators connected.
+    pub fn with_injection_policy(
+        mut self,
+        policy: genie_common::config::InjectionPolicy,
+    ) -> Self {
+        self.injection_policy = policy;
         self
     }
 
@@ -578,6 +593,7 @@ async fn handle_request(
     let max_history = ctx.max_history;
     let model_family = ctx.model_family;
     let expected_runtime_contract_hash = &ctx.expected_runtime_contract_hash;
+    let injection_policy = ctx.injection_policy;
     // Capture the peer address before splitting the stream: it is the
     // transport-level proof used to gate privileged origin claims (issue #232).
     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
@@ -653,6 +669,7 @@ async fn handle_request(
             model_family,
             request_origin,
             echo_origin.as_deref(),
+            injection_policy,
         )
         .await
         {
@@ -680,6 +697,7 @@ async fn handle_request(
                     max_history,
                     model_family,
                     request_origin,
+                    injection_policy,
                 )
                 .await
             }
@@ -740,6 +758,7 @@ async fn handle_request(
                     max_history,
                     model_family,
                     request_origin,
+                    injection_policy,
                 )
                 .await
             }
@@ -832,6 +851,7 @@ async fn handle_chat_stream(
     model_family: ModelFamily,
     request_origin: RequestOrigin,
     reflect_origin: Option<&str>,
+    injection_policy: genie_common::config::InjectionPolicy,
 ) -> Result<()> {
     let Some(body) = body else {
         write_stream_headers(writer, 400, reflect_origin).await?;
@@ -867,11 +887,21 @@ async fn handle_chat_stream(
         return Ok(());
     }
 
-    // Security: scan for prompt injection (issue #196).
-    crate::security::injection::scan_and_warn(
+    // Security: gate on prompt injection policy (issue #196 + fix).
+    if let Err(blocked) = crate::security::injection::gate(
         user_text,
         crate::security::injection::source::API_CHAT_STREAM,
-    );
+        injection_policy,
+    ) {
+        tracing::info!(source = blocked.source, "injection gate blocked request");
+        write_stream_headers(writer, 403, reflect_origin).await?;
+        write_stream_event(
+            writer,
+            &serde_json::json!({"type":"error","message":"request blocked: prompt injection pattern detected"}),
+        )
+        .await?;
+        return Ok(());
+    }
 
     let conv_id = parsed
         .get("conversation_id")
@@ -1391,6 +1421,7 @@ async fn handle_chat(
     max_history: usize,
     model_family: ModelFamily,
     request_origin: RequestOrigin,
+    injection_policy: genie_common::config::InjectionPolicy,
 ) -> (u16, &'static str, String) {
     let Some(body) = body else {
         return (
@@ -1414,11 +1445,19 @@ async fn handle_chat(
         );
     }
 
-    // Security: scan for prompt injection (issue #196).
-    crate::security::injection::scan_and_warn(
+    // Security: gate on prompt injection policy (issue #196 + fix).
+    if let Err(blocked) = crate::security::injection::gate(
         user_text,
         crate::security::injection::source::API_CHAT,
-    );
+        injection_policy,
+    ) {
+        tracing::info!(source = blocked.source, "injection gate blocked request");
+        return (
+            403,
+            "application/json",
+            r#"{"error":"request blocked: prompt injection pattern detected"}"#.into(),
+        );
+    }
 
     let conv_id = parsed
         .get("conversation_id")
@@ -2054,6 +2093,7 @@ async fn handle_openai_chat(
     max_history: usize,
     model_family: ModelFamily,
     request_origin: RequestOrigin,
+    injection_policy: genie_common::config::InjectionPolicy,
 ) -> (u16, &'static str, String) {
     let Some(body) = body else {
         return (
@@ -2103,11 +2143,19 @@ async fn handle_openai_chat(
         .and_then(|v| v.as_str())
         .unwrap_or("nemotron-4b");
 
-    // Security: scan for prompt injection.
-    crate::security::injection::scan_and_warn(
+    // Security: gate on prompt injection policy (issue #196 + fix).
+    if let Err(blocked) = crate::security::injection::gate(
         &user_text,
         crate::security::injection::source::OPENAI_BRIDGE,
-    );
+        injection_policy,
+    ) {
+        tracing::info!(source = blocked.source, "injection gate blocked request");
+        return (
+            403,
+            "application/json",
+            r#"{"error":{"message":"request blocked: prompt injection pattern detected"}}"#.into(),
+        );
+    }
 
     if let Some(call) = crate::tools::quick::route_for_available_tools(
         &user_text,
@@ -2580,6 +2628,7 @@ mod tests {
                     12,
                     ModelFamily::Phi,
                     RequestOrigin::Api,
+                    genie_common::config::InjectionPolicy::Warn,
                 )
                 .await;
             });

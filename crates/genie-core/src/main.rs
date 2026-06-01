@@ -275,6 +275,7 @@ async fn main() -> Result<()> {
                 speaker_identity: genie_core::voice::identity::SpeakerIdentityProvider::from_config(
                     &config.core.speaker_identity,
                 ),
+                injection_policy: config.security.injection_policy,
             };
             genie_core::voice_loop::run(
                 voice_cfg,
@@ -303,6 +304,7 @@ async fn main() -> Result<()> {
             &system_prompt,
             config.core.max_history_turns,
             model_family,
+            config.security.injection_policy,
         )
         .await
     } else {
@@ -330,7 +332,8 @@ async fn main() -> Result<()> {
             boot_harness,
         )?
         .with_http_config(config.http.clone())
-        .with_origin_auth(origin_resolver);
+        .with_origin_auth(origin_resolver)
+        .with_injection_policy(config.security.injection_policy);
 
         tracing::info!(port, "starting HTTP chat API");
         if config.telegram.enabled {

@@ -66,6 +66,55 @@ pub fn scan_and_warn(text: &str, source: &str) -> bool {
     }
 }
 
+/// Returned by [`gate`] when the injection policy is [`InjectionPolicy::Block`]
+/// and a pattern match is detected.
+#[derive(Debug)]
+pub struct InjectionBlocked {
+    pub source: &'static str,
+    pub reason: String,
+}
+
+impl std::fmt::Display for InjectionBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "request blocked: prompt injection pattern detected (source={}, reason={})",
+            self.source, self.reason
+        )
+    }
+}
+
+impl std::error::Error for InjectionBlocked {}
+
+/// Enforce the configured injection policy at an entry point.
+///
+/// - Under [`InjectionPolicy::Warn`]: behaves identically to [`scan_and_warn`]
+///   and always returns `Ok(())`.
+/// - Under [`InjectionPolicy::Block`]: logs the warning **and** returns
+///   `Err(InjectionBlocked)`, which the caller must convert to a rejection
+///   response (HTTP 403, voice rejection utterance, REPL error line).
+///
+/// **Ordering invariant**: call this *before* `conversations.append(…, "user", …)`
+/// so that a blocked message is never persisted to conversation history.
+pub fn gate(
+    text: &str,
+    source: &'static str,
+    policy: genie_common::config::InjectionPolicy,
+) -> Result<(), InjectionBlocked> {
+    match scan(text) {
+        InjectionCheck::Clean => Ok(()),
+        InjectionCheck::Suspicious(reason) => {
+            tracing::warn!(source, reason, "prompt injection pattern detected");
+            match policy {
+                genie_common::config::InjectionPolicy::Warn => Ok(()),
+                genie_common::config::InjectionPolicy::Block => {
+                    Err(InjectionBlocked { source, reason })
+                }
+            }
+        }
+    }
+}
+
 fn normalize(text: &str) -> String {
     text.to_lowercase()
         .split_whitespace()
