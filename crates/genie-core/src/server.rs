@@ -312,6 +312,16 @@ impl RequestRoute<'_> {
     }
 }
 
+fn export_conv_id_from_path(path: &str) -> &str {
+    let query = path.split('?').nth(1).unwrap_or("");
+    for part in query.split('&') {
+        if let Some(value) = part.strip_prefix("id=") {
+            return value;
+        }
+    }
+    ""
+}
+
 fn classify_route<'a>(method: &str, path: &'a str) -> RequestRoute<'a> {
     match (method, path) {
         ("GET", "/" | "/index.html") => RequestRoute::Root,
@@ -337,7 +347,7 @@ fn classify_route<'a>(method: &str, path: &'a str) -> RequestRoute<'a> {
         ("GET", "/v1/models") => RequestRoute::Models,
         ("OPTIONS", _) => RequestRoute::Options,
         ("GET", path) if path.starts_with("/api/chat/export") => {
-            RequestRoute::Export(path.split("id=").nth(1).unwrap_or(""))
+            RequestRoute::Export(export_conv_id_from_path(path))
         }
         _ => RequestRoute::NotFound,
     }
