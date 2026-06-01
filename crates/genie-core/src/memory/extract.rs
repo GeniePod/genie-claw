@@ -140,7 +140,14 @@ pub fn extract_and_store(memory: &Memory, user_text: &str) -> usize {
         match memory.has_similar(&fact.content) {
             Ok(true) => continue,
             Ok(false) => {}
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    content = %fact.content,
+                    "auto-capture deduplication check failed; skipping fact"
+                );
+                continue;
+            }
         }
 
         let policy = super::policy::assess_memory_write(&fact.category, &fact.content);
@@ -153,16 +160,25 @@ pub fn extract_and_store(memory: &Memory, user_text: &str) -> usize {
             continue;
         }
 
-        if let Ok(outcome) = memory.store_resolved(&fact.category, &fact.content)
-            && !outcome.duplicate
-        {
-            tracing::debug!(
-                category = %fact.category,
-                content = %fact.content,
-                replaced = outcome.replaced,
-                "auto-captured memory"
-            );
-            stored += 1;
+        match memory.store_resolved(&fact.category, &fact.content) {
+            Ok(outcome) if !outcome.duplicate => {
+                tracing::debug!(
+                    category = %fact.category,
+                    content = %fact.content,
+                    replaced = outcome.replaced,
+                    "auto-captured memory"
+                );
+                stored += 1;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    category = %fact.category,
+                    content = %fact.content,
+                    "auto-capture store failed"
+                );
+            }
         }
     }
 

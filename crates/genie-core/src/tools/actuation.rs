@@ -304,6 +304,58 @@ pub struct AuditEvent {
     pub undo_of: Option<u64>,
 }
 
+/// A failure while appending one JSON line to an audit log, tagged by the step
+/// that failed. Kept narrow (one variant per IO step) so structured-log filters
+/// and future metric labels can tell a disk-full `Write` apart from a
+/// permission-denied `Open`.
+#[derive(Debug)]
+pub enum AuditError {
+    CreateDir(std::io::Error),
+    Open(std::io::Error),
+    Serialize(serde_json::Error),
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for AuditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateDir(e) => write!(f, "audit log: create parent directory: {e}"),
+            Self::Open(e) => write!(f, "audit log: open file for append: {e}"),
+            Self::Serialize(e) => write!(f, "audit log: serialize event: {e}"),
+            Self::Write(e) => write!(f, "audit log: write line: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AuditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CreateDir(e) | Self::Open(e) | Self::Write(e) => Some(e),
+            Self::Serialize(e) => Some(e),
+        }
+    }
+}
+
+/// Append one `\n`-terminated JSON record to a JSONL file, creating the parent
+/// directory and the file if needed. Shared by both audit loggers so the IO
+/// path and its failure handling live in one tested place. Callers hold their
+/// own serialization lock across this call.
+pub(crate) fn append_json_line<T: Serialize>(path: &Path, payload: &T) -> Result<(), AuditError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(AuditError::CreateDir)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(AuditError::Open)?;
+    let line = serde_json::to_string(payload).map_err(AuditError::Serialize)?;
+    writeln!(file, "{line}").map_err(AuditError::Write)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AuditLogger {
     path: Option<PathBuf>,
@@ -322,21 +374,28 @@ impl AuditLogger {
         }
     }
 
-    pub fn append(&self, event: AuditEvent) {
+    /// Append an audit event. Returns `Ok(())` for a disabled logger (no path)
+    /// and surfaces the failing IO step otherwise, so a security-critical caller
+    /// can adopt a "no audit, no action" posture if it chooses.
+    pub fn append(&self, event: AuditEvent) -> Result<(), AuditError> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
         let _guard = self.lock.lock().expect("audit logger lock");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        append_json_line(path, &event)
+    }
+
+    /// Log-and-continue wrapper: append and, on failure, emit a `tracing::error!`
+    /// with the path and underlying error rather than silently dropping the
+    /// event. This is the default posture for the existing call sites.
+    pub fn append_or_log(&self, event: AuditEvent) {
+        if let Err(err) = self.append(event) {
+            tracing::error!(
+                path = ?self.path,
+                error = %err,
+                "audit event dropped due to IO failure"
+            );
         }
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-            return;
-        };
-        let Ok(line) = serde_json::to_string(&event) else {
-            return;
-        };
-        let _ = writeln!(file, "{line}");
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -700,6 +759,73 @@ mod tests {
         assert_eq!(next.id, 12);
     }
 
+    fn sample_event(ts_ms: u64) -> AuditEvent {
+        AuditEvent {
+            ts_ms,
+            status: AuditStatus::Executed,
+            origin: RequestOrigin::Voice,
+            entity: "kitchen light".into(),
+            action: "turn_on".into(),
+            value: None,
+            reason: "home action executed".into(),
+            token: None,
+            confidence: Some(0.9),
+            action_id: Some(1),
+            undo_of: None,
+        }
+    }
+
+    #[test]
+    fn append_returns_ok_when_logger_is_disabled() {
+        let logger = AuditLogger::disabled();
+        assert!(logger.append(sample_event(1)).is_ok());
+    }
+
+    #[test]
+    fn append_writes_jsonl_line_with_event_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-actuation-audit-write-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let logger = AuditLogger::new(&path);
+
+        logger
+            .append(sample_event(42))
+            .expect("append should succeed");
+
+        let line = std::fs::read_to_string(&path).unwrap();
+        let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(event["ts_ms"], 42);
+        assert_eq!(event["status"], "executed");
+        assert_eq!(event["entity"], "kitchen light");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_surfaces_io_error_when_parent_path_is_a_file() {
+        // Put a regular file where the audit log's parent directory should be.
+        // create_dir_all then fails deterministically on both Unix and Windows,
+        // so the append surfaces an AuditError instead of silently no-op'ing.
+        let blocker = std::env::temp_dir().join(format!(
+            "geniepod-actuation-audit-blocker-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("actuation.jsonl");
+        let logger = AuditLogger::new(&path);
+
+        let err = logger
+            .append(sample_event(1))
+            .expect_err("append must fail");
+        assert!(matches!(
+            err,
+            AuditError::CreateDir(_) | AuditError::Open(_)
+        ));
+        let _ = std::fs::remove_file(&blocker);
+    }
+
     #[test]
     fn audit_logger_reads_recent_executed_actions_from_log_tail() {
         let path = std::env::temp_dir().join(format!(
@@ -710,23 +836,25 @@ mod tests {
         let logger = AuditLogger::new(&path);
 
         for idx in 0..500 {
-            logger.append(AuditEvent {
-                ts_ms: idx,
-                status: if idx % 2 == 0 {
-                    AuditStatus::Executed
-                } else {
-                    AuditStatus::ConfirmationIssued
-                },
-                origin: RequestOrigin::Voice,
-                entity: format!("entity-{idx}"),
-                action: "turn_on".into(),
-                value: None,
-                reason: "home action executed".into(),
-                token: None,
-                confidence: None,
-                action_id: if idx % 2 == 0 { Some(idx) } else { None },
-                undo_of: None,
-            });
+            logger
+                .append(AuditEvent {
+                    ts_ms: idx,
+                    status: if idx % 2 == 0 {
+                        AuditStatus::Executed
+                    } else {
+                        AuditStatus::ConfirmationIssued
+                    },
+                    origin: RequestOrigin::Voice,
+                    entity: format!("entity-{idx}"),
+                    action: "turn_on".into(),
+                    value: None,
+                    reason: "home action executed".into(),
+                    token: None,
+                    confidence: None,
+                    action_id: if idx % 2 == 0 { Some(idx) } else { None },
+                    undo_of: None,
+                })
+                .expect("append audit event");
         }
 
         let actions = logger.read_recent_executed_actions(3);
@@ -746,32 +874,36 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let logger = AuditLogger::new(&path);
 
-        logger.append(AuditEvent {
-            ts_ms: 100,
-            status: AuditStatus::Executed,
-            origin: RequestOrigin::Voice,
-            entity: "kitchen light".into(),
-            action: "turn_on".into(),
-            value: None,
-            reason: "home action executed".into(),
-            token: None,
-            confidence: Some(0.9),
-            action_id: Some(1),
-            undo_of: None,
-        });
-        logger.append(AuditEvent {
-            ts_ms: 200,
-            status: AuditStatus::ConfirmationIssued,
-            origin: RequestOrigin::Voice,
-            entity: "front door".into(),
-            action: "unlock".into(),
-            value: None,
-            reason: "needs confirmation".into(),
-            token: Some("act-test".into()),
-            confidence: None,
-            action_id: None,
-            undo_of: None,
-        });
+        logger
+            .append(AuditEvent {
+                ts_ms: 100,
+                status: AuditStatus::Executed,
+                origin: RequestOrigin::Voice,
+                entity: "kitchen light".into(),
+                action: "turn_on".into(),
+                value: None,
+                reason: "home action executed".into(),
+                token: None,
+                confidence: Some(0.9),
+                action_id: Some(1),
+                undo_of: None,
+            })
+            .expect("append executed event");
+        logger
+            .append(AuditEvent {
+                ts_ms: 200,
+                status: AuditStatus::ConfirmationIssued,
+                origin: RequestOrigin::Voice,
+                entity: "front door".into(),
+                action: "unlock".into(),
+                value: None,
+                reason: "needs confirmation".into(),
+                token: Some("act-test".into()),
+                confidence: None,
+                action_id: None,
+                undo_of: None,
+            })
+            .expect("append confirmation event");
 
         let actions = logger.read_recent_executed_actions(10);
         assert_eq!(actions.len(), 1);
