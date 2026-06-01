@@ -9,6 +9,8 @@ use genie_common::config::{
     AgentConfig, OptionalAiProviderAuthMode, OptionalAiProviderConfig, OptionalAiProviderKind,
 };
 
+use crate::security::sandbox::validate_inference_route;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderReadiness {
     Disabled,
@@ -82,19 +84,7 @@ fn remote_url(url: &str) -> bool {
     if url.is_empty() {
         return false;
     }
-    let stripped = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
-    let authority = stripped.split('/').next().unwrap_or(stripped);
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.find(']')
-            .map(|idx| &authority[..=idx + 1])
-            .unwrap_or(authority)
-    } else {
-        authority.split(':').next().unwrap_or(authority)
-    };
-    !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    validate_inference_route(url).is_err()
 }
 
 #[cfg(test)]
@@ -146,6 +136,46 @@ mod tests {
         assert_eq!(
             plan.readiness(&AgentConfig::default()),
             ProviderReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn loopback_127_range_allowed_without_remote_flag() {
+        let provider = OptionalAiProviderConfig {
+            enabled: true,
+            provider: OptionalAiProviderKind::OpenAiCompatible,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
+            base_url: "http://127.0.0.2:11434/v1".into(),
+            api_key_env: "LOCAL_PROVIDER_KEY".into(),
+            oauth_token_env: "LOCAL_PROVIDER_OAUTH_TOKEN".into(),
+            context_window_tokens: 4096,
+            allow_remote_base_url: false,
+        };
+        let plan = OptionalProviderPlan::from_config(&provider).unwrap();
+
+        assert_eq!(
+            plan.readiness(&AgentConfig::default()),
+            ProviderReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn loopback_looking_hostname_requires_remote_allow() {
+        let provider = OptionalAiProviderConfig {
+            enabled: true,
+            provider: OptionalAiProviderKind::OpenAiCompatible,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
+            base_url: "http://127.evil.com:11434/v1".into(),
+            api_key_env: "LOCAL_PROVIDER_KEY".into(),
+            oauth_token_env: "LOCAL_PROVIDER_OAUTH_TOKEN".into(),
+            context_window_tokens: 4096,
+            allow_remote_base_url: false,
+        };
+        let plan = OptionalProviderPlan::from_config(&provider).unwrap();
+
+        assert_eq!(
+            plan.readiness(&AgentConfig::default()),
+            ProviderReadiness::Blocked(vec!["remote_base_url_not_allowed"])
         );
     }
 

@@ -4,15 +4,13 @@ use genie_common::config::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::actuation::{
-    ActionLedger, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager, PendingConfirmation,
-    RecordedAction, RequestOrigin, now_ms,
+    ActionLedger, AuditError, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager,
+    PendingConfirmation, RecordedAction, RequestOrigin, append_json_line, now_ms,
 };
 use super::home;
 use super::timer;
@@ -55,6 +53,14 @@ fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Opti
         );
     }
     Ok((entity, action, args.get("value").and_then(|v| v.as_f64())))
+}
+
+fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
+    args.get("entity")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("home_status requires non-empty string argument 'entity'"))
 }
 
 /// Tool definition for LLM function calling.
@@ -181,21 +187,22 @@ impl ToolAuditLogger {
         }
     }
 
-    fn append(&self, event: ToolAuditEvent) {
+    fn append(&self, event: ToolAuditEvent) -> Result<(), AuditError> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
         let _guard = self.lock.lock().expect("tool audit logger lock");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        append_json_line(path, &event)
+    }
+
+    fn append_or_log(&self, event: ToolAuditEvent) {
+        if let Err(err) = self.append(event) {
+            tracing::error!(
+                path = ?self.path,
+                error = %err,
+                "tool audit event dropped due to IO failure"
+            );
         }
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-            return;
-        };
-        let Ok(line) = serde_json::to_string(&event) else {
-            return;
-        };
-        let _ = writeln!(file, "{line}");
     }
 
     fn path(&self) -> Option<&std::path::Path> {
@@ -654,6 +661,7 @@ impl ToolDispatcher {
             .unwrap_or((None, None));
 
         self.tool_audit_logger.append(ToolAuditEvent {
+        self.tool_audit_logger.append_or_log(ToolAuditEvent {
             ts_ms: now_ms(),
             tool: call.name.clone(),
             action_class: result.action_class,
@@ -692,7 +700,7 @@ impl ToolDispatcher {
                 "actuation from '{}' is not allowed by channel policy",
                 exec_ctx.request_origin.as_policy_key()
             );
-            self.audit_logger.append(AuditEvent {
+            self.audit_logger.append_or_log(AuditEvent {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedPolicy,
                 origin: exec_ctx.request_origin,
@@ -717,7 +725,7 @@ impl ToolDispatcher {
                 .check_and_record(&self.actuation_safety, exec_ctx.request_origin)
         {
             let reason = err.to_string();
-            self.audit_logger.append(AuditEvent {
+            self.audit_logger.append_or_log(AuditEvent {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedRuntime,
                 origin: exec_ctx.request_origin,
@@ -764,7 +772,7 @@ impl ToolDispatcher {
                         confidence,
                     )
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::Executed,
                     origin: exec_ctx.request_origin,
@@ -791,7 +799,7 @@ impl ToolDispatcher {
                         "Too many pending home confirmations; confirm or wait for existing ones to expire before requesting another.".into(),
                     );
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::ConfirmationIssued,
                     origin: exec_ctx.request_origin,
@@ -824,7 +832,7 @@ impl ToolDispatcher {
                 } else {
                     AuditStatus::Failed
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status,
                     origin: exec_ctx.request_origin,
@@ -944,7 +952,7 @@ impl ToolDispatcher {
             .ha
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let entity_name = parse_home_status_args(args)?;
         let entity_name = self.resolve_device_alias(entity_name);
 
         home::status(ha.as_ref(), &entity_name).await
@@ -2208,6 +2216,48 @@ mod tests {
         // (Verified indirectly: this test only checks a skill invocation.)
 
         let _ = std::fs::remove_file(&path);
+    #[test]
+    fn tool_audit_logger_disabled_appends_ok() {
+        let logger = ToolAuditLogger::default();
+        let event = ToolAuditEvent {
+            ts_ms: now_ms(),
+            tool: "calculate".into(),
+            action_class: ToolActionClass::ReadOnly,
+            origin: RequestOrigin::Api,
+            success: true,
+            duration_ms: 1,
+            argument_keys: vec!["expression".into()],
+            output_chars: 3,
+        };
+        assert!(logger.append(event).is_ok());
+    }
+
+    #[test]
+    fn tool_audit_logger_surfaces_blocked_parent_error() {
+        let blocker = std::env::temp_dir().join(format!(
+            "geniepod-tool-audit-blocker-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let logger = ToolAuditLogger::new(blocker.join("tool-audit.jsonl"));
+
+        let event = ToolAuditEvent {
+            ts_ms: now_ms(),
+            tool: "calculate".into(),
+            action_class: ToolActionClass::ReadOnly,
+            origin: RequestOrigin::Api,
+            success: true,
+            duration_ms: 1,
+            argument_keys: vec!["expression".into()],
+            output_chars: 3,
+        };
+        let err = logger.append(event).expect_err("append must fail");
+        assert!(matches!(
+            err,
+            AuditError::CreateDir(_) | AuditError::Open(_)
+        ));
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[tokio::test]

@@ -783,6 +783,14 @@ pub struct TelegramConfig {
     /// Voice-message handling for the Telegram channel (issue #42).
     #[serde(default)]
     pub voice: TelegramVoiceConfig,
+
+    /// Bound on concurrent in-flight update tasks. Issue #278: the poll loop
+    /// spawns a task per update with no back-pressure; this caps total
+    /// concurrent work so a message flood cannot exhaust memory or the Tokio
+    /// thread pool. Must be >= `voice.max_parallel_voice` — enforced at
+    /// startup by clamping if the config violates the invariant.
+    #[serde(default = "defaults::telegram_max_parallel_updates")]
+    pub max_parallel_updates: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1614,6 +1622,7 @@ impl Default for TelegramConfig {
             allowed_chat_ids: Vec::new(),
             allow_all_chats: false,
             voice: TelegramVoiceConfig::default(),
+            max_parallel_updates: defaults::telegram_max_parallel_updates(),
         }
     }
 }
@@ -2821,6 +2830,13 @@ mod defaults {
         // Jetson Orin Nano-class device. Bump in deployment configs if the
         // host has more CPU / a dedicated whisper-server.
         2
+    }
+    pub fn telegram_max_parallel_updates() -> usize {
+        // Issue #278: bound total concurrent update tasks to cap memory and
+        // Tokio worker pressure under a message flood. 8 is enough for a busy
+        // household bot while leaving headroom on Jetson Orin Nano. Must be
+        // >= max_parallel_voice (default 2); enforced at runtime by clamping.
+        8
     }
     pub fn web_search_enabled() -> bool {
         true

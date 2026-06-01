@@ -9,6 +9,7 @@
 use genie_common::config::{AgentConfig, OptionalAiProviderConfig};
 use serde::Serialize;
 
+use crate::memory::Memory;
 use crate::runtime_boundary::JETSON_BASELINE_CONTEXT_TOKENS;
 use crate::tools::dispatch::ToolDef;
 
@@ -107,6 +108,48 @@ pub fn validate_limited_context_agent(
 
 pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
+}
+
+/// Evaluate the Jetson limited-context harness against the boot-time prompt,
+/// live tool manifest, and a representative per-turn memory hydration sample.
+pub fn validate_boot_harness(
+    system_prompt: &str,
+    tools: &[ToolDef],
+    memory: &Memory,
+    agent: &AgentConfig,
+    provider: &OptionalAiProviderConfig,
+) -> LimitedContextHarnessReport {
+    let memory_context =
+        crate::memory::inject::build_memory_context(memory, "turn on the kitchen lights");
+    validate_limited_context_agent(system_prompt, tools, &memory_context, agent, provider)
+}
+
+pub fn log_harness_report(report: &LimitedContextHarnessReport) {
+    if report.pass {
+        tracing::info!(
+            pass = report.pass,
+            context_window_tokens = report.context_window_tokens,
+            estimated_total_tokens = report.estimated_total_tokens,
+            response_reserve_tokens = report.response_reserve_tokens,
+            "agent harness passed Jetson limited-context checks"
+        );
+        return;
+    }
+
+    for check in report.checks.iter().filter(|check| !check.pass) {
+        tracing::warn!(
+            check = check.name,
+            detail = %check.detail,
+            "agent harness check failed"
+        );
+    }
+    tracing::warn!(
+        pass = report.pass,
+        context_window_tokens = report.context_window_tokens,
+        estimated_total_tokens = report.estimated_total_tokens,
+        response_reserve_tokens = report.response_reserve_tokens,
+        "agent harness failed Jetson limited-context checks"
+    );
 }
 
 #[cfg(test)]
