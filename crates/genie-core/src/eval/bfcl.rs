@@ -6,13 +6,22 @@
 
 use crate::tools::{ToolCall, parse_tool_calls_for_eval};
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use genie_common::config::WebSearchConfig;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::sync::Arc;
+
+use crate::ha::{
+    ActionResult, DeviceRef, HomeAction, HomeActionKind, HomeAutomationProvider, HomeGraph,
+    HomeState, HomeTarget, HomeTargetKind, IntegrationHealth, SceneRef,
+};
+use crate::tools::dispatch::{ToolDef, ToolDispatcher};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BfclCase {
@@ -411,6 +420,148 @@ fn ratio(count: usize, total: usize) -> f64 {
     }
 }
 
+struct BfclCatalogHomeStub;
+
+#[async_trait]
+impl HomeAutomationProvider for BfclCatalogHomeStub {
+    async fn health(&self) -> IntegrationHealth {
+        IntegrationHealth {
+            connected: true,
+            cached_graph: false,
+            message: "bfcl-catalog".into(),
+        }
+    }
+
+    async fn sync_structure(&self) -> Result<HomeGraph> {
+        Ok(HomeGraph {
+            areas: Vec::new(),
+            devices: Vec::new(),
+            entities: Vec::new(),
+            scenes: Vec::new(),
+            scripts: Vec::new(),
+            aliases: Vec::new(),
+            domains: Vec::new(),
+            capabilities: Vec::new(),
+        })
+    }
+
+    async fn resolve_target(
+        &self,
+        query: &str,
+        _action_hint: Option<HomeActionKind>,
+    ) -> Result<HomeTarget> {
+        Ok(HomeTarget {
+            kind: HomeTargetKind::Entity,
+            query: query.into(),
+            display_name: query.into(),
+            entity_ids: vec!["light.test".into()],
+            domain: Some("light".into()),
+            area: Some("Kitchen".into()),
+            confidence: 0.96,
+            voice_safe: true,
+        })
+    }
+
+    async fn get_state(&self, target: &HomeTarget) -> Result<HomeState> {
+        Ok(HomeState {
+            target_name: target.display_name.clone(),
+            domain: target.domain.clone(),
+            area: target.area.clone(),
+            entities: Vec::new(),
+            available: true,
+            spoken_summary: format!("{} is available", target.display_name),
+        })
+    }
+
+    async fn execute(&self, action: HomeAction) -> Result<ActionResult> {
+        Ok(ActionResult {
+            success: true,
+            spoken_summary: format!("Executed {:?}", action.kind),
+            affected_targets: vec![action.target.display_name],
+            state_snapshot: None,
+            confidence: Some(action.target.confidence),
+        })
+    }
+
+    async fn list_scenes(&self, _room: Option<&str>) -> Result<Vec<SceneRef>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_devices(&self, _room: Option<&str>) -> Result<Vec<DeviceRef>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Compact BFCL LLM catalog entries derived from runtime `ToolDef` schemas.
+pub fn bfcl_llm_runtime_tool_catalog() -> BTreeMap<String, String> {
+    let web_search = WebSearchConfig {
+        enabled: true,
+        ..WebSearchConfig::default()
+    };
+    let dispatcher =
+        ToolDispatcher::new(Some(Arc::new(BfclCatalogHomeStub))).with_web_search_config(web_search);
+    dispatcher
+        .tool_defs()
+        .into_iter()
+        .map(|def| (def.name.clone(), bfcl_llm_tool_summary(&def)))
+        .collect()
+}
+
+pub fn bfcl_llm_tool_summary(def: &ToolDef) -> String {
+    format!(
+        "{}. {}",
+        bfcl_llm_tool_headline(&def.description),
+        format_bfcl_arguments(&def.parameters)
+    )
+}
+
+fn bfcl_llm_tool_headline(description: &str) -> String {
+    description
+        .split('.')
+        .next()
+        .unwrap_or(description)
+        .trim()
+        .to_string()
+}
+
+fn format_bfcl_arguments(parameters: &Value) -> String {
+    let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
+        return "arguments: {}".to_string();
+    };
+    if properties.is_empty() {
+        return "arguments: {}".to_string();
+    }
+
+    let required: HashSet<&str> = parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let mut parts = Vec::new();
+    for (name, spec) in properties {
+        if let Some(enum_values) = spec.get("enum").and_then(Value::as_array) {
+            let joined = enum_values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("|");
+            parts.push(format!(r#""{name}": "{joined}""#));
+            continue;
+        }
+
+        let value_type = spec.get("type").and_then(Value::as_str).unwrap_or("string");
+        let prefix = if required.contains(name.as_str()) {
+            String::new()
+        } else {
+            "optional ".to_string()
+        };
+        parts.push(format!(r#""{name}": {prefix}{value_type}"#));
+    }
+
+    format!("arguments: {{{}}}", parts.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,6 +778,31 @@ mod tests {
             assert!(
                 covered_tools.contains(tool),
                 "missing BFCL fixture for static built-in tool: {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn bfcl_llm_catalog_matches_runtime_home_control_schema() {
+        let catalog = bfcl_llm_runtime_tool_catalog();
+        let home_control = catalog
+            .get("home_control")
+            .expect("home_control catalog entry");
+        for action in [
+            "turn_on",
+            "turn_off",
+            "toggle",
+            "set_brightness",
+            "set_temperature",
+            "open",
+            "close",
+            "lock",
+            "unlock",
+            "activate",
+        ] {
+            assert!(
+                home_control.contains(action),
+                "missing home_control action {action} in BFCL catalog: {home_control}"
             );
         }
     }

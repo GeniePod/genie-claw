@@ -19,6 +19,50 @@ use crate::skills::SkillLoader;
 
 const ACTUATION_RATE_WINDOW_MS: u64 = 60_000;
 
+const HOME_CONTROL_ACTIONS: &[&str] = &[
+    "turn_on",
+    "turn_off",
+    "toggle",
+    "set_brightness",
+    "set_temperature",
+    "open",
+    "close",
+    "lock",
+    "unlock",
+    "activate",
+];
+
+fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Option<f64>)> {
+    let entity = args
+        .get("entity")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("home_control requires non-empty string argument 'entity'")
+        })?;
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("home_control requires string argument 'action'"))?;
+    if !HOME_CONTROL_ACTIONS.contains(&action) {
+        anyhow::bail!(
+            "home_control action '{}' is invalid; expected one of: {}",
+            action,
+            HOME_CONTROL_ACTIONS.join(", ")
+        );
+    }
+    Ok((entity, action, args.get("value").and_then(|v| v.as_f64())))
+}
+
+fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
+    args.get("entity")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("home_status requires non-empty string argument 'entity'"))
+}
+
 /// Tool definition for LLM function calling.
 ///
 /// These are sent to the configured LLM backend as part of the system prompt or
@@ -616,13 +660,8 @@ impl ToolDispatcher {
             .ha
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let (entity_name, action, value) = parse_home_control_args(args)?;
         let resolved_entity = self.resolve_device_alias(entity_name);
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("toggle");
-        let value = args.get("value").and_then(|v| v.as_f64());
         if !actuation_origin_allowed(&self.actuation_safety, exec_ctx.request_origin) {
             let reason = format!(
                 "actuation from '{}' is not allowed by channel policy",
@@ -880,7 +919,7 @@ impl ToolDispatcher {
             .ha
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let entity_name = parse_home_status_args(args)?;
         let entity_name = self.resolve_device_alias(entity_name);
 
         home::status(ha.as_ref(), &entity_name).await

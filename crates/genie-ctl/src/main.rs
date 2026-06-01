@@ -1715,6 +1715,7 @@ Prefer deterministic home state, memory retrieval, and typed-tool arguments over
 }
 
 fn bfcl_llm_tool_catalog(cases: &[genie_core::eval::bfcl::BfclCase]) -> Vec<String> {
+    let runtime_catalog = genie_core::eval::bfcl::bfcl_llm_runtime_tool_catalog();
     let expected_tools = cases
         .iter()
         .flat_map(|case| {
@@ -1726,18 +1727,14 @@ fn bfcl_llm_tool_catalog(cases: &[genie_core::eval::bfcl::BfclCase]) -> Vec<Stri
     let include_all = expected_tools.is_empty();
     let mut rows = Vec::new();
 
-    for (name, description) in BFCL_LLM_KNOWN_TOOLS {
-        if include_all || expected_tools.contains(name) {
-            rows.push(format!("- {name}: {description}"));
+    for (name, summary) in &runtime_catalog {
+        if include_all || expected_tools.contains(name.as_str()) {
+            rows.push(format!("- {name}: {summary}"));
         }
     }
 
-    let known_names = BFCL_LLM_KNOWN_TOOLS
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<BTreeSet<_>>();
     for name in expected_tools {
-        if !known_names.contains(name) {
+        if !runtime_catalog.contains_key(name) {
             rows.push(format!(
                 "- {name}: dynamic local skill tool. Return only the required JSON arguments."
             ));
@@ -1746,66 +1743,6 @@ fn bfcl_llm_tool_catalog(cases: &[genie_core::eval::bfcl::BfclCase]) -> Vec<Stri
 
     rows
 }
-
-const BFCL_LLM_KNOWN_TOOLS: &[(&str, &str)] = &[
-    (
-        "home_control",
-        r#"control a home entity. arguments: {"entity": string, "action": "turn_on|turn_off|set_temperature|set_brightness|activate|open|close", "value": optional number}"#,
-    ),
-    (
-        "home_status",
-        r#"read deterministic home/device state. arguments: {"entity": string}"#,
-    ),
-    (
-        "home_undo",
-        r#"undo the last reversible home action. arguments: {}"#,
-    ),
-    (
-        "action_history",
-        r#"summarize recent home/security/action changes. arguments: {}"#,
-    ),
-    ("get_time", r#"current local time. arguments: {}"#),
-    (
-        "get_weather",
-        r#"weather for home or a named location. arguments: {"location": string}"#,
-    ),
-    (
-        "set_timer",
-        r#"create a timer. arguments: {"seconds": number, "label": optional string}"#,
-    ),
-    (
-        "web_search",
-        r#"fresh external lookup. arguments: {"query": string, "limit": optional number, "fresh": optional bool}"#,
-    ),
-    (
-        "calculate",
-        r#"deterministic math/unit calculation. arguments: {"expression": string}"#,
-    ),
-    (
-        "play_media",
-        r#"play media, playlist, station, or local entertainment. arguments: {"query": string}"#,
-    ),
-    (
-        "memory_recall",
-        r#"retrieve household or family memory. arguments: {"query": string, "limit": optional number}"#,
-    ),
-    (
-        "memory_store",
-        r#"store an explicit household memory or preference. arguments: {"content": string, "category": optional string}"#,
-    ),
-    (
-        "memory_forget",
-        r#"remove matching household memory. arguments: {"query": string}"#,
-    ),
-    (
-        "memory_status",
-        r#"inspect memory health/status. arguments: {}"#,
-    ),
-    (
-        "system_info",
-        r#"local Jetson/runtime status. arguments: {}"#,
-    ),
-];
 
 fn format_score_rate(rate: f64) -> String {
     format!("{:.2}%", rate * 100.0)
@@ -3076,6 +3013,9 @@ mod tests {
 
         assert!(system_prompt.contains("4096-token"));
         assert!(system_prompt.contains("home_control"));
+        assert!(system_prompt.contains("toggle"));
+        assert!(system_prompt.contains("lock"));
+        assert!(system_prompt.contains("unlock"));
         assert!(system_prompt.contains(r#""tool":"tool_name""#));
         assert!(system_prompt.len() < 2500);
         assert_eq!(messages.len(), 2);
