@@ -15,6 +15,7 @@ use crate::conversation::ConversationStore;
 use crate::llm::{LlmClient, LlmRequestHints, Message};
 use crate::memory::{Memory, SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
+use crate::ota::OtaManager;
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
 use crate::tools::ToolDispatcher;
@@ -75,6 +76,8 @@ const CHAT_UI: StaticHtml = StaticHtml::new(include_str!("chat_ui.html"));
 ///   POST /api/memories/delete   — delete a saved memory
 ///   POST /api/memories/reorder  — persist dashboard memory ordering
 ///   POST /v1/chat/completions   — OpenAI-compatible (for local apps and adapters)
+///   POST /api/ota/check         — check GitHub Releases for a newer version
+///   POST /api/ota/apply         — download, verify, and apply an update (requires [ota].enabled)
 ///
 /// The local web UI and any first-party adapters connect here.
 pub struct ChatServer {
@@ -98,6 +101,9 @@ pub struct ChatServer {
     /// Trusted resolution of the request origin from the (forgeable) header,
     /// the peer transport, and any authenticated token (issue #232).
     origin_resolver: OriginResolver,
+    /// OTA update manager. `None` when OTA config is absent from the startup
+    /// config (handled gracefully by the route handlers).
+    ota_manager: Option<Rc<OtaManager>>,
 }
 
 pub struct ChatTurnResult {
@@ -140,6 +146,7 @@ impl ChatServer {
             boot_harness,
             http_config: HttpServerConfig::default(),
             origin_resolver: OriginResolver::default(),
+            ota_manager: None,
         })
     }
 
@@ -156,6 +163,13 @@ impl ChatServer {
     /// non-loopback peer to `api` (issue #232).
     pub fn with_origin_auth(mut self, origin_resolver: OriginResolver) -> Self {
         self.origin_resolver = origin_resolver;
+        self
+    }
+
+    /// Attach an `OtaManager` to enable the `POST /api/ota/check` and
+    /// `POST /api/ota/apply` endpoints. Without this, both routes return 503.
+    pub fn with_ota_manager(mut self, ota_manager: OtaManager) -> Self {
+        self.ota_manager = Some(Rc::new(ota_manager));
         self
     }
 
@@ -290,6 +304,8 @@ enum RequestRoute<'a> {
     MemoriesReorder,
     OpenAiChat,
     Models,
+    OtaCheck,
+    OtaApply,
     Options,
     Export(&'a str),
     NotFound,
@@ -311,6 +327,7 @@ impl RequestRoute<'_> {
                 | RequestRoute::MemoriesDelete
                 | RequestRoute::MemoriesReorder
                 | RequestRoute::OpenAiChat
+                | RequestRoute::OtaApply
         )
     }
 }
@@ -338,6 +355,8 @@ fn classify_route<'a>(method: &str, path: &'a str) -> RequestRoute<'a> {
         ("POST", "/api/memories/reorder") => RequestRoute::MemoriesReorder,
         ("POST", "/v1/chat/completions") => RequestRoute::OpenAiChat,
         ("GET", "/v1/models") => RequestRoute::Models,
+        ("POST", "/api/ota/check") => RequestRoute::OtaCheck,
+        ("POST", "/api/ota/apply") => RequestRoute::OtaApply,
         ("OPTIONS", _) => RequestRoute::Options,
         ("GET", path) if path.starts_with("/api/chat/export") => {
             RequestRoute::Export(path.split("id=").nth(1).unwrap_or(""))
@@ -746,6 +765,8 @@ async fn handle_request(
             None => openai_busy_response(),
         },
         RequestRoute::Models => handle_list_models(),
+        RequestRoute::OtaCheck => handle_ota_check(ctx.ota_manager.as_deref()).await,
+        RequestRoute::OtaApply => handle_ota_apply(ctx.ota_manager.as_deref()).await,
         RequestRoute::Options => (200, "text/plain", String::new()),
         RequestRoute::Export(conv_id) => handle_export(conversations, conv_id),
         RequestRoute::NotFound | RequestRoute::ChatStream => {
@@ -2393,6 +2414,67 @@ fn handle_list_models() -> (u16, &'static str, String) {
         }]
     });
     (200, "application/json", response.to_string())
+}
+
+/// POST /api/ota/check — check GitHub Releases for a newer version.
+///
+/// Read-only: does not download or modify any files. Returns `update_available`
+/// and, when a signed release is present, indicates that `apply` can run.
+async fn handle_ota_check(ota: Option<&OtaManager>) -> (u16, &'static str, String) {
+    let Some(ota) = ota else {
+        return (
+            503,
+            "application/json",
+            r#"{"error":"OTA manager not configured"}"#.into(),
+        );
+    };
+    match ota.check_update().await {
+        Ok(status) => (
+            200,
+            "application/json",
+            serde_json::to_string(&status).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(e) => (
+            502,
+            "application/json",
+            serde_json::json!({ "error": e.to_string() }).to_string(),
+        ),
+    }
+}
+
+/// POST /api/ota/apply — download, verify, and apply an update.
+///
+/// Mutating: requires `[ota].enabled = true` in config. Performs the full
+/// pipeline: manifest download → Ed25519 signature verify → binary SHA-256
+/// verify → backup → atomic replace. On any failure, the caller should run
+/// `rollback` via the CLI; the daemon itself is not restarted here.
+async fn handle_ota_apply(ota: Option<&OtaManager>) -> (u16, &'static str, String) {
+    let Some(ota) = ota else {
+        return (
+            503,
+            "application/json",
+            r#"{"error":"OTA manager not configured"}"#.into(),
+        );
+    };
+    match ota.apply_update().await {
+        Ok(result) => (
+            200,
+            "application/json",
+            serde_json::to_string(&result).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "OTA apply failed");
+            (
+                500,
+                "application/json",
+                serde_json::json!({
+                    "error": e.to_string(),
+                    "hint": "run 'genie-ctl ota rollback' if binaries were partially replaced"
+                })
+                .to_string(),
+            )
+        }
+    }
 }
 
 fn should_summarize_tool_result(tool_name: &str) -> bool {

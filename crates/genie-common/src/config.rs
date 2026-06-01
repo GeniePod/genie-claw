@@ -41,6 +41,9 @@ pub struct Config {
 
     #[serde(default)]
     pub http: HttpServerConfig,
+
+    #[serde(default)]
+    pub ota: OtaConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -900,6 +903,50 @@ pub enum WebSearchProvider {
     Searxng,
 }
 
+/// OTA (over-the-air) update configuration.
+///
+/// Controls the download–verify–apply pipeline. Disabled by default so the
+/// check-only path keeps working (as before) without exposing the apply side
+/// to an unconfigured deployment. Set `enabled = true` and configure a public
+/// key to unlock `POST /api/ota/apply` and `genie-ctl ota apply`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OtaConfig {
+    /// Enable the OTA apply pipeline. When false, the check endpoint is still
+    /// available but `/api/ota/apply` and `genie-ctl ota apply` are rejected.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Automatically apply an update when `check_update()` finds one (requires
+    /// `enabled = true`). Off by default — operator must confirm with the CLI or
+    /// API even when OTA is enabled.
+    #[serde(default)]
+    pub auto_apply: bool,
+
+    /// Path to the Ed25519 public key file (base64-encoded 32-byte key) used to
+    /// verify release manifests before any binary is written to disk. Required
+    /// when `enabled = true`; apply is refused if the key cannot be loaded.
+    #[serde(default = "defaults::ota_public_key_path")]
+    pub public_key_path: PathBuf,
+
+    /// Network timeout in seconds for GitHub API calls and asset downloads.
+    /// Bounds every `curl` call so a hung DNS or TCP handshake cannot block
+    /// the caller indefinitely (the bug documented in the issue for line 219
+    /// of the original ota/mod.rs).
+    #[serde(default = "defaults::ota_network_timeout_secs")]
+    pub network_timeout_secs: u64,
+}
+
+impl Default for OtaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_apply: false,
+            public_key_path: defaults::ota_public_key_path(),
+            network_timeout_secs: defaults::ota_network_timeout_secs(),
+        }
+    }
+}
+
 /// Inbound HTTP-server hardening shared by `genie-core` (`:3000`) and
 /// `genie-api` (`:3080`).
 ///
@@ -1684,6 +1731,7 @@ mod tests {
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
             http: HttpServerConfig::default(),
+            ota: OtaConfig::default(),
         }
     }
 
@@ -2550,6 +2598,38 @@ expected_runtime_contract_hash = "abc123"
     }
 
     #[test]
+    fn ota_defaults_to_disabled() {
+        let config = test_config();
+        assert!(!config.ota.enabled);
+        assert!(!config.ota.auto_apply);
+        assert_eq!(
+            config.ota.public_key_path,
+            PathBuf::from("/etc/geniepod/ota.pub")
+        );
+        assert_eq!(config.ota.network_timeout_secs, 30);
+    }
+
+    #[test]
+    fn ota_config_parses() {
+        let config: OtaConfig = toml::from_str(
+            r#"
+enabled = true
+auto_apply = false
+public_key_path = "/etc/geniepod/ota-release.pub"
+network_timeout_secs = 60
+"#,
+        )
+        .unwrap();
+        assert!(config.enabled);
+        assert!(!config.auto_apply);
+        assert_eq!(
+            config.public_key_path,
+            PathBuf::from("/etc/geniepod/ota-release.pub")
+        );
+        assert_eq!(config.network_timeout_secs, 60);
+    }
+
+    #[test]
     fn http_server_config_falls_back_when_section_absent() {
         // Existing deployments have no [http] section yet — the whole config
         // must still parse and use the hardened defaults.
@@ -2896,5 +2976,11 @@ mod defaults {
     }
     pub fn esp32c6_uart_response_timeout_ms() -> u64 {
         250
+    }
+    pub fn ota_public_key_path() -> PathBuf {
+        PathBuf::from("/etc/geniepod/ota.pub")
+    }
+    pub fn ota_network_timeout_secs() -> u64 {
+        30
     }
 }

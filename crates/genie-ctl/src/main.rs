@@ -210,6 +210,13 @@ async fn main() -> Result<()> {
         "health" => cmd_health().await?,
         "conversations" | "convos" => cmd_conversations().await?,
         "update-check" | "update" => cmd_update_check().await?,
+        "ota" => {
+            if args.len() < 3 {
+                print_ota_usage();
+                std::process::exit(1);
+            }
+            cmd_ota(&args[2..]).await?;
+        }
         "diag" | "diagnostics" => cmd_diag().await?,
         "support-bundle" | "bundle" => {
             let output_path = args
@@ -268,7 +275,8 @@ COMMANDS:
 {speaker}\
     health              Service health check
     conversations       List all conversations
-    update-check        Check for OTA updates
+    update-check        Check for OTA updates (alias for 'ota check')
+    ota <SUBCOMMAND>    OTA update management (check / apply / rollback)
     diag                Full system diagnostics report
     support-bundle [P]  Write JSON diagnostics bundle to path P
     version             Show version info
@@ -2011,6 +2019,200 @@ async fn cmd_update_check() -> Result<()> {
     Ok(())
 }
 
+fn print_ota_usage() {
+    println!(
+        "\
+USAGE:
+    genie-ctl ota <SUBCOMMAND>
+
+SUBCOMMANDS:
+    check       Check GitHub Releases for a newer version (via genie-core)
+    apply       Download, verify, and apply the latest update
+                  Requires [ota].enabled = true and a configured public key
+    rollback    Restore the previous binaries from the backup directory
+
+NOTES:
+    'apply' runs the full pipeline on genie-core:
+      1. Download checksums.sha256 and checksums.sha256.sig from the release
+      2. Verify the manifest Ed25519 signature against [ota].public_key_path
+      3. Download each managed binary to staging, verify SHA-256 against manifest
+      4. Back up current binaries to the backup directory
+      5. Atomically rename staging binaries into the install directory
+    The daemon must be restarted manually after a successful apply."
+    );
+}
+
+async fn cmd_ota(args: &[String]) -> Result<()> {
+    match args[0].as_str() {
+        "check" => cmd_ota_check().await,
+        "apply" => cmd_ota_apply().await,
+        "rollback" => cmd_ota_rollback().await,
+        other => {
+            anyhow::bail!("Unknown ota subcommand: '{}'. Run 'genie-ctl ota' for usage.", other);
+        }
+    }
+}
+
+/// genie-ctl ota check — delegate to genie-core's /api/ota/check.
+async fn cmd_ota_check() -> Result<()> {
+    let core = load_core_addr()?;
+    println!("Checking for updates...\n");
+    match http_post(&core, "/api/ota/check", "").await {
+        Ok(body) => {
+            let data: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+            let current = data
+                .get("current_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let latest = data
+                .get("latest_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let available = data
+                .get("update_available")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let signed = data
+                .get("signed_release")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            println!("  Current: v{}", current);
+            println!("  Latest:  v{}", latest);
+            println!("  Signed release: {}", if signed { "yes" } else { "no (apply will refuse)" });
+
+            if available {
+                println!("\n  Update available.");
+                if signed {
+                    println!("  Run 'genie-ctl ota apply' to download, verify, and apply.");
+                } else {
+                    println!(
+                        "  The release has no checksums.sha256 / checksums.sha256.sig assets.\n  \
+                         OTA apply requires a signed manifest; manual update required."
+                    );
+                }
+            } else {
+                println!("\n  You're up to date.");
+            }
+        }
+        Err(e) => {
+            eprintln!("OTA check failed: {}", e);
+            eprintln!("Is genie-core running?");
+        }
+    }
+    Ok(())
+}
+
+/// genie-ctl ota apply — delegate to genie-core's /api/ota/apply.
+async fn cmd_ota_apply() -> Result<()> {
+    let core = load_core_addr()?;
+    println!("Applying OTA update...\n");
+    println!(
+        "  This will download, verify, and atomically replace the managed binaries.\n  \
+         Requires [ota].enabled = true and [ota].public_key_path in geniepod.toml.\n"
+    );
+
+    match http_post(&core, "/api/ota/apply", "").await {
+        Ok(body) => {
+            let data: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+            if let Some(err) = data.get("error").and_then(|v| v.as_str()) {
+                eprintln!("OTA apply failed: {}", err);
+                if let Some(hint) = data.get("hint").and_then(|v| v.as_str()) {
+                    eprintln!("  Hint: {}", hint);
+                }
+                std::process::exit(1);
+            }
+            let version = data.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+            let replaced = data
+                .get("binaries_replaced")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let verified = data
+                .get("verified")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            println!("  Version:          {}", version);
+            println!("  Binaries replaced: {}", if replaced.is_empty() { "(none)" } else { &replaced });
+            println!("  Verified:         {}", verified);
+            println!("\n  Restart genie-core (and other replaced services) to activate the update:");
+            println!("    sudo systemctl restart genie-core");
+        }
+        Err(e) => {
+            eprintln!("OTA apply request failed: {}", e);
+            eprintln!("Is genie-core running? Is [ota].enabled = true in geniepod.toml?");
+        }
+    }
+    Ok(())
+}
+
+/// genie-ctl ota rollback — call the OTA manager's rollback path.
+///
+/// Rollback is a direct filesystem operation (copy backup → install), not an
+/// API call, so it works even when genie-core is not running. This makes it
+/// safe to use when an apply succeeded but the binary fails to start.
+async fn cmd_ota_rollback() -> Result<()> {
+    let config = Config::load()?;
+    let base_dir = &config.data_dir;
+    let backup_dir = base_dir.join("backup");
+    let install_dir = base_dir.join("bin");
+
+    if !backup_dir.exists() {
+        anyhow::bail!(
+            "backup directory {} does not exist; nothing to roll back",
+            backup_dir.display()
+        );
+    }
+
+    println!("Rolling back to backed-up binaries...\n");
+    let binaries = [
+        "genie-core",
+        "genie-ctl",
+        "genie-governor",
+        "genie-health",
+        "genie-api",
+    ];
+    let mut rolled_back = Vec::new();
+    let mut errors = Vec::new();
+
+    for binary in &binaries {
+        let src = backup_dir.join(binary);
+        let dst = install_dir.join(binary);
+        if src.exists() {
+            match std::fs::copy(&src, &dst) {
+                Ok(_) => {
+                    println!("  Restored: {}", binary);
+                    rolled_back.push(*binary);
+                }
+                Err(e) => {
+                    eprintln!("  Failed:   {} — {}", binary, e);
+                    errors.push(format!("{binary}: {e}"));
+                }
+            }
+        } else {
+            println!("  Skipped:  {} (no backup)", binary);
+        }
+    }
+
+    if errors.is_empty() {
+        println!(
+            "\n  Rollback complete ({} binaries restored).",
+            rolled_back.len()
+        );
+        println!("  Restart services to activate the rollback:");
+        println!("    sudo systemctl restart genie-core");
+        Ok(())
+    } else {
+        anyhow::bail!("rollback partially failed: {}", errors.join("; "))
+    }
+}
+
 async fn cmd_diag() -> Result<()> {
     let config = Config::load()?;
     let core = config.core_http_addr();
@@ -2779,6 +2981,7 @@ mod tests {
             web_search: Default::default(),
             connectivity: Default::default(),
             http: Default::default(),
+            ota: Default::default(),
         };
 
         assert_eq!(config.core_http_addr(), "127.0.0.1:3001");
@@ -2807,6 +3010,7 @@ mod tests {
             web_search: Default::default(),
             connectivity: Default::default(),
             http: Default::default(),
+            ota: Default::default(),
         };
 
         assert_eq!(config.core_http_addr(), "127.0.0.1:3000");

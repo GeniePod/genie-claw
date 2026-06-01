@@ -32,6 +32,15 @@ const ROUND_CONSTANTS: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+/// Lowercase 64-character SHA-256 hex digest of arbitrary bytes.
+///
+/// Used for OTA binary verification (compare downloaded asset against manifest).
+/// Identical algorithm to [`sha256_hex`]; accepts `&[u8]` directly so callers
+/// do not need to perform an infallible UTF-8 round-trip on binary content.
+pub fn sha256_hex_bytes(data: &[u8]) -> String {
+    sha256_hex_inner(data)
+}
+
 /// Lowercase 64-character SHA-256 hex digest of `data`.
 ///
 /// Used for the system-prompt determinism fingerprint; see the module docs.
@@ -39,8 +48,13 @@ const ROUND_CONSTANTS: [u32; 64] = [
 // FIPS-180; keeping them mirrors the spec and the reference test vectors.
 #[allow(clippy::many_single_char_names)]
 pub fn sha256_hex(data: &str) -> String {
+    sha256_hex_inner(data.as_bytes())
+}
+
+#[allow(clippy::many_single_char_names)]
+fn sha256_hex_inner(bytes: &[u8]) -> String {
     let mut state = INITIAL_STATE;
-    let mut message = data.as_bytes().to_vec();
+    let mut message = bytes.to_vec();
     let bit_len = (message.len() as u64).wrapping_mul(8);
 
     // Pad: append 0x80, zero-fill until 56 mod 64, then the 64-bit big-endian
@@ -140,6 +154,21 @@ mod tests {
         let digest = sha256_hex("NVIDIA Jetson Orin 8GB");
         assert_eq!(digest.len(), 64);
         assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sha256_hex_bytes_matches_str_variant_on_utf8_input() {
+        let text = "abc";
+        assert_eq!(sha256_hex(text), sha256_hex_bytes(text.as_bytes()));
+    }
+
+    #[test]
+    fn sha256_hex_bytes_known_vector() {
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        assert_eq!(
+            sha256_hex_bytes(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]
