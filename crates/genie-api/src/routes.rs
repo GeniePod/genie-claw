@@ -44,6 +44,17 @@ pub async fn get_status(_config: &Config) -> Response {
     }
 }
 
+/// Classify a SQLite error string and return an HTTP status code + error message.
+fn classify_sqlite_error(err: &str) -> (u16, String) {
+    let lower = err.to_lowercase();
+    let is_transient = lower.contains("database is locked") || lower.contains("database is busy");
+    if is_transient {
+        (503, "tegrastats data temporarily unavailable".into())
+    } else {
+        (500, "failed to read tegrastats data".into())
+    }
+}
+
 /// GET /api/tegrastats — recent history from governor's SQLite.
 pub async fn get_tegrastats(config: &Config) -> Response {
     let db_path = config.data_dir.join("governor.db");
@@ -88,11 +99,30 @@ pub async fn get_tegrastats(config: &Config) -> Response {
             content_type: "application/json",
             body: json,
         },
-        _ => Response {
-            status: 200,
-            content_type: "application/json",
-            body: "[]".into(),
-        },
+        Ok(Err(e)) => {
+            let (status, error_msg) = classify_sqlite_error(&e);
+            tracing::error!(%e, "failed to read tegrastats from governor.db");
+            Response {
+                status,
+                content_type: "application/json",
+                body: serde_json::json!({
+                    "error": error_msg,
+                    "detail": e
+                })
+                .to_string(),
+            }
+        }
+        Err(e) => {
+            tracing::error!(%e, "tegrastats spawn_blocking panicked or was cancelled");
+            Response {
+                status: 500,
+                content_type: "application/json",
+                body: serde_json::json!({
+                    "error": "internal error reading tegrastats"
+                })
+                .to_string(),
+            }
+        }
     }
 }
 
@@ -1175,5 +1205,35 @@ mod tests {
             error.contains(&format!("core response exceeds {max} bytes")),
             "expected size cap error, got: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn tegrastats_returns_500_when_db_does_not_exist() {
+        let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
+        let mut config = test_config();
+        config.data_dir = tmp.path().to_path_buf();
+
+        let response = get_tegrastats(&config).await;
+
+        assert_eq!(response.status, 500);
+        assert!(response.body.contains("error"));
+        assert!(response.body.contains("failed to read tegrastats data"));
+    }
+
+    #[test]
+    fn classify_sqlite_error_transient() {
+        let (status, msg) = classify_sqlite_error("database is locked");
+        assert_eq!(status, 503);
+        assert_eq!(msg, "tegrastats data temporarily unavailable");
+
+        let (status, _) = classify_sqlite_error("Database is Busy");
+        assert_eq!(status, 503);
+    }
+
+    #[test]
+    fn classify_sqlite_error_permanent() {
+        let (status, msg) = classify_sqlite_error("unable to open database file");
+        assert_eq!(status, 500);
+        assert_eq!(msg, "failed to read tegrastats data");
     }
 }
