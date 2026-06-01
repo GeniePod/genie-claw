@@ -43,7 +43,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use genie_common;
 use genie_core::conversation::ConversationStore;
 use genie_core::llm::{LlmClient, Message};
 use genie_core::memory::{Memory, SharedMemory};
