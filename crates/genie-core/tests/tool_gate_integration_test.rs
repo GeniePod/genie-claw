@@ -460,3 +460,78 @@ async fn tool_gate_audit_logs_are_append_only_and_record_all_dispatches() {
         "one executed plus one blocked_runtime home_control event"
     );
 }
+
+#[tokio::test]
+async fn home_control_rejects_invalid_arguments_and_audits() {
+    let paths = TestAuditPaths::new();
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = paths.dispatcher(
+        Some(Arc::new(FakeHomeProvider::light(executed.clone()))),
+        ToolPolicyConfig::default(),
+        ActuationSafetyConfig::default(),
+    );
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Dashboard,
+        ..ToolExecutionContext::default()
+    };
+
+    let invalid_calls = [
+        (
+            serde_json::json!({}),
+            "home_control requires non-empty string argument 'entity'",
+        ),
+        (
+            serde_json::json!({"entity": "", "action": "turn_on"}),
+            "home_control requires non-empty string argument 'entity'",
+        ),
+        (
+            serde_json::json!({"entity": "kitchen light", "action": "turnn_on"}),
+            "home_control action 'turnn_on' is invalid",
+        ),
+        (
+            serde_json::json!({"entity": "kitchen light"}),
+            "home_control requires string argument 'action'",
+        ),
+    ];
+    let expected_audit_count = invalid_calls.len();
+
+    for (arguments, expected_snippet) in &invalid_calls {
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: arguments.clone(),
+                },
+                ctx,
+            )
+            .await;
+
+        assert!(
+            !result.success,
+            "expected schema rejection, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(expected_snippet),
+            "expected output to contain {expected_snippet:?}, got: {}",
+            result.output
+        );
+    }
+
+    assert!(
+        executed.lock().unwrap().is_empty(),
+        "invalid home_control calls must not reach the home provider"
+    );
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(
+        events.len(),
+        expected_audit_count,
+        "each rejected call must be tool-audited"
+    );
+    for event in &events {
+        assert_eq!(event["tool"], "home_control");
+        assert_eq!(event["origin"], "dashboard");
+        assert_eq!(event["success"], false);
+    }
+}
