@@ -169,9 +169,8 @@ impl OtaManager {
         let sig_bytes = self
             .download_to_bytes(checksum_sig_url, "checksums.sha256.sig")
             .await?;
-        let sig_b64 = String::from_utf8(sig_bytes).map_err(|_| {
-            anyhow::anyhow!("checksums.sha256.sig contains non-UTF-8 bytes")
-        })?;
+        let sig_b64 = String::from_utf8(sig_bytes)
+            .map_err(|_| anyhow::anyhow!("checksums.sha256.sig contains non-UTF-8 bytes"))?;
 
         let verifier = verify::OtaVerifyingKey::load(&self.config.public_key_path)?;
         verifier.verify(&manifest_bytes, sig_b64.trim())?;
@@ -179,9 +178,8 @@ impl OtaManager {
 
         // Step 3: parse the manifest to discover which binaries are available
         // and what their expected SHA-256 digests are.
-        let manifest_str = String::from_utf8(manifest_bytes.clone()).map_err(|_| {
-            anyhow::anyhow!("checksums.sha256 contains non-UTF-8 bytes")
-        })?;
+        let manifest_str = String::from_utf8(manifest_bytes.clone())
+            .map_err(|_| anyhow::anyhow!("checksums.sha256 contains non-UTF-8 bytes"))?;
         let manifest_entries = verify::parse_manifest(&manifest_str)?;
 
         // Step 4: download each managed binary that appears in the manifest and
@@ -305,8 +303,7 @@ impl OtaManager {
                 checksum_url = url;
             } else if name == "checksums.sha256.sig" {
                 checksum_sig_url = url;
-            } else if (name.contains("aarch64") || name.contains("arm64"))
-                && download_url.is_none()
+            } else if (name.contains("aarch64") || name.contains("arm64")) && download_url.is_none()
             {
                 // First aarch64 asset wins as the primary binary download.
                 download_url = url;
@@ -357,9 +354,9 @@ impl OtaManager {
             let src = self.install_dir.join(bin);
             let dst = self.backup_dir.join(bin);
             if src.exists() {
-                tokio::fs::copy(&src, &dst).await.map_err(|e| {
-                    anyhow::anyhow!("failed to back up {}: {e}", src.display())
-                })?;
+                tokio::fs::copy(&src, &dst)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to back up {}: {e}", src.display()))?;
                 tracing::debug!(binary = bin, "backed up");
             } else {
                 tracing::warn!(
@@ -455,7 +452,10 @@ impl OtaManager {
     /// Verify the SHA-256 digest of `path` against `expected_hex`.
     async fn verify_sha256(&self, path: &Path, expected_hex: &str, label: &str) -> Result<()> {
         let data = tokio::fs::read(path).await.map_err(|e| {
-            anyhow::anyhow!("failed to read {} for hash verification: {e}", path.display())
+            anyhow::anyhow!(
+                "failed to read {} for hash verification: {e}",
+                path.display()
+            )
         })?;
         let actual = crate::prompt_sha::sha256_hex_bytes(&data);
         if actual != expected_hex {
@@ -481,7 +481,10 @@ fn derive_binary_url(download_url: &str, binary_name: &str) -> String {
     }
     // Otherwise replace the last path segment with the binary name.
     // This handles the common pattern of a base URL shared between assets.
-    let base = download_url.rsplit_once('/').map(|(b, _)| b).unwrap_or(download_url);
+    let base = download_url
+        .rsplit_once('/')
+        .map(|(b, _)| b)
+        .unwrap_or(download_url);
     format!("{base}/{binary_name}")
 }
 

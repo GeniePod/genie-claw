@@ -316,10 +316,7 @@ async fn main() -> Result<()> {
         let origin_resolver =
             genie_core::origin_auth::OriginResolver::from_config(&config.core.origin_auth);
 
-        let ota_manager = genie_core::ota::OtaManager::new(
-            &config.data_dir,
-            config.ota.clone(),
-        );
+        let ota_manager = genie_core::ota::OtaManager::new(&config.data_dir, config.ota.clone());
 
         let chat_server = genie_core::server::ChatServer::new(
             llm,

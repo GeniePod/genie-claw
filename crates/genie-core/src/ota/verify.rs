@@ -71,9 +71,9 @@ impl OtaVerifyingKey {
     /// failure. Callers must propagate the error and must not proceed with the
     /// update if this returns `Err`.
     pub fn verify(&self, message: &[u8], signature_b64: &str) -> Result<()> {
-        let sig_bytes = BASE64.decode(signature_b64.trim()).map_err(|e| {
-            anyhow::anyhow!("OTA manifest signature is not valid base64: {e}")
-        })?;
+        let sig_bytes = BASE64
+            .decode(signature_b64.trim())
+            .map_err(|e| anyhow::anyhow!("OTA manifest signature is not valid base64: {e}"))?;
         let signature = Signature::from_slice(&sig_bytes).map_err(|e| {
             anyhow::anyhow!(
                 "OTA manifest signature has wrong length ({} bytes, need 64): {e}",
@@ -99,9 +99,13 @@ pub fn parse_manifest(manifest: &str) -> Result<Vec<(String, String)>> {
             continue;
         }
         // sha256sum format: "<hash>  <filename>" (two spaces).
-        let (hash, filename) = line
-            .split_once("  ")
-            .ok_or_else(|| anyhow::anyhow!("manifest line {} is malformed (expected '<hash>  <filename>'): {:?}", line_no + 1, line))?;
+        let (hash, filename) = line.split_once("  ").ok_or_else(|| {
+            anyhow::anyhow!(
+                "manifest line {} is malformed (expected '<hash>  <filename>'): {:?}",
+                line_no + 1,
+                line
+            )
+        })?;
         let hash = hash.trim();
         if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             bail!(
@@ -136,8 +140,7 @@ mod tests {
 
     #[test]
     fn load_and_verify_valid_signature() {
-        let dir = std::env::temp_dir()
-            .join(format!("geniepod-ota-verify-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("geniepod-ota-verify-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -155,8 +158,7 @@ mod tests {
 
     #[test]
     fn tampered_manifest_fails_verification() {
-        let dir = std::env::temp_dir()
-            .join(format!("geniepod-ota-tamper-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("geniepod-ota-tamper-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -177,10 +179,7 @@ mod tests {
         let result = OtaVerifyingKey::load(Path::new("/nonexistent/ota.pub"));
         match result {
             Ok(_) => panic!("expected Err, got Ok"),
-            Err(e) => assert!(
-                e.to_string().contains("not found"),
-                "unexpected error: {e}"
-            ),
+            Err(e) => assert!(e.to_string().contains("not found"), "unexpected error: {e}"),
         }
     }
 

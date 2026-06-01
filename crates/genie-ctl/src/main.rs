@@ -2048,7 +2048,10 @@ async fn cmd_ota(args: &[String]) -> Result<()> {
         "apply" => cmd_ota_apply().await,
         "rollback" => cmd_ota_rollback().await,
         other => {
-            anyhow::bail!("Unknown ota subcommand: '{}'. Run 'genie-ctl ota' for usage.", other);
+            anyhow::bail!(
+                "Unknown ota subcommand: '{}'. Run 'genie-ctl ota' for usage.",
+                other
+            );
         }
     }
 }
@@ -2059,7 +2062,8 @@ async fn cmd_ota_check() -> Result<()> {
     println!("Checking for updates...\n");
     match http_post(&core, "/api/ota/check", "").await {
         Ok(body) => {
-            let data: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+            let data: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
             let current = data
                 .get("current_version")
                 .and_then(|v| v.as_str())
@@ -2079,7 +2083,14 @@ async fn cmd_ota_check() -> Result<()> {
 
             println!("  Current: v{}", current);
             println!("  Latest:  v{}", latest);
-            println!("  Signed release: {}", if signed { "yes" } else { "no (apply will refuse)" });
+            println!(
+                "  Signed release: {}",
+                if signed {
+                    "yes"
+                } else {
+                    "no (apply will refuse)"
+                }
+            );
 
             if available {
                 println!("\n  Update available.");
@@ -2114,7 +2125,8 @@ async fn cmd_ota_apply() -> Result<()> {
 
     match http_post(&core, "/api/ota/apply", "").await {
         Ok(body) => {
-            let data: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+            let data: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
             if let Some(err) = data.get("error").and_then(|v| v.as_str()) {
                 eprintln!("OTA apply failed: {}", err);
                 if let Some(hint) = data.get("hint").and_then(|v| v.as_str()) {
@@ -2139,9 +2151,18 @@ async fn cmd_ota_apply() -> Result<()> {
                 .unwrap_or(false);
 
             println!("  Version:          {}", version);
-            println!("  Binaries replaced: {}", if replaced.is_empty() { "(none)" } else { &replaced });
+            println!(
+                "  Binaries replaced: {}",
+                if replaced.is_empty() {
+                    "(none)"
+                } else {
+                    &replaced
+                }
+            );
             println!("  Verified:         {}", verified);
-            println!("\n  Restart genie-core (and other replaced services) to activate the update:");
+            println!(
+                "\n  Restart genie-core (and other replaced services) to activate the update:"
+            );
             println!("    sudo systemctl restart genie-core");
         }
         Err(e) => {
