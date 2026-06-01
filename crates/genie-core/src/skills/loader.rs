@@ -433,17 +433,16 @@ fn read_manifest_source(skill_path: &Path) -> ManifestSource {
 
 /// Verify the sidecar's detached signature over the exact bytes of the `.so`
 /// that will be loaded. Returns `true` only when a trusted key validates the
-/// signature over the file contents; fails closed on any read or verification
-/// error. This must be evaluated on the bytes that will actually execute.
+/// signature over the supplied bytes; fails closed on any verification error.
+/// The caller is responsible for reading the file once and passing the same
+/// buffer to both this function and the library loader, so that the verified
+/// bytes are identical to the bytes that execute.
 fn verify_skill_signature(
-    skill_path: &Path,
+    so_bytes: &[u8],
     manifest: &SkillManifest,
     trusted_keys: &TrustedKeys,
 ) -> bool {
-    match std::fs::read(skill_path) {
-        Ok(bytes) => trusted_keys.verify_detached(&manifest.key_id, &bytes, &manifest.signature),
-        Err(_) => false,
-    }
+    trusted_keys.verify_detached(&manifest.key_id, so_bytes, &manifest.signature)
 }
 
 /// Build the audit view once the vtable's name/version are known. `signed`
@@ -489,6 +488,66 @@ fn enforce_skill_policy(manifest: &SkillManifestAudit, policy: &SkillLoadPolicy)
     }
 
     Ok(())
+}
+
+/// Load a shared library from an in-memory buffer via a sealed Linux `memfd`.
+///
+/// The bytes are written into an anonymous file descriptor, which is then
+/// sealed with `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`.
+/// Once sealed, no process — including this one — can alter the mapping.
+/// `dlopen` is then called on `/proc/self/fd/<n>`, so the kernel loads exactly
+/// the bytes that were cryptographically verified, not whatever happens to be
+/// on disk at the time.  This closes the TOCTOU window that existed between
+/// the path-based `verify_skill_signature` and the previous `Library::new(path)`.
+#[cfg(target_os = "linux")]
+fn load_library_from_memfd(bytes: &[u8], label: &str) -> Result<Library> {
+    use std::io::Write as _;
+    use std::os::unix::io::FromRawFd as _;
+
+    let c_label = std::ffi::CString::new(label).unwrap_or_default();
+    // SAFETY: memfd_create is a simple syscall; no memory-safety preconditions.
+    let fd = unsafe {
+        libc::memfd_create(
+            c_label.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        anyhow::bail!("memfd_create failed: {}", std::io::Error::last_os_error());
+    }
+
+    // Write the verified bytes.  ManuallyDrop keeps fd open after the File is
+    // "dropped" — we need it alive for sealing and dlopen below.
+    let write_result = {
+        // SAFETY: fd is valid and we own it exclusively at this point.
+        let mut file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        file.write_all(bytes)
+    };
+    if let Err(e) = write_result {
+        // SAFETY: fd is still open; close to avoid leaking.
+        unsafe { libc::close(fd) };
+        return Err(e.into());
+    }
+
+    // Seal: prevent any future writes or size changes.  F_SEAL_SEAL prevents
+    // further seals from being added after this call.
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    // SAFETY: fd is open; F_ADD_SEALS takes a seals bitmask as its third arg.
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        unsafe { libc::close(fd) };
+        anyhow::bail!("memfd sealing failed: {}", std::io::Error::last_os_error());
+    }
+
+    // dlopen via /proc/self/fd/<n>.  The dynamic linker mmaps from offset 0
+    // regardless of file position; file-position state is irrelevant here.
+    // dlopen internally dups the fd, so closing ours after the call is safe.
+    let fd_path = format!("/proc/self/fd/{fd}");
+    // SAFETY: loading a .so is inherently unsafe; bytes have been verified.
+    let lib = unsafe { Library::new(&fd_path) };
+    // SAFETY: dlopen has its own reference; close ours to avoid leaking.
+    unsafe { libc::close(fd) };
+
+    lib.map_err(|e| anyhow::anyhow!("dlopen from sealed memfd failed: {e}"))
 }
 
 /// Skill loader — scans a directory for `.so` files and loads them.
@@ -562,15 +621,17 @@ impl SkillLoader {
 
     /// Load a single skill from a `.so` file.
     pub fn load_skill(&mut self, path: &Path) -> Result<String> {
-        // Read the sidecar and verify its detached signature over the .so bytes
-        // BEFORE dlopen. Loading a .so executes arbitrary native code in the
-        // genie-core address space, so the authenticity gate must be decided on
-        // the exact bytes about to run — and an unverified skill must never be
-        // loaded at all when a signature is required.
+        // Read the sidecar manifest and the .so bytes exactly once.
+        // Both signature verification and library loading consume the same
+        // buffer — eliminating the TOCTOU window that previously existed
+        // between a path-based verify and a separate dlopen.
         let manifest_source = read_manifest_source(path);
+        let so_bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+
         let signed = match &manifest_source {
             ManifestSource::Present { manifest, .. } => {
-                verify_skill_signature(path, manifest, &self.trusted_keys)
+                verify_skill_signature(&so_bytes, manifest, &self.trusted_keys)
             }
             ManifestSource::Missing | ManifestSource::Invalid { .. } => false,
         };
@@ -584,12 +645,25 @@ impl SkillLoader {
             );
         }
 
-        // Safety: loading a .so is inherently unsafe. With require_signature on,
-        // the bytes have been verified against a trusted key above; otherwise we
-        // trust skills from the skills directory (like Linux trusts kernel
-        // modules from /lib/modules).
+        // Load the library from the exact bytes already read and verified above.
+        // On Linux a sealed memfd is used so the kernel loads those bytes and
+        // not whatever is on disk when dlopen runs — closing the TOCTOU window.
+        // On other platforms we fall back to path-based dlopen (no TOCTOU
+        // mitigation; require_signature is a Linux-first production boundary).
+        #[cfg(target_os = "linux")]
+        let lib = {
+            let label = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("genie-skill");
+            load_library_from_memfd(&so_bytes, label)?
+        };
+        #[cfg(not(target_os = "linux"))]
         let lib = unsafe { Library::new(path) }
             .map_err(|e| anyhow::anyhow!("dlopen failed for {}: {}", path.display(), e))?;
+
+        // The .so bytes are no longer needed; free them before vtable extraction.
+        drop(so_bytes);
 
         // Find the entry point.
         let init_fn: Symbol<extern "C" fn() -> *const SkillVTable> =
@@ -1222,6 +1296,65 @@ mod tests {
             "dlopen must not be attempted before the signature gate, got: {msg}"
         );
         assert_eq!(loader.count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- TOCTOU mitigation (issue #280) -------------------------------------
+
+    /// On Linux, `load_library_from_memfd` loads from the supplied byte buffer,
+    /// not from the original path.  Passing valid `.so` bytes must produce a
+    /// working library; the source file path is never consulted.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn memfd_loads_library_from_bytes_not_path() {
+        let so_bytes = std::fs::read(sample_skill_path()).unwrap();
+
+        // load_library_from_memfd takes bytes — the source file is irrelevant.
+        let lib = load_library_from_memfd(&so_bytes, "genie-skill-toctou-test")
+            .expect("load_library_from_memfd failed");
+
+        // Confirm the right code was loaded by finding the entry-point symbol.
+        let init_fn: Symbol<unsafe extern "C" fn() -> *const SkillVTable> =
+            unsafe { lib.get(b"genie_skill_init\0") }
+                .expect("genie_skill_init symbol not found in memfd-loaded library");
+        let vtable_ptr = unsafe { init_fn() };
+        assert!(
+            !vtable_ptr.is_null(),
+            "genie_skill_init returned null from memfd-loaded library"
+        );
+    }
+
+    /// End-to-end TOCTOU regression: a signed skill is loaded via the memfd
+    /// path; replacing the .so on disk afterwards has no effect on the already-
+    /// loaded library because the kernel loaded the sealed in-memory copy.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn loader_toctou_disk_swap_after_load_has_no_effect() {
+        let (dir, keys_dir, so_path, key) = signed_skill_dirs("toctou", "geniepod");
+        let signature = sign_file(&key, &so_path);
+        write_signed_manifest(&dir, &signature, "geniepod");
+
+        let mut loader = SkillLoader::new_with_policy(&dir, require_signature_policy(&keys_dir));
+        let name = loader.load_skill(&so_path).unwrap();
+        assert_eq!(name, "hello_world");
+        assert!(
+            loader.loaded().first().unwrap().manifest.signed,
+            "skill must be reported as cryptographically verified"
+        );
+
+        // Simulate what an attacker does after the TOCTOU window: replace the
+        // .so with arbitrary bytes.  The sealed memfd is already loaded; this
+        // disk write must have no effect on execution.
+        std::fs::write(&so_path, b"attacker payload swapped after verification").unwrap();
+
+        let skill = loader.get_mut("hello_world").unwrap();
+        let (success, output) = skill.execute_parsed(r#"{"name":"TOCTOU"}"#).await;
+        assert!(success, "skill execution failed after disk swap: {output}");
+        assert!(
+            output.contains("TOCTOU"),
+            "expected legitimate skill output after disk swap, got: {output}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
