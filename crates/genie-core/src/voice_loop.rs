@@ -27,7 +27,7 @@ use crate::reasoning::InteractionKind;
 use crate::tools::ToolDispatcher;
 use crate::voice::identity::{self, SpeakerIdentityProvider};
 use crate::voice::intent::{self, VoiceIntentDecision};
-use crate::voice::{aec, format, streaming, stt, tts};
+use crate::voice::{aec, format, streaming, stt, tts, vad};
 
 /// Configuration for the voice loop.
 pub struct VoiceConfig {
@@ -907,7 +907,25 @@ async fn voice_cycle(
     // For now: just AEC reference tracking (no-op on headphone) + let Whisper handle it.
     aec::process_aec(&wav_path, voice_cfg.sample_rate).await;
 
-    // Step 3: Transcribe.
+    // Step 3: VAD pre-check — skip STT if Silero finds no speech.
+    // Errors (model not cached, 10 s timeout) are treated as non-fatal: log,
+    // remove the WAV, and re-arm the voice loop rather than deadlocking it.
+    match vad::detect_speech(&wav_path).await {
+        Ok((false, _)) => {
+            eprintln!("[voice] VAD: no speech in recording — re-arming.");
+            let _ = tokio::fs::remove_file(&wav_path).await;
+            return true;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "VAD detect_speech failed, skipping utterance");
+            eprintln!("[voice] VAD error ({}): skipping utterance.", e);
+            let _ = tokio::fs::remove_file(&wav_path).await;
+            return true;
+        }
+        Ok((true, _)) => {} // speech confirmed — proceed to STT
+    }
+
+    // Step 4: Transcribe.
     eprintln!("[voice] Transcribing...");
     let transcript = match stt_engine.transcribe_file(&wav_path).await {
         Ok(t) => t,

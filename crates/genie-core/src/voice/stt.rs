@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -417,7 +418,17 @@ impl SttEngine {
             args.push("--no-gpu".to_string());
         }
 
-        let output = Command::new(&self.cli_path).args(&args).output().await?;
+        let child = Command::new(&self.cli_path)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn whisper-cli: {}", e))?;
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .map_err(|_| anyhow::anyhow!("whisper-cli timed out after 30 s"))?
+            .map_err(|e| anyhow::anyhow!("whisper-cli I/O error: {}", e))?;
 
         // If GPU allocation fails (NvMap error), retry with --no-gpu.
         if !output.status.success() && !self.no_gpu {
@@ -431,7 +442,17 @@ impl SttEngine {
                     stderr.lines().next().unwrap_or("")
                 );
                 args.push("--no-gpu".to_string());
-                let retry = Command::new(&self.cli_path).args(&args).output().await?;
+                let retry_child = Command::new(&self.cli_path)
+                    .args(&args)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|e| anyhow::anyhow!("failed to spawn whisper-cli (CPU retry): {}", e))?;
+                let retry = tokio::time::timeout(Duration::from_secs(30), retry_child.wait_with_output())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("whisper-cli (CPU retry) timed out after 30 s"))?
+                    .map_err(|e| anyhow::anyhow!("whisper-cli (CPU retry) I/O error: {}", e))?;
                 if !retry.status.success() {
                     let stderr2 = String::from_utf8_lossy(&retry.stderr);
                     anyhow::bail!("whisper-cli failed (CPU retry): {}", stderr2);

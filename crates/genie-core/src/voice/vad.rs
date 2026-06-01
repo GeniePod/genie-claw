@@ -9,15 +9,50 @@
 //! but runs AFTER recording is complete (not in the critical path).
 
 use anyhow::Result;
+use std::time::Duration;
 use tokio::process::Command;
+
+const VAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Return true when the Silero VAD model appears to be in the torch hub
+/// on-disk cache. This is a fast, offline, filesystem-only check.
+///
+/// torch.hub caches under `${XDG_CACHE_HOME}/torch/hub/` (or
+/// `~/.cache/torch/hub/` when XDG_CACHE_HOME is unset). The directory name
+/// is derived from the repo slug: `snakers4/silero-vad` → `snakers4_silero-vad_master`.
+pub fn silero_model_cached() -> bool {
+    let xdg_cache = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{}/.cache", home)
+    });
+    std::path::Path::new(&xdg_cache)
+        .join("torch/hub/snakers4_silero-vad_master")
+        .exists()
+}
 
 /// Detect speech segments in a WAV file using Silero VAD.
 ///
 /// Returns (has_speech, speech_end_ms) — whether speech was found,
 /// and the timestamp (in ms) where speech ends.
 /// If speech_end_ms < total duration, the file can be trimmed.
+///
+/// Returns `Err` immediately if the Silero model is not in the torch hub cache
+/// (avoids a `torch.hub.load` network download that can block for tens of
+/// minutes on a LAN-only Jetson). Also returns `Err` if the Python subprocess
+/// exceeds the 10-second timeout or fails for any other reason. Callers should
+/// treat the error as a non-fatal skip: log, remove the WAV, re-arm the voice
+/// loop.
 pub async fn detect_speech(wav_path: &str) -> Result<(bool, u64)> {
-    let output = Command::new("python3")
+    if !silero_model_cached() {
+        anyhow::bail!(
+            "Silero VAD model not in torch hub cache \
+             (~/.cache/torch/hub/snakers4_silero-vad_master/); \
+             pre-cache it while online: python3 -c \
+             \"import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)\""
+        );
+    }
+
+    let child = Command::new("python3")
         .args([
             "-c",
             &format!(
@@ -43,8 +78,22 @@ except Exception as e:
                 wav_path
             ),
         ])
-        .output()
-        .await?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn VAD python3 subprocess: {}", e))?;
+
+    let output = tokio::time::timeout(VAD_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "VAD python3 subprocess timed out after {} s \
+                 (torch.hub.load may be attempting a network download on a LAN-only host)",
+                VAD_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("VAD subprocess I/O error: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.trim();
@@ -108,13 +157,20 @@ pub async fn trim_wav(wav_path: &str, end_ms: u64, sample_rate: u32) -> Result<(
 
 /// Check if Silero VAD is available (torch + silero-vad installed).
 pub async fn is_available() -> bool {
-    let output = Command::new("python3")
+    let child = Command::new("python3")
         .args(["-c", "import torch; print('OK')"])
-        .output()
-        .await;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn();
 
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).contains("OK"),
-        Err(_) => false,
+    let child = match child {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    match tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await {
+        Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).contains("OK"),
+        _ => false,
     }
 }

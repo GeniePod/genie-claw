@@ -276,6 +276,20 @@ async fn main() -> Result<()> {
                     &config.core.speaker_identity,
                 ),
             };
+            // Pre-flight: check Silero VAD model cache before starting the voice loop.
+            // On a LAN-only Jetson, a missing cache causes torch.hub.load to attempt a
+            // GitHub download that never completes, permanently deadlocking the voice task.
+            // Emit a loud warning so the operator knows to pre-cache while online.
+            if !genie_core::voice::vad::silero_model_cached() {
+                tracing::warn!(
+                    "Silero VAD model not found in torch hub cache \
+                     (~/.cache/torch/hub/snakers4_silero-vad_master/). \
+                     Voice VAD will skip every utterance until the model is cached. \
+                     Pre-cache it while online: \
+                     python3 -c \"import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)\""
+                );
+            }
+
             genie_core::voice_loop::run(
                 voice_cfg,
                 &llm,
