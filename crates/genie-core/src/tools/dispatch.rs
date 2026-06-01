@@ -660,7 +660,6 @@ impl ToolDispatcher {
             })
             .unwrap_or((None, None));
 
-        self.tool_audit_logger.append(ToolAuditEvent {
         self.tool_audit_logger.append_or_log(ToolAuditEvent {
             ts_ms: now_ms(),
             tool: call.name.clone(),
@@ -2216,6 +2215,8 @@ mod tests {
         // (Verified indirectly: this test only checks a skill invocation.)
 
         let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn tool_audit_logger_disabled_appends_ok() {
         let logger = ToolAuditLogger::default();
@@ -2228,6 +2229,8 @@ mod tests {
             duration_ms: 1,
             argument_keys: vec!["expression".into()],
             output_chars: 3,
+            skill_signed: None,
+            skill_key_id: None,
         };
         assert!(logger.append(event).is_ok());
     }
@@ -2251,6 +2254,8 @@ mod tests {
             duration_ms: 1,
             argument_keys: vec!["expression".into()],
             output_chars: 3,
+            skill_signed: None,
+            skill_key_id: None,
         };
         let err = logger.append(event).expect_err("append must fail");
         assert!(matches!(
