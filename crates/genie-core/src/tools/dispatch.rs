@@ -155,6 +155,16 @@ struct ToolAuditEvent {
     duration_ms: u64,
     argument_keys: Vec<String>,
     output_chars: usize,
+    /// Present only for native skill invocations. `true` means the .so bytes
+    /// were verified against a trusted Ed25519 key before loading; `false`
+    /// means the skill loaded without a valid signature (only possible when
+    /// `require_signature = false`). Absent for built-in tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill_signed: Option<bool>,
+    /// Key id of the trusted public key that verified the skill, if any.
+    /// Absent when the skill has no manifest, was unsigned, or is a built-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill_key_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -623,6 +633,26 @@ impl ToolDispatcher {
         started: Instant,
         result: &ToolResult,
     ) {
+        // Look up signature metadata if the tool name matches a loaded native
+        // skill.  The skills lock is not held across any await here, so this
+        // brief synchronous acquisition cannot deadlock or starve.
+        let (skill_signed, skill_key_id) = self
+            .skills
+            .as_ref()
+            .and_then(|skills| skills.lock().ok())
+            .and_then(|loader| {
+                loader
+                    .loaded()
+                    .iter()
+                    .find(|s| s.name == call.name)
+                    .map(|s| {
+                        let key_id = (!s.manifest.key_id.is_empty())
+                            .then(|| s.manifest.key_id.clone());
+                        (Some(s.manifest.signed), key_id)
+                    })
+            })
+            .unwrap_or((None, None));
+
         self.tool_audit_logger.append(ToolAuditEvent {
             ts_ms: now_ms(),
             tool: call.name.clone(),
@@ -632,6 +662,8 @@ impl ToolDispatcher {
             duration_ms: started.elapsed().as_millis() as u64,
             argument_keys: tool_argument_keys(&call.arguments),
             output_chars: result.output.chars().count(),
+            skill_signed,
+            skill_key_id,
         });
     }
 
@@ -2123,6 +2155,57 @@ mod tests {
         assert_eq!(event["argument_keys"], serde_json::json!(["expression"]));
         assert!(event["duration_ms"].as_u64().is_some());
         assert!(!line.contains("secret-token-value"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Native skill invocations must include `skill_signed` (and `skill_key_id`
+    /// when present) in the tool-audit JSONL so operators can see whether the
+    /// executed code was cryptographically verified.
+    #[tokio::test]
+    async fn skill_audit_event_includes_signature_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-skill-audit-sig-test-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let dispatcher = ToolDispatcher::new(None)
+            .with_skill_loader(sample_skill_loader())
+            .with_tool_audit_path(path.clone());
+
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "hello_world".into(),
+                    arguments: serde_json::json!({"name": "AuditTest"}),
+                },
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Api,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+
+        assert!(result.success);
+
+        let line = std::fs::read_to_string(&path).unwrap();
+        let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+
+        assert_eq!(event["tool"], "hello_world");
+        // The sample skill has no sidecar manifest, so it must be reported as
+        // unsigned — never silently absent from the audit record.
+        assert_eq!(
+            event["skill_signed"], false,
+            "unsigned skill must appear as skill_signed=false in audit"
+        );
+        // key_id is empty for unsigned skills — field is omitted (skip_serializing_if).
+        assert!(
+            event.get("skill_key_id").is_none(),
+            "unsigned skill with no key_id must omit skill_key_id from audit"
+        );
+        // Built-in tools must not have skill_signed in their audit records.
+        // (Verified indirectly: this test only checks a skill invocation.)
 
         let _ = std::fs::remove_file(&path);
     }

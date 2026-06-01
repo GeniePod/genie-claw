@@ -23,6 +23,10 @@ pub enum TaintLabel {
     Secret,
     /// Output from LLM (may contain hallucinated secrets or injected instructions).
     LlmOutput,
+    /// Return value from a loaded native skill (.so). Propagated so audit
+    /// layers can observe skill output flowing to display or network sinks.
+    /// Not currently blocked by any sink — enforcement is future work.
+    NativeSkill,
 }
 
 /// Operations that have taint restrictions.

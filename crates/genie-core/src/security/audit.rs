@@ -43,6 +43,12 @@ pub fn run_audit(config_path: &Path, data_dir: &Path) -> Vec<AuditFinding> {
     // 5. Check if API port is bound to localhost only.
     check_localhost_binding(&mut findings);
 
+    // 6. Check skills directory permissions. A world- or group-writable skills
+    //    dir allows an attacker to plant a malicious .so before genie-core reads
+    //    it — even the sealed-memfd TOCTOU fix reads bytes from disk, so the
+    //    write window is before the read, not between verify and dlopen.
+    check_skills_dir_permissions(&crate::skills::skills_dir(), &mut findings);
+
     // Log all findings.
     for finding in &findings {
         match finding.severity {
@@ -257,6 +263,50 @@ fn check_not_root(findings: &mut Vec<AuditFinding>) {
     }
 }
 
+fn check_skills_dir_permissions(skills_dir: &Path, findings: &mut Vec<AuditFinding>) {
+    if !skills_dir.exists() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(skills_dir) {
+            let bits = meta.permissions().mode() & 0o777;
+
+            if bits & 0o002 != 0 {
+                findings.push(AuditFinding {
+                    id: "fs.skills_dir.world_writable".into(),
+                    severity: Severity::Critical,
+                    message: format!(
+                        "skills directory is world-writable (mode {:o}) — \
+                         an untrusted process can plant a malicious .so before \
+                         genie-core reads it, bypassing signature verification",
+                        bits
+                    ),
+                    remediation: format!(
+                        "chmod 755 {0} && chown root:root {0}",
+                        skills_dir.display()
+                    ),
+                });
+            }
+
+            if bits & 0o020 != 0 {
+                findings.push(AuditFinding {
+                    id: "fs.skills_dir.group_writable".into(),
+                    severity: Severity::Warning,
+                    message: format!(
+                        "skills directory is group-writable (mode {:o}) — \
+                         a process in the same group can replace skill binaries",
+                        bits
+                    ),
+                    remediation: format!("chmod 755 {}", skills_dir.display()),
+                });
+            }
+        }
+    }
+}
+
 fn check_localhost_binding(findings: &mut Vec<AuditFinding>) {
     // This is informational — we always bind to 127.0.0.1.
     findings.push(AuditFinding {
@@ -333,5 +383,76 @@ mod tests {
     fn severity_ordering() {
         assert_ne!(Severity::Critical, Severity::Warning);
         assert_ne!(Severity::Warning, Severity::Info);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_world_writable_skills_dir_is_critical() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-audit-skills-world-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let mut findings = Vec::new();
+        check_skills_dir_permissions(&path, &mut findings);
+        assert!(
+            findings.iter().any(|f| f.id == "fs.skills_dir.world_writable"
+                && f.severity == Severity::Critical),
+            "world-writable skills dir must be a Critical finding"
+        );
+
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_group_writable_skills_dir_is_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-audit-skills-group-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o775)).unwrap();
+
+        let mut findings = Vec::new();
+        check_skills_dir_permissions(&path, &mut findings);
+        assert!(
+            findings.iter().any(|f| f.id == "fs.skills_dir.group_writable"
+                && f.severity == Severity::Warning),
+            "group-writable skills dir must be a Warning finding"
+        );
+
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_safe_skills_dir_has_no_permission_findings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-audit-skills-safe-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut findings = Vec::new();
+        check_skills_dir_permissions(&path, &mut findings);
+        assert!(
+            findings.is_empty(),
+            "mode 755 skills dir must produce no permission findings"
+        );
+
+        let _ = fs::remove_dir_all(&path);
     }
 }

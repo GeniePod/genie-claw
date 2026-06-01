@@ -602,7 +602,15 @@ impl SkillLoader {
             if path.extension().is_some_and(|ext| ext == "so") {
                 match self.load_skill(&path) {
                     Ok(name) => {
-                        tracing::info!(skill = %name, path = %path.display(), "skill loaded");
+                        // SAFETY: load_skill always pushes before returning Ok.
+                        let skill = self.loaded().last().expect("just pushed");
+                        tracing::info!(
+                            skill = %name,
+                            path = %path.display(),
+                            signed = skill.manifest.signed,
+                            key_id = %skill.manifest.key_id,
+                            "skill loaded"
+                        );
                         loaded_names.push(name);
                     }
                     Err(e) => {
