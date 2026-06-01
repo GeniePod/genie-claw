@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use zeroize::Zeroizing;
@@ -41,6 +41,9 @@ pub struct TelegramRuntimeConfig {
     /// proof (issue #232). `None` when no token is configured, in which case
     /// the loopback `core_base_url` is trusted by transport.
     pub origin_token: Option<Zeroizing<String>>,
+    /// Bound on concurrent in-flight update tasks (issue #278). Clamped to
+    /// >= `voice.max_parallel_voice` at construction time.
+    pub max_parallel_updates: usize,
 }
 
 /// Voice-message ingestion settings for the Telegram channel (issue #42).
@@ -72,6 +75,49 @@ pub struct TelegramVoiceRuntimeConfig {
     pub max_parallel_voice: usize,
 }
 
+/// TTL after which an idle chat lock entry is eligible for eviction (issue #278).
+const CHAT_LOCK_TTL: Duration = Duration::from_secs(300);
+
+/// Per-chat serialization map with TTL-based eviction.
+///
+/// Issue #278: the original `HashMap<i64, Arc<AsyncMutex<()>>>` grew without
+/// bound for `allow_all_chats = true` deployments. Each access sweeps entries
+/// that have been idle for `CHAT_LOCK_TTL` seconds so the map stays bounded
+/// under real-world traffic patterns without requiring a background GC task.
+///
+/// The struct lives inside a `StdMutex` — all operations are synchronous (no
+/// `.await` across the lock), so a regular mutex is correct and avoids the
+/// async-mutex-inside-sync-mutex hazard.
+struct ChatLocks {
+    inner: HashMap<i64, (Arc<AsyncMutex<()>>, Instant)>,
+}
+
+impl ChatLocks {
+    fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    /// Return (creating if absent) the per-chat mutex, updating last-access
+    /// time. Sweeps expired entries before inserting to keep the map bounded.
+    fn get(&mut self, chat_id: i64) -> Arc<AsyncMutex<()>> {
+        let now = Instant::now();
+        self.inner
+            .retain(|_, (_, last_seen)| now.duration_since(*last_seen) < CHAT_LOCK_TTL);
+        let (mutex, last_seen) = self
+            .inner
+            .entry(chat_id)
+            .or_insert_with(|| (Arc::new(AsyncMutex::new(())), now));
+        *last_seen = now;
+        mutex.clone()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
 pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
     let client = Client::builder()
         .user_agent("GenieClaw/1.0")
@@ -90,20 +136,26 @@ pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
         }
     };
 
-    // Issue #77: spawn each update so a slow voice pipeline (STT + LLM
-    // cold start can take tens of seconds) does not block unrelated chats.
-    // `TelegramApi` is `Send + Sync` behind `Arc`; per-chat ordering is
-    // preserved by a `chat_id` keyed mutex inside `handle_update`, and the
-    // voice pipeline itself is bounded by `voice_permits` so concurrent
-    // bursts don't overrun ffmpeg / whisper-server.
+    // Issue #77 / #278: spawn each update so a slow voice pipeline does not
+    // block unrelated chats. `TelegramApi` is `Send + Sync` behind `Arc`;
+    // per-chat ordering is preserved by a `chat_id` keyed mutex inside
+    // `handle_update`. Issue #278: acquire an update permit *before* spawning
+    // so total in-flight tasks are bounded — back-pressure is applied in the
+    // poll loop rather than inside the spawned task, which means we stop
+    // draining `getUpdates` until capacity is available.
     loop {
         match api.get_updates(offset).await {
             Ok(updates) => {
                 for update in updates {
                     offset = offset.max(update.update_id.saturating_add(1));
-                    let api = Arc::clone(&api);
+                    let permit = Arc::clone(&api.update_permits)
+                        .acquire_owned()
+                        .await
+                        .context("telegram update permit semaphore closed unexpectedly")?;
+                    let api2 = Arc::clone(&api);
                     tokio::spawn(async move {
-                        if let Err(e) = api.handle_update(update).await {
+                        let _permit = permit;
+                        if let Err(e) = api2.handle_update(update).await {
                             tracing::warn!(error = %e, "telegram update handling failed");
                         }
                     });
@@ -124,36 +176,41 @@ struct TelegramApi {
     /// 1 even when the config asks for 0, otherwise voice messages would
     /// deadlock waiting for a permit that never comes.
     voice_permits: Arc<Semaphore>,
-    /// Per-chat serialization (issue #77): a single chat_id processes its
-    /// updates one at a time so reply order matches Telegram's delivery
-    /// order, while different chat_ids run in parallel. Entries are kept
-    /// for the process lifetime — fine for an allowlisted bot; for
-    /// `allow_all_chats = true` deployments this grows with the number of
-    /// distinct chats that have ever messaged the bot.
-    chat_locks: StdMutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
+    /// Bounds total concurrent in-flight update tasks (issue #278). Always at
+    /// least `voice_permits` count so the voice inner semaphore is never the
+    /// tighter outer constraint.
+    update_permits: Arc<Semaphore>,
+    /// Per-chat serialization (issue #77 / #278): a single chat_id processes
+    /// its updates one at a time so reply order matches Telegram's delivery
+    /// order, while different chat_ids run in parallel. Entries idle for
+    /// longer than `CHAT_LOCK_TTL` are evicted on the next access so the map
+    /// stays bounded for `allow_all_chats = true` deployments.
+    chat_locks: StdMutex<ChatLocks>,
 }
 
 impl TelegramApi {
     fn new(client: Client, config: TelegramRuntimeConfig) -> Self {
-        let permits = config.voice.max_parallel_voice.max(1);
+        let voice_slots = config.voice.max_parallel_voice.max(1);
+        // Clamp update_slots to >= voice_slots: a config like
+        // max_parallel_updates=1, max_parallel_voice=2 would mean all update
+        // slots could be consumed by text messages, starving voice permits.
+        let update_slots = config.max_parallel_updates.max(voice_slots);
         Self {
             client,
             config,
-            voice_permits: Arc::new(Semaphore::new(permits)),
-            chat_locks: StdMutex::new(HashMap::new()),
+            voice_permits: Arc::new(Semaphore::new(voice_slots)),
+            update_permits: Arc::new(Semaphore::new(update_slots)),
+            chat_locks: StdMutex::new(ChatLocks::new()),
         }
     }
 
-    /// Returns (creating if necessary) the per-chat serialization mutex.
-    /// Keeping the lookup map under a `std::sync::Mutex` is fine because the
-    /// critical section is just a HashMap insert/clone — no `.await` is held
-    /// across it.
+    /// Returns (creating if necessary) the per-chat serialization mutex,
+    /// updating the entry's last-access timestamp for TTL eviction.
+    /// Keeping the map under a `std::sync::Mutex` is correct because the
+    /// critical section is purely synchronous — no `.await` is held across it.
     fn chat_lock(&self, chat_id: i64) -> Arc<AsyncMutex<()>> {
         let mut locks = self.chat_locks.lock().unwrap_or_else(|e| e.into_inner());
-        locks
-            .entry(chat_id)
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+        locks.get(chat_id)
     }
 
     async fn bootstrap_offset(&self) -> Result<i64> {
@@ -304,11 +361,14 @@ impl TelegramApi {
             return Ok(());
         }
 
-        // Issue #77: bound concurrent voice pipelines so burst traffic doesn't
-        // spawn N ffmpeg + whisper-server requests at once. Acquired *after*
-        // the cheap rejection paths above so unauthorized / oversized messages
-        // don't take a permit they wouldn't use.
-        let _permit = self
+        // Issue #77 / #278: bound concurrent voice pipelines so burst traffic
+        // doesn't spawn N ffmpeg + whisper-server requests at once. Acquired
+        // *after* the cheap rejection paths above so unauthorized / oversized
+        // messages don't consume a permit they wouldn't use.
+        // Named (not `_permit`) so we can drop it explicitly after STT rather
+        // than holding it through the LLM call — the LLM path doesn't stress
+        // ffmpeg / whisper-server, so releasing early reclaims capacity sooner.
+        let voice_permit = self
             .voice_permits
             .acquire()
             .await
@@ -361,6 +421,13 @@ impl TelegramApi {
         };
 
         let transcript = clean_transcript(&transcript);
+
+        // STT pipeline complete. Release the voice permit so the ffmpeg /
+        // whisper-server slot is available for the next voice message while
+        // we wait on the LLM. The update permit (outer semaphore) is still
+        // held by the spawned task and keeps total concurrency bounded.
+        drop(voice_permit);
+
         if transcript.is_empty() {
             // Whisper produced nothing useful — either silence, hallucination,
             // or unrecognized speech. Mirror the intent gate's "blank audio"
@@ -1009,9 +1076,9 @@ struct CoreChatResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        TELEGRAM_MAX_MESSAGE_LEN, TelegramApi, TelegramRuntimeConfig, TelegramVoiceRuntimeConfig,
-        VoiceReplyGate, clean_transcript, configured_language, next_temp_nonce, split_message,
-        strip_bot_mention, voice_reply_gate,
+        CHAT_LOCK_TTL, TELEGRAM_MAX_MESSAGE_LEN, TelegramApi, TelegramRuntimeConfig,
+        TelegramVoiceRuntimeConfig, VoiceReplyGate, clean_transcript, configured_language,
+        next_temp_nonce, split_message, strip_bot_mention, voice_reply_gate,
     };
     use reqwest::Client;
     use std::collections::HashSet;
@@ -1019,7 +1086,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    fn test_api(max_parallel_voice: usize) -> TelegramApi {
+    fn test_api(max_parallel_voice: usize, max_parallel_updates: usize) -> TelegramApi {
         TelegramApi::new(
             Client::new(),
             TelegramRuntimeConfig {
@@ -1045,6 +1112,7 @@ mod tests {
                     max_parallel_voice,
                 },
                 origin_token: None,
+                max_parallel_updates,
             },
         )
     }
@@ -1170,7 +1238,7 @@ mod tests {
         // Issue #77: per-chat serialization depends on the same chat_id
         // mapping to the same mutex across calls. Different chats must
         // hand out distinct mutexes so they can run in parallel.
-        let api = test_api(2);
+        let api = test_api(2, 8);
         let a1 = api.chat_lock(42);
         let a2 = api.chat_lock(42);
         let b = api.chat_lock(43);
@@ -1186,7 +1254,7 @@ mod tests {
         // Issue #77: max_parallel_voice = 1 means only one voice pipeline
         // can hold a permit at a time. A third attempt waits behind the
         // outstanding two.
-        let api = test_api(2);
+        let api = test_api(2, 8);
         let p1 = api.voice_permits.clone().acquire_owned().await.unwrap();
         let p2 = api.voice_permits.clone().acquire_owned().await.unwrap();
 
@@ -1207,7 +1275,7 @@ mod tests {
         // A misconfigured `max_parallel_voice = 0` would deadlock every
         // voice message; the constructor floors it at 1 so the path still
         // works (just serially) instead of silently hanging.
-        let api = test_api(0);
+        let api = test_api(0, 0);
         assert!(api.voice_permits.available_permits() >= 1);
     }
 
@@ -1231,5 +1299,93 @@ mod tests {
         assert_eq!(voice.duration, 5);
         assert!(msg.audio.is_none());
         assert!(msg.text.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_permits_enforce_max_parallel() {
+        // Issue #278: max_parallel_updates = 3 means only three update tasks
+        // can be in-flight at once; a fourth acquire must block.
+        let api = test_api(2, 3);
+        let p1 = Arc::clone(&api.update_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let p2 = Arc::clone(&api.update_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let p3 = Arc::clone(&api.update_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let fourth = api.update_permits.try_acquire();
+        assert!(fourth.is_err(), "fourth permit must be blocked");
+
+        drop(p1);
+        let resumed = api.update_permits.try_acquire();
+        assert!(resumed.is_ok(), "freed permit must become available");
+        drop(p2);
+        drop(p3);
+    }
+
+    #[test]
+    fn update_permits_clamp_to_max_parallel_voice() {
+        // Issue #278: max_parallel_updates < max_parallel_voice is nonsensical
+        // (all update slots could be taken by text, starving voice permits);
+        // the constructor silently clamps upward so both invariants hold.
+        let api = test_api(4, 1); // voice=4, updates=1 — should be raised to 4
+        assert!(
+            api.update_permits.available_permits() >= api.voice_permits.available_permits(),
+            "update_permits must be >= voice_permits after construction clamp"
+        );
+    }
+
+    #[test]
+    fn update_permits_clamp_zero_to_one() {
+        let api = test_api(0, 0);
+        assert!(api.update_permits.available_permits() >= 1);
+    }
+
+    #[test]
+    fn chat_locks_evict_expired_entries() {
+        use super::ChatLocks;
+        use std::time::Duration;
+
+        let mut locks = ChatLocks::new();
+
+        // Insert an entry and manually back-date its timestamp so it looks expired.
+        let _m = locks.get(1);
+        assert_eq!(locks.len(), 1);
+
+        // Reach into the inner map to age the entry past the TTL.
+        {
+            let entry = locks.inner.get_mut(&1).unwrap();
+            entry.1 = std::time::Instant::now()
+                .checked_sub(CHAT_LOCK_TTL + Duration::from_secs(1))
+                .unwrap_or(std::time::Instant::now());
+        }
+
+        // A lookup for a *different* chat triggers the sweep and removes chat 1.
+        let _m2 = locks.get(2);
+        assert_eq!(locks.len(), 1, "expired chat 1 entry must be evicted");
+        assert!(
+            locks.inner.contains_key(&2),
+            "the newly accessed chat 2 must remain"
+        );
+    }
+
+    #[test]
+    fn chat_locks_fresh_entry_not_evicted() {
+        use super::ChatLocks;
+
+        let mut locks = ChatLocks::new();
+        let _m1 = locks.get(10);
+        let _m2 = locks.get(20);
+        assert_eq!(
+            locks.len(),
+            2,
+            "recently accessed entries must not be evicted"
+        );
     }
 }
