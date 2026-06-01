@@ -1712,6 +1712,7 @@ mod tests {
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
             http: HttpServerConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 

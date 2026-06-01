@@ -166,10 +166,7 @@ impl ChatServer {
     /// [`InjectionPolicy::Warn`] (log-only) to preserve backward compatibility.
     /// Set to [`InjectionPolicy::Block`] for deployments with Home Assistant or
     /// other physical-world actuators connected.
-    pub fn with_injection_policy(
-        mut self,
-        policy: genie_common::config::InjectionPolicy,
-    ) -> Self {
+    pub fn with_injection_policy(mut self, policy: genie_common::config::InjectionPolicy) -> Self {
         self.injection_policy = policy;
         self
     }

@@ -360,7 +360,9 @@ async fn run_with_wakeword(
                                     source = blocked.source,
                                     "injection gate blocked voice follow-up"
                                 );
-                                eprintln!("[voice] Follow-up blocked: prompt injection pattern detected.");
+                                eprintln!(
+                                    "[voice] Follow-up blocked: prompt injection pattern detected."
+                                );
                                 continue;
                             }
                             let response_language = transcript.language.clone().or_else(|| {
