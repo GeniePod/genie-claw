@@ -5,6 +5,102 @@
 
 use super::{Memory, policy};
 
+/// Keep aligned with `agent_harness::MEMORY_HYDRATION_BUDGET_TOKENS`.
+const MEMORY_HYDRATION_BUDGET_TOKENS: usize = 700;
+
+fn estimate_hydration_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
+}
+
+fn format_memory_lines(entries: &[String]) -> String {
+    entries
+        .iter()
+        .map(|entry| format!("- {entry}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate_entry_to_budget(entry: &str, budget_tokens: usize) -> String {
+    if estimate_hydration_tokens(&format!("- {entry}")) <= budget_tokens {
+        return entry.to_string();
+    }
+
+    let chars: Vec<char> = entry.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let truncated: String = chars.iter().take(mid).copied().collect();
+        let candidate = if mid >= chars.len() {
+            truncated
+        } else {
+            format!("{truncated}…")
+        };
+        if estimate_hydration_tokens(&format!("- {candidate}")) <= budget_tokens {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    if lo == 0 {
+        return String::new();
+    }
+
+    if lo >= chars.len() {
+        entry.to_string()
+    } else {
+        format!("{}…", chars.iter().take(lo).copied().collect::<String>())
+    }
+}
+
+fn apply_hydration_budget(entries: Vec<String>) -> String {
+    if entries.is_empty() {
+        return "(no household context yet)".to_string();
+    }
+
+    let total_candidates = entries.len();
+    let mut selected = Vec::new();
+    let first_entry = entries.first().cloned();
+
+    for entry in entries {
+        let mut trial = selected.clone();
+        trial.push(entry);
+        if estimate_hydration_tokens(&format_memory_lines(&trial)) <= MEMORY_HYDRATION_BUDGET_TOKENS
+        {
+            selected = trial;
+        } else {
+            break;
+        }
+    }
+
+    let mut truncated_content = false;
+    if selected.is_empty()
+        && let Some(first) = first_entry
+    {
+        let truncated = truncate_entry_to_budget(&first, MEMORY_HYDRATION_BUDGET_TOKENS);
+        if !truncated.is_empty() {
+            selected.push(truncated);
+            truncated_content = true;
+        }
+    }
+
+    let dropped_entries = total_candidates.saturating_sub(selected.len());
+    let output = format_memory_lines(&selected);
+
+    if dropped_entries > 0 || truncated_content {
+        tracing::warn!(
+            estimated_tokens = estimate_hydration_tokens(&output),
+            budget_tokens = MEMORY_HYDRATION_BUDGET_TOKENS,
+            dropped_entries,
+            kept_entries = selected.len(),
+            "memory hydration truncated to fit Jetson token budget"
+        );
+    }
+
+    output
+}
+
 /// Build the memory section to append to the system prompt for a given query.
 ///
 /// Strategy:
@@ -82,15 +178,7 @@ pub fn build_memory_context_with_read_context(
         }
     }
 
-    if entries.is_empty() {
-        return "(no household context yet)".to_string();
-    }
-
-    entries
-        .iter()
-        .map(|e| format!("- {}", e))
-        .collect::<Vec<_>>()
-        .join("\n")
+    apply_hydration_budget(entries)
 }
 
 fn may_inject_entry(entry: &super::MemoryEntry, read_context: policy::MemoryReadContext) -> bool {
@@ -188,6 +276,50 @@ mod tests {
             },
         );
         assert!(identified.contains("Maya likes oat milk"));
+    }
+
+    #[test]
+    fn hydration_respects_700_token_budget() {
+        let mem = temp_memory();
+        let long = "household detail sentence. ".repeat(22);
+        for i in 0..5 {
+            mem.store("identity", &format!("{long} #{i}")).unwrap();
+        }
+
+        let ctx = build_memory_context(&mem, "turn on the kitchen lights");
+        let tokens = estimate_hydration_tokens(&ctx);
+
+        assert!(
+            tokens <= MEMORY_HYDRATION_BUDGET_TOKENS,
+            "tokens={tokens}: {ctx}"
+        );
+        assert!(
+            ctx.contains("[identity]"),
+            "at least one identity entry should be kept: {ctx}"
+        );
+    }
+
+    #[test]
+    fn hydration_drops_lower_priority_entries_before_preferences() {
+        let mem = temp_memory();
+        let long = "household detail sentence. ".repeat(18);
+        for i in 0..5 {
+            mem.store("identity", &format!("{long} identity {i}"))
+                .unwrap();
+        }
+        for i in 0..3 {
+            mem.store("relationship", &format!("{long} relationship {i}"))
+                .unwrap();
+        }
+        mem.store("preference", &format!("{long} jazz preference"))
+            .unwrap();
+
+        let ctx = build_memory_context(&mem, "hello");
+        assert!(estimate_hydration_tokens(&ctx) <= MEMORY_HYDRATION_BUDGET_TOKENS);
+        assert!(
+            ctx.contains("[identity]"),
+            "identity entries should win over preferences: {ctx}"
+        );
     }
 
     #[test]

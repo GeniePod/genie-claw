@@ -18,12 +18,13 @@ Status labels:
 | --- | --- | --- | --- |
 | Rust workspace split | Implemented | `crates/genie-core`, `genie-api`, `genie-common`, `genie-governor`, `genie-health`, `genie-ctl`, `genie-skill-sdk` | Current repo is the GenieClaw agent/runtime workspace. |
 | Chat HTTP server | Implemented | `crates/genie-core/src/server.rs` | Includes local chat UI, `/api/chat`, `/api/chat/stream`, conversation history/export, `/api/health`, `/api/runtime/contract`, and OpenAI-compatible `/v1/chat/completions`. |
-| Operator CLI | Implemented | `crates/genie-ctl/src/main.rs` | Supports status, chat, search, tools, skills, speaker profiles, connectivity, health, conversations, diagnostics, support bundles, and version. |
+| Operator CLI | Implemented | `crates/genie-ctl/src/main.rs` | Supports status, chat, search, tools, BFCL tool-call scoring, skills, speaker profiles, connectivity, health, conversations, diagnostics, support bundles, and version. |
 | Dashboard/status service | Implemented | `crates/genie-api/src/routes.rs` | Lightweight local dashboard/status API, not the final product app. |
 | Conversation persistence | Implemented | `crates/genie-core/src/conversation.rs` | SQLite conversation store with recent history and export flow. |
 | Household memory | Implemented | `crates/genie-core/src/memory/*` | SQLite + FTS memory, local semantic recall, typed indexes for profiles, profile attributes such as shoe sizes, device aliases, rules, notes, media profiles, calendar events including lessons/medical/vet appointments, shopping-list items, pantry inventory, access permissions, chore/task logs including hygiene and pet-care checks, household schedules including school transport/sunset/community/business/channel-guide/subscription/TV/community-meeting hours, appliance/environment/location/presence/waste/access/finance/market/fitness/health/security/payment event logs, delivery/package, laundry, device-audit, device-health, school-task, guest-mode, safety-route, room-comfort, project-note, electrical-panel, trash-day, pest-history, homework-connectivity, plant-care, alarm-failure, gate-away, guest-device, end-of-day-summary, after-dinner cleanup, school/project form, filter, camera/privacy, guest-network, air-quality, garage-change, and final-safety-sweep recall, app-only sensitive references, contextual comfort/routine/safety/report semantic recall, extraction, recall, injection, decay, policy metadata, canonical markdown artifacts, namespace projection, dashboard edit/delete/reorder endpoints. |
 | Prompt and reasoning policy | Implemented | `crates/genie-core/src/prompt.rs`, `crates/genie-core/src/reasoning.rs` | Model-family prompt selection and no-think/think-mode application by interaction kind. |
 | Built-in tool dispatcher | Implemented | `crates/genie-core/src/tools/*` | Time, calculator, weather, system info, timers, memory tools, media hook, optional home tools, optional web search, quick router, policy checks, and audit logging. |
+| Tool-call evaluation | Implemented | `crates/genie-core/src/eval/bfcl.rs`, `crates/genie-ctl/src/main.rs`, `crates/genie-ctl/src/bfcl_import.rs`, `tests/bfcl/*` | BFCL-style JSONL scoring for parsed tool names and JSON arguments, plus local Home Assistant Intents import, deterministic quick-router prediction generation, local-LLM prediction generation, and one-step local-LLM scoring. It is side-effect free and does not execute tools or require a live home backend. Current 2026-05-29 HA English quick-router baseline: 208 cases, 0 missing predictions, 5.77% strict accuracy. |
 | Web search tool | Implemented | `crates/genie-core/src/tools/web_search.rs` | No-key DuckDuckGo provider and optional SearXNG provider with cache and sensitive-query blocking. It is a lightweight search tool, not a full browser/research crawler. |
 | Home action safety in agent layer | Implemented | `crates/genie-core/src/tools/actuation.rs`, `crates/genie-core/src/ha/policy.rs` | Origin allowlist, target confidence thresholds, sensitive-action confirmation tokens, rate limits, action ledger, bounded undo, and append-only audit log. |
 | Runtime contract | Implemented | `crates/genie-core/src/runtime_contract.rs`, `crates/genie-core/src/server.rs` | Prompt/tool/policy/hydration fingerprints, optional drift detection, and boot contract log. |
@@ -67,7 +68,7 @@ Status labels:
 
 ## Current Alpha Truth
 
-The workspace version is currently `1.0.0-alpha.9`.
+The workspace version is currently `1.0.0-alpha.10`.
 
 The current alpha line defaults Jetson deployments to `genie-ai-runtime`,
 preserves the 4096-token agent harness, and treats optional remote/API providers

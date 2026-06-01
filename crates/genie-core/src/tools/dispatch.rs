@@ -4,15 +4,13 @@ use genie_common::config::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::actuation::{
-    ActionLedger, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager, PendingConfirmation,
-    RecordedAction, RequestOrigin, now_ms,
+    ActionLedger, AuditError, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager,
+    PendingConfirmation, RecordedAction, RequestOrigin, append_json_line, now_ms,
 };
 use super::home;
 use super::timer;
@@ -20,6 +18,50 @@ use crate::ha::HomeAutomationProvider;
 use crate::skills::SkillLoader;
 
 const ACTUATION_RATE_WINDOW_MS: u64 = 60_000;
+
+const HOME_CONTROL_ACTIONS: &[&str] = &[
+    "turn_on",
+    "turn_off",
+    "toggle",
+    "set_brightness",
+    "set_temperature",
+    "open",
+    "close",
+    "lock",
+    "unlock",
+    "activate",
+];
+
+fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Option<f64>)> {
+    let entity = args
+        .get("entity")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("home_control requires non-empty string argument 'entity'")
+        })?;
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("home_control requires string argument 'action'"))?;
+    if !HOME_CONTROL_ACTIONS.contains(&action) {
+        anyhow::bail!(
+            "home_control action '{}' is invalid; expected one of: {}",
+            action,
+            HOME_CONTROL_ACTIONS.join(", ")
+        );
+    }
+    Ok((entity, action, args.get("value").and_then(|v| v.as_f64())))
+}
+
+fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
+    args.get("entity")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("home_status requires non-empty string argument 'entity'"))
+}
 
 /// Tool definition for LLM function calling.
 ///
@@ -80,7 +122,7 @@ pub struct ToolExecutionContext {
 
 /// LLM-generated tool call (parsed from model output).
 /// Accepts both `{"tool": "..."}` and `{"name": "..."}` formats.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     #[serde(alias = "tool")]
     pub name: String,
@@ -135,21 +177,22 @@ impl ToolAuditLogger {
         }
     }
 
-    fn append(&self, event: ToolAuditEvent) {
+    fn append(&self, event: ToolAuditEvent) -> Result<(), AuditError> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
         let _guard = self.lock.lock().expect("tool audit logger lock");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        append_json_line(path, &event)
+    }
+
+    fn append_or_log(&self, event: ToolAuditEvent) {
+        if let Err(err) = self.append(event) {
+            tracing::error!(
+                path = ?self.path,
+                error = %err,
+                "tool audit event dropped due to IO failure"
+            );
         }
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-            return;
-        };
-        let Ok(line) = serde_json::to_string(&event) else {
-            return;
-        };
-        let _ = writeln!(file, "{line}");
     }
 
     fn path(&self) -> Option<&std::path::Path> {
@@ -557,7 +600,7 @@ impl ToolDispatcher {
             "memory_status" => self.exec_memory_status(),
             "memory_forget" => self.exec_memory_forget(&call.arguments),
             "memory_store" => self.exec_memory_store(&call.arguments),
-            other => self.exec_skill(other, &call.arguments),
+            other => self.exec_skill(other, &call.arguments).await,
         };
 
         let tool_result = match result {
@@ -587,7 +630,7 @@ impl ToolDispatcher {
         started: Instant,
         result: &ToolResult,
     ) {
-        self.tool_audit_logger.append(ToolAuditEvent {
+        self.tool_audit_logger.append_or_log(ToolAuditEvent {
             ts_ms: now_ms(),
             tool: call.name.clone(),
             action_class: result.action_class,
@@ -617,19 +660,14 @@ impl ToolDispatcher {
             .ha
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let (entity_name, action, value) = parse_home_control_args(args)?;
         let resolved_entity = self.resolve_device_alias(entity_name);
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("toggle");
-        let value = args.get("value").and_then(|v| v.as_f64());
         if !actuation_origin_allowed(&self.actuation_safety, exec_ctx.request_origin) {
             let reason = format!(
                 "actuation from '{}' is not allowed by channel policy",
                 exec_ctx.request_origin.as_policy_key()
             );
-            self.audit_logger.append(AuditEvent {
+            self.audit_logger.append_or_log(AuditEvent {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedPolicy,
                 origin: exec_ctx.request_origin,
@@ -654,7 +692,7 @@ impl ToolDispatcher {
                 .check_and_record(&self.actuation_safety, exec_ctx.request_origin)
         {
             let reason = err.to_string();
-            self.audit_logger.append(AuditEvent {
+            self.audit_logger.append_or_log(AuditEvent {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedRuntime,
                 origin: exec_ctx.request_origin,
@@ -701,7 +739,7 @@ impl ToolDispatcher {
                         confidence,
                     )
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::Executed,
                     origin: exec_ctx.request_origin,
@@ -717,14 +755,18 @@ impl ToolDispatcher {
                 Ok(output)
             }
             Ok(home::ControlOutcome::ConfirmationRequired { reason, .. }) => {
-                let pending = self.confirmations.issue(
+                let Some(pending) = self.confirmations.issue(
                     &resolved_entity,
                     action,
                     value,
                     &reason,
                     exec_ctx.request_origin,
-                );
-                self.audit_logger.append(AuditEvent {
+                ) else {
+                    return Ok(
+                        "Too many pending home confirmations; confirm or wait for existing ones to expire before requesting another.".into(),
+                    );
+                };
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::ConfirmationIssued,
                     origin: exec_ctx.request_origin,
@@ -757,7 +799,7 @@ impl ToolDispatcher {
                 } else {
                     AuditStatus::Failed
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status,
                     origin: exec_ctx.request_origin,
@@ -877,7 +919,7 @@ impl ToolDispatcher {
             .ha
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let entity_name = parse_home_status_args(args)?;
         let entity_name = self.resolve_device_alias(entity_name);
 
         home::status(ha.as_ref(), &entity_name).await
@@ -904,7 +946,9 @@ impl ToolDispatcher {
             .get("label")
             .and_then(|v| v.as_str())
             .unwrap_or("timer");
-        self.timers.set(seconds, label);
+        self.timers
+            .set(seconds, label)
+            .map_err(|e| anyhow::anyhow!(e))?;
         Ok(format!("Timer set for {} seconds: {}", seconds, label))
     }
 
@@ -1151,32 +1195,56 @@ impl ToolDispatcher {
         )
     }
 
-    fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
+    async fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
         let skills = self
             .skills
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
-        let mut loader = skills
-            .lock()
-            .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
 
         let args_json = serde_json::to_string(args)?;
-        let (success, output) = {
+
+        // Build a Send invocation handle under a short lock, then drop the lock
+        // BEFORE awaiting the (possibly blocking) C call. The invocation owns an
+        // Arc to the skill's library, so the native code stays mapped for the
+        // whole call even though the loader lock is released. Holding a
+        // std::sync::Mutex guard across the await would both serialize every
+        // other skill access and trip clippy's `await_holding_lock`.
+        let invocation = {
+            let loader = skills
+                .lock()
+                .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
             let skill = loader
-                .get_mut(name)
+                .loaded()
+                .iter()
+                .find(|s| s.name == name)
                 .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
-            skill.execute_parsed(&args_json)
+            skill.prepare(&args_json)
         };
 
-        let pruned = loader.prune_faulted();
-        if pruned.iter().any(|skill_name| skill_name == name) {
-            tracing::warn!(skill = name, "skill auto-unloaded after repeated faults");
+        let outcome = invocation.run().await;
+
+        // Re-acquire the lock to record the fault and reap a skill that has
+        // exceeded its fault budget. The skill may have been unloaded meanwhile;
+        // that is fine — the Arc kept its library alive for the call above.
+        {
+            let mut loader = skills
+                .lock()
+                .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
+            if outcome.faulted
+                && let Some(skill) = loader.get_mut(name)
+            {
+                skill.fault_count += 1;
+            }
+            let pruned = loader.prune_faulted();
+            if pruned.iter().any(|skill_name| skill_name == name) {
+                tracing::warn!(skill = name, "skill auto-unloaded after repeated faults");
+            }
         }
 
-        if success {
-            Ok(output)
+        if outcome.success {
+            Ok(outcome.output)
         } else {
-            Err(anyhow::anyhow!("{}", output))
+            Err(anyhow::anyhow!("{}", outcome.output))
         }
     }
 
@@ -2064,6 +2132,50 @@ mod tests {
         assert!(!line.contains("secret-token-value"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tool_audit_logger_disabled_appends_ok() {
+        let logger = ToolAuditLogger::default();
+        let event = ToolAuditEvent {
+            ts_ms: now_ms(),
+            tool: "calculate".into(),
+            action_class: ToolActionClass::ReadOnly,
+            origin: RequestOrigin::Api,
+            success: true,
+            duration_ms: 1,
+            argument_keys: vec!["expression".into()],
+            output_chars: 3,
+        };
+        assert!(logger.append(event).is_ok());
+    }
+
+    #[test]
+    fn tool_audit_logger_surfaces_blocked_parent_error() {
+        let blocker = std::env::temp_dir().join(format!(
+            "geniepod-tool-audit-blocker-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let logger = ToolAuditLogger::new(blocker.join("tool-audit.jsonl"));
+
+        let event = ToolAuditEvent {
+            ts_ms: now_ms(),
+            tool: "calculate".into(),
+            action_class: ToolActionClass::ReadOnly,
+            origin: RequestOrigin::Api,
+            success: true,
+            duration_ms: 1,
+            argument_keys: vec!["expression".into()],
+            output_chars: 3,
+        };
+        let err = logger.append(event).expect_err("append must fail");
+        assert!(matches!(
+            err,
+            AuditError::CreateDir(_) | AuditError::Open(_)
+        ));
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[tokio::test]

@@ -137,6 +137,17 @@ async fn main() -> Result<()> {
         "system prompt assembled"
     );
 
+    let boot_harness = memory::with_shared_memory(&memory, |mem| {
+        agent_harness::validate_boot_harness(
+            &system_prompt,
+            &tool_dispatcher.tool_defs(),
+            mem,
+            &config.agent,
+            &config.optional_ai_provider,
+        )
+    });
+    agent_harness::log_harness_report(&boot_harness);
+
     // Check if stdin is a terminal (REPL mode) or pipe/systemd (server-only).
     let interactive = atty_check();
 
@@ -316,6 +327,7 @@ async fn main() -> Result<()> {
             config.core.max_history_turns,
             model_family,
             config.core.expected_runtime_contract_hash.clone(),
+            boot_harness,
         )?
         .with_http_config(config.http.clone())
         .with_origin_auth(origin_resolver);
@@ -370,7 +382,7 @@ async fn main() -> Result<()> {
                         piper_model: config.core.piper_model.clone(),
                         max_parallel_voice: config.telegram.voice.max_parallel_voice,
                     },
-                    origin_token: telegram_origin_token,
+                    origin_token: telegram_origin_token.map(zeroize::Zeroizing::new),
                 };
 
                 tracing::info!(

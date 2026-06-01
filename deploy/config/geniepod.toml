@@ -168,6 +168,11 @@ wakeword_script = ""              # Empty = push-to-talk.
 #                             # not enough. Fails closed with no trusted keys.
 # signature_key_dir = "/etc/geniepod/skill-keys"  # holds <key_id>.pub keys
 # denied_permissions = ["network.raw", "filesystem.write"]
+# skill_execution_timeout_ms = 30000   # deadline for one native skill call.
+#                             # The C ABI call runs on a blocking thread; if it
+#                             # overruns this budget the call is abandoned and a
+#                             # timeout fault is returned, so a hung skill can't
+#                             # freeze the async executor (health, voice, etc.).
 
 # Optional per-origin tool policy. Defaults are allow unless a rule exists.
 # Use "*" as a wildcard origin or tool name. Deny rules override allow rules.

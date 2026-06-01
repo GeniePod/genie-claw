@@ -2,8 +2,8 @@
 
 ## Purpose
 
-GenieClaw is the limited-context local agent layer for GeniePod Home and the
-broader Genie ecosystem.
+GenieClaw is the limited-context local agent layer native to NVIDIA Jetson Orin
+8GB and the broader Genie ecosystem.
 
 The repo is optimized around a narrow goal:
 
