@@ -425,8 +425,9 @@ mod tests {
         let mut findings = Vec::new();
         check_skills_dir_permissions(&path, &mut findings);
         assert!(
-            findings.iter().any(|f| f.id == "fs.skills_dir.group_writable"
-                && f.severity == Severity::Warning),
+            findings
+                .iter()
+                .any(|f| f.id == "fs.skills_dir.group_writable" && f.severity == Severity::Warning),
             "group-writable skills dir must be a Warning finding"
         );
 
@@ -438,10 +439,8 @@ mod tests {
     fn audit_safe_skills_dir_has_no_permission_findings() {
         use std::os::unix::fs::PermissionsExt;
 
-        let path = std::env::temp_dir().join(format!(
-            "geniepod-audit-skills-safe-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("geniepod-audit-skills-safe-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();

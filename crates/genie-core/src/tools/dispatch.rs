@@ -653,8 +653,8 @@ impl ToolDispatcher {
                     .iter()
                     .find(|s| s.name == call.name)
                     .map(|s| {
-                        let key_id = (!s.manifest.key_id.is_empty())
-                            .then(|| s.manifest.key_id.clone());
+                        let key_id =
+                            (!s.manifest.key_id.is_empty()).then(|| s.manifest.key_id.clone());
                         (Some(s.manifest.signed), key_id)
                     })
             })
