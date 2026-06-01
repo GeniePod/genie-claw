@@ -92,6 +92,7 @@ pub struct ChatServer {
     max_history: usize,
     model_family: ModelFamily,
     expected_runtime_contract_hash: String,
+    boot_harness: crate::agent_harness::LimitedContextHarnessReport,
     /// Inbound HTTP-server hardening (read caps, timeout, connection ceiling).
     http_config: HttpServerConfig,
     /// Trusted resolution of the request origin from the (forgeable) header,
@@ -117,6 +118,7 @@ impl ChatServer {
         max_history: usize,
         model_family: ModelFamily,
         expected_runtime_contract_hash: String,
+        boot_harness: crate::agent_harness::LimitedContextHarnessReport,
     ) -> Result<Self> {
         // Create initial conversation.
         let conv_id = conversations.create()?;
@@ -135,6 +137,7 @@ impl ChatServer {
             max_history,
             model_family,
             expected_runtime_contract_hash,
+            boot_harness,
             http_config: HttpServerConfig::default(),
             origin_resolver: OriginResolver::default(),
         })
@@ -714,6 +717,7 @@ async fn handle_request(
                 model_family,
                 expected_runtime_contract_hash,
                 chat_gate,
+                &ctx.boot_harness,
             )
             .await
         }
@@ -1500,6 +1504,7 @@ async fn handle_health(
     model_family: ModelFamily,
     expected_runtime_contract_hash: &str,
     chat_gate: &ChatTurnGate,
+    boot_harness: &crate::agent_harness::LimitedContextHarnessReport,
 ) -> (u16, &'static str, String) {
     let llm_ok = llm.health().await;
     let connectivity_health = connectivity.health().await;
@@ -1523,7 +1528,12 @@ async fn handle_health(
     let runtime_contract =
         runtime_contract_summary_json(&runtime_contract, expected_runtime_contract_hash);
 
-    let status = overall_health_status(llm_ok, connectivity_health.state, chat.wedged);
+    let status = overall_health_status(
+        llm_ok,
+        connectivity_health.state,
+        chat.wedged,
+        boot_harness.pass,
+    );
 
     let resp = serde_json::json!({
         "status": status,
@@ -1547,6 +1557,7 @@ async fn handle_health(
         "chat": chat,
         "web_search": tools.web_search_status(),
         "system_prompt_sha": system_prompt_sha,
+        "agent_harness": boot_harness,
         "runtime_contract": runtime_contract,
         "version": env!("CARGO_PKG_VERSION"),
     });
@@ -1558,9 +1569,11 @@ fn overall_health_status(
     llm_ok: bool,
     connectivity_state: ConnectivityState,
     chat_wedged: bool,
+    harness_pass: bool,
 ) -> &'static str {
     if llm_ok
         && !chat_wedged
+        && harness_pass
         && matches!(
             connectivity_state,
             ConnectivityState::Disabled | ConnectivityState::Ready
@@ -2447,6 +2460,19 @@ mod tests {
         Arc::new(StdMutex::new(Memory::open(path).unwrap()))
     }
 
+    fn sample_boot_harness(
+        system_prompt: &str,
+    ) -> crate::agent_harness::LimitedContextHarnessReport {
+        use genie_common::config::{AgentConfig, OptionalAiProviderConfig};
+        crate::agent_harness::validate_limited_context_agent(
+            system_prompt,
+            &[],
+            "",
+            &AgentConfig::default(),
+            &OptionalAiProviderConfig::default(),
+        )
+    }
+
     use tokio::sync::Mutex;
     use tracing::subscriber::with_default;
     use tracing::{Event, Subscriber};
@@ -2624,7 +2650,7 @@ mod tests {
     #[test]
     fn overall_health_is_ok_when_llm_is_up_and_connectivity_is_disabled() {
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Disabled, false),
+            overall_health_status(true, ConnectivityState::Disabled, false, true),
             "ok"
         );
     }
@@ -2632,7 +2658,7 @@ mod tests {
     #[test]
     fn overall_health_is_ok_when_llm_is_up_and_connectivity_is_ready() {
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Ready, false),
+            overall_health_status(true, ConnectivityState::Ready, false, true),
             "ok"
         );
     }
@@ -2640,7 +2666,7 @@ mod tests {
     #[test]
     fn overall_health_is_degraded_when_connectivity_is_offline() {
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Offline, false),
+            overall_health_status(true, ConnectivityState::Offline, false, true),
             "degraded"
         );
     }
@@ -2650,7 +2676,15 @@ mod tests {
         // Even with the LLM reachable and connectivity ready, a stuck chat turn
         // must surface as degraded so monitoring can't stay green (issue #181).
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Ready, true),
+            overall_health_status(true, ConnectivityState::Ready, true, true),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn overall_health_is_degraded_when_agent_harness_fails() {
+        assert_eq!(
+            overall_health_status(true, ConnectivityState::Ready, false, false),
             "degraded"
         );
     }
@@ -2679,6 +2713,7 @@ mod tests {
 
         let prompt_sha = crate::prompt_sha::sha256_hex("system prompt");
         let gate = super::ChatTurnGate::new();
+        let boot_harness = sample_boot_harness("system prompt");
         let (status, _, body) = handle_health(
             &llm,
             &tools,
@@ -2691,6 +2726,7 @@ mod tests {
             ModelFamily::Phi,
             "",
             &gate,
+            &boot_harness,
         )
         .await;
 
@@ -2699,6 +2735,7 @@ mod tests {
         assert_eq!(parsed["llm"], "offline");
         assert_eq!(parsed["llm_backend"], "genie-ai-runtime");
         assert_eq!(parsed["system_prompt_sha"], prompt_sha);
+        assert_eq!(parsed["agent_harness"]["pass"], true);
         assert_eq!(parsed["system_prompt_sha"].as_str().unwrap().len(), 64);
         // Liveness block is present; no turns have run yet on a fresh gate.
         assert_eq!(parsed["chat"]["in_flight"], false);
@@ -3063,7 +3100,7 @@ mod tests {
         let snap = gate.snapshot();
         assert!(!snap.wedged);
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Ready, snap.wedged),
+            overall_health_status(true, ConnectivityState::Ready, snap.wedged, true),
             "ok",
             "healthy before any turn"
         );
@@ -3075,7 +3112,7 @@ mod tests {
             assert!(snap.in_flight, "stuck turn is in flight");
             assert!(snap.wedged, "a turn held past wedge_after reports wedged");
             assert_eq!(
-                overall_health_status(true, ConnectivityState::Ready, snap.wedged),
+                overall_health_status(true, ConnectivityState::Ready, snap.wedged, true),
                 "degraded",
                 "a wedged chat turn must surface as degraded even with the LLM reachable"
             );
@@ -3096,7 +3133,7 @@ mod tests {
         );
         assert_eq!(snap.completed_turns, 1);
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Ready, snap.wedged),
+            overall_health_status(true, ConnectivityState::Ready, snap.wedged, true),
             "ok",
             "overall health recovers to ok once the wedged turn completes"
         );
@@ -3164,6 +3201,7 @@ mod tests {
             10,
             ModelFamily::Phi,
             "".into(),
+            sample_boot_harness(system_prompt),
         )
         .unwrap();
 
@@ -3275,6 +3313,7 @@ mod tests {
             10,
             ModelFamily::Phi,
             "".into(),
+            sample_boot_harness(system_prompt),
         )
         .unwrap()
         .with_http_config(http)

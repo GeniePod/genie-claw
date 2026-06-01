@@ -247,7 +247,7 @@ fn extract_host(url: &str) -> String {
 
 /// True when `host` is a literal loopback target (not a hostname that merely
 /// starts with a loopback-looking prefix).
-pub(crate) fn is_loopback_host(host: &str) -> bool {
+fn is_loopback_host(host: &str) -> bool {
     let host = host.trim();
     if host.is_empty() {
         return false;

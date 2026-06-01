@@ -83,6 +83,99 @@ fn apply_agc(samples: &mut [f32]) {
     }
 }
 
+/// Second-order IIR (biquad) section in transposed direct-form II.
+///
+/// Coefficients follow the Audio EQ Cookbook (RBJ). A biquad has a true
+/// 12 dB/octave slope, so a shelf/peak built from one does not leak into
+/// neighbouring bands the way a 1-pole (6 dB/octave) filter does — which is
+/// exactly what the previous EQ got wrong: a 1-pole "presence" low-pass spilled
+/// well past 4 kHz and overwhelmed the high cut, turning it into a high *boost*.
+#[derive(Clone, Copy)]
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
+}
+
+impl Biquad {
+    /// Build from un-normalized cookbook coefficients (a0 normalizes the rest).
+    fn new(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    /// Low-shelf: `gain_db` applied below `freq`, flat (0 dB) above.
+    fn low_shelf(sr: f32, freq: f32, gain_db: f32, q: f32) -> Self {
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let w = 2.0 * std::f32::consts::PI * freq / sr;
+        let (sin_w, cos_w) = (w.sin(), w.cos());
+        let alpha = sin_w / (2.0 * q);
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        Self::new(
+            a * ((a + 1.0) - (a - 1.0) * cos_w + two_sqrt_a_alpha),
+            2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w),
+            a * ((a + 1.0) - (a - 1.0) * cos_w - two_sqrt_a_alpha),
+            (a + 1.0) + (a - 1.0) * cos_w + two_sqrt_a_alpha,
+            -2.0 * ((a - 1.0) + (a + 1.0) * cos_w),
+            (a + 1.0) + (a - 1.0) * cos_w - two_sqrt_a_alpha,
+        )
+    }
+
+    /// Peaking EQ: `gain_db` bump centered at `freq`, flat far from it.
+    fn peaking(sr: f32, freq: f32, gain_db: f32, q: f32) -> Self {
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let w = 2.0 * std::f32::consts::PI * freq / sr;
+        let (sin_w, cos_w) = (w.sin(), w.cos());
+        let alpha = sin_w / (2.0 * q);
+        Self::new(
+            1.0 + alpha * a,
+            -2.0 * cos_w,
+            1.0 - alpha * a,
+            1.0 + alpha / a,
+            -2.0 * cos_w,
+            1.0 - alpha / a,
+        )
+    }
+
+    /// High-shelf: `gain_db` applied above `freq`, flat (0 dB) below.
+    /// With a negative `gain_db` this is the high cut.
+    fn high_shelf(sr: f32, freq: f32, gain_db: f32, q: f32) -> Self {
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let w = 2.0 * std::f32::consts::PI * freq / sr;
+        let (sin_w, cos_w) = (w.sin(), w.cos());
+        let alpha = sin_w / (2.0 * q);
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        Self::new(
+            a * ((a + 1.0) + (a - 1.0) * cos_w + two_sqrt_a_alpha),
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w),
+            a * ((a + 1.0) + (a - 1.0) * cos_w - two_sqrt_a_alpha),
+            (a + 1.0) - (a - 1.0) * cos_w + two_sqrt_a_alpha,
+            2.0 * ((a - 1.0) - (a + 1.0) * cos_w),
+            (a + 1.0) - (a - 1.0) * cos_w - two_sqrt_a_alpha,
+        )
+    }
+
+    /// Process one sample, advancing the filter state.
+    #[inline]
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
+}
+
 /// Simple 3-band EQ for voice clarity.
 ///
 /// Voice-optimized curve:
@@ -90,7 +183,9 @@ fn apply_agc(samples: &mut [f32]) {
 /// - Presence peak (+4 dB at 2-4 kHz): speech clarity and intelligibility
 /// - High cut (-3 dB above 6 kHz): reduce hiss and sibilance
 ///
-/// Implemented as simple 1-pole IIR filters (minimal CPU, good enough for TTS).
+/// Implemented as a cascade of RBJ biquad sections. Each band has a true
+/// 12 dB/octave slope, so the presence peak stays inside 2-4 kHz instead of
+/// leaking into the high band and fighting the cut.
 fn apply_voice_eq(samples: &mut [f32], sample_rate: u32) {
     if samples.len() < 2 {
         return;
@@ -98,49 +193,21 @@ fn apply_voice_eq(samples: &mut [f32], sample_rate: u32) {
 
     let sr = sample_rate as f32;
 
-    // Bass shelf: boost low frequencies (+2 dB ≈ 1.26x).
-    // 1-pole low-pass at 200 Hz, mix back with gain.
-    let bass_alpha = 1.0 - (-2.0 * std::f32::consts::PI * 200.0 / sr).exp();
-    let bass_gain = 1.26; // +2 dB
-    let mut bass_lp = 0.0f32;
+    // The presence center and high-cut corner must stay below Nyquist; at very
+    // low sample rates clamp them so the cookbook math stays well-conditioned.
+    let nyquist = sr / 2.0;
+    let presence_hz = 3000.0f32.min(nyquist * 0.45);
+    let hicut_hz = 6000.0f32.min(nyquist * 0.85);
 
-    // Presence boost: bandpass around 3 kHz (+4 dB ≈ 1.58x).
-    // Simple approach: high-pass at 2kHz + low-pass at 4kHz → extract band → add back.
-    let pres_hp_alpha = 1.0 - (-2.0 * std::f32::consts::PI * 2000.0 / sr).exp();
-    let pres_lp_alpha = 1.0 - (-2.0 * std::f32::consts::PI * 4000.0 / sr).exp();
-    let pres_gain = 1.58; // +4 dB
-    let mut pres_hp = 0.0f32;
-    let mut pres_lp = 0.0f32;
-    let mut pres_prev = 0.0f32;
-
-    // High cut: low-pass at 6 kHz to reduce hiss.
-    let hicut_alpha = 1.0 - (-2.0 * std::f32::consts::PI * 6000.0 / sr).exp();
-    let hicut_gain = 0.71; // -3 dB on high content
-    let mut hicut_lp = 0.0f32;
+    let mut bass = Biquad::low_shelf(sr, 200.0, 2.0, 0.707);
+    let mut presence = Biquad::peaking(sr, presence_hz, 4.0, 1.0);
+    let mut hicut = Biquad::high_shelf(sr, hicut_hz, -3.0, 0.707);
 
     for sample in samples.iter_mut() {
-        let dry = *sample;
-
-        // Bass shelf: extract low frequencies, boost, mix back.
-        bass_lp += bass_alpha * (dry - bass_lp);
-        let bass_boost = bass_lp * (bass_gain - 1.0);
-
-        // Presence: extract 2-4 kHz band, boost, mix back.
-        pres_hp += pres_hp_alpha * (dry - pres_hp);
-        let hp_out = dry - pres_hp; // high-pass at 2 kHz
-        pres_lp += pres_lp_alpha * (hp_out - pres_lp);
-        let band = pres_lp; // bandpass 2-4 kHz
-        let pres_boost = band * (pres_gain - 1.0);
-
-        // High cut: low-pass, mix difference back (attenuate highs).
-        hicut_lp += hicut_alpha * (dry - hicut_lp);
-        let high_content = dry - hicut_lp;
-        let hicut_reduction = high_content * (hicut_gain - 1.0);
-
-        // Sum: original + bass boost + presence boost + high cut.
-        *sample = dry + bass_boost + pres_boost + hicut_reduction;
-
-        pres_prev = dry;
+        let mut s = bass.process(*sample);
+        s = presence.process(s);
+        s = hicut.process(s);
+        *sample = s;
     }
 }
 
@@ -234,5 +301,93 @@ mod tests {
     fn rms_of(samples: &[f32]) -> f32 {
         let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
         (sum_sq / samples.len() as f64).sqrt() as f32
+    }
+
+    /// Measure the steady-state gain `apply_voice_eq` applies at `freq_hz`.
+    ///
+    /// Drives a pure sine of known amplitude through the EQ and returns the
+    /// ratio of output peak to input peak, measured over the back half of the
+    /// buffer so the biquad transients have settled.
+    fn eq_gain_at(freq_hz: f32, sample_rate: u32) -> f32 {
+        let sr = sample_rate as f32;
+        let amplitude = 8000.0f32;
+        let n = 8192usize;
+        let mut samples: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * freq_hz * i as f32 / sr).sin() * amplitude)
+            .collect();
+
+        apply_voice_eq(&mut samples, sample_rate);
+
+        // Ignore the settling region; measure peak over the steady state.
+        let settled = &samples[n / 2..];
+        let out_peak = settled.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        out_peak / amplitude
+    }
+
+    #[test]
+    fn voice_eq_cuts_high_frequencies() {
+        // Regression: the "high cut" must ATTENUATE the hiss/sibilance band,
+        // not boost it. The old 1-pole implementation boosted 6-10 kHz by
+        // ~+1.6 dB; the biquad high shelf should pull it below unity.
+        for &f in &[7000.0, 8000.0, 9000.0, 10000.0] {
+            let gain = eq_gain_at(f, 22050);
+            assert!(
+                gain < 1.0,
+                "high cut should attenuate {f} Hz (gain {gain:.3} should be < 1.0)"
+            );
+        }
+        // Approach the documented ~-3 dB (≈0.71x) well above the corner.
+        let high = eq_gain_at(9000.0, 22050);
+        assert!(
+            (0.60..0.85).contains(&high),
+            "9 kHz gain {high:.3} should sit near the documented -3 dB"
+        );
+    }
+
+    #[test]
+    fn voice_eq_boosts_presence_band() {
+        // Presence peak (+4 dB ≈ 1.58x) around 3 kHz for speech intelligibility.
+        let gain = eq_gain_at(3000.0, 22050);
+        assert!(
+            (1.3..1.8).contains(&gain),
+            "presence band gain {gain:.3} should be a clear boost (~+4 dB)"
+        );
+    }
+
+    #[test]
+    fn voice_eq_boosts_bass() {
+        // Bass shelf (+2 dB ≈ 1.26x) below 200 Hz to warm thin speakers.
+        let gain = eq_gain_at(120.0, 22050);
+        assert!(
+            gain > 1.1,
+            "bass shelf gain {gain:.3} should boost low frequencies"
+        );
+    }
+
+    #[test]
+    fn voice_eq_presence_outranks_highs() {
+        // The presence band must end up louder than the cut high band — the old
+        // code inverted this, leaving the highs hotter than the presence peak.
+        let presence = eq_gain_at(3000.0, 22050);
+        let highs = eq_gain_at(9000.0, 22050);
+        assert!(
+            presence > highs,
+            "presence ({presence:.3}) should exceed cut highs ({highs:.3})"
+        );
+    }
+
+    #[test]
+    fn voice_eq_handles_short_and_silent_input() {
+        // Guard rails: no panic / no NaN on degenerate inputs.
+        let mut tiny = vec![1234.0f32];
+        apply_voice_eq(&mut tiny, 22050);
+        assert_eq!(tiny, vec![1234.0], "buffers < 2 samples are left untouched");
+
+        let mut silence = vec![0.0f32; 256];
+        apply_voice_eq(&mut silence, 22050);
+        assert!(
+            silence.iter().all(|&s| s == 0.0),
+            "silence in must stay silence out"
+        );
     }
 }

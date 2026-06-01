@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use zeroize::Zeroizing;
 
 /// TCP-connect cap. Same value the file had hard-coded since scaffolding;
 /// surfaced as a named constant so tests can assert against it.
@@ -29,11 +30,11 @@ const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// - state reads
 /// - service calls
 /// - lightweight template rendering for area discovery
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HaClient {
     host: String,
     port: u16,
-    token: String,
+    token: Zeroizing<String>,
     connect_timeout: Duration,
     request_timeout: Duration,
     max_response_bytes: usize,
@@ -68,7 +69,7 @@ impl HaClient {
         Self {
             host: host.to_string(),
             port,
-            token: token.to_string(),
+            token: Zeroizing::new(token.to_string()),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
@@ -200,33 +201,31 @@ impl HaClient {
 
         let (reader, mut writer) = stream.into_split();
 
-        let request = if let Some(body) = body {
+        // Build the request in two parts around the token so it is never
+        // embedded in a single heap allocation alongside the rest of the
+        // headers. The token is written as a separate `write_all` from a
+        // Zeroizing<String> that is wiped when the async block returns.
+        let head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer ",);
+        let tail = if let Some(body) = body {
             format!(
-                "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{body}",
-                method = method,
-                path = path,
-                addr = addr,
-                token = self.token,
-                content_type = content_type.unwrap_or("application/json"),
-                content_length = body.len(),
+                "\r\nContent-Type: {ct}\r\nContent-Length: {cl}\r\nConnection: close\r\n\r\n{body}",
+                ct = content_type.unwrap_or("application/json"),
+                cl = body.len(),
                 body = body
             )
         } else {
-            format!(
-                "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n",
-                method = method,
-                path = path,
-                addr = addr,
-                token = self.token
-            )
+            "\r\nConnection: close\r\n\r\n".to_string()
         };
+        let token = self.token.clone();
 
         // Enforce a single deadline that covers write + status-line + headers
         // + body. Pre-fix only the `connect` step had a timeout; a hung HA
         // (Python GC pause, integration reload, Supervisor self-update,
         // stalled add-on) blocked the calling task indefinitely.
-        let response = match tokio::time::timeout(request_timeout, async {
-            writer.write_all(request.as_bytes()).await?;
+        let response = match tokio::time::timeout(request_timeout, async move {
+            writer.write_all(head.as_bytes()).await?;
+            writer.write_all(token.as_bytes()).await?;
+            writer.write_all(tail.as_bytes()).await?;
             read_http_response(reader, max_response_bytes).await
         })
         .await

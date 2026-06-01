@@ -1,162 +1,88 @@
-# Milestone 1 Portable Home Agent Architecture
+# Milestone 1 Jetson Agent Harness
 
-Milestone 1 should keep GenieClaw focused on NVIDIA Jetson Orin 8GB while making
-the project easier to validate without Jetson hardware.
+Milestone 1 is the current GenieClaw focus: keep the local home agent fast,
+reliable, and measurable on NVIDIA Jetson Orin Nano 8GB with a 4096-token
+context.
 
-The goal is not to turn GenieClaw into a generic hosted assistant. The goal is
-to keep the Jetson-first home AI agent intact and make most contribution paths
-portable, deterministic, and reviewable by CI.
+The goal is not a broader assistant, a larger prompt, a hosted provider demo, or
+generic product expansion. The goal is a small-context home agent that chooses
+the right typed tool, retrieves the right family/home memory, and behaves
+deterministically under Jetson constraints.
 
-## Why This Matters
+## Current Focus
 
-The original target remains specific:
+- BFCL scoring for quick-router and local-LLM tool-call accuracy
+- deterministic typed-tool routing for home control, home status, memory, and safety
+- high-signal family memory and home-state retrieval inside the 4096-token budget
+- STT-like typo/noise robustness for real voice input
+- deterministic device state and structured memory before prompt growth
+- Jetson Orin Nano 8GB validation for native, performance-sensitive, and runtime changes
+- CI gates that measure regressions before a PR reaches hardware testing
 
-- NVIDIA Jetson Orin 8GB hardware
-- local-first voice interaction
-- `genie-ai-runtime` as the flagship local LLM runtime
-- Home Assistant today, external home boundary as the longer-term direction
-- private memory, safety gates, audit trails, and bounded physical actuation
-- small context windows because VRAM and latency are tight on edge hardware
-
-The contribution problem is that most developers do not own Jetson hardware.
-When a PR can only be validated on a real device, quality depends on maintainer
-manual testing. That does not scale.
-
-Milestone 1 should make the important behavior testable on ordinary developer
-machines while preserving the final Jetson appliance shape.
+Everything else is noise until routing, memory retrieval, typed-tool accuracy,
+BFCL score, and Jetson behavior are stable.
 
 ## Non-Negotiables
 
-- GenieClaw remains a home automation AI agent, not a broad chatbot shell.
-- Jetson remains the default flagship target.
-- Raspberry Pi and generic portable SBC profiles remain maintained targets for
-  the headless agent, memory, tools, HTTP/CLI, and home-provider boundaries.
-- The full default-feature build must continue to represent the original
-  NVIDIA Jetson Orin 8GB goal: local runtime, voice, home control, family
-  memory, safety, audit, and `genie-ai-runtime` integration.
-- Small context is a product constraint. The baseline target is currently 4096
-  tokens.
-- Every provider path must work correctly under the small-context contract before
-  larger adaptive context is treated as an optimization.
-- API-key, OAuth, and OpenAI-compatible providers must be optional development
-  and transitional validation paths. They must not materially bloat the final
-  device image or redefine the local on-device product path. Small config/type
-  overhead is acceptable; heavy provider dependencies should be feature-gated.
-- Voice remains optional for headless devices, laptops, CI, and remote
-  development.
+- GenieClaw is a local home automation agent, not a broad chatbot shell.
+- NVIDIA Jetson Orin Nano 8GB is the flagship runtime target.
+- The default agent context remains 4096 tokens.
+- Larger context windows and stronger providers are optimization paths, not the
+  product baseline.
+- Device state, memory retrieval, and tool schemas must stay compact enough to
+  fit the Jetson context contract.
+- PRs that touch routing, memory, tool calls, prompt assembly, latency, native
+  runtime behavior, or hardware-facing paths need real tests.
+- PRs that make the agent less native, slower, less deterministic, or harder to
+  test should be rejected.
 
-## Runtime Profiles
+## In Scope
 
-The project should name and test distinct runtime profiles.
+- BFCL quick-router and local-LLM scoring
+- Home Assistant Intents import and other legally usable public test sources
+- generated local stress fixtures under ignored paths such as `tests/bfcl/local/`
+- typed tool fixtures for home control, home status, timers, media, memory, and safety
+- robust parsing for misspellings, STT errors, slot variation, and short voice utterances
+- deterministic fake home/device state for repeatable tests
+- family memory retrieval tests that fit the small context budget
+- prompt/tool/memory budget checks for the 4096-token harness
+- Jetson aarch64 cross-builds and Jetson hardware smoke tests when relevant
 
-| Profile | Purpose |
-| --- | --- |
-| `geniepod-full` | Flagship deployment: Jetson, `genie-ai-runtime`, voice, home automation, family memory, safety, and audit. |
-| `portable-home` | Maintained non-Jetson installs: Home Assistant or fake home runtime, optional API-compatible LLM provider for validation only, headless or local UI. |
-| `headless-agent` | No audio stack. Runs HTTP/chat/tool APIs and agent behavior for servers, laptops, CI, Raspberry Pi, and generic SBCs. |
-| `contributor-ci` | Deterministic validation profile: mock LLM, fake home automation, fixed memory fixtures, no hardware or API keys. |
+## Out Of Scope
 
-These profiles are validation and packaging tools. They do not change the
-product identity.
+- generic AI assistant features
+- broad prompt expansion without measured BFCL or retrieval improvement
+- hosted-provider churn that does not improve the Jetson contract
+- UI, mobile app, hardware product, OS image, and community-growth work
+- voice runtime internals except where GenieClaw's agent contract needs a boundary
+- demo-only tools or routes that do not improve measured home-agent behavior
+- untested native/runtime changes
 
-## Provider Contract
+## M1 Quality Gate
 
-LLM providers should sit behind one contract. The agent should not learn
-provider-specific details outside that boundary.
+A PR aimed at M1 should explain:
 
-Provider capabilities should describe:
+- which home-agent behavior changed
+- which typed tools, memory retrieval paths, or deterministic device-state paths it improves
+- how it affects the 4096-token harness
+- which BFCL, unit, integration, or fake-home tests were added or updated
+- whether Jetson Orin Nano 8GB validation is required, completed, or still a gap
 
-- provider id
-- local or remote execution
-- streaming support
-- JSON / tool-call reliability
-- maximum context tokens
-- recommended context tokens
-- default output-token reserve
-- required API key environment variable, if any
-- whether the provider is compiled into the current binary
+Docs-only PRs can use static checks. Code PRs need tests that match the risk.
+Native/runtime, performance-sensitive, and hardware-facing changes should be
+validated on Jetson whenever possible before merge.
 
-All provider requests should pass through the same context budgeter before the
-provider sees them.
+## Immediate Engineering Plan
 
-## Small-Context Budget Contract
-
-The default small-context contract should be explicit and testable.
-
-Baseline target:
-
-```toml
-[agent.context]
-default_max_tokens = 4096
-output_reserve_tokens = 512
-system_prompt_max_tokens = 900
-tool_schema_max_tokens = 900
-memory_max_tokens = 700
-history_max_tokens = 900
-```
-
-Larger providers may use adaptive context, but they must still pass the 4096
-baseline tests. Strong remote models are an enhancement path, not the baseline
-contract.
-
-## Contributor Test Harness
-
-Milestone 1 should establish a hardware-free validation harness:
-
-- mock LLM provider for deterministic text, JSON, and streaming responses
-- fake home automation provider with controllable entity state and failures
-- golden conversation tests for tool calls, home actions, undo, and memory
-- provider compliance tests for missing API keys, health checks, streaming
-  cancellation, and JSON/tool-call handling
-- context-budget tests that prove the default prompt/tool/memory assembly fits
-  within the 4096-token target
-
-Jetson tests still matter, but they should be release and hardware-behavior
-proof, not the only way to review ordinary agent logic.
-
-## PR Validation Tiers
-
-Review should map PRs to the smallest meaningful proof tier.
-
-| Tier | Applies to | Expected proof |
-| --- | --- | --- |
-| 1 | Pure logic or docs | Unit tests or docs review. |
-| 2 | Agent behavior | Golden conversation test with mock LLM and fake home automation. |
-| 3 | Provider integration | Mock HTTP/provider compliance test; real API-key run optional. |
-| 4 | Jetson/audio/runtime behavior | Cross-compile plus maintainer or contributor hardware smoke test before release. |
-
-This makes PR expectations clearer for contributors and reduces maintainer
-guesswork.
-
-## CI Direction
-
-CI should eventually include:
-
-- default workspace fmt, clippy, and tests
-- no-default-features headless build
-- contributor profile tests with mock LLM and fake home automation
-- provider-contract tests without real API keys
-- small-context budget tests
-- aarch64 cross-compile for Jetson release confidence
-
-The CI goal is not to emulate a Jetson perfectly. The goal is to catch
-architecture, prompt, provider, memory, and tool regressions before hardware
-validation is needed.
-
-## Migration Path
-
-1. Document the architecture movement and PR validation tiers.
-2. Add a `genie-testkit` or equivalent internal test harness.
-3. Add the small-context budget contract and tests.
-4. Introduce a mock LLM provider for deterministic agent tests.
-5. Introduce a fake home automation provider for tool and safety tests.
-6. Formalize provider capabilities and compliance tests.
-7. Add optional API-compatible provider support behind features for development
-   and transitional validation only.
-8. Keep `geniepod-full` as the flagship release target.
+1. Keep BFCL quick-router and local-LLM scoring easy to run.
+2. Expand BFCL fixtures for typed tools, family memory, home state, and STT-like noise.
+3. Track expected tool names and arguments, not just natural-language answers.
+4. Add score thresholds to CI once the fixture set is stable enough to be a fair gate.
+5. Use BFCL failures to improve routing, memory retrieval, and typed-tool accuracy.
+6. Preserve the 4096-token prompt/tool/memory budget before adding larger prompts.
+7. Validate native and runtime-sensitive behavior on Jetson Orin Nano 8GB.
 
 ## Principle
 
-The community path should be portable.
-
-The product identity should stay edge-first, private, and home-native.
+Accuracy should come from deterministic state, typed tools, and reliable memory
+retrieval, not from larger prompts.

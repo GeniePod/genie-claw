@@ -82,11 +82,71 @@ pub async fn spawn_listener() -> Result<mpsc::Receiver<(Command, ResponseSender)
 /// Channel for sending a JSON response back to the client.
 pub type ResponseSender = tokio::sync::oneshot::Sender<String>;
 
+const MAX_CONTROL_LINE_BYTES: usize = 16 * 1024;
+
+async fn read_control_line<R>(reader: &mut R) -> Result<Option<String>, String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let mut out = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.map_err(|e| e.to_string())?;
+        if available.is_empty() {
+            return if out.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8_lossy(&out).into_owned()))
+            };
+        }
+        if let Some(idx) = available.iter().position(|&b| b == b'\n') {
+            let take = idx + 1;
+            if out.len() + take > MAX_CONTROL_LINE_BYTES {
+                return Err(format!(
+                    "control command exceeds {} bytes",
+                    MAX_CONTROL_LINE_BYTES
+                ));
+            }
+            out.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            let mut line = String::from_utf8_lossy(&out).into_owned();
+            if line.ends_with('\n') {
+                line.pop();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+            }
+            return Ok(Some(line));
+        }
+        let take = available.len();
+        if out.len() + take > MAX_CONTROL_LINE_BYTES {
+            return Err(format!(
+                "control command exceeds {} bytes",
+                MAX_CONTROL_LINE_BYTES
+            ));
+        }
+        out.extend_from_slice(available);
+        reader.consume(take);
+    }
+}
+
 async fn handle_connection(stream: UnixStream, tx: mpsc::Sender<(Command, ResponseSender)>) {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let line = match read_control_line(&mut reader).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) => {
+                let err = serde_json::json!({"error": e});
+                let mut msg = err.to_string();
+                msg.push('\n');
+                let _ = writer.write_all(msg.as_bytes()).await;
+                break;
+            }
+        };
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
@@ -130,4 +190,36 @@ pub async fn send_command(cmd: &Command) -> Result<String> {
     let mut lines = BufReader::new(reader).lines();
     let response = lines.next_line().await?.unwrap_or_else(|| "{}".to_string());
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn read_control_line_rejects_oversized_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let payload = "x".repeat(MAX_CONTROL_LINE_BYTES + 1);
+            let _ = stream.write_all(payload.as_bytes()).await;
+            let _ = stream.write_all(b"\n").await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let error = read_control_line(&mut reader).await.unwrap_err();
+        server.abort();
+
+        assert!(
+            error.contains(&format!(
+                "control command exceeds {MAX_CONTROL_LINE_BYTES} bytes"
+            )),
+            "expected cap error, got: {error}"
+        );
+    }
 }
