@@ -176,10 +176,20 @@ wakeword_script = ""              # Empty = push-to-talk.
 
 # Optional per-origin tool policy. Defaults are allow unless a rule exists.
 # Use "*" as a wildcard origin or tool name. Deny rules override allow rules.
+# Every tool call (quick-tool, LLM dispatch, skill, summary) is enforced at one
+# dispatcher gate, so these rules apply uniformly regardless of how a tool runs.
 # [core.tool_policy]
 # enabled = true
 # allowed_tools_by_origin = { voice = ["get_time", "get_weather", "memory_recall", "home_status", "home_control"] }
 # denied_tools_by_origin = { telegram = ["play_media"], "*" = [] }
+# Per-tool sliding-window rate limits (calls/minute). "*" is a catch-all; tools
+# without an entry are unlimited. A fast loop bounces off the limit after N calls.
+# max_actions_per_minute_by_tool = { play_media = 10, web_search = 20 }
+# Sensitive tools that must be requested twice with the same arguments within
+# confirmation_ttl_secs before they run. The first call returns a pending
+# response with a stable token; the confirming call passes confirmed = true.
+# requires_confirmation_tools = ["play_media"]
+# confirmation_ttl_secs = 120
 
 # Final actuation safety gate for physical home-control execution:
 # [core.actuation_safety]

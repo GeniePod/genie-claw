@@ -505,6 +505,23 @@ pub struct ToolPolicyConfig {
     /// Tools blocked by origin. Deny rules override allow rules.
     #[serde(default)]
     pub denied_tools_by_origin: HashMap<String, Vec<String>>,
+
+    /// Per-tool sliding-window rate limits, e.g. `{ play_media = 10 }`. A `"*"`
+    /// key applies to any tool without a more specific entry. Tools absent from
+    /// the map are unlimited. Enforced at the dispatcher gate for every origin.
+    #[serde(default)]
+    pub max_actions_per_minute_by_tool: HashMap<String, usize>,
+
+    /// Sensitive tools that must be requested twice with the same arguments
+    /// within `confirmation_ttl_secs` before they execute. A `"*"` entry makes
+    /// every tool confirmable. Empty by default (no tool requires confirmation).
+    #[serde(default)]
+    pub requires_confirmation_tools: Vec<String>,
+
+    /// Window, in seconds, in which the confirming leg of a sensitive tool call
+    /// must arrive after the first leg.
+    #[serde(default = "defaults::tool_confirmation_ttl_secs")]
+    pub confirmation_ttl_secs: u64,
 }
 
 impl Default for ToolPolicyConfig {
@@ -513,6 +530,9 @@ impl Default for ToolPolicyConfig {
             enabled: defaults::tool_policy_enabled(),
             allowed_tools_by_origin: HashMap::new(),
             denied_tools_by_origin: HashMap::new(),
+            max_actions_per_minute_by_tool: HashMap::new(),
+            requires_confirmation_tools: Vec::new(),
+            confirmation_ttl_secs: defaults::tool_confirmation_ttl_secs(),
         }
     }
 }
@@ -2405,6 +2425,42 @@ signature_key_dir = "/custom/keys"
         assert!(config.core.tool_policy.enabled);
         assert!(config.core.tool_policy.allowed_tools_by_origin.is_empty());
         assert!(config.core.tool_policy.denied_tools_by_origin.is_empty());
+        assert!(
+            config
+                .core
+                .tool_policy
+                .max_actions_per_minute_by_tool
+                .is_empty()
+        );
+        assert!(
+            config
+                .core
+                .tool_policy
+                .requires_confirmation_tools
+                .is_empty()
+        );
+        assert_eq!(config.core.tool_policy.confirmation_ttl_secs, 120);
+    }
+
+    #[test]
+    fn tool_policy_gate_extensions_parse() {
+        let config: ToolPolicyConfig = toml::from_str(
+            r#"
+enabled = true
+max_actions_per_minute_by_tool = { play_media = 10, "*" = 30 }
+requires_confirmation_tools = ["home_control", "play_media"]
+confirmation_ttl_secs = 45
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_actions_per_minute_by_tool["play_media"], 10);
+        assert_eq!(config.max_actions_per_minute_by_tool["*"], 30);
+        assert_eq!(
+            config.requires_confirmation_tools,
+            vec!["home_control", "play_media"]
+        );
+        assert_eq!(config.confirmation_ttl_secs, 45);
     }
 
     #[test]
@@ -2770,6 +2826,9 @@ mod defaults {
     }
     pub fn tool_policy_enabled() -> bool {
         true
+    }
+    pub fn tool_confirmation_ttl_secs() -> u64 {
+        120
     }
     pub fn actuation_safety_enabled() -> bool {
         true
