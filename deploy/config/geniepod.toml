@@ -180,6 +180,13 @@ wakeword_script = ""              # Empty = push-to-talk.
 # enabled = true
 # allowed_tools_by_origin = { voice = ["get_time", "get_weather", "memory_recall", "home_status", "home_control"] }
 # denied_tools_by_origin = { telegram = ["play_media"], "*" = [] }
+# Per-tool rate limit (calls/min) and two-call confirmation, enforced at the
+# single dispatch gate for every origin (issue #22). A confirmation-required
+# tool returns a pending token on first call and runs on an identical repeat
+# within confirmation_ttl_secs:
+# max_actions_per_minute_by_tool = { play_media = 10 }
+# requires_confirmation_tools = ["play_media"]
+# confirmation_ttl_secs = 120
 
 # Final actuation safety gate for physical home-control execution:
 # [core.actuation_safety]
