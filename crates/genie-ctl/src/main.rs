@@ -18,6 +18,8 @@
 //!                              Generate and score local LLM tool-call predictions
 //!   genie-ctl bfcl-import-ha-intents --source INTENTS_DIR --out CASES.jsonl
 //!                              Convert Home Assistant Intents into BFCL cases
+//!   genie-ctl bfcl-compare --baseline-report A.json --candidate-report B.json
+//!                              Compare two bfcl-score-llm JSON reports (issue #376)
 //!   genie-ctl skill ...       Manage loadable skill modules
 //!   genie-ctl speaker ...     Manage local speaker identity profiles
 //!   genie-ctl health          Check service health
@@ -29,6 +31,10 @@
 
 use anyhow::{Context, Result};
 use genie_common::config::{Config, ServiceProbeTarget, parse_service_probe_target};
+use genie_core::eval::bfcl_profile::{
+    BfclEvalProfileId, BfclEvalRunRecord, BfclJetsonRuntimeMetrics, build_eval_run_record,
+    compare_eval_runs, format_head_to_head_table,
+};
 use genie_common::probe::{ProbeTimeouts, probe_service_target};
 use genie_core::skills::{
     SkillLoader, SkillManifestAudit, find_manifest_sidecar, manifest_sidecar_candidates,
@@ -180,6 +186,10 @@ async fn main() -> Result<()> {
             );
             println!("output: {}", import_args.out.display());
         }
+        "bfcl-compare" | "bfcl-head-to-head" => {
+            let compare_args = parse_bfcl_compare_args(&args[2..])?;
+            cmd_bfcl_compare(&compare_args)?;
+        }
         "connectivity" | "radio" => cmd_connectivity().await?,
         "skill" | "skills" => {
             if args.len() < 3 {
@@ -263,6 +273,8 @@ COMMANDS:
                         Generate local LLM predictions without executing tools
     bfcl-import-ha-intents --source DIR --out CASES.jsonl [--language en] [--limit N]
                         Convert Home Assistant Intents into attributed BFCL cases
+    bfcl-compare --baseline-report A.json --candidate-report B.json [--json]
+                        Head-to-head BFCL table for issue #376 (Qwen vs hybrid)
     connectivity        Inspect ESP32-C6 Thread/Matter sidecar status
     skill <SUBCOMMAND>  Manage loadable skill modules
 {speaker}\
@@ -993,6 +1005,15 @@ struct BfclScoreLlmArgs {
     limit: Option<usize>,
     json_mode: bool,
     json: bool,
+    profile: Option<String>,
+    runtime_metrics: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BfclCompareArgs {
+    baseline_report: PathBuf,
+    candidate_report: PathBuf,
+    json: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1008,6 +1029,7 @@ struct BfclPredictLlmArgs {
     max_tokens: u32,
     limit: Option<usize>,
     json_mode: bool,
+    profile: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1029,6 +1051,11 @@ struct BfclLlmPredictionRun {
     predictions: Vec<genie_core::eval::bfcl::BfclPrediction>,
     tool_calls: usize,
     backend: String,
+    profile_label: String,
+    llm_model_name: String,
+    context_window_tokens: u32,
+    config_path: Option<PathBuf>,
+    architecture_note: Option<&'static str>,
 }
 
 fn parse_search_args(args: &[String]) -> Result<SearchArgs> {
@@ -1137,6 +1164,8 @@ fn parse_bfcl_score_llm_args(args: &[String]) -> Result<BfclScoreLlmArgs> {
     let mut limit = None;
     let mut json_mode = true;
     let mut json = false;
+    let mut profile = None;
+    let mut runtime_metrics = None;
     let mut idx = 0;
 
     while idx < args.len() {
@@ -1182,6 +1211,20 @@ fn parse_bfcl_score_llm_args(args: &[String]) -> Result<BfclScoreLlmArgs> {
                 json = true;
                 idx += 1;
             }
+            "--profile" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--profile requires qwen4096 or nemotron16k");
+                };
+                profile = Some(value.clone());
+                idx += 2;
+            }
+            "--runtime-metrics" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--runtime-metrics requires a JSON path");
+                };
+                runtime_metrics = Some(PathBuf::from(value));
+                idx += 2;
+            }
             _ if arg.starts_with("--cases=") => {
                 cases = Some(PathBuf::from(arg.trim_start_matches("--cases=")));
                 idx += 1;
@@ -1218,13 +1261,22 @@ fn parse_bfcl_score_llm_args(args: &[String]) -> Result<BfclScoreLlmArgs> {
                 )?);
                 idx += 1;
             }
+            _ if arg.starts_with("--profile=") => {
+                profile = Some(arg.trim_start_matches("--profile=").to_string());
+                idx += 1;
+            }
+            _ if arg.starts_with("--runtime-metrics=") => {
+                runtime_metrics =
+                    Some(PathBuf::from(arg.trim_start_matches("--runtime-metrics=")));
+                idx += 1;
+            }
             other => anyhow::bail!("unknown bfcl-score-llm option: {}", other),
         }
     }
 
     let Some(cases) = cases else {
         anyhow::bail!(
-            "Usage: genie-ctl bfcl-score-llm --cases CASES.jsonl [--out PREDICTIONS.jsonl] [--json] [--max-tokens N] [--limit N]"
+            "Usage: genie-ctl bfcl-score-llm --cases CASES.jsonl [--out PREDICTIONS.jsonl] [--profile qwen4096|nemotron16k] [--runtime-metrics METRICS.json] [--json] [--max-tokens N] [--limit N]"
         );
     };
 
@@ -1235,6 +1287,8 @@ fn parse_bfcl_score_llm_args(args: &[String]) -> Result<BfclScoreLlmArgs> {
         limit,
         json_mode,
         json,
+        profile,
+        runtime_metrics,
     })
 }
 
@@ -1300,6 +1354,7 @@ fn parse_bfcl_predict_llm_args(args: &[String]) -> Result<BfclPredictLlmArgs> {
     let mut max_tokens = BFCL_LLM_DEFAULT_MAX_TOKENS;
     let mut limit = None;
     let mut json_mode = true;
+    let mut profile = None;
     let mut idx = 0;
 
     while idx < args.len() {
@@ -1341,6 +1396,13 @@ fn parse_bfcl_predict_llm_args(args: &[String]) -> Result<BfclPredictLlmArgs> {
                 json_mode = false;
                 idx += 1;
             }
+            "--profile" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--profile requires qwen4096 or nemotron16k");
+                };
+                profile = Some(value.clone());
+                idx += 2;
+            }
             _ if arg.starts_with("--cases=") => {
                 cases = Some(PathBuf::from(arg.trim_start_matches("--cases=")));
                 idx += 1;
@@ -1369,18 +1431,22 @@ fn parse_bfcl_predict_llm_args(args: &[String]) -> Result<BfclPredictLlmArgs> {
                 )?);
                 idx += 1;
             }
+            _ if arg.starts_with("--profile=") => {
+                profile = Some(arg.trim_start_matches("--profile=").to_string());
+                idx += 1;
+            }
             other => anyhow::bail!("unknown bfcl-predict-llm option: {}", other),
         }
     }
 
     let Some(cases) = cases else {
         anyhow::bail!(
-            "Usage: genie-ctl bfcl-predict-llm --cases CASES.jsonl --out PREDICTIONS.jsonl [--max-tokens N] [--limit N]"
+            "Usage: genie-ctl bfcl-predict-llm --cases CASES.jsonl --out PREDICTIONS.jsonl [--profile qwen4096|nemotron16k] [--max-tokens N] [--limit N]"
         );
     };
     let Some(out) = out else {
         anyhow::bail!(
-            "Usage: genie-ctl bfcl-predict-llm --cases CASES.jsonl --out PREDICTIONS.jsonl [--max-tokens N] [--limit N]"
+            "Usage: genie-ctl bfcl-predict-llm --cases CASES.jsonl --out PREDICTIONS.jsonl [--profile qwen4096|nemotron16k] [--max-tokens N] [--limit N]"
         );
     };
 
@@ -1390,6 +1456,7 @@ fn parse_bfcl_predict_llm_args(args: &[String]) -> Result<BfclPredictLlmArgs> {
         max_tokens,
         limit,
         json_mode,
+        profile,
     })
 }
 
@@ -1463,38 +1530,61 @@ fn cmd_bfcl_score(args: &BfclScoreArgs) -> Result<()> {
 }
 
 async fn cmd_bfcl_score_llm(args: &BfclScoreLlmArgs) -> Result<()> {
-    let run =
-        generate_bfcl_llm_predictions(&args.cases, args.max_tokens, args.limit, args.json_mode)
-            .await?;
+    let run = generate_bfcl_llm_predictions(
+        &args.cases,
+        args.max_tokens,
+        args.limit,
+        args.json_mode,
+        args.profile.as_deref(),
+    )
+    .await?;
 
     if let Some(out) = &args.out {
         write_bfcl_predictions_jsonl(out, &run.predictions)?;
     }
 
     let report = genie_core::eval::bfcl::score_cases(&run.cases, &run.predictions);
+    let runtime_metrics = args
+        .runtime_metrics
+        .as_ref()
+        .map(|path| load_bfcl_runtime_metrics(path))
+        .transpose()?;
+    let record = build_eval_run_record(
+        run.profile_label,
+        run.llm_model_name,
+        run.context_window_tokens,
+        run.backend,
+        run.config_path,
+        run.architecture_note,
+        run.predictions.len(),
+        run.tool_calls,
+        args.out.clone(),
+        runtime_metrics,
+        report,
+    );
 
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "backend": run.backend,
-                "generated_predictions": run.predictions.len(),
-                "tool_calls": run.tool_calls,
-                "predictions_out": args.out,
-                "report": report,
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&record)?);
         return Ok(());
     }
 
     println!("BFCL local-LLM tool-call score");
-    println!("backend:             {}", run.backend);
-    println!("generated_predictions: {}", run.predictions.len());
-    println!("tool_calls:          {}", run.tool_calls);
+    println!("profile:             {}", record.profile_label);
+    println!("llm_model_name:      {}", record.llm_model_name);
+    println!(
+        "context_window:      {} tokens",
+        record.context_window_tokens
+    );
+    println!("backend:             {}", record.backend);
+    println!("generated_predictions: {}", record.generated_predictions);
+    println!("tool_calls:          {}", record.tool_calls);
     if let Some(out) = &args.out {
         println!("predictions:         {}", out.display());
     }
-    print_bfcl_report_metrics(&report);
+    if let Some(path) = &record.config_path {
+        println!("config:              {}", path);
+    }
+    print_bfcl_report_metrics(&record.report);
 
     Ok(())
 }
@@ -1584,9 +1674,14 @@ fn cmd_bfcl_predict_quick(args: &BfclPredictQuickArgs) -> Result<BfclPredictQuic
 }
 
 async fn cmd_bfcl_predict_llm(args: &BfclPredictLlmArgs) -> Result<BfclPredictLlmReport> {
-    let run =
-        generate_bfcl_llm_predictions(&args.cases, args.max_tokens, args.limit, args.json_mode)
-            .await?;
+    let run = generate_bfcl_llm_predictions(
+        &args.cases,
+        args.max_tokens,
+        args.limit,
+        args.json_mode,
+        args.profile.as_deref(),
+    )
+    .await?;
 
     write_bfcl_predictions_jsonl(&args.out, &run.predictions)?;
 
@@ -1597,16 +1692,113 @@ async fn cmd_bfcl_predict_llm(args: &BfclPredictLlmArgs) -> Result<BfclPredictLl
     })
 }
 
+struct BfclLoadedEvalConfig {
+    config: Config,
+    profile_label: String,
+    config_path: Option<PathBuf>,
+    architecture_note: Option<&'static str>,
+}
+
+fn bfcl_workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn resolve_bfcl_profile_config(profile_name: &str) -> Result<(BfclEvalProfileId, PathBuf)> {
+    let profile = BfclEvalProfileId::parse(profile_name).with_context(|| {
+        format!(
+            "unknown BFCL profile {profile_name:?}; expected qwen4096 or nemotron16k"
+        )
+    })?;
+    let repo_path = profile.resolve_config_path(bfcl_workspace_root());
+    if repo_path.is_file() {
+        return Ok((profile, repo_path));
+    }
+    let installed = PathBuf::from("/etc/geniepod").join(format!(
+        "geniepod.bfcl-{}.jetson.toml",
+        match profile {
+            BfclEvalProfileId::Qwen4096 => "qwen4096",
+            BfclEvalProfileId::Nemotron16k => "nemotron16k",
+        }
+    ));
+    if installed.is_file() {
+        return Ok((profile, installed));
+    }
+    anyhow::bail!(
+        "BFCL profile config not found for {profile_name}; expected {} or {}",
+        repo_path.display(),
+        installed.display()
+    );
+}
+
+fn load_bfcl_eval_config(profile: Option<&str>) -> Result<BfclLoadedEvalConfig> {
+    if let Some(profile_name) = profile {
+        let (profile_id, config_path) = resolve_bfcl_profile_config(profile_name)?;
+        let config = Config::load_from(&config_path).with_context(|| {
+            format!(
+                "failed to load BFCL profile config {}",
+                config_path.display()
+            )
+        })?;
+        if config.core.llm_model_name != profile_id.expected_llm_model_name() {
+            eprintln!(
+                "warning: profile {} expects llm_model_name={} but config has {}",
+                profile_id.label(),
+                profile_id.expected_llm_model_name(),
+                config.core.llm_model_name
+            );
+        }
+        if config.agent.context_window_tokens != profile_id.expected_context_window_tokens() {
+            eprintln!(
+                "warning: profile {} expects context_window_tokens={} but config has {}",
+                profile_id.label(),
+                profile_id.expected_context_window_tokens(),
+                config.agent.context_window_tokens
+            );
+        }
+        return Ok(BfclLoadedEvalConfig {
+            config,
+            profile_label: profile_id.label().to_string(),
+            config_path: Some(config_path),
+            architecture_note: Some(profile_id.architecture_note()),
+        });
+    }
+
+    let config = Config::load()?;
+    let profile_label = format!(
+        "{}-{}",
+        config.core.llm_model_name, config.agent.context_window_tokens
+    );
+    Ok(BfclLoadedEvalConfig {
+        config,
+        profile_label,
+        config_path: std::env::var("GENIEPOD_CONFIG").ok().map(PathBuf::from),
+        architecture_note: None,
+    })
+}
+
+fn load_bfcl_runtime_metrics(path: &Path) -> Result<BfclJetsonRuntimeMetrics> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read runtime metrics {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse runtime metrics {}", path.display()))
+}
+
 async fn generate_bfcl_llm_predictions(
     cases_path: &Path,
     max_tokens: u32,
     limit: Option<usize>,
     json_mode: bool,
+    profile: Option<&str>,
 ) -> Result<BfclLlmPredictionRun> {
+    let loaded = load_bfcl_eval_config(profile)?;
+    let config = loaded.config;
     let cases = genie_core::eval::bfcl::load_cases_jsonl(cases_path)?;
     let selected_cases = select_bfcl_cases(cases, limit);
-    let system_prompt = build_bfcl_llm_system_prompt(&selected_cases);
-    let config = Config::load()?;
+    let system_prompt = build_bfcl_llm_system_prompt(
+        &selected_cases,
+        config.agent.context_window_tokens,
+        &config.core.llm_model_name,
+    );
     let timeouts = genie_core::llm::LlmTimeouts::from_secs(
         config.core.llm_connect_timeout_secs,
         config.core.llm_read_timeout_secs,
@@ -1643,6 +1835,11 @@ async fn generate_bfcl_llm_predictions(
         predictions,
         tool_calls,
         backend,
+        profile_label: loaded.profile_label,
+        llm_model_name: config.core.llm_model_name,
+        context_window_tokens: config.agent.context_window_tokens,
+        config_path: loaded.config_path,
+        architecture_note: loaded.architecture_note,
     })
 }
 
@@ -1689,12 +1886,17 @@ fn build_bfcl_llm_messages(system_prompt: &str, prompt: &str) -> Vec<genie_core:
     ]
 }
 
-fn build_bfcl_llm_system_prompt(cases: &[genie_core::eval::bfcl::BfclCase]) -> String {
+fn build_bfcl_llm_system_prompt(
+    cases: &[genie_core::eval::bfcl::BfclCase],
+    context_window_tokens: u32,
+    llm_model_name: &str,
+) -> String {
     let catalog = bfcl_llm_tool_catalog(cases).join("\n");
     format!(
         "\
 You are GenieClaw's BFCL tool-call evaluator for a private local home agent.
-The target runtime is NVIDIA Jetson Orin 8GB with a 4096-token context, so be terse.
+The target runtime is NVIDIA Jetson Orin 8GB with model {llm_model_name} and a \
+{context_window_tokens}-token context budget, so be terse.
 Return only JSON. Do not explain. Do not execute tools.
 
 If the utterance needs one tool, return:
@@ -1746,6 +1948,94 @@ fn bfcl_llm_tool_catalog(cases: &[genie_core::eval::bfcl::BfclCase]) -> Vec<Stri
 
 fn format_score_rate(rate: f64) -> String {
     format!("{:.2}%", rate * 100.0)
+}
+
+fn parse_bfcl_compare_args(args: &[String]) -> Result<BfclCompareArgs> {
+    let mut baseline_report = None;
+    let mut candidate_report = None;
+    let mut json = false;
+    let mut idx = 0;
+
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--baseline-report" | "--baseline" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--baseline-report requires a JSON path");
+                };
+                baseline_report = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--candidate-report" | "--candidate" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--candidate-report requires a JSON path");
+                };
+                candidate_report = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--json" => {
+                json = true;
+                idx += 1;
+            }
+            _ if arg.starts_with("--baseline-report=") => {
+                baseline_report =
+                    Some(PathBuf::from(arg.trim_start_matches("--baseline-report=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--baseline=") => {
+                baseline_report = Some(PathBuf::from(arg.trim_start_matches("--baseline=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--candidate-report=") => {
+                candidate_report =
+                    Some(PathBuf::from(arg.trim_start_matches("--candidate-report=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--candidate=") => {
+                candidate_report = Some(PathBuf::from(arg.trim_start_matches("--candidate=")));
+                idx += 1;
+            }
+            other => anyhow::bail!("unknown bfcl-compare option: {}", other),
+        }
+    }
+
+    let Some(baseline_report) = baseline_report else {
+        anyhow::bail!(
+            "Usage: genie-ctl bfcl-compare --baseline-report BASE.json --candidate-report CAND.json [--json]"
+        );
+    };
+    let Some(candidate_report) = candidate_report else {
+        anyhow::bail!(
+            "Usage: genie-ctl bfcl-compare --baseline-report BASE.json --candidate-report CAND.json [--json]"
+        );
+    };
+
+    Ok(BfclCompareArgs {
+        baseline_report,
+        candidate_report,
+        json,
+    })
+}
+
+fn load_bfcl_eval_run_record(path: &Path) -> Result<BfclEvalRunRecord> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read BFCL report {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse BFCL report {}", path.display()))
+}
+
+fn cmd_bfcl_compare(args: &BfclCompareArgs) -> Result<()> {
+    let baseline = load_bfcl_eval_run_record(&args.baseline_report)?;
+    let candidate = load_bfcl_eval_run_record(&args.candidate_report)?;
+    let comparison = compare_eval_runs(&baseline, &candidate);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&comparison)?);
+        return Ok(());
+    }
+
+    print!("{}", format_head_to_head_table(&comparison));
+    Ok(())
 }
 
 async fn cmd_history() -> Result<()> {
@@ -3008,10 +3298,11 @@ mod tests {
             allow_extra_arguments: true,
         }];
 
-        let system_prompt = build_bfcl_llm_system_prompt(&cases);
+        let system_prompt = build_bfcl_llm_system_prompt(&cases, 4096, "qwen");
         let messages = build_bfcl_llm_messages(&system_prompt, &cases[0].prompt);
 
         assert!(system_prompt.contains("4096-token"));
+        assert!(system_prompt.contains("qwen"));
         assert!(system_prompt.contains("home_control"));
         assert!(system_prompt.contains("toggle"));
         assert!(system_prompt.contains("lock"));

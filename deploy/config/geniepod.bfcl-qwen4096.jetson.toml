@@ -1,0 +1,40 @@
+# BFCL evaluation overlay — Qwen3-4B @ 4096 (issue #376 baseline arm).
+# Does not replace deploy/config/geniepod.toml on device images.
+#
+# Usage on Jetson:
+#   GENIEPOD_CONFIG=/etc/geniepod/geniepod.bfcl-qwen4096.jetson.toml \
+#     genie-ctl bfcl-score-llm --profile qwen4096 --cases ... --out ...
+#
+# Ensure genie-ai-runtime serves Qwen3-4B Q4_K_M before scoring.
+
+data_dir = "/opt/geniepod/data"
+
+[agent]
+runtime_profile = "jetson"
+context_window_tokens = 4096
+ai_runtime_boundary = "external_runtime"
+voice_runtime_boundary = "transitional_adapter"
+home_runtime_boundary = "transitional_adapter"
+
+[optional_ai_provider]
+enabled = false
+provider = "open_ai_compatible"
+auth_mode = "api_key"
+base_url = ""
+api_key_env = "GENIEPOD_AI_PROVIDER_API_KEY"
+oauth_token_env = "GENIEPOD_AI_PROVIDER_OAUTH_TOKEN"
+context_window_tokens = 4096
+allow_remote_base_url = false
+
+[core]
+port = 3000
+bind_host = "127.0.0.1"
+llm_model_name = "qwen"
+llm_model_path = "/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf"
+llm_connect_timeout_secs = 10
+llm_read_timeout_secs = 120
+llm_request_timeout_secs = 180
+
+[services.llm]
+backend = "genie_ai_runtime"
+url = "http://127.0.0.1:8080/v1"

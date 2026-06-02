@@ -387,9 +387,10 @@ Implemented in `crates/genie-ctl/src/main.rs`.
 | `genie-ctl history` | Show current conversation history |
 | `genie-ctl tools` | List available tools |
 | `genie-ctl bfcl-score --cases C --predictions P [--json]` | Score BFCL-style tool-call fixtures |
-| `genie-ctl bfcl-score-llm --cases C [--out P] [--json] [--max-tokens N] [--limit N]` | Generate and score local LLM BFCL predictions |
+| `genie-ctl bfcl-score-llm --cases C [--out P] [--profile qwen4096\|nemotron16k] [--runtime-metrics M] [--json] [--max-tokens N] [--limit N]` | Generate and score local LLM BFCL predictions |
 | `genie-ctl bfcl-predict-quick --cases C --out P` | Generate deterministic quick-router BFCL predictions |
-| `genie-ctl bfcl-predict-llm --cases C --out P [--max-tokens N] [--limit N]` | Generate local LLM BFCL predictions |
+| `genie-ctl bfcl-predict-llm --cases C --out P [--profile qwen4096\|nemotron16k] [--max-tokens N] [--limit N]` | Generate local LLM BFCL predictions |
+| `genie-ctl bfcl-compare --baseline-report A --candidate-report B [--json]` | Head-to-head BFCL table (issue #376) |
 | `genie-ctl bfcl-import-ha-intents --source DIR --out C [--language en] [--limit N]` | Convert Home Assistant Intents into attributed BFCL cases |
 | `genie-ctl connectivity` | Show coprocessor boundary status |
 | `genie-ctl skill ...` | Manage loadable skills |

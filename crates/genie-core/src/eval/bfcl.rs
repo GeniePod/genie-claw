@@ -67,7 +67,7 @@ pub struct BfclPrediction {
     pub response: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BfclCaseScore {
     pub id: String,
     pub category: Option<String>,
@@ -84,7 +84,7 @@ pub struct BfclCaseScore {
     pub diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BfclReport {
     pub total_cases: usize,
     pub parsed_cases: usize,

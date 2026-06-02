@@ -55,6 +55,32 @@ cargo run -p genie-ctl -- bfcl-score \
   --predictions tests/bfcl/local/ha_home_predictions.jsonl
 ```
 
+## Mamba-2 hybrid @ 16k vs Qwen @ 4096 (issue #376)
+
+Head-to-head Jetson evaluation uses opt-in config overlays and does not change
+the production default in `deploy/config/geniepod.toml`:
+
+```bash
+cargo run -p genie-ctl -- bfcl-score-llm \
+  --profile qwen4096 \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_qwen4096_predictions.jsonl \
+  --json > tests/bfcl/local/ha_qwen4096_report.json
+
+# Switch genie-ai-runtime to Nemotron-H 4B @ 16k, then:
+cargo run -p genie-ctl -- bfcl-score-llm \
+  --profile nemotron16k \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --out tests/bfcl/local/ha_nemotron16k_predictions.jsonl \
+  --json > tests/bfcl/local/ha_nemotron16k_report.json
+
+cargo run -p genie-ctl -- bfcl-compare \
+  --baseline-report tests/bfcl/local/ha_qwen4096_report.json \
+  --candidate-report tests/bfcl/local/ha_nemotron16k_report.json
+```
+
+See [doc/bfcl-mamba-hybrid-evaluation.md](../../doc/bfcl-mamba-hybrid-evaluation.md).
+
 ## Local-LLM BFCL
 
 The local-LLM path calls the configured `[services.llm]` backend directly and
