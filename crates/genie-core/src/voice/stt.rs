@@ -448,11 +448,16 @@ impl SttEngine {
                     .stderr(std::process::Stdio::piped())
                     .kill_on_drop(true)
                     .spawn()
-                    .map_err(|e| anyhow::anyhow!("failed to spawn whisper-cli (CPU retry): {}", e))?;
-                let retry = tokio::time::timeout(Duration::from_secs(30), retry_child.wait_with_output())
-                    .await
-                    .map_err(|_| anyhow::anyhow!("whisper-cli (CPU retry) timed out after 30 s"))?
-                    .map_err(|e| anyhow::anyhow!("whisper-cli (CPU retry) I/O error: {}", e))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to spawn whisper-cli (CPU retry): {}", e)
+                    })?;
+                let retry =
+                    tokio::time::timeout(Duration::from_secs(30), retry_child.wait_with_output())
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!("whisper-cli (CPU retry) timed out after 30 s")
+                        })?
+                        .map_err(|e| anyhow::anyhow!("whisper-cli (CPU retry) I/O error: {}", e))?;
                 if !retry.status.success() {
                     let stderr2 = String::from_utf8_lossy(&retry.stderr);
                     anyhow::bail!("whisper-cli failed (CPU retry): {}", stderr2);
