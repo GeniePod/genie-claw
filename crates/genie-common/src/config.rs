@@ -506,20 +506,23 @@ pub struct ToolPolicyConfig {
     #[serde(default)]
     pub denied_tools_by_origin: HashMap<String, Vec<String>>,
 
-    /// Per-tool sliding-window rate limits, e.g. `{ play_media = 10 }`. A `"*"`
-    /// key applies to any tool without a more specific entry. Tools absent from
-    /// the map are unlimited. Enforced at the dispatcher gate for every origin.
+    /// Per-tool sliding-window rate limit, in calls per minute, enforced at the
+    /// dispatch gate for *every* origin (issue #22). A tool not listed has no
+    /// per-tool cap; this is independent of the per-origin home actuation
+    /// limits in `[actuation_safety]`. Example:
+    /// `max_actions_per_minute_by_tool = { play_media = 10 }`.
     #[serde(default)]
     pub max_actions_per_minute_by_tool: HashMap<String, usize>,
 
-    /// Sensitive tools that must be requested twice with the same arguments
-    /// within `confirmation_ttl_secs` before they execute. A `"*"` entry makes
-    /// every tool confirmable. Empty by default (no tool requires confirmation).
+    /// Tools that require a two-call confirmation before they execute (issue
+    /// #22). The first call returns a pending token without running the tool; a
+    /// second call with the same origin and arguments within
+    /// `confirmation_ttl_secs` proceeds. `home_control` keeps its own richer
+    /// risk-based confirmation regardless of this list.
     #[serde(default)]
     pub requires_confirmation_tools: Vec<String>,
 
-    /// Window, in seconds, in which the confirming leg of a sensitive tool call
-    /// must arrive after the first leg.
+    /// Validity window for a pending tool confirmation, in seconds (issue #22).
     #[serde(default = "defaults::tool_confirmation_ttl_secs")]
     pub confirmation_ttl_secs: u64,
 }
@@ -2443,33 +2446,15 @@ signature_key_dir = "/custom/keys"
     }
 
     #[test]
-    fn tool_policy_gate_extensions_parse() {
-        let config: ToolPolicyConfig = toml::from_str(
-            r#"
-enabled = true
-max_actions_per_minute_by_tool = { play_media = 10, "*" = 30 }
-requires_confirmation_tools = ["home_control", "play_media"]
-confirmation_ttl_secs = 45
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.max_actions_per_minute_by_tool["play_media"], 10);
-        assert_eq!(config.max_actions_per_minute_by_tool["*"], 30);
-        assert_eq!(
-            config.requires_confirmation_tools,
-            vec!["home_control", "play_media"]
-        );
-        assert_eq!(config.confirmation_ttl_secs, 45);
-    }
-
-    #[test]
     fn tool_policy_config_parses() {
         let config: ToolPolicyConfig = toml::from_str(
             r#"
 enabled = true
 allowed_tools_by_origin = { telegram = ["get_time", "memory_recall"] }
 denied_tools_by_origin = { voice = ["web_search"], "*" = ["play_media"] }
+max_actions_per_minute_by_tool = { play_media = 10 }
+requires_confirmation_tools = ["play_media"]
+confirmation_ttl_secs = 90
 "#,
         )
         .unwrap();
@@ -2481,6 +2466,9 @@ denied_tools_by_origin = { voice = ["web_search"], "*" = ["play_media"] }
         );
         assert_eq!(config.denied_tools_by_origin["voice"], vec!["web_search"]);
         assert_eq!(config.denied_tools_by_origin["*"], vec!["play_media"]);
+        assert_eq!(config.max_actions_per_minute_by_tool["play_media"], 10);
+        assert_eq!(config.requires_confirmation_tools, vec!["play_media"]);
+        assert_eq!(config.confirmation_ttl_secs, 90);
     }
 
     #[test]
