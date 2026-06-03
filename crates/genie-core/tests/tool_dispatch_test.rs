@@ -4,9 +4,22 @@
 
 use std::process::Command;
 
+/// The two release-build tests below each run a size-optimized LTO
+/// `cargo build --release` (slow, ~1-2 min). They are skipped locally so
+/// `cargo test` stays fast, and run in CI where `GENIE_RUN_RELEASE_TESTS` is set
+/// (see `.github/workflows/ci.yml`). Run them locally with:
+///   `GENIE_RUN_RELEASE_TESTS=1 cargo test -p genie-core --test tool_dispatch_test`
+fn release_tests_enabled() -> bool {
+    std::env::var_os("GENIE_RUN_RELEASE_TESTS").is_some()
+}
+
 /// Verify genie-core builds successfully.
 #[test]
 fn core_binary_builds() {
+    if !release_tests_enabled() {
+        eprintln!("skipping core_binary_builds (release build); set GENIE_RUN_RELEASE_TESTS=1");
+        return;
+    }
     let output = build_release_genie_core();
 
     assert!(
@@ -30,6 +43,10 @@ const RELEASE_BINARY_SIZE_BUDGET_MB: f64 = 6.4;
 /// Verify release binary stays within the release size budget.
 #[test]
 fn binary_size_budget() {
+    if !release_tests_enabled() {
+        eprintln!("skipping binary_size_budget (release build); set GENIE_RUN_RELEASE_TESTS=1");
+        return;
+    }
     let output = build_release_genie_core();
     assert!(
         output.status.success(),
