@@ -8,20 +8,16 @@
 # free-memory headroom. It is safe (caches just re-warm from disk), so the only
 # cost is a brief slowdown as hot files are re-read.
 #
-# Usage (on the Jetson, as root):
-#   sudo bash /opt/geniepod/bin/genie-drop-caches.sh        # drop everything (3)
-#   sudo bash /opt/geniepod/bin/genie-drop-caches.sh 1      # page cache only
-#   sudo bash /opt/geniepod/bin/genie-drop-caches.sh 2      # dentries + inodes
+# Usage (on the Jetson — uses sudo internally, so no need to run the whole
+# script as root):
+#   bash /opt/geniepod/bin/genie-drop-caches.sh        # drop everything (3)
+#   bash /opt/geniepod/bin/genie-drop-caches.sh 1      # page cache only
+#   bash /opt/geniepod/bin/genie-drop-caches.sh 2      # dentries + inodes
 #
 # Levels follow /proc/sys/vm/drop_caches: 1=pagecache, 2=slab (dentries/inodes),
 # 3=both (default).
 
 set -euo pipefail
-
-if [[ $EUID -ne 0 ]]; then
-  echo "This script must run as root. Re-run with: sudo $0 $*" >&2
-  exit 1
-fi
 
 level="${1:-3}"
 case "$level" in
@@ -36,13 +32,16 @@ avail_mb() { free -m | awk '/^Mem:/ {print $7}'; }
 
 before="$(avail_mb)"
 
-# Flush dirty pages first so they are reclaimable, then drop the requested caches.
-sync
-echo "$level" > /proc/sys/vm/drop_caches
+# Flush dirty pages first so they are reclaimable, then drop the requested
+# caches. Only the privileged writes use sudo: the proc files are root-owned, and
+# a plain `echo 3 > /proc/...` runs the redirect as the calling user and fails —
+# so write through `sudo tee` instead.
+sudo sync
+echo "$level" | sudo tee /proc/sys/vm/drop_caches > /dev/null
 
 # Best-effort: compact free memory so large contiguous allocations (model load /
 # KV cache) are easier to satisfy. Not present on every kernel — ignore failures.
-echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+echo 1 | sudo tee /proc/sys/vm/compact_memory > /dev/null 2>&1 || true
 
 after="$(avail_mb)"
 
