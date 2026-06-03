@@ -12,7 +12,7 @@ ExecStart=/opt/geniepod/bin/llama-server \
     --model ${GENIEPOD_LLM_MODEL} \
     --host 0.0.0.0 \
     --port 8080 \
-    --ctx-size 2048 \
+    --ctx-size ${GENIEPOD_LLM_CTX_SIZE} \
     --n-gpu-layers 999 \
     --threads 4 \
     --parallel 1 \
@@ -23,11 +23,18 @@ ExecStart=/opt/geniepod/bin/llama-server \
 # Tegra/aarch64 CUDA this combination currently crashes with
 # `GGML_ASSERT(ggml_is_contiguous(a)) failed` in ggml_reshape_2d via
 # llm_build_phi3::build_attn. Tracked upstream in llama.cpp; the
-# --ctx-size 2048 reduction alone (was 4096) is enough to ease the
+# --ctx-size default of 2048 (down from 4096) is enough to ease the
 # iGPU eviction pressure that was slowing STT after long LLM responses
 # (see #2 for the full memory-budget math).
 
+# Model + context size are env-driven so a host can override them WITHOUT editing
+# this unit or using systemd drop-ins (setup-jetson.sh wipes ctx.conf/model.conf
+# drop-ins; the optional EnvironmentFile below is left alone). The defaults keep
+# current behavior; /etc/geniepod/llm.env is where the issue #376 16k experiment
+# raises the context and points at a different model. See deploy/config/llm.env.example.
 Environment=GENIEPOD_LLM_MODEL=/opt/geniepod/models/phi-4-mini-instruct-q4_k_m.gguf
+Environment=GENIEPOD_LLM_CTX_SIZE=2048
+EnvironmentFile=-/etc/geniepod/llm.env
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=120
