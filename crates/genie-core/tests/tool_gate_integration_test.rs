@@ -602,3 +602,220 @@ async fn home_status_rejects_invalid_arguments_and_audits() {
         assert_eq!(event["success"], false);
     }
 }
+
+// --- Issue #22: per-tool rate limits + two-step confirmation gate ----------
+
+#[tokio::test]
+async fn tool_gate_per_tool_rate_limit_bounces_after_n_and_audits() {
+    let paths = TestAuditPaths::new();
+    let mut policy = ToolPolicyConfig::default();
+    policy
+        .max_actions_per_minute_by_tool
+        .insert("calculate".into(), 2);
+
+    let dispatcher = paths.dispatcher(None, policy, ActuationSafetyConfig::default());
+    let call = ToolCall {
+        name: "calculate".into(),
+        arguments: serde_json::json!({"expression": "1 + 1"}),
+    };
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Api,
+        ..ToolExecutionContext::default()
+    };
+
+    let first = dispatcher.execute_with_context(&call, ctx).await;
+    let second = dispatcher.execute_with_context(&call, ctx).await;
+    let third = dispatcher.execute_with_context(&call, ctx).await;
+
+    assert!(first.success, "first call within limit: {}", first.output);
+    assert!(
+        second.success,
+        "second call within limit: {}",
+        second.output
+    );
+    assert!(!third.success, "third call must bounce off the limit");
+    assert!(
+        third.output.contains("rate limit"),
+        "expected rate-limit refusal, got: {}",
+        third.output
+    );
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(events.len(), 3, "every attempt is audited");
+    assert_eq!(events[0]["decision"], "executed");
+    assert_eq!(events[1]["decision"], "executed");
+    assert_eq!(events[2]["decision"], "rate_limited");
+    assert_eq!(events[2]["success"], false);
+}
+
+#[tokio::test]
+async fn tool_gate_confirmation_two_step_executes_within_ttl() {
+    let paths = TestAuditPaths::new();
+    let policy = ToolPolicyConfig {
+        requires_confirmation_tools: vec!["calculate".into()],
+        confirmation_ttl_secs: 120,
+        ..ToolPolicyConfig::default()
+    };
+
+    let dispatcher = paths.dispatcher(None, policy, ActuationSafetyConfig::default());
+    let call = ToolCall {
+        name: "calculate".into(),
+        arguments: serde_json::json!({"expression": "2 + 2"}),
+    };
+    let request_ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Api,
+        ..ToolExecutionContext::default()
+    };
+    let confirm_ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Api,
+        confirmed: true,
+        ..ToolExecutionContext::default()
+    };
+
+    let pending = dispatcher.execute_with_context(&call, request_ctx).await;
+    assert!(pending.success, "pending leg returns guidance, not failure");
+    assert!(
+        pending.output.contains("Confirmation required"),
+        "expected confirmation guidance, got: {}",
+        pending.output
+    );
+    assert!(
+        pending.output.contains("conf-"),
+        "expected a stable confirmation token, got: {}",
+        pending.output
+    );
+    assert!(
+        !pending.output.contains("= 4"),
+        "tool must not execute on the first leg: {}",
+        pending.output
+    );
+
+    let confirmed = dispatcher.execute_with_context(&call, confirm_ctx).await;
+    assert!(
+        confirmed.success,
+        "confirming leg within TTL executes: {}",
+        confirmed.output
+    );
+    assert!(
+        confirmed.output.contains("= 4"),
+        "expected calculation result, got: {}",
+        confirmed.output
+    );
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["decision"], "pending_confirmation");
+    assert_eq!(events[1]["decision"], "executed");
+}
+
+#[tokio::test]
+async fn tool_gate_confirmation_without_first_leg_is_refused() {
+    let paths = TestAuditPaths::new();
+    let policy = ToolPolicyConfig {
+        requires_confirmation_tools: vec!["calculate".into()],
+        ..ToolPolicyConfig::default()
+    };
+
+    let dispatcher = paths.dispatcher(None, policy, ActuationSafetyConfig::default());
+    let call = ToolCall {
+        name: "calculate".into(),
+        arguments: serde_json::json!({"expression": "9 + 9"}),
+    };
+    let confirm_ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Api,
+        confirmed: true,
+        ..ToolExecutionContext::default()
+    };
+
+    let result = dispatcher.execute_with_context(&call, confirm_ctx).await;
+    assert!(
+        !result.success,
+        "confirming with no pending first leg must error"
+    );
+    assert!(
+        result.output.contains("expired") || result.output.contains("never requested"),
+        "expected an expiry error, got: {}",
+        result.output
+    );
+    assert!(!result.output.contains("= 18"));
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["decision"], "confirmation_expired");
+}
+
+#[tokio::test]
+async fn tool_gate_confirmation_outside_ttl_errors() {
+    let paths = TestAuditPaths::new();
+    let policy = ToolPolicyConfig {
+        requires_confirmation_tools: vec!["calculate".into()],
+        confirmation_ttl_secs: 1,
+        ..ToolPolicyConfig::default()
+    };
+
+    let dispatcher = paths.dispatcher(None, policy, ActuationSafetyConfig::default());
+    let call = ToolCall {
+        name: "calculate".into(),
+        arguments: serde_json::json!({"expression": "3 + 3"}),
+    };
+    let request_ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Api,
+        ..ToolExecutionContext::default()
+    };
+    let confirm_ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Api,
+        confirmed: true,
+        ..ToolExecutionContext::default()
+    };
+
+    let pending = dispatcher.execute_with_context(&call, request_ctx).await;
+    assert!(pending.output.contains("Confirmation required"));
+
+    // Let the 1s confirmation window lapse before the confirming leg arrives.
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+    let confirmed = dispatcher.execute_with_context(&call, confirm_ctx).await;
+    assert!(
+        !confirmed.success,
+        "confirming after the TTL window must error: {}",
+        confirmed.output
+    );
+    assert!(confirmed.output.contains("expired"));
+}
+
+#[tokio::test]
+async fn gate_tool_call_rejects_denied_origin_and_audits() {
+    // The voice web_search fast-path uses `gate_tool_call` rather than
+    // `execute_with_context`; it must still refuse a denied origin and audit it.
+    let paths = TestAuditPaths::new();
+    let mut policy = ToolPolicyConfig::default();
+    policy
+        .denied_tools_by_origin
+        .insert("voice".into(), vec!["web_search".into()]);
+    let dispatcher = paths.dispatcher(None, policy, ActuationSafetyConfig::default());
+
+    let call = ToolCall {
+        name: "web_search".into(),
+        arguments: serde_json::json!({"query": "weather"}),
+    };
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Voice,
+        ..ToolExecutionContext::default()
+    };
+
+    let rejected = dispatcher
+        .gate_tool_call(&call, ctx)
+        .expect("gate must reject web_search denied from voice");
+    assert!(!rejected.success);
+    assert!(
+        rejected.output.contains("origin policy"),
+        "expected ACL refusal, got: {}",
+        rejected.output
+    );
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["decision"], "denied_policy");
+    assert_eq!(events[0]["origin"], "voice");
+    assert_eq!(events[0]["tool"], "web_search");
+}
