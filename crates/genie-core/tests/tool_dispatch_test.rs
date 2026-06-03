@@ -252,25 +252,41 @@ fn jetson_lifecycle_scripts_are_valid_shell() {
     }
 }
 
-/// Verify the deploy pipeline copies the Jetson lifecycle helper scripts.
+/// Verify the deploy pipeline ships the Jetson helper scripts. They are deployed
+/// via the `JETSON_SCRIPTS = $(wildcard deploy/scripts/*)` glob, so this guards
+/// the mechanism (glob + install into bin) and that each critical helper exists
+/// under deploy/scripts/ so the glob actually picks it up.
 #[test]
 fn makefile_deploys_lifecycle_helpers() {
-    let path = workspace_root().join("Makefile");
-    let contents = std::fs::read_to_string(&path).unwrap();
+    let makefile = std::fs::read_to_string(workspace_root().join("Makefile")).unwrap();
+
+    assert!(
+        makefile.contains("JETSON_SCRIPTS = $(wildcard deploy/scripts/*)"),
+        "Makefile should glob deploy/scripts/* into JETSON_SCRIPTS so new scripts ship automatically"
+    );
+    assert!(
+        makefile.contains("scp $(JETSON_SCRIPTS)"),
+        "deploy-setup should scp every script in JETSON_SCRIPTS to the Jetson"
+    );
+    assert!(
+        makefile.contains("$(addprefix $(INSTALL_DIR)/bin/,$(notdir $(JETSON_SCRIPTS)))"),
+        "deploy-setup should install the JETSON_SCRIPTS into $(INSTALL_DIR)/bin"
+    );
 
     for script in [
         "genie-restart-all.sh",
         "start_all.sh",
         "stop_all.sh",
         "genie-model-cache-status.sh",
+        "genie-disable-gui.sh",
+        "genie-drop-caches.sh",
     ] {
         assert!(
-            contents.contains(&format!("deploy/scripts/{script}")),
-            "Makefile should copy {script} during deploy"
-        );
-        assert!(
-            contents.contains(&format!("$(INSTALL_DIR)/bin/{script}")),
-            "Makefile should install {script} into /opt/geniepod/bin"
+            workspace_root()
+                .join("deploy/scripts")
+                .join(script)
+                .exists(),
+            "{script} should exist under deploy/scripts/ so the deploy glob ships it"
         );
     }
 }
