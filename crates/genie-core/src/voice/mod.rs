@@ -265,7 +265,17 @@ impl VoiceOrchestrator {
                 name: call.tool,
                 arguments: call.arguments,
             };
-            return Some(self.tools.execute(&tc).await);
+            return Some(
+                self.tools
+                    .execute_with_context(
+                        &tc,
+                        crate::tools::ToolExecutionContext {
+                            request_origin: crate::tools::RequestOrigin::Voice,
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+            );
         }
 
         // Try finding JSON embedded in the response.
@@ -280,7 +290,17 @@ impl VoiceOrchestrator {
                     name: call.tool,
                     arguments: call.arguments,
                 };
-                return Some(self.tools.execute(&tc).await);
+                return Some(
+                    self.tools
+                        .execute_with_context(
+                            &tc,
+                            crate::tools::ToolExecutionContext {
+                                request_origin: crate::tools::RequestOrigin::Voice,
+                                ..Default::default()
+                            },
+                        )
+                        .await,
+                );
             }
         }
 

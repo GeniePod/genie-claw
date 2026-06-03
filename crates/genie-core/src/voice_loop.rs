@@ -705,6 +705,27 @@ async fn handle_quick_tool_for_voice(
         tools.has_web_search(),
     )?;
     if call.name == "web_search" {
+        // The voice web_search fast-path renders its own speech-optimized output
+        // instead of dispatching through `execute_with_context`, so it must
+        // still flow through the single gate chokepoint (ACLs, confirmation,
+        // per-tool rate limits, audit) rather than reaching the provider
+        // directly. Refusals are spoken back like any other tool result.
+        let exec_ctx = crate::tools::ToolExecutionContext {
+            memory_read_context: Some(read_context),
+            request_origin: crate::tools::RequestOrigin::Voice,
+            confirmed: false,
+        };
+        if let Some(rejected) = tools.gate_tool_call(&call, exec_ctx) {
+            let response = crate::security::sandbox::sanitize_output(&rejected.output);
+            conversations.append_or_log(conv_id, "assistant", &response, None);
+            let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
+            let voice_text = format::for_voice(&response);
+            if !voice_text.is_empty() {
+                let _ = tts_engine.speak(&voice_text).await;
+            }
+            return Some(response);
+        }
+
         let query = call
             .arguments
             .get("query")
@@ -722,17 +743,19 @@ async fn handle_quick_tool_for_voice(
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
 
-        let (response, voice_response) = match tools.web_search_response(query, limit, fresh).await
-        {
-            Ok(result) => {
-                let voice_response = result.render_voice();
-                (result.response, voice_response)
-            }
-            Err(e) => {
-                let error = format!("web_search failed: {}", e);
-                (error.clone(), error)
-            }
-        };
+        let started = std::time::Instant::now();
+        let (response, voice_response, success) =
+            match tools.web_search_response(query, limit, fresh).await {
+                Ok(result) => {
+                    let voice_response = result.render_voice();
+                    (result.response, voice_response, true)
+                }
+                Err(e) => {
+                    let error = format!("web_search failed: {}", e);
+                    (error.clone(), error, false)
+                }
+            };
+        tools.audit_gated_tool(&call, exec_ctx, started, success, &response);
         let response = crate::security::sandbox::sanitize_output(&response);
         let tool_json = serde_json::json!({
             "tool": call.name,

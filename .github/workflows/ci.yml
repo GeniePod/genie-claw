@@ -52,6 +52,10 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Run the slow release-build tests (binary_size_budget, core_binary_builds)
+      # here; they skip locally so `cargo test` stays fast for contributors.
+      GENIE_RUN_RELEASE_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
