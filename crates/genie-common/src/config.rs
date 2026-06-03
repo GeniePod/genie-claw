@@ -505,6 +505,26 @@ pub struct ToolPolicyConfig {
     /// Tools blocked by origin. Deny rules override allow rules.
     #[serde(default)]
     pub denied_tools_by_origin: HashMap<String, Vec<String>>,
+
+    /// Per-tool sliding-window rate limit, in calls per minute, enforced at the
+    /// dispatch gate for *every* origin (issue #22). A tool not listed has no
+    /// per-tool cap; this is independent of the per-origin home actuation
+    /// limits in `[actuation_safety]`. Example:
+    /// `max_actions_per_minute_by_tool = { play_media = 10 }`.
+    #[serde(default)]
+    pub max_actions_per_minute_by_tool: HashMap<String, usize>,
+
+    /// Tools that require a two-call confirmation before they execute (issue
+    /// #22). The first call returns a pending token without running the tool; a
+    /// second call with the same origin and arguments within
+    /// `confirmation_ttl_secs` proceeds. `home_control` keeps its own richer
+    /// risk-based confirmation regardless of this list.
+    #[serde(default)]
+    pub requires_confirmation_tools: Vec<String>,
+
+    /// Validity window for a pending tool confirmation, in seconds (issue #22).
+    #[serde(default = "defaults::tool_confirmation_ttl_secs")]
+    pub confirmation_ttl_secs: u64,
 }
 
 impl Default for ToolPolicyConfig {
@@ -513,6 +533,9 @@ impl Default for ToolPolicyConfig {
             enabled: defaults::tool_policy_enabled(),
             allowed_tools_by_origin: HashMap::new(),
             denied_tools_by_origin: HashMap::new(),
+            max_actions_per_minute_by_tool: HashMap::new(),
+            requires_confirmation_tools: Vec::new(),
+            confirmation_ttl_secs: defaults::tool_confirmation_ttl_secs(),
         }
     }
 }
@@ -2405,6 +2428,21 @@ signature_key_dir = "/custom/keys"
         assert!(config.core.tool_policy.enabled);
         assert!(config.core.tool_policy.allowed_tools_by_origin.is_empty());
         assert!(config.core.tool_policy.denied_tools_by_origin.is_empty());
+        assert!(
+            config
+                .core
+                .tool_policy
+                .max_actions_per_minute_by_tool
+                .is_empty()
+        );
+        assert!(
+            config
+                .core
+                .tool_policy
+                .requires_confirmation_tools
+                .is_empty()
+        );
+        assert_eq!(config.core.tool_policy.confirmation_ttl_secs, 120);
     }
 
     #[test]
@@ -2414,6 +2452,9 @@ signature_key_dir = "/custom/keys"
 enabled = true
 allowed_tools_by_origin = { telegram = ["get_time", "memory_recall"] }
 denied_tools_by_origin = { voice = ["web_search"], "*" = ["play_media"] }
+max_actions_per_minute_by_tool = { play_media = 10 }
+requires_confirmation_tools = ["play_media"]
+confirmation_ttl_secs = 90
 "#,
         )
         .unwrap();
@@ -2425,6 +2466,9 @@ denied_tools_by_origin = { voice = ["web_search"], "*" = ["play_media"] }
         );
         assert_eq!(config.denied_tools_by_origin["voice"], vec!["web_search"]);
         assert_eq!(config.denied_tools_by_origin["*"], vec!["play_media"]);
+        assert_eq!(config.max_actions_per_minute_by_tool["play_media"], 10);
+        assert_eq!(config.requires_confirmation_tools, vec!["play_media"]);
+        assert_eq!(config.confirmation_ttl_secs, 90);
     }
 
     #[test]
@@ -2770,6 +2814,9 @@ mod defaults {
     }
     pub fn tool_policy_enabled() -> bool {
         true
+    }
+    pub fn tool_confirmation_ttl_secs() -> u64 {
+        120
     }
     pub fn actuation_safety_enabled() -> bool {
         true

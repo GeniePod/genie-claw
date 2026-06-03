@@ -27,6 +27,27 @@ pub async fn try_tool_call_with_context(
     Some(tools.execute_with_context(&call, exec_ctx).await)
 }
 
+/// Shown to the user instead of leaking raw tool-call JSON when the model
+/// produced something that looks like a tool call but could not be parsed
+/// (issue #378).
+pub const UNPARSED_TOOL_CALL_FALLBACK: &str =
+    "Sorry, I didn't quite catch that — could you say it another way?";
+
+/// True when the model output structurally resembles a tool call but no valid
+/// tool-call JSON can be extracted from it — e.g. the model emitted invalid
+/// JSON like `{"seconds": 60*60*12}` (issue #378). Such output must not be
+/// rendered to the user as a normal reply, which would leak raw tool-call JSON.
+/// Normal prose, or a response whose tool-call JSON parses cleanly (and is
+/// therefore handled by `try_tool_call_with_context`), returns false.
+pub fn is_unparsed_tool_call(response: &str) -> bool {
+    let trimmed = response.trim();
+    let looks_toolish = (trimmed.starts_with('{') || trimmed.starts_with("```"))
+        && (trimmed.contains("\"tool\"")
+            || trimmed.contains("\"arguments\"")
+            || trimmed.contains("\"name\""));
+    looks_toolish && extract_json(response).is_none()
+}
+
 /// Parse tool calls from model output without executing them.
 ///
 /// This is intentionally separate from `try_tool_call_with_context`: evaluation
@@ -339,6 +360,32 @@ mod tests {
     fn no_tool_call_in_normal_response() {
         let input = "The current time is 3:45 PM. Is there anything else I can help with?";
         assert!(extract_json(input).is_none());
+    }
+
+    #[test]
+    fn unparsed_tool_call_detected_for_invalid_json() {
+        // The exact Jetson leak (issue #378): `60*60*12` is a JS expression,
+        // not valid JSON, so the tool call never parses and would otherwise be
+        // shown to the user verbatim.
+        let leak = r#"{"tool":"set_timer","arguments":{"seconds":60*60*12,"label":"meeting"}}"#;
+        assert!(is_unparsed_tool_call(leak));
+        // Also when fenced.
+        assert!(is_unparsed_tool_call(
+            "```json\n{\"tool\":\"set_timer\",\"arguments\":{\"seconds\":60*60}}\n```"
+        ));
+    }
+
+    #[test]
+    fn valid_tool_call_is_not_flagged_as_unparsed() {
+        let ok = r#"{"tool":"set_timer","arguments":{"seconds":300}}"#;
+        assert!(!is_unparsed_tool_call(ok));
+    }
+
+    #[test]
+    fn normal_prose_is_not_flagged_as_unparsed() {
+        assert!(!is_unparsed_tool_call("The timer is set for 5 minutes."));
+        assert!(!is_unparsed_tool_call("Hi! How can I help you today?"));
+        assert!(!is_unparsed_tool_call(""));
     }
 
     #[test]

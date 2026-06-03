@@ -35,6 +35,15 @@ zeroize = { version = "1", features = ["derive", "serde"] }
 # Workspace crate references
 genie-common = { path = "crates/genie-common" }
 
+# Faster local/debug builds: line-tables keep backtraces readable but skip the
+# heavy per-variable debuginfo, and dependencies need no debuginfo at all. This
+# cuts compile + link time without touching the release (Jetson) build below.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = "z"     # Optimize for binary size
 lto = true
