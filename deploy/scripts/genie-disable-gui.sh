@@ -7,8 +7,8 @@
 # this drops to a console-only boot and frees that memory for the agent.
 #
 # Usage (run on the Jetson, as root):
-#   sudo bash /opt/geniepod/scripts/genie-disable-gui.sh          # disable GUI
-#   sudo bash /opt/geniepod/scripts/genie-disable-gui.sh --enable # restore GUI
+#   sudo bash /opt/geniepod/bin/genie-disable-gui.sh          # disable GUI
+#   sudo bash /opt/geniepod/bin/genie-disable-gui.sh --enable # restore GUI
 #
 # It is idempotent and reversible. Best run over SSH — it tears down the local
 # desktop session immediately, so a monitor/keyboard session would be dropped
