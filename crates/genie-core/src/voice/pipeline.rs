@@ -218,7 +218,17 @@ impl VoicePipeline {
             name: call.tool,
             arguments: call.arguments,
         };
-        Some(self.tools.execute(&tc).await)
+        Some(
+            self.tools
+                .execute_with_context(
+                    &tc,
+                    crate::tools::ToolExecutionContext {
+                        request_origin: crate::tools::RequestOrigin::Voice,
+                        ..Default::default()
+                    },
+                )
+                .await,
+        )
     }
 
     /// Clear conversation history.
