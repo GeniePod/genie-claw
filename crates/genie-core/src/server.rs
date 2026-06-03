@@ -1070,7 +1070,11 @@ async fn handle_chat_stream(
         }
         summary
     } else {
-        let sanitized = crate::security::sandbox::sanitize_output(&llm_response);
+        let sanitized = if crate::tools::is_unparsed_tool_call(&llm_response) {
+            crate::tools::UNPARSED_TOOL_CALL_FALLBACK.to_string()
+        } else {
+            crate::security::sandbox::sanitize_output(&llm_response)
+        };
         if !state.pending.is_empty() && state.mode == StreamMode::Undecided {
             write_stream_event(
                 writer,
@@ -1196,7 +1200,11 @@ pub async fn process_chat_turn(
         )
         .await
     } else {
-        let sanitized = crate::security::sandbox::sanitize_output(&llm_response);
+        let sanitized = if crate::tools::is_unparsed_tool_call(&llm_response) {
+            crate::tools::UNPARSED_TOOL_CALL_FALLBACK.to_string()
+        } else {
+            crate::security::sandbox::sanitize_output(&llm_response)
+        };
         conversations.append_or_log(conv_id, "assistant", &sanitized, None);
         sanitized
     };
@@ -2240,6 +2248,8 @@ async fn handle_openai_chat(
         } else {
             tool_result.output
         }
+    } else if crate::tools::is_unparsed_tool_call(&llm_response) {
+        crate::tools::UNPARSED_TOOL_CALL_FALLBACK.to_string()
     } else {
         llm_response
     };
