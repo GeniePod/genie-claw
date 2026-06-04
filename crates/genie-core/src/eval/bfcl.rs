@@ -505,7 +505,12 @@ fn bfcl_reference_home() -> HomeGraph {
             entity("light.kitchen", "Kitchen Lights", "light", "Kitchen"),
             entity("fan.kitchen", "Kitchen Fan", "fan", "Kitchen"),
             entity("climate.kitchen", "Thermostat", "climate", "Kitchen"),
-            entity("cover.living_room", "Living Room Blinds", "cover", "Living Room"),
+            entity(
+                "cover.living_room",
+                "Living Room Blinds",
+                "cover",
+                "Living Room",
+            ),
         ],
         scenes: Vec::new(),
         scripts: Vec::new(),
@@ -868,8 +873,9 @@ mod tests {
 
         let prediction = BfclPrediction {
             id: case.id.clone(),
-            response: r#"{"tool":"home_control","arguments":{"action":"turn_off","entity":"lights"}}"#
-                .to_string(),
+            response:
+                r#"{"tool":"home_control","arguments":{"action":"turn_off","entity":"lights"}}"#
+                    .to_string(),
         };
 
         let score = score_response(&case, &prediction.response);
