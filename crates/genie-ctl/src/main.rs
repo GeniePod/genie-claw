@@ -1519,8 +1519,16 @@ fn print_bfcl_report_metrics(report: &genie_core::eval::bfcl::BfclReport) {
         format_score_rate(report.argument_accuracy)
     );
     println!(
+        "grounded_arg_acc:    {}",
+        format_score_rate(report.grounded_argument_accuracy)
+    );
+    println!(
         "strict_accuracy:     {}",
         format_score_rate(report.strict_accuracy)
+    );
+    println!(
+        "grounded_strict_acc: {}",
+        format_score_rate(report.grounded_strict_accuracy)
     );
     println!("missing_predictions: {}", report.missing_predictions);
     println!("failures:            {}", report.failure_count);
