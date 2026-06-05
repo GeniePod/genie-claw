@@ -925,6 +925,11 @@ async fn cmd_status() -> Result<()> {
             if let Some(sha) = data.get("system_prompt_sha").and_then(|v| v.as_str()) {
                 println!("Prompt:    {}", sha);
             }
+            if let Some(harness) = data.get("agent_harness")
+                && let Some(summary) = format_agent_harness_status(harness)
+            {
+                println!("Harness:   {}", summary);
+            }
         }
         Err(_) => println!("Core:      offline"),
     }
@@ -1750,6 +1755,33 @@ fn bfcl_llm_tool_catalog(cases: &[genie_core::eval::bfcl::BfclCase]) -> Vec<Stri
     }
 
     rows
+}
+
+fn format_agent_harness_status(harness: &serde_json::Value) -> Option<String> {
+    let pass = harness.get("pass")?.as_bool()?;
+    if pass {
+        return Some("pass".to_string());
+    }
+
+    let failed_checks: Vec<String> = harness
+        .get("checks")
+        .and_then(|checks| checks.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|check| check.get("pass").and_then(|v| v.as_bool()) == Some(false))
+        .filter_map(|check| {
+            check
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+
+    if failed_checks.is_empty() {
+        Some("FAIL".to_string())
+    } else {
+        Some(format!("FAIL ({})", failed_checks.join(", ")))
+    }
 }
 
 fn format_score_rate(rate: f64) -> String {
@@ -3264,5 +3296,36 @@ mod tests {
         let removed = remove_skill("hello_world", &skills_dir).unwrap();
         assert_eq!(removed.file_name().unwrap().to_string_lossy(), "hello.so");
         assert!(load_installed_skills(&skills_dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn format_agent_harness_status_reports_pass() {
+        let harness = serde_json::json!({
+            "pass": true,
+            "checks": [
+                {"name": "memory_hydration_budget", "pass": true, "detail": "ok"}
+            ]
+        });
+
+        assert_eq!(
+            format_agent_harness_status(&harness).as_deref(),
+            Some("pass")
+        );
+    }
+
+    #[test]
+    fn format_agent_harness_status_lists_failed_checks() {
+        let harness = serde_json::json!({
+            "pass": false,
+            "checks": [
+                {"name": "memory_hydration_budget", "pass": false, "detail": "over budget"},
+                {"name": "tool_manifest_budget", "pass": true, "detail": "ok"}
+            ]
+        });
+
+        assert_eq!(
+            format_agent_harness_status(&harness).as_deref(),
+            Some("FAIL (memory_hydration_budget)")
+        );
     }
 }
