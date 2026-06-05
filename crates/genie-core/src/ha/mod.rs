@@ -12,7 +12,7 @@ pub use policy::{
     assess_runtime_home_action,
 };
 pub use provider::{
-    ActionResult, AreaRef, DeviceRef, HomeAction, HomeActionKind, HomeAssistantProvider,
+    ActionResult, AreaRef, DeviceRef, EntityRef, HomeAction, HomeActionKind, HomeAssistantProvider,
     HomeAutomationProvider, HomeGraph, HomeState, HomeTarget, HomeTargetKind, IntegrationHealth,
     SceneRef, ScriptRef, into_provider,
 };

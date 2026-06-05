@@ -327,7 +327,7 @@ impl HomeAssistantProvider {
         }
     }
 
-    fn resolve_target_in_graph(
+    pub(crate) fn resolve_target_in_graph(
         graph: &HomeGraph,
         query: &str,
         action_hint: Option<HomeActionKind>,
@@ -929,9 +929,10 @@ fn domain_synonyms(domain: &str) -> Vec<String> {
 
 fn infer_domain(query: &str) -> Option<String> {
     let query = normalize(query);
-    let checks: [(&str, &[&str]); 5] = [
+    let checks: [(&str, &[&str]); 6] = [
         ("light", &["light", "lights", "lamp", "lamps"]),
         ("switch", &["switch", "switches", "plug", "outlet"]),
+        ("fan", &["fan", "fans"]),
         (
             "climate",
             &[
