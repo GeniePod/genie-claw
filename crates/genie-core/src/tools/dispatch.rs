@@ -109,6 +109,14 @@ fn normalize_memory_recall_query(raw: &str) -> String {
     }
 }
 
+fn parse_play_media_query(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("play_media requires non-empty string argument 'query'"))
+}
+
 /// Tool definition for LLM function calling.
 ///
 /// These are sent to the configured LLM backend as part of the system prompt or
@@ -1514,7 +1522,7 @@ impl ToolDispatcher {
     }
 
     async fn exec_play_media(&self, args: &serde_json::Value) -> Result<String> {
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let query = parse_play_media_query(args)?;
         let resolved = self.resolve_media_query(query);
         tracing::info!(
             query,
