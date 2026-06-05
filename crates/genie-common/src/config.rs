@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Top-level GeniePod system configuration.
 ///
@@ -58,7 +59,7 @@ pub struct CoreConfig {
     /// Home Assistant long-lived access token.
     /// Can also be set via HA_TOKEN env var.
     #[serde(default)]
-    pub ha_token: String,
+    pub ha_token: Zeroizing<String>,
 
     /// LLM model name (for prompt optimization). Auto-detected from filename.
     #[serde(default = "defaults::llm_model_name")]
@@ -222,7 +223,7 @@ impl Default for CoreConfig {
         Self {
             port: defaults::core_port(),
             bind_host: defaults::core_bind_host(),
-            ha_token: String::new(),
+            ha_token: Zeroizing::new(String::new()),
             llm_model_name: defaults::llm_model_name(),
             whisper_model: defaults::whisper_model(),
             whisper_port: 0,
@@ -470,6 +471,13 @@ pub struct SkillPolicyConfig {
     /// Reject skills requesting any of these permission labels.
     #[serde(default)]
     pub denied_permissions: Vec<String>,
+
+    /// Deadline for a single native skill invocation, in milliseconds. The C
+    /// ABI call runs on a blocking thread; if it does not return within this
+    /// budget the call is abandoned and a timeout error is returned to the
+    /// caller, so a hung skill cannot freeze the async executor.
+    #[serde(default = "defaults::skill_execution_timeout_ms")]
+    pub skill_execution_timeout_ms: u64,
 }
 
 impl Default for SkillPolicyConfig {
@@ -479,6 +487,7 @@ impl Default for SkillPolicyConfig {
             require_signature: false,
             signature_key_dir: defaults::skill_signature_key_dir(),
             denied_permissions: Vec::new(),
+            skill_execution_timeout_ms: defaults::skill_execution_timeout_ms(),
         }
     }
 }
@@ -496,6 +505,26 @@ pub struct ToolPolicyConfig {
     /// Tools blocked by origin. Deny rules override allow rules.
     #[serde(default)]
     pub denied_tools_by_origin: HashMap<String, Vec<String>>,
+
+    /// Per-tool sliding-window rate limit, in calls per minute, enforced at the
+    /// dispatch gate for *every* origin (issue #22). A tool not listed has no
+    /// per-tool cap; this is independent of the per-origin home actuation
+    /// limits in `[actuation_safety]`. Example:
+    /// `max_actions_per_minute_by_tool = { play_media = 10 }`.
+    #[serde(default)]
+    pub max_actions_per_minute_by_tool: HashMap<String, usize>,
+
+    /// Tools that require a two-call confirmation before they execute (issue
+    /// #22). The first call returns a pending token without running the tool; a
+    /// second call with the same origin and arguments within
+    /// `confirmation_ttl_secs` proceeds. `home_control` keeps its own richer
+    /// risk-based confirmation regardless of this list.
+    #[serde(default)]
+    pub requires_confirmation_tools: Vec<String>,
+
+    /// Validity window for a pending tool confirmation, in seconds (issue #22).
+    #[serde(default = "defaults::tool_confirmation_ttl_secs")]
+    pub confirmation_ttl_secs: u64,
 }
 
 impl Default for ToolPolicyConfig {
@@ -504,6 +533,9 @@ impl Default for ToolPolicyConfig {
             enabled: defaults::tool_policy_enabled(),
             allowed_tools_by_origin: HashMap::new(),
             denied_tools_by_origin: HashMap::new(),
+            max_actions_per_minute_by_tool: HashMap::new(),
+            requires_confirmation_tools: Vec::new(),
+            confirmation_ttl_secs: defaults::tool_confirmation_ttl_secs(),
         }
     }
 }
@@ -753,7 +785,7 @@ pub struct TelegramConfig {
 
     /// Telegram Bot API token. Can also be provided via TELEGRAM_BOT_TOKEN.
     #[serde(default)]
-    pub bot_token: String,
+    pub bot_token: Zeroizing<String>,
 
     /// Optional Telegram Bot API base URL.
     #[serde(default = "defaults::telegram_api_base")]
@@ -774,6 +806,14 @@ pub struct TelegramConfig {
     /// Voice-message handling for the Telegram channel (issue #42).
     #[serde(default)]
     pub voice: TelegramVoiceConfig,
+
+    /// Bound on concurrent in-flight update tasks. Issue #278: the poll loop
+    /// spawns a task per update with no back-pressure; this caps total
+    /// concurrent work so a message flood cannot exhaust memory or the Tokio
+    /// thread pool. Must be >= `voice.max_parallel_voice` — enforced at
+    /// startup by clamping if the config violates the invariant.
+    #[serde(default = "defaults::telegram_max_parallel_updates")]
+    pub max_parallel_updates: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1332,15 +1372,18 @@ impl Config {
     }
 
     /// Resolve the Home Assistant token from config first, then the environment.
-    pub fn homeassistant_token(&self) -> Option<String> {
-        let token = if self.core.ha_token.is_empty() {
-            std::env::var("HA_TOKEN").unwrap_or_default()
+    pub fn homeassistant_token(&self) -> Option<Zeroizing<String>> {
+        let raw = if self.core.ha_token.is_empty() {
+            Zeroizing::new(std::env::var("HA_TOKEN").unwrap_or_default())
         } else {
             self.core.ha_token.clone()
         };
-
-        let token = token.trim().to_string();
-        if token.is_empty() { None } else { Some(token) }
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(Zeroizing::new(trimmed))
+        }
     }
 
     /// Whether the current deployment should manage a given service alias.
@@ -1383,15 +1426,18 @@ impl Config {
     }
 
     /// Resolve the Telegram bot token from config first, then the environment.
-    pub fn telegram_bot_token(&self) -> Option<String> {
-        let token = if self.telegram.bot_token.is_empty() {
-            std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default()
+    pub fn telegram_bot_token(&self) -> Option<Zeroizing<String>> {
+        let raw = if self.telegram.bot_token.is_empty() {
+            Zeroizing::new(std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default())
         } else {
             self.telegram.bot_token.clone()
         };
-
-        let token = token.trim().to_string();
-        if token.is_empty() { None } else { Some(token) }
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(Zeroizing::new(trimmed))
+        }
     }
 
     pub fn connectivity_enabled(&self) -> bool {
@@ -1521,7 +1567,8 @@ impl Config {
                 "skill_signature_required": self.core.skill_policy.require_signature,
                 "skill_signature_scheme": "ed25519_detached_over_so_bytes",
                 "skill_signature_key_dir": self.core.skill_policy.signature_key_dir.display().to_string(),
-                "skill_signature_trusted_keys_present": has_trusted_skill_keys(&self.core.skill_policy.signature_key_dir)
+                "skill_signature_trusted_keys_present": has_trusted_skill_keys(&self.core.skill_policy.signature_key_dir),
+                "skill_execution_timeout_ms": self.core.skill_policy.skill_execution_timeout_ms
             },
             "secret_presence": {
                 "homeassistant_token_configured": self.homeassistant_token().is_some(),
@@ -1592,12 +1639,13 @@ impl Default for TelegramConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bot_token: String::new(),
+            bot_token: Zeroizing::new(String::new()),
             api_base: defaults::telegram_api_base(),
             poll_timeout_secs: defaults::telegram_poll_timeout_secs(),
             allowed_chat_ids: Vec::new(),
             allow_all_chats: false,
             voice: TelegramVoiceConfig::default(),
+            max_parallel_updates: defaults::telegram_max_parallel_updates(),
         }
     }
 }
@@ -2106,10 +2154,10 @@ bind_host = "0.0.0.0"
     #[test]
     fn configured_homeassistant_token_is_used() {
         let mut config = test_config();
-        config.core.ha_token = "secret-token".into();
+        config.core.ha_token = "secret-token".to_string().into();
 
         assert_eq!(
-            config.homeassistant_token().as_deref(),
+            config.homeassistant_token().as_deref().map(String::as_str),
             Some("secret-token")
         );
     }
@@ -2189,10 +2237,10 @@ backend = "genie_ai_runtime"
     #[test]
     fn configured_telegram_token_is_used() {
         let mut config = test_config();
-        config.telegram.bot_token = "telegram-secret".into();
+        config.telegram.bot_token = "telegram-secret".to_string().into();
 
         assert_eq!(
-            config.telegram_bot_token().as_deref(),
+            config.telegram_bot_token().as_deref().map(String::as_str),
             Some("telegram-secret")
         );
     }
@@ -2297,6 +2345,9 @@ local_min_score = 0.91
         assert!(!config.core.skill_policy.require_manifest);
         assert!(!config.core.skill_policy.require_signature);
         assert!(config.core.skill_policy.denied_permissions.is_empty());
+        // A bounded execution deadline is always in effect, even in audit-only
+        // mode, so a hung skill can never freeze the executor by default.
+        assert_eq!(config.core.skill_policy.skill_execution_timeout_ms, 30_000);
     }
 
     #[test]
@@ -2321,6 +2372,19 @@ denied_permissions = ["network.raw", "filesystem.write"]
             config.signature_key_dir,
             PathBuf::from("/etc/geniepod/skill-keys")
         );
+        // Omitting the key keeps the documented default deadline.
+        assert_eq!(config.skill_execution_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn skill_execution_timeout_overridable() {
+        let config: SkillPolicyConfig = toml::from_str(
+            r#"
+skill_execution_timeout_ms = 1500
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.skill_execution_timeout_ms, 1500);
     }
 
     #[test]
@@ -2364,6 +2428,21 @@ signature_key_dir = "/custom/keys"
         assert!(config.core.tool_policy.enabled);
         assert!(config.core.tool_policy.allowed_tools_by_origin.is_empty());
         assert!(config.core.tool_policy.denied_tools_by_origin.is_empty());
+        assert!(
+            config
+                .core
+                .tool_policy
+                .max_actions_per_minute_by_tool
+                .is_empty()
+        );
+        assert!(
+            config
+                .core
+                .tool_policy
+                .requires_confirmation_tools
+                .is_empty()
+        );
+        assert_eq!(config.core.tool_policy.confirmation_ttl_secs, 120);
     }
 
     #[test]
@@ -2373,6 +2452,9 @@ signature_key_dir = "/custom/keys"
 enabled = true
 allowed_tools_by_origin = { telegram = ["get_time", "memory_recall"] }
 denied_tools_by_origin = { voice = ["web_search"], "*" = ["play_media"] }
+max_actions_per_minute_by_tool = { play_media = 10 }
+requires_confirmation_tools = ["play_media"]
+confirmation_ttl_secs = 90
 "#,
         )
         .unwrap();
@@ -2384,6 +2466,9 @@ denied_tools_by_origin = { voice = ["web_search"], "*" = ["play_media"] }
         );
         assert_eq!(config.denied_tools_by_origin["voice"], vec!["web_search"]);
         assert_eq!(config.denied_tools_by_origin["*"], vec!["play_media"]);
+        assert_eq!(config.max_actions_per_minute_by_tool["play_media"], 10);
+        assert_eq!(config.requires_confirmation_tools, vec!["play_media"]);
+        assert_eq!(config.confirmation_ttl_secs, 90);
     }
 
     #[test]
@@ -2474,9 +2559,9 @@ expected_runtime_contract_hash = "abc123"
     fn household_security_summary_redacts_raw_config() {
         let mut config = test_config();
         config.telegram.enabled = true;
-        config.telegram.bot_token = "telegram-secret".into();
+        config.telegram.bot_token = "telegram-secret".to_string().into();
         config.telegram.allow_all_chats = true;
-        config.core.ha_token = "ha-secret".into();
+        config.core.ha_token = "ha-secret".to_string().into();
 
         let summary = config.household_security_summary();
 
@@ -2724,8 +2809,14 @@ mod defaults {
     pub fn skill_signature_key_dir() -> PathBuf {
         PathBuf::from("/etc/geniepod/skill-keys")
     }
+    pub fn skill_execution_timeout_ms() -> u64 {
+        30_000
+    }
     pub fn tool_policy_enabled() -> bool {
         true
+    }
+    pub fn tool_confirmation_ttl_secs() -> u64 {
+        120
     }
     pub fn actuation_safety_enabled() -> bool {
         true
@@ -2786,6 +2877,13 @@ mod defaults {
         // Jetson Orin Nano-class device. Bump in deployment configs if the
         // host has more CPU / a dedicated whisper-server.
         2
+    }
+    pub fn telegram_max_parallel_updates() -> usize {
+        // Issue #278: bound total concurrent update tasks to cap memory and
+        // Tokio worker pressure under a message flood. 8 is enough for a busy
+        // household bot while leaving headroom on Jetson Orin Nano. Must be
+        // >= max_parallel_voice (default 2); enforced at runtime by clamping.
+        8
     }
     pub fn web_search_enabled() -> bool {
         true

@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- **Tool-call gate: single chokepoint, confirmation, per-tool rate limits**
+  (#22): every tool invocation now passes one enforced gate. The voice
+  `web_search` quick-path (which renders its own speech output) and the
+  `voice::VoiceAssistant` / `voice::pipeline` fall-back paths no longer reach a
+  tool or provider directly with a defaulted origin — they flow through the
+  dispatcher gate as `RequestOrigin::Voice`, so per-origin ACLs, rate limits,
+  and the audit trail apply uniformly. Two new `[core.tool_policy]` mechanisms:
+  `max_actions_per_minute_by_tool` (per-tool sliding-window limit, `"*"`
+  catch-all) bounces a fast loop off the limit after N calls; and
+  `requires_confirmation_tools` + `confirmation_ttl_secs` require a sensitive
+  tool to be requested twice with the same arguments inside the TTL window
+  (first call returns a pending response with a stable token, the confirming
+  call passes `confirmed = true`; a confirming leg outside the window errors).
+  Every gate decision (`executed`, `denied_policy`, `rate_limited`,
+  `pending_confirmation`, `confirmation_expired`) is recorded on the tool-audit
+  line.
+
+## 1.0.0-alpha.10 - 2026-05-29
+
+Alpha 10 is the **Jetson-context harness + BFCL measurement** release. It
+keeps GenieClaw focused on the 4096-token NVIDIA Jetson Orin 8GB contract,
+records the current Home Assistant Intents BFCL quick-router baseline, and
+continues hardening local memory, tool routing, HTTP safety, and voice-facing
+runtime behavior.
+
+Current measured BFCL baseline for the Home Assistant Intents English import:
+208 cases, 208 generated quick-router predictions, 0 missing predictions, and
+5.77% strict tool-call accuracy. This is intentionally tracked as a baseline,
+not as a product-quality target; the next accuracy work is deterministic
+intent routing, entity/slot normalization, and typed-tool argument accuracy
+for high-signal home commands.
+
 - **CORS lockdown + local API token** (#228): the hand-rolled HTTP servers in
   both `genie-core` (`:3000`) and `genie-api` (`:3080`) previously answered
   every request with a wildcard `Access-Control-Allow-Origin: *` and did no

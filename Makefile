@@ -30,6 +30,9 @@ BINARIES = genie-core genie-ctl genie-governor genie-health genie-api
 RELEASE_DIR = target/release
 CROSS_DIR = target/$(AARCH64)/release
 INSTALL_DIR = /opt/geniepod
+# Every helper under deploy/scripts/ deploys to $(INSTALL_DIR)/bin on the Jetson.
+# A wildcard means a newly added script ships automatically (no list to update).
+JETSON_SCRIPTS = $(wildcard deploy/scripts/*)
 
 .PHONY: all build test release jetson deploy deploy-config deploy-systemd clean check fmt jetson-ai-runtime soak-selfcheck
 
@@ -127,12 +130,9 @@ deploy-docker:
 
 deploy-setup:
 	scp deploy/setup-jetson.sh $(JETSON_TARGET):/tmp/
-	scp deploy/scripts/genie-wake-listen.py deploy/scripts/genie-wakeword.py deploy/scripts/detect-audio-device.sh deploy/scripts/genie-restart-all.sh deploy/scripts/start_all.sh deploy/scripts/stop_all.sh deploy/scripts/genie-model-cache-status.sh deploy/scripts/genie-audio-init $(JETSON_TARGET):/tmp/
-	ssh $(JETSON_TARGET) 'sudo cp /tmp/setup-jetson.sh $(INSTALL_DIR)/setup-jetson.sh && \
-		sudo chmod +x $(INSTALL_DIR)/setup-jetson.sh && \
-		sudo mkdir -p $(INSTALL_DIR)/bin && \
-		sudo cp /tmp/genie-wake-listen.py /tmp/genie-wakeword.py /tmp/detect-audio-device.sh /tmp/genie-restart-all.sh /tmp/start_all.sh /tmp/stop_all.sh /tmp/genie-model-cache-status.sh /tmp/genie-audio-init $(INSTALL_DIR)/bin/ && \
-		sudo chmod +x $(INSTALL_DIR)/bin/genie-wake-listen.py $(INSTALL_DIR)/bin/genie-wakeword.py $(INSTALL_DIR)/bin/detect-audio-device.sh $(INSTALL_DIR)/bin/genie-restart-all.sh $(INSTALL_DIR)/bin/start_all.sh $(INSTALL_DIR)/bin/stop_all.sh $(INSTALL_DIR)/bin/genie-model-cache-status.sh $(INSTALL_DIR)/bin/genie-audio-init'
+	ssh $(JETSON_TARGET) 'rm -rf /tmp/geniepod-scripts && mkdir -p /tmp/geniepod-scripts'
+	scp $(JETSON_SCRIPTS) $(JETSON_TARGET):/tmp/geniepod-scripts/
+	ssh $(JETSON_TARGET) 'sudo cp /tmp/setup-jetson.sh $(INSTALL_DIR)/setup-jetson.sh && sudo chmod +x $(INSTALL_DIR)/setup-jetson.sh && sudo mkdir -p $(INSTALL_DIR)/bin && sudo cp /tmp/geniepod-scripts/* $(INSTALL_DIR)/bin/ && sudo chmod +x $(addprefix $(INSTALL_DIR)/bin/,$(notdir $(JETSON_SCRIPTS))) && rm -rf /tmp/geniepod-scripts'
 
 # ── Alternate LLM runtime: genie-ai-runtime (issue #54) ─────────
 #

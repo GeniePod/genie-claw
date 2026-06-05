@@ -27,6 +27,44 @@ pub async fn try_tool_call_with_context(
     Some(tools.execute_with_context(&call, exec_ctx).await)
 }
 
+/// Shown to the user instead of leaking raw tool-call JSON when the model
+/// produced something that looks like a tool call but could not be parsed
+/// (issue #378).
+pub const UNPARSED_TOOL_CALL_FALLBACK: &str =
+    "Sorry, I didn't quite catch that — could you say it another way?";
+
+/// True when the model output structurally resembles a tool call but no valid
+/// tool-call JSON can be extracted from it — e.g. the model emitted invalid
+/// JSON like `{"seconds": 60*60*12}` (issue #378). Such output must not be
+/// rendered to the user as a normal reply, which would leak raw tool-call JSON.
+/// Normal prose, or a response whose tool-call JSON parses cleanly (and is
+/// therefore handled by `try_tool_call_with_context`), returns false.
+pub fn is_unparsed_tool_call(response: &str) -> bool {
+    let trimmed = response.trim();
+    let looks_toolish = (trimmed.starts_with('{') || trimmed.starts_with("```"))
+        && (trimmed.contains("\"tool\"")
+            || trimmed.contains("\"arguments\"")
+            || trimmed.contains("\"name\""));
+    looks_toolish && extract_json(response).is_none()
+}
+
+/// Parse tool calls from model output without executing them.
+///
+/// This is intentionally separate from `try_tool_call_with_context`: evaluation
+/// should never depend on a live dispatcher or trigger side effects. It accepts
+/// the same JSON shapes as the runtime parser plus common OpenAI-compatible
+/// `tool_calls` / `function_call` wrappers used by function-calling benchmarks.
+pub fn parse_tool_calls_for_eval(response: &str) -> Vec<ToolCall> {
+    let Some(json_str) = extract_json(response) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+        return Vec::new();
+    };
+
+    parse_tool_call_value_for_eval(value)
+}
+
 fn parse_tool_call_value(value: serde_json::Value, tools: &ToolDispatcher) -> Option<ToolCall> {
     if let Ok(call) = serde_json::from_value::<ToolCall>(value.clone()) {
         return Some(call);
@@ -62,6 +100,105 @@ fn normalize_single_key_tool_call(
     })
 }
 
+fn parse_tool_call_value_for_eval(value: serde_json::Value) -> Vec<ToolCall> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(parse_single_tool_call_for_eval)
+            .collect(),
+        serde_json::Value::Object(object) => {
+            if let Some(tool_calls) = object.get("tool_calls").and_then(|value| value.as_array()) {
+                return tool_calls
+                    .iter()
+                    .filter_map(parse_openai_tool_call_for_eval)
+                    .collect();
+            }
+
+            if let Some(function_call) = object.get("function_call") {
+                return parse_openai_function_call_for_eval(function_call)
+                    .into_iter()
+                    .collect();
+            }
+
+            parse_single_tool_call_for_eval(serde_json::Value::Object(object))
+                .into_iter()
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_single_tool_call_for_eval(value: serde_json::Value) -> Option<ToolCall> {
+    if let Ok(mut call) = serde_json::from_value::<ToolCall>(value.clone()) {
+        call.arguments = normalize_eval_arguments(call.arguments);
+        return (!call.name.trim().is_empty()).then_some(call);
+    }
+
+    normalize_single_key_tool_call_for_eval(value)
+}
+
+fn normalize_single_key_tool_call_for_eval(value: serde_json::Value) -> Option<ToolCall> {
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+
+    let (tool_name, nested) = object.iter().next()?;
+    if matches!(
+        tool_name.as_str(),
+        "answer" | "response" | "message" | "content" | "text"
+    ) {
+        return None;
+    }
+
+    let arguments = if nested.is_object() {
+        nested.clone()
+    } else {
+        serde_json::json!({})
+    };
+
+    Some(ToolCall {
+        name: tool_name.clone(),
+        arguments,
+    })
+}
+
+fn parse_openai_tool_call_for_eval(value: &serde_json::Value) -> Option<ToolCall> {
+    if let Some(function) = value.get("function") {
+        return parse_openai_function_call_for_eval(function);
+    }
+
+    parse_openai_function_call_for_eval(value)
+}
+
+fn parse_openai_function_call_for_eval(value: &serde_json::Value) -> Option<ToolCall> {
+    let name = value.get("name")?.as_str()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let arguments = value
+        .get("arguments")
+        .cloned()
+        .map(normalize_eval_arguments)
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    Some(ToolCall {
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+fn normalize_eval_arguments(arguments: serde_json::Value) -> serde_json::Value {
+    match arguments {
+        serde_json::Value::String(text) => {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+        }
+        serde_json::Value::Null => serde_json::json!({}),
+        other => other,
+    }
+}
+
 /// Extract the first valid JSON object from LLM output.
 ///
 /// Handles: raw JSON, markdown fenced blocks, embedded in prose.
@@ -69,10 +206,7 @@ fn extract_json(text: &str) -> Option<String> {
     let trimmed = text.trim();
 
     // 1. Try the whole response as JSON.
-    if trimmed.starts_with('{')
-        && trimmed.ends_with('}')
-        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
-    {
+    if is_json_container(trimmed) && serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
         return Some(trimmed.to_string());
     }
 
@@ -89,6 +223,10 @@ fn extract_json(text: &str) -> Option<String> {
     None
 }
 
+fn is_json_container(text: &str) -> bool {
+    (text.starts_with('{') && text.ends_with('}')) || (text.starts_with('[') && text.ends_with(']'))
+}
+
 /// Extract JSON from markdown fenced code blocks.
 fn extract_from_code_block(text: &str) -> Option<String> {
     // Match ```json\n...\n``` or ```\n...\n```
@@ -99,7 +237,7 @@ fn extract_from_code_block(text: &str) -> Option<String> {
             let content_start = start + pattern.len();
             if let Some(end) = text[content_start..].find("```") {
                 let json_str = text[content_start..content_start + end].trim();
-                if json_str.starts_with('{')
+                if is_json_container(json_str)
                     && serde_json::from_str::<serde_json::Value>(json_str).is_ok()
                 {
                     return Some(json_str.to_string());
@@ -113,42 +251,61 @@ fn extract_from_code_block(text: &str) -> Option<String> {
 
 /// Find a JSON object embedded in prose text.
 fn extract_embedded_json(text: &str) -> Option<String> {
-    // Find the first '{' and try to match it with a closing '}'.
     let bytes = text.as_bytes();
     let mut i = 0;
 
     while i < bytes.len() {
-        if bytes[i] == b'{' {
-            // Try to find the matching closing brace.
-            let mut depth = 0;
-            let mut in_string = false;
-            let mut escape = false;
-
-            for j in i..bytes.len() {
-                if escape {
-                    escape = false;
-                    continue;
-                }
-
-                match bytes[j] {
-                    b'\\' if in_string => escape = true,
-                    b'"' => in_string = !in_string,
-                    b'{' if !in_string => depth += 1,
-                    b'}' if !in_string => {
-                        depth -= 1;
-                        if depth == 0 {
-                            let candidate = &text[i..=j];
-                            if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
-                                return Some(candidate.to_string());
-                            }
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
+        let close = match bytes[i] {
+            b'{' => b'}',
+            b'[' => b']',
+            _ => {
+                i += 1;
+                continue;
             }
+        };
+
+        if let Some(candidate) = extract_balanced_json_candidate(text, i, bytes[i], close) {
+            return Some(candidate);
         }
         i += 1;
+    }
+
+    None
+}
+
+fn extract_balanced_json_candidate(
+    text: &str,
+    start: usize,
+    open: u8,
+    close: u8,
+) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for j in start..bytes.len() {
+        if escape {
+            escape = false;
+            continue;
+        }
+
+        match bytes[j] {
+            b'\\' if in_string => escape = true,
+            b'"' => in_string = !in_string,
+            value if value == open && !in_string => depth += 1,
+            value if value == close && !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    let candidate = &text[start..=j];
+                    if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                        return Some(candidate.to_string());
+                    }
+                    return None;
+                }
+            }
+            _ => {}
+        }
     }
 
     None
@@ -206,6 +363,32 @@ mod tests {
     }
 
     #[test]
+    fn unparsed_tool_call_detected_for_invalid_json() {
+        // The exact Jetson leak (issue #378): `60*60*12` is a JS expression,
+        // not valid JSON, so the tool call never parses and would otherwise be
+        // shown to the user verbatim.
+        let leak = r#"{"tool":"set_timer","arguments":{"seconds":60*60*12,"label":"meeting"}}"#;
+        assert!(is_unparsed_tool_call(leak));
+        // Also when fenced.
+        assert!(is_unparsed_tool_call(
+            "```json\n{\"tool\":\"set_timer\",\"arguments\":{\"seconds\":60*60}}\n```"
+        ));
+    }
+
+    #[test]
+    fn valid_tool_call_is_not_flagged_as_unparsed() {
+        let ok = r#"{"tool":"set_timer","arguments":{"seconds":300}}"#;
+        assert!(!is_unparsed_tool_call(ok));
+    }
+
+    #[test]
+    fn normal_prose_is_not_flagged_as_unparsed() {
+        assert!(!is_unparsed_tool_call("The timer is set for 5 minutes."));
+        assert!(!is_unparsed_tool_call("Hi! How can I help you today?"));
+        assert!(!is_unparsed_tool_call(""));
+    }
+
+    #[test]
     fn nested_json_in_arguments() {
         let input = r#"{"tool": "home_control", "arguments": {"entity": "thermostat", "action": "set_temperature", "value": 72}}"#;
         let json = extract_json(input).unwrap();
@@ -247,6 +430,33 @@ mod tests {
         });
 
         assert!(normalize_single_key_tool_call(value, &dispatcher).is_none());
+    }
+
+    #[test]
+    fn eval_parser_accepts_json_array_tool_calls() {
+        let input = r#"[{"tool": "get_time", "arguments": {}}, {"tool": "set_timer", "arguments": {"seconds": 60}}]"#;
+        let calls = parse_tool_calls_for_eval(input);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "get_time");
+        assert_eq!(calls[1].arguments["seconds"], 60);
+    }
+
+    #[test]
+    fn eval_parser_accepts_openai_tool_calls_wrapper() {
+        let input = r#"{"tool_calls":[{"type":"function","function":{"name":"home_control","arguments":"{\"entity\":\"kitchen light\",\"action\":\"turn_on\"}"}}]}"#;
+        let calls = parse_tool_calls_for_eval(input);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "home_control");
+        assert_eq!(calls[0].arguments["entity"], "kitchen light");
+    }
+
+    #[test]
+    fn eval_parser_does_not_treat_answer_object_as_tool_call() {
+        let calls = parse_tool_calls_for_eval(r#"{"answer":"hello"}"#);
+
+        assert!(calls.is_empty());
     }
 
     // The `system_info` tool reads /proc/meminfo (via tegrastats), /proc/uptime,
