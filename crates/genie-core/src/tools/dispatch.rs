@@ -63,6 +63,27 @@ fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("home_status requires non-empty string argument 'entity'"))
 }
 
+fn parse_set_timer_args(args: &serde_json::Value) -> Result<(u64, &str)> {
+    let seconds = match args.get("seconds") {
+        Some(value) => value
+            .as_u64()
+            .filter(|seconds| *seconds >= 1)
+            .ok_or_else(|| {
+                if value.as_u64() == Some(0) {
+                    anyhow::anyhow!("set_timer seconds must be at least 1")
+                } else {
+                    anyhow::anyhow!("set_timer requires integer argument 'seconds'")
+                }
+            })?,
+        None => anyhow::bail!("set_timer requires integer argument 'seconds'"),
+    };
+    let label = args
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("timer");
+    Ok((seconds, label))
+}
+
 /// Tool definition for LLM function calling.
 ///
 /// These are sent to the configured LLM backend as part of the system prompt or
@@ -1162,11 +1183,7 @@ impl ToolDispatcher {
     }
 
     fn exec_set_timer(&self, args: &serde_json::Value) -> Result<String> {
-        let seconds = args.get("seconds").and_then(|v| v.as_u64()).unwrap_or(60);
-        let label = args
-            .get("label")
-            .and_then(|v| v.as_str())
-            .unwrap_or("timer");
+        let (seconds, label) = parse_set_timer_args(args)?;
         self.timers
             .set(seconds, label)
             .map_err(|e| anyhow::anyhow!(e))?;
