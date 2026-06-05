@@ -467,6 +467,18 @@ fn ratio(count: usize, total: usize) -> f64 {
 /// canonicalized through the runtime resolver for the grounded metric.
 const ENTITY_ARG_KEYS: [&str; 4] = ["entity", "name", "target", "device"];
 
+/// Argument keys whose string value names an action verb. For the grounded
+/// metric these are canonicalized through [`canon_action`] so that synonyms the
+/// agent executes identically (e.g. `deactivate` == `turn_off`) are credited.
+const ACTION_ARG_KEYS: [&str; 1] = ["action"];
+
+/// Query words that do not pin a request to a specific place. Used by the
+/// whole-home fidelity guard to decide whether leftover tokens name a real area.
+const BENIGN_QUERY_TOKENS: &[&str] = &[
+    "all", "the", "a", "an", "every", "any", "my", "our", "this", "that", "please", "now", "here",
+    "turn", "switch", "set", "get", "status", "of", "to", "in",
+];
+
 /// Reference home that mirrors the HA-Intents reference home used by the BFCL
 /// dataset. It is intentionally minimal and dataset-specific: it contains
 /// exactly the four physical entities needed to unify the eight distinct gold
@@ -536,6 +548,11 @@ fn canonicalize_entity_args(args: &Value, graph: &HomeGraph) -> Value {
             for (key, value) in object {
                 let canonical_value = if ENTITY_ARG_KEYS.contains(&key.as_str()) {
                     canonicalize_entity_value(value, graph)
+                } else if ACTION_ARG_KEYS.contains(&key.as_str()) {
+                    match value {
+                        Value::String(text) => Value::String(canon_action(text)),
+                        other => canonicalize_entity_args(other, graph),
+                    }
                 } else {
                     canonicalize_entity_args(value, graph)
                 };
@@ -562,13 +579,88 @@ fn canonicalize_entity_value(value: &Value, graph: &HomeGraph) -> Value {
     };
 
     match HomeAssistantProvider::resolve_target_in_graph(graph, text, None) {
-        Some(target) if !target.entity_ids.is_empty() => {
+        // An area-specific resolution is trusted directly. A whole-home domain
+        // fallback (`area == None`) is only trusted when it passes the fidelity
+        // guard — otherwise a query naming a place the home does not have (e.g.
+        // "upstairs lights", or "living room light" when no light lives there)
+        // would silently collapse to the only device of that domain and be
+        // credited as correct.
+        Some(target)
+            if !target.entity_ids.is_empty()
+                && (target.area.is_some() || whole_home_resolution_is_trustworthy(graph, text)) =>
+        {
             let mut ids = target.entity_ids;
             ids.sort();
             Value::String(format!("ids:{}", ids.join(",")))
         }
         _ => value.clone(),
     }
+}
+
+/// Canonicalize an action verb to a small set of stable forms, so the grounded
+/// metric credits synonyms the agent would execute identically. Unknown verbs
+/// pass through normalized (lowercase, separators -> `_`) so exact matches still
+/// hold. Mirrors the canonicalization the runtime tool dispatch should apply.
+fn canon_action(text: &str) -> String {
+    let normalized = text.trim().to_lowercase().replace([' ', '-'], "_");
+    match normalized.as_str() {
+        "deactivate" | "disable" | "switch_off" | "power_off" | "shut_off" | "turn_off" => {
+            "turn_off".to_string()
+        }
+        "activate" | "enable" | "switch_on" | "power_on" | "turn_on" => "turn_on".to_string(),
+        _ => normalized,
+    }
+}
+
+/// Split a free-text query into lowercase alphanumeric tokens.
+fn query_tokens(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Map a single query word to a device domain, mirroring the runtime
+/// `infer_domain`. Used only by the fidelity guard.
+fn domain_of_word(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "light" | "lights" | "lamp" | "lamps" => "light",
+        "fan" | "fans" => "fan",
+        "thermostat" | "temperature" | "heat" | "heating" | "cooling" | "ac" => "climate",
+        "blind" | "blinds" | "shade" | "shades" | "curtain" | "curtains" | "cover" | "covers"
+        | "garage" => "cover",
+        "lock" | "locks" | "unlock" => "lock",
+        "switch" | "switches" | "plug" | "outlet" => "switch",
+        _ => return None,
+    })
+}
+
+/// Fidelity guard for whole-home (area-less) resolutions. A query that resolved
+/// only because every device of its domain happens to live in one place is
+/// trustworthy *iff* every place-token it names belongs to an area that actually
+/// contains a device of the inferred domain. This rejects foreign rooms the home
+/// does not have ("upstairs lights") and known rooms lacking the device ("living
+/// room light"), while still crediting bare-domain ("lights") and correctly
+/// room-qualified ("kitchen lights") requests.
+fn whole_home_resolution_is_trustworthy(graph: &HomeGraph, text: &str) -> bool {
+    let tokens = query_tokens(text);
+    let Some(domain) = tokens.iter().find_map(|t| domain_of_word(t)) else {
+        // No recognizable domain word — not a case this guard reasons about.
+        return true;
+    };
+    let valid_place: std::collections::HashSet<String> = graph
+        .entities
+        .iter()
+        .filter(|entity| entity.domain == domain)
+        .filter_map(|entity| entity.area.as_deref())
+        .flat_map(query_tokens)
+        .collect();
+    tokens.iter().all(|token| {
+        domain_of_word(token).is_some()
+            || BENIGN_QUERY_TOKENS.contains(&token.as_str())
+            || valid_place.contains(token)
+    })
 }
 
 struct BfclCatalogHomeStub;
@@ -897,6 +989,69 @@ mod tests {
         assert_eq!(report.strict_matches, 0);
         assert_eq!(report.grounded_strict_matches, 1);
         assert!((report.grounded_strict_accuracy - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fidelity_guard_rejects_foreign_and_deviceless_rooms() {
+        // The reference home has no upstairs, and no light in the living room.
+        // A whole-home fallback must not silently credit either as the kitchen light.
+        for foreign in ["upstairs lights", "upstairs_lights", "living room light"] {
+            let case = case(vec![expected(
+                "home_control",
+                serde_json::json!({"action": "turn_off", "entity": "kitchen lights"}),
+            )]);
+            let response = format!(
+                r#"{{"tool":"home_control","arguments":{{"action":"turn_off","entity":"{foreign}"}}}}"#
+            );
+            let score = score_response(&case, &response);
+            assert!(
+                !score.grounded_argument_match,
+                "'{foreign}' names a place the home lacks and must NOT ground to the kitchen light"
+            );
+        }
+
+        // Control: the legitimate room-default still grounds.
+        let case = case(vec![expected(
+            "home_control",
+            serde_json::json!({"action": "turn_off", "entity": "kitchen lights"}),
+        )]);
+        let ok = score_response(
+            &case,
+            r#"{"tool":"home_control","arguments":{"action":"turn_off","entity":"lights"}}"#,
+        );
+        assert!(
+            ok.grounded_argument_match,
+            "bare 'lights' should still ground"
+        );
+    }
+
+    #[test]
+    fn grounded_metric_credits_action_synonym() {
+        // Right device, but the model said "deactivate" instead of "turn_off".
+        let case = case(vec![expected(
+            "home_control",
+            serde_json::json!({"action": "turn_off", "entity": "kitchen lights"}),
+        )]);
+        let prediction = BfclPrediction {
+            id: case.id.clone(),
+            response:
+                r#"{"tool":"home_control","arguments":{"action":"deactivate","entity":"kitchen lights"}}"#
+                    .to_string(),
+        };
+
+        let score = score_response(&case, &prediction.response);
+        assert!(
+            !score.argument_match,
+            "raw action strings differ, exact match must fail"
+        );
+        assert!(
+            score.grounded_argument_match,
+            "grounded metric should treat 'deactivate' as 'turn_off'"
+        );
+
+        let report = score_cases(&[case], &[prediction]);
+        assert_eq!(report.argument_matches, 0);
+        assert_eq!(report.grounded_strict_matches, 1);
     }
 
     #[test]
