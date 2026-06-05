@@ -24,6 +24,33 @@ The default agent contract is intentionally small: the Jetson profile uses
 stronger models, but provider/runtime paths must pass the 4096-token harness
 first.
 
+## The Edge Bet
+
+The hard version of "edge AI" is delivering — on one private device, with no
+cloud — the bundle the industry says needs a data center:
+
+- **quick response** — no network round-trip
+- **on-device processing** — everything runs on the Jetson Orin Nano 8 GB
+- **high accuracy for the home** — the hard one
+- **data privacy** — household and family data never leave the device
+- **energy efficiency** — small quantized models inside a tight power and memory budget
+- **zero subscription** — fully local; the user owns it, with no recurring cloud cost
+
+These pillars fight each other. Accuracy usually buys itself with a bigger model
+on a cloud GPU — which immediately costs you on-device, energy, privacy, and the
+no-subscription promise. GenieClaw resolves that tension with one bet:
+
+> **Accuracy comes from deterministic grounding — family memory and live
+> room/device state — not from model scale.**
+
+A small local model reaches household-class tool-call accuracy because it is
+handed the right grounded context and its outputs are resolved against real
+device state, not because it ships a large prompt to a remote model. That is the
+keystone: hold the accuracy pillar with grounding and the other five stay
+affordable. The BFCL harness and the 4096-token Jetson baseline exist to keep
+that bet honest and measurable — accuracy is earned against grounded device
+state, not asserted.
+
 ## What Works Today
 
 - local chat through `genie-core`
