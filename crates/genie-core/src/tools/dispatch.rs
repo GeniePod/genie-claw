@@ -671,7 +671,7 @@ impl ToolDispatcher {
             "play_media" => self.exec_play_media(&call.arguments).await,
             "memory_recall" => self.exec_memory_recall(&call.arguments, exec_ctx),
             "memory_status" => self.exec_memory_status(),
-            "memory_forget" => self.exec_memory_forget(&call.arguments),
+            "memory_forget" => self.exec_memory_forget(&call.arguments, exec_ctx),
             "memory_store" => self.exec_memory_store(&call.arguments),
             other => self.exec_skill(other, &call.arguments).await,
         };
@@ -1284,7 +1284,11 @@ impl ToolDispatcher {
         ))
     }
 
-    fn exec_memory_forget(&self, args: &serde_json::Value) -> Result<String> {
+    fn exec_memory_forget(
+        &self,
+        args: &serde_json::Value,
+        exec_ctx: ToolExecutionContext,
+    ) -> Result<String> {
         let mem = self
             .memory
             .as_ref()
@@ -1298,7 +1302,23 @@ impl ToolDispatcher {
             return Ok("Please specify what to forget.".to_string());
         }
 
-        let deleted = mem.delete_matching(query)?;
+        // Gate deletes through the same MemoryReadContext that exec_memory_recall
+        // uses. Without it, an LLM that cannot READ a person-scoped row could
+        // still DELETE it by calling memory_forget — destroying data it has no
+        // privilege to see. This mirrors the read-side fix landed in
+        // PR #201 (commit be4a2da).
+        let read_context = exec_ctx
+            .memory_read_context
+            .unwrap_or_else(crate::memory::policy::MemoryReadContext::shared_room_voice);
+        let candidates = mem.search(query, 10)?;
+        let allowed = crate::memory::recall::filter_recall_results(candidates, read_context);
+        let mut deleted = 0usize;
+        for recallable in &allowed {
+            if mem.delete_by_id(recallable.entry.id)? {
+                deleted += 1;
+            }
+        }
+
         if deleted == 0 {
             Ok(format!("No memories found matching '{}'.", query))
         } else {
@@ -3292,6 +3312,88 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "I remember: Maya likes oat milk");
+    }
+
+    #[test]
+    fn memory_forget_blocks_person_scope_without_verified_context() {
+        // Regression for the delete-side analogue of be4a2da (PR #201): without a
+        // verified MemoryReadContext, the LLM must not be able to destroy
+        // person-scoped rows it cannot read. memory_forget previously called
+        // Memory::delete_matching directly (scope-blind), so an LLM that could
+        // not READ Maya's person_preference could still DELETE it.
+        let db = std::env::temp_dir().join(format!(
+            "memory-forget-shared-room-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_forget(
+                &serde_json::json!({"query": "Maya"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(
+            output.contains("No memories"),
+            "shared-room delete must report no-match, got: {output}"
+        );
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        let still_there = mem.search("Maya", 5).unwrap();
+        assert_eq!(
+            still_there.len(),
+            1,
+            "person-scoped row must remain after a shared-room forget"
+        );
+    }
+
+    #[test]
+    fn memory_forget_allows_person_scope_with_verified_context() {
+        // Mirror of the read-side identity-context unlock: when the server /
+        // voice pipeline has set a verified MemoryReadContext on exec_ctx,
+        // memory_forget should be able to delete person-scoped rows.
+        let db = std::env::temp_dir().join(format!(
+            "memory-forget-identity-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_forget(
+                &serde_json::json!({"query": "Maya"}),
+                ToolExecutionContext {
+                    memory_read_context: Some(crate::memory::policy::MemoryReadContext {
+                        identity_confidence: crate::memory::policy::IdentityConfidence::High,
+                        explicit_named_person: false,
+                        explicit_private_intent: false,
+                        shared_space_voice: true,
+                    }),
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            output.contains("Forgot 1"),
+            "verified-context delete must report success, got: {output}"
+        );
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert!(
+            mem.search("Maya", 5).unwrap().is_empty(),
+            "person-scoped row must be deleted under a verified context"
+        );
     }
 
     #[tokio::test]
