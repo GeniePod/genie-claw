@@ -1,0 +1,85 @@
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+# ==========================================
+# MOCK HARDWARE FOR GENIE-CLAW AI TESTING
+# ==========================================
+
+# 1. The "Demo" Integration
+# Instantly creates a fully simulated house with controllable lights, switches, 
+# media players, covers (blinds/garage), and climate entities.
+# Your AI can immediately call services like light.turn_on, cover.open_cover, etc.
+demo:
+
+# 2. Input Helpers (The "Under the Hood" Virtual Hardware)
+# These act as the raw memory registers of your mock devices. 
+# You can change these in the HA UI to simulate physical events.
+input_boolean:
+  mock_front_door_contact:
+    name: Front Door Contact (Mock)
+    initial: off
+    icon: mdi:door
+  mock_motion_in_hallway:
+    name: Hallway Motion (Mock)
+    initial: off
+    icon: mdi:motion-sensor
+  mock_is_night_mode:
+    name: Night Mode (Mock)
+    initial: off
+    icon: mdi:weather-night
+
+input_number:
+  mock_outdoor_temperature:
+    name: Outdoor Temperature (Mock)
+    initial: 15.0
+    min: -10
+    max: 40
+    step: 0.5
+  mock_indoor_co2_level:
+    name: Indoor CO2 Level (Mock)
+    initial: 450
+    min: 400
+    max: 2000
+    step: 10
+  mock_living_room_temp:  # ← Creates entity_id: input_number.mock_living_room_temp
+    name: Living Room Temp (Mock)
+    initial: 22
+    min: 10
+    max: 30
+    step: 0.5
+
+# 3. Template Entities (What the AI Actually "Sees")
+# We map the inputs above to proper HA entities with correct device classes.
+# This ensures the AI understands context (e.g., knows CO2 is in ppm, door is a boolean).
+template:
+  - binary_sensor:
+      - name: "Front Door"
+        unique_id: "genie_mock_front_door"
+        device_class: door
+        state: "{{ is_state('input_boolean.mock_front_door_contact', 'on') }}"
+
+      - name: "Hallway Motion"
+        unique_id: "genie_mock_hallway_motion"
+        device_class: motion
+        state: "{{ is_state('input_boolean.mock_motion_in_hallway', 'on') }}"
+
+  - sensor:
+      - name: "Outdoor Temperature"
+        unique_id: "genie_mock_outdoor_temp"
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state: "{{ states('input_number.mock_outdoor_temperature') | float }}"
+
+      - name: "Indoor CO2 Level"
+        unique_id: "genie_mock_co2"
+        unit_of_measurement: "ppm"
+        device_class: carbon_dioxide
+        state: "{{ states('input_number.mock_indoor_co2_level') | int }}"
