@@ -1,4 +1,5 @@
-use super::dispatch::{ToolCall, ToolDispatcher, ToolExecutionContext, ToolResult};
+use super::dispatch::{ToolCall, ToolExecutionContext, ToolResult};
+use super::dispatcher::ToolDispatcher;
 
 /// Parse a tool call from LLM output and execute it.
 ///
@@ -314,7 +315,7 @@ fn extract_balanced_json_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::dispatch::ToolDispatcher;
+    use crate::tools::ToolDispatcher;
 
     #[test]
     fn parse_raw_json() {
