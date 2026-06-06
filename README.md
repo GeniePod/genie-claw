@@ -173,6 +173,11 @@ real behavior proof will be closed immediately to protect review quality.
 A PR is accepted **only** if it lands in one of these two buckets, with
 reproducible on-device proof. Anything else will be closed.
 
+> 💎 **Performance PRs are rewarded.** Land a performance-improvement PR that
+> meets the rules below — measurable Jetson win, reproducible before→after proof —
+> and you're eligible for a reward through [gittensor](https://gittensor.io/),
+> the Bittensor subnet that pays out for merged open-source contributions.
+
 1. **Performance improvement** — measurable latency / throughput / memory wins
    on Jetson Orin Nano 8 GB, with before→after numbers.
    - e.g. [genie-ai-runtime#85](https://github.com/GeniePod/genie-ai-runtime/pull/85)
