@@ -1704,11 +1704,7 @@ fn build_bfcl_llm_messages(system_prompt: &str, prompt: &str) -> Vec<genie_core:
 
 fn build_bfcl_llm_system_prompt(cases: &[genie_core::eval::bfcl::BfclCase]) -> String {
     let catalog = bfcl_llm_tool_catalog(cases).join("\n");
-    let devices = genie_core::eval::bfcl::bfcl_reference_home_device_catalog()
-        .iter()
-        .map(|device| format!("- {device}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let devices = genie_core::eval::bfcl::bfcl_reference_home_device_catalog().join(", ");
     format!(
         "\
 You are GenieClaw's BFCL tool-call evaluator for a private local home agent.
@@ -1727,15 +1723,8 @@ If no tool is needed, return:
 Use only these tools and compact arguments:
 {catalog}
 
-This home has exactly these devices — there are no other rooms or devices:
-{devices}
-
-For any entity/target/device argument, use one of the device names above verbatim.
-Resolve underspecified references to the matching device (e.g. \"lights\" or \"the lights\"
--> \"Kitchen Lights\"; \"fan\" -> \"Kitchen Fan\"). Never invent a room or device that is not
-listed (e.g. there is no upstairs or bedroom). For action arguments, use the exact values
-from the tool schema (e.g. turn_on, turn_off, set_temperature), not synonyms like
-\"deactivate\" or \"activate\".
+Devices in this home (use these exact lowercase names; no other rooms or devices exist): {devices}.
+Map vague references to one of them (\"lights\" -> \"kitchen lights\", \"fan\" -> \"kitchen fan\"); never invent a room such as \"upstairs\". Use the schema's exact action values (turn_on, turn_off, set_temperature), not synonyms like \"deactivate\".
 
 Normalize obvious speech-to-text noise, casing, and misspellings before choosing a tool.
 Prefer deterministic home state, memory retrieval, and typed-tool arguments over natural-language answers."
