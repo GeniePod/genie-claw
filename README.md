@@ -129,16 +129,39 @@ Harden the smart-home agent boundary.
 - Marketplace or community campaigns
 - Voice and audio pipeline internals
 
-### Active Contribution Gate
+### Accepted contribution scope
 
-We are working M1 now. A PR that is technically correct but outside the M1
-in-scope list is noise for this phase and will be closed.
+We are working M1 now. A PR is accepted **only** if it lands in one of these
+two buckets, with reproducible on-device proof. Anything else is closed.
 
-Valuable contributions are the ones that help this repository become what it
-is intended to be: a private, local, deterministic household agent that can
-run well on NVIDIA Jetson Orin Nano 8 GB hardware. Spam-like PRs, AI-generated
-issue churn, duplicate reports, unplanned bug-fix batches, or changes without
-real behavior proof will be closed immediately to protect review quality.
+> **Performance PRs are rewarded.** Land a performance-improvement PR that
+> meets the rules below — measurable Jetson win, reproducible before→after
+> proof — and you're eligible for a reward through
+> [gittensor](https://gittensor.io/), the Bittensor subnet that pays out for
+> merged open-source contributions.
+
+**1. Performance improvement** — measurable latency / throughput / memory wins
+on Jetson Orin Nano 8 GB, with before→after numbers. Example:
+[genie-ai-runtime#85](https://github.com/GeniePod/genie-ai-runtime/pull/85) —
+in-memory KV prefix cache, ~13× faster prefill (16 s → ~1 s per command); cut
+the BFCL eval from ~62 min to ~20 min.
+
+**2. Tool-dispatch / real-Home-Assistant error fix** — correctness fixes in
+tool routing or home actuation, reproduced against a real Home Assistant. A
+runnable sample HA config is provided at
+[`deploy/homeassistant/`](deploy/homeassistant/) — bring it up, reproduce the
+failure, and prove the fix by showing the entity state change confirmed via the
+HA API. Examples: [#400](https://github.com/GeniePod/genie-claw/pull/400) —
+canonicalize `home_control` action synonyms; [#380](https://github.com/GeniePod/genie-claw/pull/380)
+— stop leaking unparsed tool-call JSON to the user.
+
+Every such PR must include a **Real Behavior Proof** section — what you ran,
+on what hardware, what changed. For HA fixes: live-HA before/after, confirmed
+via the API.
+
+Closed on sight: anything outside these two buckets, prompt growth without a
+measured accuracy gain, generated/demo-only code, duplicate or churn PRs, or
+changes without reproducible proof.
 
 ## Product Quality Bar
 
