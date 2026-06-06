@@ -41,18 +41,36 @@ fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Opti
         .ok_or_else(|| {
             anyhow::anyhow!("home_control requires non-empty string argument 'entity'")
         })?;
-    let action = args
+    let raw_action = args
         .get("action")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("home_control requires string argument 'action'"))?;
-    if !HOME_CONTROL_ACTIONS.contains(&action) {
-        anyhow::bail!(
+    let action = canon_home_control_action(raw_action).ok_or_else(|| {
+        anyhow::anyhow!(
             "home_control action '{}' is invalid; expected one of: {}",
-            action,
+            raw_action,
             HOME_CONTROL_ACTIONS.join(", ")
-        );
-    }
+        )
+    })?;
     Ok((entity, action, args.get("value").and_then(|v| v.as_f64())))
+}
+
+/// Canonicalize a model-emitted action verb to one of [`HOME_CONTROL_ACTIONS`].
+///
+/// Small models routinely emit the natural-language form ("turn off"),
+/// hyphenated/cased variants ("Turn-Off"), or a synonym ("deactivate") rather
+/// than the exact enum value `turn_off`. Rejecting those means a correct intent
+/// silently fails to actuate. Normalize separators + case, map a few
+/// unambiguous synonyms, and accept the result only if it lands on a real
+/// action. `activate` is left as-is (it is its own action for scenes/scripts).
+fn canon_home_control_action(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_lowercase().replace([' ', '-'], "_");
+    let mapped: &str = match normalized.as_str() {
+        "deactivate" | "disable" | "switch_off" | "power_off" | "shut_off" => "turn_off",
+        "enable" | "switch_on" | "power_on" => "turn_on",
+        other => other,
+    };
+    HOME_CONTROL_ACTIONS.iter().copied().find(|&a| a == mapped)
 }
 
 fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
@@ -2429,6 +2447,32 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.action_class, ToolActionClass::ReadOnly);
         assert!(!result.output.is_empty());
+    }
+
+    #[test]
+    fn home_control_canonicalizes_action_synonyms() {
+        // The bug: a small model emits "turn off" (space), the runtime rejected
+        // it, and a correct intent silently failed to actuate.
+        for (raw, want) in [
+            ("turn off", Some("turn_off")),
+            ("Turn-Off", Some("turn_off")),
+            ("deactivate", Some("turn_off")),
+            ("disable", Some("turn_off")),
+            ("turn on", Some("turn_on")),
+            ("switch_on", Some("turn_on")),
+            ("toggle", Some("toggle")),
+            ("activate", Some("activate")), // distinct action, must not remap
+            ("frobnicate", None),
+        ] {
+            assert_eq!(canon_home_control_action(raw), want, "action {raw:?}");
+        }
+
+        // End-to-end through the arg parser: "turn off" now resolves to "turn_off".
+        let args = serde_json::json!({"entity": "kitchen lights", "action": "turn off"});
+        let (entity, action, _) =
+            parse_home_control_args(&args).expect("'turn off' should canonicalize and parse");
+        assert_eq!(entity, "kitchen lights");
+        assert_eq!(action, "turn_off");
     }
 
     #[test]
