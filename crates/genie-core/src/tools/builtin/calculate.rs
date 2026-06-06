@@ -12,7 +12,8 @@ impl ToolEntry for CalculateTool {
     fn schema(&self) -> ToolDef {
         ToolDef {
             name: "calculate".into(),
-            description: "Evaluate a math expression. Supports +, -, *, /, parentheses, decimals.".into(),
+            description: "Evaluate a math expression. Supports +, -, *, /, parentheses, decimals."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

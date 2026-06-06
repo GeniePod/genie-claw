@@ -47,9 +47,17 @@ impl ToolEntry for MemoryStatusTool {
                 health.memory_rows,
                 health.fts_rows,
                 if health.fts_consistent { "yes" } else { "no" },
-                if health.migration_degraded { "yes" } else { "no" },
+                if health.migration_degraded {
+                    "yes"
+                } else {
+                    "no"
+                },
                 promoted,
-                if health.canonical_root_exists { "present" } else { "missing" },
+                if health.canonical_root_exists {
+                    "present"
+                } else {
+                    "missing"
+                },
                 health.canonical_namespace_files,
                 health.canonical_daily_files,
                 health.canonical_event_logs,

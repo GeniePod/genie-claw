@@ -126,9 +126,7 @@ impl ToolEntry for MemoryStoreTool {
     }
 }
 
-pub(crate) fn normalize_memories_to_store(
-    args: &serde_json::Value,
-) -> Vec<(String, String)> {
+pub(crate) fn normalize_memories_to_store(args: &serde_json::Value) -> Vec<(String, String)> {
     let category_hint = args
         .get("category")
         .and_then(|v| v.as_str())

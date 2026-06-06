@@ -12,7 +12,9 @@ impl ToolEntry for GetWeatherTool {
     fn schema(&self) -> ToolDef {
         ToolDef {
             name: "get_weather".into(),
-            description: "Get current weather or forecast for a location. Use for any weather question.".into(),
+            description:
+                "Get current weather or forecast for a location. Use for any weather question."
+                    .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

@@ -19,11 +19,7 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub async fn dispatch(
-        &self,
-        call: &ToolCall,
-        ctx: ToolExecutionContext,
-    ) -> Result<String> {
+    pub async fn dispatch(&self, call: &ToolCall, ctx: ToolExecutionContext) -> Result<String> {
         let entry = self
             .entries
             .iter()

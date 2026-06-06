@@ -3,8 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::tools::actuation::{
-    ActionLedger, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager, RequestOrigin,
-    now_ms,
+    ActionLedger, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager, RequestOrigin, now_ms,
 };
 use crate::tools::dispatch::{ToolDef, ToolEntry, ToolExecutionContext};
 use crate::tools::dispatcher::ActuationRateLimiter;
@@ -30,9 +29,7 @@ pub fn parse_home_control_args(args: &serde_json::Value) -> Result<(String, Stri
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("home_control requires non-empty string argument 'entity'")
-        })?
+        .ok_or_else(|| anyhow::anyhow!("home_control requires non-empty string argument 'entity'"))?
         .to_owned();
     let action = args
         .get("action")
@@ -86,9 +83,7 @@ impl ToolEntry for HomeControlTool {
         ctx: ToolExecutionContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
         let args = args.clone();
-        Box::pin(async move {
-            self.exec_home_control_inner(&args, ctx, None).await
-        })
+        Box::pin(async move { self.exec_home_control_inner(&args, ctx, None).await })
     }
 }
 

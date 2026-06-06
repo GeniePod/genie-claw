@@ -51,7 +51,9 @@ impl ToolEntry for PlayMediaTool {
     fn schema(&self) -> ToolDef {
         ToolDef {
             name: "play_media".into(),
-            description: "Play media on the TV/HDMI output. Triggers media mode (unloads LLM, launches mpv).".into(),
+            description:
+                "Play media on the TV/HDMI output. Triggers media mode (unloads LLM, launches mpv)."
+                    .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

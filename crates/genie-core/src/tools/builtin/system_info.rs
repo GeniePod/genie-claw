@@ -28,8 +28,6 @@ impl ToolEntry for SystemInfoTool {
         _ctx: ToolExecutionContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
         let ha = self.ha.clone();
-        Box::pin(async move {
-            crate::tools::system::system_info(ha.as_deref()).await
-        })
+        Box::pin(async move { crate::tools::system::system_info(ha.as_deref()).await })
     }
 }

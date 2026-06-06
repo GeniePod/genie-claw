@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use genie_common::config::{ActuationSafetyConfig, ToolPolicyConfig, WebSearchConfig, WebSearchProvider};
+use genie_common::config::{
+    ActuationSafetyConfig, ToolPolicyConfig, WebSearchConfig, WebSearchProvider,
+};
 use serde::Serialize;
 
 use super::actuation::{
@@ -12,12 +14,22 @@ use super::actuation::{
     RecordedAction, RequestOrigin, append_json_line, now_ms,
 };
 use super::builtin::{
-    action_history::ActionHistoryTool, calculate::CalculateTool, get_time::GetTimeTool,
-    get_weather::GetWeatherTool, home_control::HomeControlTool, home_status::HomeStatusTool,
-    home_undo::HomeUndoTool, memory_forget::MemoryForgetTool, memory_recall::MemoryRecallTool,
-    memory_status::MemoryStatusTool, memory_store::MemoryStoreTool, play_media::PlayMediaTool,
-    set_timer::SetTimerTool, skill_runner::{SkillRunnerTool, runtime_skill_description},
-    system_info::SystemInfoTool, web_search::WebSearchTool,
+    action_history::ActionHistoryTool,
+    calculate::CalculateTool,
+    get_time::GetTimeTool,
+    get_weather::GetWeatherTool,
+    home_control::HomeControlTool,
+    home_status::HomeStatusTool,
+    home_undo::HomeUndoTool,
+    memory_forget::MemoryForgetTool,
+    memory_recall::MemoryRecallTool,
+    memory_status::MemoryStatusTool,
+    memory_store::MemoryStoreTool,
+    play_media::PlayMediaTool,
+    set_timer::SetTimerTool,
+    skill_runner::{SkillRunnerTool, runtime_skill_description},
+    system_info::SystemInfoTool,
+    web_search::WebSearchTool,
 };
 use super::config::ToolDispatcherConfig;
 use super::dispatch::{
@@ -507,8 +519,7 @@ impl ToolDispatcher {
         limit: usize,
         fresh: bool,
     ) -> Result<super::web_search::SearchResponse> {
-        super::web_search::search_response_with_options(query, limit, &self.web_search, fresh)
-            .await
+        super::web_search::search_response_with_options(query, limit, &self.web_search, fresh).await
     }
 
     // ── Builder methods (kept for backward compat with server.rs tests) ──────
