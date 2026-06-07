@@ -168,6 +168,47 @@ run well on NVIDIA Jetson Orin Nano 8 GB hardware. Spam-like PRs, AI-generated
 issue churn, duplicate reports, unplanned bug-fix batches, or changes without
 real behavior proof will be closed immediately to protect review quality.
 
+### Accepted contribution scope
+
+A PR is accepted **only** if it lands in one of these two buckets, with
+reproducible on-device proof. Anything else will be closed.
+
+> 💎 **Performance PRs are rewarded.** Land a performance-improvement PR that
+> meets the rules below — measurable Jetson win, reproducible before→after proof —
+> and you're eligible for a reward through [gittensor](https://gittensor.io/),
+> the Bittensor subnet that pays out for merged open-source contributions.
+
+1. **Performance improvement** — measurable latency / throughput / memory wins
+   on Jetson Orin Nano 8 GB, with before→after numbers.
+   - e.g. [genie-ai-runtime#85](https://github.com/GeniePod/genie-ai-runtime/pull/85)
+     — in-memory KV prefix cache, **~13× faster prefill** (16s → ~1s per
+     command); cut the BFCL eval from ~62 min to ~20 min.
+
+2. **Tool-dispatch / real-Home-Assistant correctness** — fixes to tool routing,
+   tool-call arguments, or home actuation, **measured** (BFCL) and/or
+   **reproduced against a real Home Assistant**. A runnable sample HA config is
+   provided at [`deploy/homeassistant/`](deploy/homeassistant/) so you can
+   reproduce the failure and prove the fix.
+   - **Accuracy, measured:** [#399](https://github.com/GeniePod/genie-claw/pull/399)
+     — ground the predict prompt in the home device catalog: raw BFCL strict
+     **20.19% → 50.96%**, grounded **72.12% → 82.69%** (Qwen3-4B @ 4096, same
+     model — deterministic device-state grounding, not scale);
+     [#390](https://github.com/GeniePod/genie-claw/pull/390) — action-synonym
+     canonicalization + wrong-room fidelity guard;
+     [#388](https://github.com/GeniePod/genie-claw/pull/388) — grounded
+     entity-argument metric.
+   - **Live-HA actuation:** [#400](https://github.com/GeniePod/genie-claw/pull/400)
+     — canonicalize `home_control` action synonyms. *Before:* the model emits
+     `"turn off"`, the runtime rejects it (*"action 'turn off' is invalid"*) and
+     the light stays on. *After:* `"turn off" → "turn_off"`, and
+     `light.kitchen_lights` goes `off → on`, confirmed via the HA API. Also
+     [#380](https://github.com/GeniePod/genie-claw/pull/380) — stop leaking
+     unparsed tool-call JSON to the user.
+
+Every such PR needs a **Real Behavior Proof**: what you ran, on what hardware,
+and what changed — for HA fixes, live-HA before/after confirmed via the API.
+No reproducible proof, or outside these two buckets → closed.
+
 ## Product Quality Bar
 
 PRs must improve the product behavior or make it easier to measure product
