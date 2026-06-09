@@ -11,4 +11,7 @@ pub(crate) mod web_search;
 
 pub use actuation::{PendingConfirmation, RequestOrigin};
 pub use dispatch::{ToolActionClass, ToolCall, ToolDispatcher, ToolExecutionContext, ToolResult};
-pub use parser::{parse_tool_calls_for_eval, try_tool_call, try_tool_call_with_context};
+pub use parser::{
+    UNPARSED_TOOL_CALL_FALLBACK, is_unparsed_tool_call, parse_tool_calls_for_eval, try_tool_call,
+    try_tool_call_with_context,
+};
