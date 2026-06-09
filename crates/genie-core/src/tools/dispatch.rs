@@ -41,18 +41,36 @@ fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Opti
         .ok_or_else(|| {
             anyhow::anyhow!("home_control requires non-empty string argument 'entity'")
         })?;
-    let action = args
+    let raw_action = args
         .get("action")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("home_control requires string argument 'action'"))?;
-    if !HOME_CONTROL_ACTIONS.contains(&action) {
-        anyhow::bail!(
+    let action = canon_home_control_action(raw_action).ok_or_else(|| {
+        anyhow::anyhow!(
             "home_control action '{}' is invalid; expected one of: {}",
-            action,
+            raw_action,
             HOME_CONTROL_ACTIONS.join(", ")
-        );
-    }
+        )
+    })?;
     Ok((entity, action, args.get("value").and_then(|v| v.as_f64())))
+}
+
+/// Canonicalize a model-emitted action verb to one of [`HOME_CONTROL_ACTIONS`].
+///
+/// Small models routinely emit the natural-language form ("turn off"),
+/// hyphenated/cased variants ("Turn-Off"), or a synonym ("deactivate") rather
+/// than the exact enum value `turn_off`. Rejecting those means a correct intent
+/// silently fails to actuate. Normalize separators + case, map a few
+/// unambiguous synonyms, and accept the result only if it lands on a real
+/// action. `activate` is left as-is (it is its own action for scenes/scripts).
+fn canon_home_control_action(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_lowercase().replace([' ', '-'], "_");
+    let mapped: &str = match normalized.as_str() {
+        "deactivate" | "disable" | "switch_off" | "power_off" | "shut_off" => "turn_off",
+        "enable" | "switch_on" | "power_on" => "turn_on",
+        other => other,
+    };
+    HOME_CONTROL_ACTIONS.iter().copied().find(|&a| a == mapped)
 }
 
 fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
@@ -61,6 +79,52 @@ fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("home_status requires non-empty string argument 'entity'"))
+}
+
+fn parse_set_timer_args(args: &serde_json::Value) -> Result<(u64, &str)> {
+    let seconds = match args.get("seconds") {
+        Some(value) => value
+            .as_u64()
+            .filter(|seconds| *seconds >= 1)
+            .ok_or_else(|| {
+                if value.as_u64() == Some(0) {
+                    anyhow::anyhow!("set_timer seconds must be at least 1")
+                } else {
+                    anyhow::anyhow!("set_timer requires integer argument 'seconds'")
+                }
+            })?,
+        None => anyhow::bail!("set_timer requires integer argument 'seconds'"),
+    };
+    let label = args
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("timer");
+    Ok((seconds, label))
+}
+
+fn parse_memory_recall_query(args: &serde_json::Value) -> Result<String> {
+    let raw = args
+        .get("query")
+        .or_else(|| args.get("topic"))
+        .or_else(|| args.get("what"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("memory_recall requires non-empty string argument 'query'")
+        })?;
+    Ok(normalize_memory_recall_query(raw))
+}
+
+fn normalize_memory_recall_query(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("my name") || lower == "name" || lower.contains("who am i") {
+        "name".into()
+    } else if lower.contains("about me") || lower == "me" || lower == "user" {
+        "user".into()
+    } else {
+        raw.to_string()
+    }
 }
 
 /// Tool definition for LLM function calling.
@@ -1162,11 +1226,7 @@ impl ToolDispatcher {
     }
 
     fn exec_set_timer(&self, args: &serde_json::Value) -> Result<String> {
-        let seconds = args.get("seconds").and_then(|v| v.as_u64()).unwrap_or(60);
-        let label = args
-            .get("label")
-            .and_then(|v| v.as_str())
-            .unwrap_or("timer");
+        let (seconds, label) = parse_set_timer_args(args)?;
         self.timers
             .set(seconds, label)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -1178,6 +1238,10 @@ impl ToolDispatcher {
         args: &serde_json::Value,
         exec_ctx: ToolExecutionContext,
     ) -> Result<String> {
+        let query = parse_memory_recall_query(args)?;
+        let read_context = exec_ctx
+            .memory_read_context
+            .unwrap_or_else(|| memory_read_context(args));
         let mem = self
             .memory
             .as_ref()
@@ -1185,32 +1249,30 @@ impl ToolDispatcher {
         let mem = mem
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-        let query = memory_query(args);
-        let read_context = exec_ctx
-            .memory_read_context
-            .unwrap_or_else(|| memory_read_context(args));
+        let query_ref = query.as_str();
 
-        if let Some(answer) = mem.structured_household_answer(query)? {
+        if let Some(answer) = mem.structured_household_answer(query_ref)? {
             return Ok(answer);
         }
 
-        if let Some(role) = household_role_query(query) {
+        if let Some(role) = household_role_query(query_ref) {
             let profiles = mem.household_profiles_by_role(role)?;
             if !profiles.is_empty() {
                 return Ok(format_household_role_answer(role, &profiles));
             }
         }
 
-        let results = crate::memory::recall::recall_with_context(&mem, query, 10, read_context)?;
+        let results =
+            crate::memory::recall::recall_with_context(&mem, query_ref, 10, read_context)?;
         if results.is_empty() {
-            return Ok(match query {
+            return Ok(match query_ref {
                 "name" => "I don't remember your name yet.".to_string(),
                 "user" => "I don't remember anything about you yet.".to_string(),
                 other => format!("I don't remember anything about {} yet.", other),
             });
         }
 
-        if query == "name"
+        if query_ref == "name"
             && let Some(entry) = results
                 .iter()
                 .find(|entry| entry.entry.content.to_lowercase().contains("name is "))
@@ -1221,7 +1283,7 @@ impl ToolDispatcher {
                 .replace("User's name is ", "Your name is "));
         }
 
-        if query == "user" || query == "me" {
+        if query_ref == "user" || query_ref == "me" {
             let items = results
                 .iter()
                 .take(3)
@@ -1757,24 +1819,6 @@ fn tool_confirmation_token(key: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
     format!("conf-{:016x}", hasher.finish())
-}
-
-fn memory_query(args: &serde_json::Value) -> &str {
-    let raw = args
-        .get("query")
-        .or_else(|| args.get("topic"))
-        .or_else(|| args.get("what"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("user");
-
-    let lower = raw.to_lowercase();
-    if lower.contains("my name") || lower == "name" || lower.contains("who am i") {
-        "name"
-    } else if lower.contains("about me") || lower == "me" || lower == "user" {
-        "user"
-    } else {
-        raw
-    }
 }
 
 fn household_role_query(query: &str) -> Option<&'static str> {
@@ -2426,6 +2470,32 @@ mod tests {
     }
 
     #[test]
+    fn home_control_canonicalizes_action_synonyms() {
+        // The bug: a small model emits "turn off" (space), the runtime rejected
+        // it, and a correct intent silently failed to actuate.
+        for (raw, want) in [
+            ("turn off", Some("turn_off")),
+            ("Turn-Off", Some("turn_off")),
+            ("deactivate", Some("turn_off")),
+            ("disable", Some("turn_off")),
+            ("turn on", Some("turn_on")),
+            ("switch_on", Some("turn_on")),
+            ("toggle", Some("toggle")),
+            ("activate", Some("activate")), // distinct action, must not remap
+            ("frobnicate", None),
+        ] {
+            assert_eq!(canon_home_control_action(raw), want, "action {raw:?}");
+        }
+
+        // End-to-end through the arg parser: "turn off" now resolves to "turn_off".
+        let args = serde_json::json!({"entity": "kitchen lights", "action": "turn off"});
+        let (entity, action, _) =
+            parse_home_control_args(&args).expect("'turn off' should canonicalize and parse");
+        assert_eq!(entity, "kitchen lights");
+        assert_eq!(action, "turn_off");
+    }
+
+    #[test]
     fn tool_action_class_maps_side_effecting_tools() {
         assert_eq!(
             tool_action_class("home_control"),
@@ -3008,6 +3078,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "Your name is Jared");
+    }
+
+    #[test]
+    fn memory_recall_accepts_topic_alias_after_schema_validation() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-topic-alias-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("preference", "User likes jazz music").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"topic": "jazz"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("jazz"));
     }
 
     #[test]

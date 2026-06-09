@@ -74,7 +74,7 @@ pub async fn control(
 
     if !confirmed
         && matches!(request_origin, RequestOrigin::Api)
-        && matches!(policy.risk, crate::ha::ActionRisk::High)
+        && !matches!(policy.risk, crate::ha::ActionRisk::Low)
     {
         return Ok(ControlOutcome::ConfirmationRequired {
             reason: format!(
