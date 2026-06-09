@@ -41,18 +41,36 @@ fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Opti
         .ok_or_else(|| {
             anyhow::anyhow!("home_control requires non-empty string argument 'entity'")
         })?;
-    let action = args
+    let raw_action = args
         .get("action")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("home_control requires string argument 'action'"))?;
-    if !HOME_CONTROL_ACTIONS.contains(&action) {
-        anyhow::bail!(
+    let action = canon_home_control_action(raw_action).ok_or_else(|| {
+        anyhow::anyhow!(
             "home_control action '{}' is invalid; expected one of: {}",
-            action,
+            raw_action,
             HOME_CONTROL_ACTIONS.join(", ")
-        );
-    }
+        )
+    })?;
     Ok((entity, action, args.get("value").and_then(|v| v.as_f64())))
+}
+
+/// Canonicalize a model-emitted action verb to one of [`HOME_CONTROL_ACTIONS`].
+///
+/// Small models routinely emit the natural-language form ("turn off"),
+/// hyphenated/cased variants ("Turn-Off"), or a synonym ("deactivate") rather
+/// than the exact enum value `turn_off`. Rejecting those means a correct intent
+/// silently fails to actuate. Normalize separators + case, map a few
+/// unambiguous synonyms, and accept the result only if it lands on a real
+/// action. `activate` is left as-is (it is its own action for scenes/scripts).
+fn canon_home_control_action(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_lowercase().replace([' ', '-'], "_");
+    let mapped: &str = match normalized.as_str() {
+        "deactivate" | "disable" | "switch_off" | "power_off" | "shut_off" => "turn_off",
+        "enable" | "switch_on" | "power_on" => "turn_on",
+        other => other,
+    };
+    HOME_CONTROL_ACTIONS.iter().copied().find(|&a| a == mapped)
 }
 
 fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
@@ -725,7 +743,7 @@ impl ToolDispatcher {
             "play_media" => self.exec_play_media(&call.arguments).await,
             "memory_recall" => self.exec_memory_recall(&call.arguments, exec_ctx),
             "memory_status" => self.exec_memory_status(),
-            "memory_forget" => self.exec_memory_forget(&call.arguments),
+            "memory_forget" => self.exec_memory_forget(&call.arguments, exec_ctx),
             "memory_store" => self.exec_memory_store(&call.arguments),
             other => self.exec_skill(other, &call.arguments).await,
         };
@@ -1336,7 +1354,11 @@ impl ToolDispatcher {
         ))
     }
 
-    fn exec_memory_forget(&self, args: &serde_json::Value) -> Result<String> {
+    fn exec_memory_forget(
+        &self,
+        args: &serde_json::Value,
+        exec_ctx: ToolExecutionContext,
+    ) -> Result<String> {
         let mem = self
             .memory
             .as_ref()
@@ -1350,7 +1372,23 @@ impl ToolDispatcher {
             return Ok("Please specify what to forget.".to_string());
         }
 
-        let deleted = mem.delete_matching(query)?;
+        // Gate deletes through the same MemoryReadContext that exec_memory_recall
+        // uses. Without it, an LLM that cannot READ a person-scoped row could
+        // still DELETE it by calling memory_forget — destroying data it has no
+        // privilege to see. This mirrors the read-side fix landed in
+        // PR #201 (commit be4a2da).
+        let read_context = exec_ctx
+            .memory_read_context
+            .unwrap_or_else(crate::memory::policy::MemoryReadContext::shared_room_voice);
+        let candidates = mem.search(query, 10)?;
+        let allowed = crate::memory::recall::filter_recall_results(candidates, read_context);
+        let mut deleted = 0usize;
+        for recallable in &allowed {
+            if mem.delete_by_id(recallable.entry.id)? {
+                deleted += 1;
+            }
+        }
+
         if deleted == 0 {
             Ok(format!("No memories found matching '{}'.", query))
         } else {
@@ -2440,6 +2478,32 @@ mod tests {
     }
 
     #[test]
+    fn home_control_canonicalizes_action_synonyms() {
+        // The bug: a small model emits "turn off" (space), the runtime rejected
+        // it, and a correct intent silently failed to actuate.
+        for (raw, want) in [
+            ("turn off", Some("turn_off")),
+            ("Turn-Off", Some("turn_off")),
+            ("deactivate", Some("turn_off")),
+            ("disable", Some("turn_off")),
+            ("turn on", Some("turn_on")),
+            ("switch_on", Some("turn_on")),
+            ("toggle", Some("toggle")),
+            ("activate", Some("activate")), // distinct action, must not remap
+            ("frobnicate", None),
+        ] {
+            assert_eq!(canon_home_control_action(raw), want, "action {raw:?}");
+        }
+
+        // End-to-end through the arg parser: "turn off" now resolves to "turn_off".
+        let args = serde_json::json!({"entity": "kitchen lights", "action": "turn off"});
+        let (entity, action, _) =
+            parse_home_control_args(&args).expect("'turn off' should canonicalize and parse");
+        assert_eq!(entity, "kitchen lights");
+        assert_eq!(action, "turn_off");
+    }
+
+    #[test]
     fn tool_action_class_maps_side_effecting_tools() {
         assert_eq!(
             tool_action_class("home_control"),
@@ -3348,6 +3412,88 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "I remember: Maya likes oat milk");
+    }
+
+    #[test]
+    fn memory_forget_blocks_person_scope_without_verified_context() {
+        // Regression for the delete-side analogue of be4a2da (PR #201): without a
+        // verified MemoryReadContext, the LLM must not be able to destroy
+        // person-scoped rows it cannot read. memory_forget previously called
+        // Memory::delete_matching directly (scope-blind), so an LLM that could
+        // not READ Maya's person_preference could still DELETE it.
+        let db = std::env::temp_dir().join(format!(
+            "memory-forget-shared-room-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_forget(
+                &serde_json::json!({"query": "Maya"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(
+            output.contains("No memories"),
+            "shared-room delete must report no-match, got: {output}"
+        );
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        let still_there = mem.search("Maya", 5).unwrap();
+        assert_eq!(
+            still_there.len(),
+            1,
+            "person-scoped row must remain after a shared-room forget"
+        );
+    }
+
+    #[test]
+    fn memory_forget_allows_person_scope_with_verified_context() {
+        // Mirror of the read-side identity-context unlock: when the server /
+        // voice pipeline has set a verified MemoryReadContext on exec_ctx,
+        // memory_forget should be able to delete person-scoped rows.
+        let db = std::env::temp_dir().join(format!(
+            "memory-forget-identity-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_forget(
+                &serde_json::json!({"query": "Maya"}),
+                ToolExecutionContext {
+                    memory_read_context: Some(crate::memory::policy::MemoryReadContext {
+                        identity_confidence: crate::memory::policy::IdentityConfidence::High,
+                        explicit_named_person: false,
+                        explicit_private_intent: false,
+                        shared_space_voice: true,
+                    }),
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            output.contains("Forgot 1"),
+            "verified-context delete must report success, got: {output}"
+        );
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert!(
+            mem.search("Maya", 5).unwrap().is_empty(),
+            "person-scoped row must be deleted under a verified context"
+        );
     }
 
     #[tokio::test]
