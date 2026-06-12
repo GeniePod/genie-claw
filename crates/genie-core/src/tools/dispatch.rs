@@ -127,6 +127,14 @@ fn normalize_memory_recall_query(raw: &str) -> String {
     }
 }
 
+fn parse_calculate_expression(args: &serde_json::Value) -> Result<&str> {
+    args.get("expression")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("calculate requires non-empty string argument 'expression'"))
+}
+
 fn parse_play_media_query(args: &serde_json::Value) -> Result<&str> {
     args.get("query")
         .and_then(|v| v.as_str())
@@ -2050,10 +2058,7 @@ fn tool_argument_keys(args: &serde_json::Value) -> Vec<String> {
 }
 
 fn exec_calculate(args: &serde_json::Value) -> Result<String> {
-    let expr = args
-        .get("expression")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0");
+    let expr = parse_calculate_expression(args)?;
     match super::calc::evaluate(expr) {
         Ok(result) => {
             // Format nicely: drop trailing zeros for integers.
