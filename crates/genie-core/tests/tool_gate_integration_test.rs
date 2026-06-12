@@ -875,8 +875,10 @@ async fn play_media_rejects_invalid_arguments_and_audits() {
 #[tokio::test]
 async fn web_search_rejects_invalid_arguments_and_audits() {
     let paths = TestAuditPaths::new();
-    let mut web_search = WebSearchConfig::default();
-    web_search.enabled = true;
+    let web_search = WebSearchConfig {
+        enabled: true,
+        ..Default::default()
+    };
     let dispatcher = paths
         .dispatcher(
             None,
