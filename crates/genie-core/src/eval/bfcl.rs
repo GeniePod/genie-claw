@@ -532,6 +532,21 @@ fn bfcl_reference_home() -> HomeGraph {
     }
 }
 
+/// Controllable device names for the BFCL reference home, lowercased to match
+/// the dataset's canonical entity surface forms. A real on-device agent always
+/// knows its home's devices; feeding this list into the eval prompt grounds
+/// entity arguments in real device state (the GeniePod thesis) instead of
+/// forcing the model to guess names it cannot see. Lowercase so the model emits
+/// the exact gold strings (raw exact-match), and compact so the system prompt
+/// stays inside the runtime's prefix-cache window (keeps prefill fast).
+pub fn bfcl_reference_home_device_catalog() -> Vec<String> {
+    bfcl_reference_home()
+        .entities
+        .iter()
+        .map(|entity| entity.name.to_lowercase())
+        .collect()
+}
+
 /// Deep-clone `args`, replacing any entity-like string argument with a stable
 /// canonical token derived from the entities the runtime resolver would act on.
 ///

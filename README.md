@@ -1,5 +1,6 @@
 # GenieClaw
 
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/r6B22DP83k)
 [![CI](https://github.com/GeniePod/genie-claw/actions/workflows/ci.yml/badge.svg)](https://github.com/GeniePod/genie-claw/actions/workflows/ci.yml)
 [![Jetson cross-compile](https://github.com/GeniePod/genie-claw/actions/workflows/cross.yml/badge.svg)](https://github.com/GeniePod/genie-claw/actions/workflows/cross.yml)
 [![Audit](https://github.com/GeniePod/genie-claw/actions/workflows/audit.yml/badge.svg)](https://github.com/GeniePod/genie-claw/actions/workflows/audit.yml)
@@ -23,6 +24,33 @@ The default agent contract is intentionally small: the Jetson profile uses
 `[agent].context_window_tokens = 4096`. Larger adaptive contexts can exist for
 stronger models, but provider/runtime paths must pass the 4096-token harness
 first.
+
+## The Edge Bet
+
+The hard version of "edge AI" is delivering — on one private device, with no
+cloud — the bundle the industry says needs a data center:
+
+- **quick response** — no network round-trip
+- **on-device processing** — everything runs on the Jetson Orin Nano 8 GB
+- **high accuracy for the home** — the hard one
+- **data privacy** — household and family data never leave the device
+- **energy efficiency** — small quantized models inside a tight power and memory budget
+- **zero subscription** — fully local; the user owns it, with no recurring cloud cost
+
+These pillars fight each other. Accuracy usually buys itself with a bigger model
+on a cloud GPU — which immediately costs you on-device, energy, privacy, and the
+no-subscription promise. GenieClaw resolves that tension with one bet:
+
+> **Accuracy comes from deterministic grounding — family memory and live
+> room/device state — not from model scale.**
+
+A small local model reaches household-class tool-call accuracy because it is
+handed the right grounded context and its outputs are resolved against real
+device state, not because it ships a large prompt to a remote model. That is the
+keystone: hold the accuracy pillar with grounding and the other five stay
+affordable. The BFCL harness and the 4096-token Jetson baseline exist to keep
+that bet honest and measurable — accuracy is earned against grounded device
+state, not asserted.
 
 ## What Works Today
 
@@ -139,6 +167,47 @@ is intended to be: a private, local, deterministic household agent that can
 run well on NVIDIA Jetson Orin Nano 8 GB hardware. Spam-like PRs, AI-generated
 issue churn, duplicate reports, unplanned bug-fix batches, or changes without
 real behavior proof will be closed immediately to protect review quality.
+
+### Accepted contribution scope
+
+A PR is accepted **only** if it lands in one of these two buckets, with
+reproducible on-device proof. Anything else will be closed.
+
+> 💎 **Performance PRs are rewarded.** Land a performance-improvement PR that
+> meets the rules below — measurable Jetson win, reproducible before→after proof —
+> and you're eligible for a reward through [gittensor](https://gittensor.io/),
+> the Bittensor subnet that pays out for merged open-source contributions.
+
+1. **Performance improvement** — measurable latency / throughput / memory wins
+   on Jetson Orin Nano 8 GB, with before→after numbers.
+   - e.g. [genie-ai-runtime#85](https://github.com/GeniePod/genie-ai-runtime/pull/85)
+     — in-memory KV prefix cache, **~13× faster prefill** (16s → ~1s per
+     command); cut the BFCL eval from ~62 min to ~20 min.
+
+2. **Tool-dispatch / real-Home-Assistant correctness** — fixes to tool routing,
+   tool-call arguments, or home actuation, **measured** (BFCL) and/or
+   **reproduced against a real Home Assistant**. A runnable sample HA config is
+   provided at [`deploy/homeassistant/`](deploy/homeassistant/) so you can
+   reproduce the failure and prove the fix.
+   - **Accuracy, measured:** [#399](https://github.com/GeniePod/genie-claw/pull/399)
+     — ground the predict prompt in the home device catalog: raw BFCL strict
+     **20.19% → 50.96%**, grounded **72.12% → 82.69%** (Qwen3-4B @ 4096, same
+     model — deterministic device-state grounding, not scale);
+     [#390](https://github.com/GeniePod/genie-claw/pull/390) — action-synonym
+     canonicalization + wrong-room fidelity guard;
+     [#388](https://github.com/GeniePod/genie-claw/pull/388) — grounded
+     entity-argument metric.
+   - **Live-HA actuation:** [#400](https://github.com/GeniePod/genie-claw/pull/400)
+     — canonicalize `home_control` action synonyms. *Before:* the model emits
+     `"turn off"`, the runtime rejects it (*"action 'turn off' is invalid"*) and
+     the light stays on. *After:* `"turn off" → "turn_off"`, and
+     `light.kitchen_lights` goes `off → on`, confirmed via the HA API. Also
+     [#380](https://github.com/GeniePod/genie-claw/pull/380) — stop leaking
+     unparsed tool-call JSON to the user.
+
+Every such PR needs a **Real Behavior Proof**: what you ran, on what hardware,
+and what changed — for HA fixes, live-HA before/after confirmed via the API.
+No reproducible proof, or outside these two buckets → closed.
 
 ## Product Quality Bar
 
