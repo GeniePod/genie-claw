@@ -51,19 +51,41 @@ pub async fn stream_and_speak_with_hints(
     hints: Option<&crate::llm::LlmRequestHints>,
 ) -> Result<String> {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (pcm_tx, mut pcm_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    let tts_for_task = Arc::clone(&tts_engine);
-    let tts_task = tokio::spawn(async move {
-        let mut spoken: usize = 0;
+    // Synthesis task: reads sentences from the LLM stream, synthesizes each
+    // to PCM, and forwards to the playback task. By running concurrently with
+    // the playback task, synthesis of sentence N+1 overlaps with playback of
+    // sentence N, eliminating the per-sentence synthesis gap.
+    let synth_engine = Arc::clone(&tts_engine);
+    let synth_task = tokio::spawn(async move {
         while let Some(sentence) = rx.recv().await {
-            if spoken == 0 {
-                eprintln!("[voice] Speaking (streaming)...");
+            match synth_engine.synthesize_only(&sentence).await {
+                Ok(pcm) => {
+                    if pcm_tx.send(pcm).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "TTS synth error"),
             }
-            if let Err(e) = tts_for_task.speak(&sentence).await {
-                tracing::warn!(error = %e, "TTS error on sentence");
+        }
+    });
+
+    // Playback task: drains the PCM channel and plays each buffer in order.
+    // Post-silence fires once after the last sentence (half-duplex gate).
+    let play_engine = Arc::clone(&tts_engine);
+    let play_task = tokio::spawn(async move {
+        let mut spoken: usize = 0;
+        while let Some(pcm) = pcm_rx.recv().await {
+            if spoken == 0 {
+                eprintln!("[voice] Speaking (streaming, pipelined)...");
+            }
+            if let Err(e) = play_engine.play_pcm_data(&pcm).await {
+                tracing::warn!(error = %e, "TTS playback error on sentence");
             }
             spoken += 1;
         }
+        play_engine.post_silence().await;
         spoken
     });
 
@@ -86,13 +108,15 @@ pub async fn stream_and_speak_with_hints(
         }
     };
 
-    // Always flush and close the channel so the TTS task exits cleanly,
-    // whether the LLM stream succeeded or errored partway through.
     if let Some(tail) = streamer.finish() {
         let _ = tx.send(tail);
     }
     drop(tx);
-    let _ = tts_task.await;
+    // Synthesis task finishes when sentence channel closes; dropping its
+    // pcm_tx closes the PCM channel and signals the playback task to stop.
+    let _ = synth_task.await;
+    // Playback task applies post-silence once after the last sentence.
+    let _ = play_task.await;
 
     stream_result
 }
