@@ -872,6 +872,71 @@ async fn play_media_rejects_invalid_arguments_and_audits() {
     }
 }
 
+#[tokio::test]
+async fn get_weather_rejects_invalid_arguments_and_audits() {
+    let paths = TestAuditPaths::new();
+    let dispatcher = paths.dispatcher(
+        None,
+        ToolPolicyConfig::default(),
+        ActuationSafetyConfig::default(),
+    );
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Dashboard,
+        ..ToolExecutionContext::default()
+    };
+
+    let invalid_calls = [
+        (
+            serde_json::json!({}),
+            "get_weather requires non-empty string argument 'location'",
+        ),
+        (
+            serde_json::json!({"location": ""}),
+            "get_weather requires non-empty string argument 'location'",
+        ),
+        (
+            serde_json::json!({"location": 42}),
+            "get_weather requires non-empty string argument 'location'",
+        ),
+    ];
+    let expected_audit_count = invalid_calls.len();
+
+    for (arguments, expected_snippet) in &invalid_calls {
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "get_weather".into(),
+                    arguments: arguments.clone(),
+                },
+                ctx,
+            )
+            .await;
+
+        assert!(
+            !result.success,
+            "expected schema rejection, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(expected_snippet),
+            "expected output to contain {expected_snippet:?}, got: {}",
+            result.output
+        );
+    }
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(
+        events.len(),
+        expected_audit_count,
+        "each rejected call must be tool-audited"
+    );
+    for event in &events {
+        assert_eq!(event["tool"], "get_weather");
+        assert_eq!(event["origin"], "dashboard");
+        assert_eq!(event["success"], false);
+    }
+}
+
 // --- Issue #22: per-tool rate limits + two-step confirmation gate ----------
 
 #[tokio::test]
