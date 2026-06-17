@@ -152,6 +152,14 @@ fn parse_web_search_query(args: &serde_json::Value) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("web_search requires non-empty string argument 'query'"))
 }
 
+fn parse_get_weather_location(args: &serde_json::Value) -> Result<&str> {
+    args.get("location")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("get_weather requires non-empty string argument 'location'"))
+}
+
 /// Tool definition for LLM function calling.
 ///
 /// These are sent to the configured LLM backend as part of the system prompt or
@@ -2074,10 +2082,7 @@ fn exec_calculate(args: &serde_json::Value) -> Result<String> {
 }
 
 async fn exec_weather(args: &serde_json::Value) -> Result<String> {
-    let location = args
-        .get("location")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Denver");
+    let location = parse_get_weather_location(args)?;
     let forecast = args
         .get("forecast")
         .and_then(|v| v.as_bool())

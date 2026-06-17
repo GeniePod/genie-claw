@@ -236,23 +236,48 @@ impl TtsEngine {
     /// Pipes text to Piper stdin, raw PCM stdout goes to aplay.
     /// Uses process pipes instead of shell to avoid escaping issues.
     pub async fn speak(&self, text: &str) -> Result<()> {
-        // Stamp the moment streaming::stream_and_speak decided to call speak()
-        // for the first time this cycle. With today's `chat_stream` that only
-        // happens after the full LLM response is collected, but a future real-
-        // streaming refactor (#26) will fire this earlier. The banner uses it
-        // to separate "LLM-thinking" from "first-sentence Piper synth".
-        mark_first_speak_called();
-
         if matches!(self.mode, TtsMode::Silent) {
-            // No-op: the integration test (issue #21) drives the voice cycle
-            // on hosts with no Piper / aplay binaries.
             return Ok(());
         }
 
         let clean = text.replace('\n', " ");
         tracing::info!(text_len = text.len(), "speaking via Piper → aplay");
 
-        // Spawn Piper: stdin=text, stdout=raw PCM
+        let pcm = self.synthesize_only(&clean).await?;
+        if pcm.is_empty() {
+            tracing::warn!("Piper produced no audio");
+            return Ok(());
+        }
+
+        tracing::info!(pcm_bytes = pcm.len(), "Piper generated audio, playing...");
+        self.play_pcm_data(&pcm).await?;
+
+        if self.post_silence_ms > 0 {
+            tracing::debug!(
+                post_silence_ms = self.post_silence_ms,
+                "half-duplex gate: sleeping for room decay"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(self.post_silence_ms)).await;
+        }
+
+        Ok(())
+    }
+
+    /// Synthesize text to raw PCM bytes (without playback).
+    ///
+    /// Used by the pipelined streaming path to overlap synthesis of sentence
+    /// N+1 with playback of sentence N. Also stamps the first-speak-called
+    /// latency marker on the first invocation per response cycle.
+    pub async fn synthesize_only(&self, text: &str) -> Result<Vec<u8>> {
+        mark_first_speak_called();
+
+        if matches!(self.mode, TtsMode::Silent) {
+            return Ok(Vec::new());
+        }
+
+        let clean = text.replace('\n', " ");
+        tracing::debug!(text_len = text.len(), "synthesizing via Piper");
+
         let mut piper = Command::new(&self.piper_path)
             .args(["--model", &self.model_path, "--output_raw"])
             .stdin(std::process::Stdio::piped())
@@ -260,37 +285,36 @@ impl TtsEngine {
             .stderr(std::process::Stdio::piped())
             .spawn()?;
 
-        // Write text to Piper stdin and close it.
         if let Some(mut stdin) = piper.stdin.take() {
-            use tokio::io::AsyncWriteExt;
             stdin.write_all(clean.as_bytes()).await?;
             stdin.write_all(b"\n").await?;
-            // Drop stdin to signal EOF — Piper starts processing.
         }
 
-        // Wait for Piper to finish and collect PCM output.
-        let piper_output = piper.wait_with_output().await?;
-
-        if !piper_output.status.success() {
-            let stderr = String::from_utf8_lossy(&piper_output.stderr);
-            anyhow::bail!("Piper failed: {}", stderr);
+        let out = piper.wait_with_output().await?;
+        if !out.status.success() {
+            anyhow::bail!("Piper failed: {}", String::from_utf8_lossy(&out.stderr));
         }
 
-        let mut pcm = piper_output.stdout;
+        let mut pcm = out.stdout;
         if pcm.is_empty() {
             tracing::warn!("Piper produced no audio");
+            return Ok(pcm);
+        }
+
+        super::dsp::process_tts_audio(&mut pcm, self.sample_rate);
+        super::aec::set_echo_reference(&pcm, self.sample_rate);
+        Ok(pcm)
+    }
+
+    /// Play pre-synthesized PCM through the speaker (no post-silence).
+    ///
+    /// Callers must invoke `post_silence()` once after the final sentence.
+    /// Stamps the first-audio latency marker on the first invocation.
+    pub async fn play_pcm_data(&self, pcm: &[u8]) -> Result<()> {
+        if matches!(self.mode, TtsMode::Silent) || pcm.is_empty() {
             return Ok(());
         }
 
-        // Apply AGC + EQ + soft limiter to TTS output.
-        super::dsp::process_tts_audio(&mut pcm, self.sample_rate);
-
-        // Save as echo reference for AEC (before sending to speaker).
-        super::aec::set_echo_reference(&pcm, self.sample_rate);
-
-        tracing::info!(pcm_bytes = pcm.len(), "Piper generated audio, playing...");
-
-        // Play PCM via aplay.
         let rate_str = self.sample_rate.to_string();
         let mut aplay_args: Vec<&str> = Vec::new();
         if !self.audio_device.is_empty() {
@@ -307,25 +331,22 @@ impl TtsEngine {
             .spawn()?;
 
         if let Some(mut stdin) = aplay.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            // TTFA marker for issue #19 latency banner: stamp the moment the
-            // first PCM byte is about to be written to aplay. ALSA's hardware
-            // buffer will turn this into audible audio within a few ms.
             mark_first_audio();
-            stdin.write_all(&pcm).await?;
+            stdin.write_all(pcm).await?;
         }
 
-        let aplay_output = aplay.wait().await?;
-        if !aplay_output.success() {
+        let status = aplay.wait().await?;
+        if !status.success() {
             tracing::warn!("aplay exited with error");
         }
+        Ok(())
+    }
 
-        // Half-duplex gate (issue #15): once aplay has exited, the ALSA
-        // hardware buffer may still be flushing the tail of the TTS PCM, and
-        // the room itself takes time to decay below the whisper-server
-        // no-speech threshold. Without this sleep, the next mic capture
-        // contains the assistant's own voice and whisper happily transcribes
-        // it as the next "user" utterance.
+    /// Apply the half-duplex post-TTS silence gate once.
+    ///
+    /// In the pipelined streaming path this fires once after the last
+    /// sentence, rather than after every sentence as `speak()` does.
+    pub async fn post_silence(&self) {
         if self.post_silence_ms > 0 {
             tracing::debug!(
                 post_silence_ms = self.post_silence_ms,
@@ -333,8 +354,6 @@ impl TtsEngine {
             );
             tokio::time::sleep(std::time::Duration::from_millis(self.post_silence_ms)).await;
         }
-
-        Ok(())
     }
 
     /// Synthesize and write directly to a WAV file.

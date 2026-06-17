@@ -1788,6 +1788,20 @@ fn format_agent_harness_status(harness: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn format_agent_harness_health_line(harness: &serde_json::Value) -> Option<String> {
+    let pass = harness.get("pass")?.as_bool()?;
+    if pass {
+        return Some("  [OK]   harness".to_string());
+    }
+
+    let summary = format_agent_harness_status(harness)?;
+    if let Some(detail) = summary.strip_prefix("FAIL ") {
+        Some(format!("  [FAIL] harness {detail}"))
+    } else {
+        Some("  [FAIL] harness".to_string())
+    }
+}
+
 fn format_score_rate(rate: f64) -> String {
     format!("{:.2}%", rate * 100.0)
 }
@@ -1935,6 +1949,12 @@ async fn cmd_health() -> Result<()> {
             } else {
                 println!("  [OK]   chat path idle");
             }
+        }
+
+        if let Some(harness) = health.get("agent_harness")
+            && let Some(line) = format_agent_harness_health_line(harness)
+        {
+            println!("{line}");
         }
     }
 
@@ -2135,6 +2155,12 @@ async fn cmd_diag() -> Result<()> {
             {
                 println!("  Runtime Drift: {}", v);
             }
+        }
+        if let Some(harness) = data.get("agent_harness")
+            && let Some(summary) = format_agent_harness_status(harness)
+        {
+            println!("\n[Harness]");
+            println!("  Status:  {}", summary);
         }
     }
 
@@ -3330,6 +3356,36 @@ mod tests {
         assert_eq!(
             format_agent_harness_status(&harness).as_deref(),
             Some("FAIL (memory_hydration_budget)")
+        );
+    }
+
+    #[test]
+    fn format_agent_harness_health_line_reports_pass() {
+        let harness = serde_json::json!({
+            "pass": true,
+            "checks": [
+                {"name": "memory_hydration_budget", "pass": true, "detail": "ok"}
+            ]
+        });
+
+        assert_eq!(
+            format_agent_harness_health_line(&harness).as_deref(),
+            Some("  [OK]   harness")
+        );
+    }
+
+    #[test]
+    fn format_agent_harness_health_line_lists_failed_checks() {
+        let harness = serde_json::json!({
+            "pass": false,
+            "checks": [
+                {"name": "memory_hydration_budget", "pass": false, "detail": "over budget"}
+            ]
+        });
+
+        assert_eq!(
+            format_agent_harness_health_line(&harness).as_deref(),
+            Some("  [FAIL] harness (memory_hydration_budget)")
         );
     }
 }
