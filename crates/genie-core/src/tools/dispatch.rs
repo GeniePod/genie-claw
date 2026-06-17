@@ -151,6 +151,22 @@ fn parse_get_weather_location(args: &serde_json::Value) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("get_weather requires non-empty string argument 'location'"))
 }
 
+fn parse_memory_forget_query(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("memory_forget requires non-empty string argument 'query'"))
+}
+
+fn parse_memory_store_content(args: &serde_json::Value) -> Result<&str> {
+    args.get("content")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("memory_store requires non-empty string argument 'content'"))
+}
+
 /// Tool definition for LLM function calling.
 ///
 /// These are sent to the configured LLM backend as part of the system prompt or
@@ -1375,6 +1391,7 @@ impl ToolDispatcher {
         args: &serde_json::Value,
         exec_ctx: ToolExecutionContext,
     ) -> Result<String> {
+        let query = parse_memory_forget_query(args)?;
         let mem = self
             .memory
             .as_ref()
@@ -1382,11 +1399,6 @@ impl ToolDispatcher {
         let mem = mem
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-
-        if query.is_empty() {
-            return Ok("Please specify what to forget.".to_string());
-        }
 
         // Gate deletes through the same MemoryReadContext that exec_memory_recall
         // uses. Without it, an LLM that cannot READ a person-scoped row could
@@ -1413,6 +1425,7 @@ impl ToolDispatcher {
     }
 
     fn exec_memory_store(&self, args: &serde_json::Value) -> Result<String> {
+        parse_memory_store_content(args)?;
         let mem = self
             .memory
             .as_ref()
@@ -1421,9 +1434,6 @@ impl ToolDispatcher {
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
         let memories = normalize_memories_to_store(args);
-        if memories.is_empty() {
-            return Ok("Please specify what to remember.".to_string());
-        }
 
         let mut stored = Vec::new();
         let mut stored_categories = Vec::new();
