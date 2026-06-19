@@ -1285,7 +1285,8 @@ mod tests {
     fn resolve_target_rejects_foreign_room_whole_home_fallback() {
         let graph = sample_graph();
         assert!(
-            HomeAssistantProvider::resolve_target_in_graph(&graph, "upstairs lights", None).is_none()
+            HomeAssistantProvider::resolve_target_in_graph(&graph, "upstairs lights", None)
+                .is_none()
         );
     }
 

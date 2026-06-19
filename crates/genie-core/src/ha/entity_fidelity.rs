@@ -43,10 +43,7 @@ pub fn domain_of_word(word: &str) -> Option<&'static str> {
 /// does not have ("upstairs lights") and known rooms lacking the device ("living
 /// room light"), while still allowing bare-domain ("lights") and correctly
 /// room-qualified ("kitchen lights") requests.
-pub fn whole_home_resolution_is_trustworthy(
-    entities: &[DomainArea<'_>],
-    text: &str,
-) -> bool {
+pub fn whole_home_resolution_is_trustworthy(entities: &[DomainArea<'_>], text: &str) -> bool {
     let tokens = query_tokens(text);
     let Some(domain) = tokens.iter().find_map(|t| domain_of_word(t)) else {
         return true;
