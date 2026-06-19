@@ -68,8 +68,8 @@ stt_language = "en"               # Whisper decoder hint. Forcing "en" uses the
                                   # multilingual / non-English installs.
 piper_model = "/opt/geniepod/voices/en_US-amy-medium.onnx"
 piper_path = "/opt/geniepod/piper/piper"
-piper_pipe_mode = false           # true = long-running subprocess (lower latency).
-max_history_turns = 20
+piper_pipe_mode = true            # true = long-running subprocess (lower latency).
+max_history_turns = 4
 llm_connect_timeout_secs = 10     # Max wait to open the TCP connection to the LLM backend.
 llm_read_timeout_secs = 60        # Max idle seconds between tokens/bytes before a read is abandoned.
                                   #   Bounds every backend read so one hung read can't wedge all chat.
@@ -114,7 +114,7 @@ audio_denoiser = "deepfilternet"  # Capture-side noise reduction backend. Option
                                   # Falls back to "sox" then "none" at runtime if the
                                   # configured backend's binary is missing.
 deep_filter_path = "/opt/geniepod/bin/deep-filter"
-deep_filter_atten_lim_db = 100.0  # DeepFilterNet attenuation limit (--atten-lim). 100.0 =
+deep_filter_atten_lim_db = 25.0   # DeepFilterNet attenuation limit (--atten-lim). 100.0 =
                                   # full denoising (upstream default). Lower values mix
                                   # the noisy signal back in — drop to ~30 if DFN
                                   # over-suppresses quiet phonemes.
@@ -129,7 +129,7 @@ post_tts_silence_ms = 1500        # Half-duplex gate (issue #15): ms to wait aft
                                   # isolation (headphones / headset).
 voice_enabled = true              # Voice mode on by default (push-to-talk unless wakeword_script is set).
                                   # Set false on hosts without whisper/piper installed.
-voice_record_secs = 3             # Seconds to record per voice interaction. Most
+voice_record_secs = 5             # Seconds to record per voice interaction. Most
                                   # household commands ("what time is it", "turn on
                                   # kitchen light") fit in 3 s; raise if you regularly
                                   # ask longer multi-clause questions.
