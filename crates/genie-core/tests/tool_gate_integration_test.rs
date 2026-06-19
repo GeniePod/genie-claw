@@ -5,7 +5,7 @@
 //! proven without a real Home Assistant instance.
 
 use async_trait::async_trait;
-use genie_common::config::{ActuationSafetyConfig, ToolPolicyConfig};
+use genie_common::config::{ActuationSafetyConfig, ToolPolicyConfig, WebSearchConfig};
 use genie_core::ha::{
     ActionResult, DeviceRef, HomeAction, HomeActionKind, HomeAutomationProvider, HomeGraph,
     HomeState, HomeTarget, HomeTargetKind, IntegrationHealth, SceneRef,
@@ -943,6 +943,77 @@ async fn play_media_rejects_invalid_arguments_and_audits() {
     );
     for event in &events {
         assert_eq!(event["tool"], "play_media");
+        assert_eq!(event["origin"], "dashboard");
+        assert_eq!(event["success"], false);
+    }
+}
+
+#[tokio::test]
+async fn web_search_rejects_invalid_arguments_and_audits() {
+    let paths = TestAuditPaths::new();
+    let web_search = WebSearchConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let dispatcher = paths
+        .dispatcher(
+            None,
+            ToolPolicyConfig::default(),
+            ActuationSafetyConfig::default(),
+        )
+        .with_web_search_config(web_search);
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Dashboard,
+        ..ToolExecutionContext::default()
+    };
+
+    let invalid_calls = [
+        (
+            serde_json::json!({}),
+            "web_search requires non-empty string argument 'query'",
+        ),
+        (
+            serde_json::json!({"query": ""}),
+            "web_search requires non-empty string argument 'query'",
+        ),
+        (
+            serde_json::json!({"query": 42}),
+            "web_search requires non-empty string argument 'query'",
+        ),
+    ];
+    let expected_audit_count = invalid_calls.len();
+
+    for (arguments, expected_snippet) in &invalid_calls {
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "web_search".into(),
+                    arguments: arguments.clone(),
+                },
+                ctx,
+            )
+            .await;
+
+        assert!(
+            !result.success,
+            "expected schema rejection, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(expected_snippet),
+            "expected output to contain {expected_snippet:?}, got: {}",
+            result.output
+        );
+    }
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(
+        events.len(),
+        expected_audit_count,
+        "each rejected call must be tool-audited"
+    );
+    for event in &events {
+        assert_eq!(event["tool"], "web_search");
         assert_eq!(event["origin"], "dashboard");
         assert_eq!(event["success"], false);
     }

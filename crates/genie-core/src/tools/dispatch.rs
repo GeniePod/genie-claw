@@ -151,6 +151,15 @@ fn parse_play_media_query(args: &serde_json::Value) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("play_media requires non-empty string argument 'query'"))
 }
 
+fn parse_web_search_query(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
+        .or_else(|| args.get("q"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("web_search requires non-empty string argument 'query'"))
+}
+
 fn parse_get_weather_location(args: &serde_json::Value) -> Result<&str> {
     args.get("location")
         .and_then(|v| v.as_str())
@@ -2098,12 +2107,7 @@ async fn exec_weather(args: &serde_json::Value) -> Result<String> {
 }
 
 async fn exec_web_search(args: &serde_json::Value, config: &WebSearchConfig) -> Result<String> {
-    let query = args
-        .get("query")
-        .or_else(|| args.get("q"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
+    let query = parse_web_search_query(args)?;
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
