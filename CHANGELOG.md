@@ -2,22 +2,59 @@
 
 ## Unreleased
 
-- **Tool-call gate: single chokepoint, confirmation, per-tool rate limits**
-  (#22): every tool invocation now passes one enforced gate. The voice
-  `web_search` quick-path (which renders its own speech output) and the
-  `voice::VoiceAssistant` / `voice::pipeline` fall-back paths no longer reach a
-  tool or provider directly with a defaulted origin — they flow through the
-  dispatcher gate as `RequestOrigin::Voice`, so per-origin ACLs, rate limits,
-  and the audit trail apply uniformly. Two new `[core.tool_policy]` mechanisms:
-  `max_actions_per_minute_by_tool` (per-tool sliding-window limit, `"*"`
-  catch-all) bounces a fast loop off the limit after N calls; and
-  `requires_confirmation_tools` + `confirmation_ttl_secs` require a sensitive
-  tool to be requested twice with the same arguments inside the TTL window
-  (first call returns a pending response with a stable token, the confirming
-  call passes `confirmed = true`; a confirming leg outside the window errors).
-  Every gate decision (`executed`, `denied_policy`, `rate_limited`,
+## 1.0.0-alpha.11 - 2026-06-20
+
+Alpha 11 is the **typed-tool contract + grounded BFCL** release. The single
+tool-call gate is complete, every tool now enforces its declared schema at the
+dispatch boundary (invalid calls fail and are audited rather than silently
+defaulting), and the grounded BFCL metric lifts Home-Assistant-Intents accuracy
+on the 4096-token Jetson Orin path (raw 20%→51%, grounded 72%→83%).
+
+- **Single tool-call gate: chokepoint, confirmation, per-tool rate limits**
+  (#22, #365, #374): every tool invocation passes one enforced gate. The voice
+  `web_search` quick-path and the `voice::VoiceAssistant` / `voice::pipeline`
+  fall-back paths now flow through the dispatcher gate as `RequestOrigin::Voice`,
+  so per-origin ACLs, rate limits, and the audit trail apply uniformly. New
+  `[core.tool_policy]` mechanisms: `max_actions_per_minute_by_tool` (per-tool
+  sliding-window limit, `"*"` catch-all) and `requires_confirmation_tools` +
+  `confirmation_ttl_secs` (two-call confirmation with a stable token inside a TTL
+  window). Every gate decision (`executed`, `denied_policy`, `rate_limited`,
   `pending_confirmation`, `confirmation_expired`) is recorded on the tool-audit
   line.
+- **Typed-tool argument enforcement at the execution boundary**: invalid tool
+  calls (missing / empty / whitespace / wrong-type required args) now fail with
+  `success: false`, a schema error, and a tool-audit failure entry instead of a
+  silent default or polite soft-success. Hardened: `set_timer` (#360),
+  `memory_recall` (#362), `home_status` (#346), `calculate` (#392; unary-minus
+  grammar #326), `play_media` (#393), `home_control` action synonyms (#400) and
+  value (#414), `get_weather` (#409), `web_search` (#412), `memory_forget` (#413,
+  gated on `MemoryReadContext` #389), and `memory_store` (#416). Unparsed
+  tool-call JSON is no longer leaked to the user (#380).
+- **Whole-home entity fidelity guard at runtime** (#419): wrong-room / foreign
+  queries (`"upstairs lights"`, `"living room light"`) no longer collapse to the
+  only device of a domain on live `home_control` / `home_status` — the BFCL
+  fidelity guard now runs in the shared resolver, returning a clear "couldn't
+  find it" instead of mis-actuating.
+- **Grounded BFCL metric** (#387, #388, #390): grounded entity-argument scoring,
+  action-synonym canonicalization, and a wrong-room fidelity guard for the
+  scorer; grounding the predict prompt in the home device catalog (#399) lifts
+  raw 20%→51% and grounded 72%→83% on the Jetson HA-Intents import.
+- **Voice**: TTS synthesis pipelined to overlap with playback (#406); sentence
+  segmentation with look-ahead so decimals/abbreviations don't split (#386);
+  `apply_voice_eq` high-cut fix (#324); Jetson-tuned voice defaults (#407).
+- **Memory & reliability**: per-turn hydration capped at the 700-token M1 budget
+  (#345); `AuditLogger` / `ToolAuditLogger` surface IO failures (#329); the API
+  distinguishes 503 (transient) vs 500 (permanent) for tegrastats DB errors
+  (#299); Telegram bounds concurrent update tasks + evicts idle chat locks
+  (#279); `validate_inference_route` loopback check for `remote_url` (#328); API
+  confirmation required for non-Low actuation risk (#356).
+- **Deploy & build**: ship all `deploy/scripts` to the Jetson + `genie-drop-caches.sh`
+  (#382, #384); run the 4096-token agent harness at boot (#342); faster local
+  builds — skip release LTO in `cargo test`, lighter dev debuginfo (#381);
+  `genie-ctl` surfaces `agent_harness` in status / health / diag (#364, #396).
+- **Docs**: README restructured around the M1/M2/M3 milestones (#352), accepted
+  contribution scope + runnable sample Home Assistant (#401), and the five-pillar
+  edge thesis (#397).
 
 ## 1.0.0-alpha.10 - 2026-05-29
 

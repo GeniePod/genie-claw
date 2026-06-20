@@ -823,6 +823,97 @@ async fn memory_forget_rejects_invalid_arguments_and_audits() {
 }
 
 #[tokio::test]
+async fn memory_store_rejects_invalid_arguments_and_audits() {
+    let paths = TestAuditPaths::new();
+    let memory_path = paths.data_dir.join("memory.db");
+    let memory = genie_core::memory::Memory::open(&memory_path).unwrap();
+    memory.store("identity", "User's name is Jared").unwrap();
+    let dispatcher = paths
+        .dispatcher(
+            None,
+            ToolPolicyConfig::default(),
+            ActuationSafetyConfig::default(),
+        )
+        .with_memory(Arc::new(Mutex::new(memory)));
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Dashboard,
+        ..ToolExecutionContext::default()
+    };
+
+    let invalid_calls = [
+        (
+            serde_json::json!({}),
+            "memory_store requires non-empty string argument 'content'",
+        ),
+        (
+            serde_json::json!({"content": ""}),
+            "memory_store requires non-empty string argument 'content'",
+        ),
+        (
+            serde_json::json!({"content": "   "}),
+            "memory_store requires non-empty string argument 'content'",
+        ),
+        (
+            serde_json::json!({"content": 123}),
+            "memory_store requires non-empty string argument 'content'",
+        ),
+    ];
+    let expected_audit_count = invalid_calls.len();
+
+    for (arguments, expected_snippet) in &invalid_calls {
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "memory_store".into(),
+                    arguments: arguments.clone(),
+                },
+                ctx,
+            )
+            .await;
+
+        assert!(
+            !result.success,
+            "expected schema rejection, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(expected_snippet),
+            "expected output to contain {expected_snippet:?}, got: {}",
+            result.output
+        );
+    }
+
+    // A valid content must still store (the guard only rejects missing content).
+    let ok = dispatcher
+        .execute_with_context(
+            &ToolCall {
+                name: "memory_store".into(),
+                arguments: serde_json::json!({"content": "the spare key is under the mat"}),
+            },
+            ctx,
+        )
+        .await;
+    assert!(
+        ok.success,
+        "valid memory_store must succeed, got: {}",
+        ok.output
+    );
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(
+        events.len(),
+        expected_audit_count + 1,
+        "each rejected call plus the valid one must be tool-audited"
+    );
+    for event in &events[..expected_audit_count] {
+        assert_eq!(event["tool"], "memory_store");
+        assert_eq!(event["origin"], "dashboard");
+        assert_eq!(event["success"], false);
+    }
+    assert_eq!(events[expected_audit_count]["success"], true);
+}
+
+#[tokio::test]
 async fn calculate_rejects_invalid_arguments_and_audits() {
     let paths = TestAuditPaths::new();
     let dispatcher = paths.dispatcher(

@@ -148,6 +148,17 @@ fn parse_memory_forget_query(args: &serde_json::Value) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("memory_forget requires non-empty string argument 'query'"))
 }
 
+/// Reject a `memory_store` call with no usable `content` (#416). Delegates to
+/// `normalize_memories_to_store` so all valid shapes (aliases, catch-all, `name`)
+/// still pass; only missing/empty/wrong-type content is rejected.
+fn parse_memory_store_content(args: &serde_json::Value) -> Result<Vec<(String, String)>> {
+    let memories = normalize_memories_to_store(args);
+    if memories.is_empty() {
+        anyhow::bail!("memory_store requires non-empty string argument 'content'");
+    }
+    Ok(memories)
+}
+
 fn parse_calculate_expression(args: &serde_json::Value) -> Result<&str> {
     args.get("expression")
         .and_then(|v| v.as_str())
@@ -1483,6 +1494,8 @@ impl ToolDispatcher {
     }
 
     fn exec_memory_store(&self, args: &serde_json::Value) -> Result<String> {
+        // Validate content before the lock; previously a soft Ok() audited as success (#416).
+        let memories = parse_memory_store_content(args)?;
         let mem = self
             .memory
             .as_ref()
@@ -1490,10 +1503,6 @@ impl ToolDispatcher {
         let mem = mem
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-        let memories = normalize_memories_to_store(args);
-        if memories.is_empty() {
-            return Ok("Please specify what to remember.".to_string());
-        }
 
         let mut stored = Vec::new();
         let mut stored_categories = Vec::new();
