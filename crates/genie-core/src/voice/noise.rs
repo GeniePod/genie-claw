@@ -203,10 +203,9 @@ fn apply_noise_suppression(samples: &mut [f32], strength: f32, sample_rate: u32)
     // Apply suppression: attenuate frames that are close to the noise floor.
     let suppression_threshold = noise_floor * 3.0; // Frames below 3× noise floor get suppressed.
 
-    for i in 0..num_frames {
+    for (i, &frame_rms) in frame_rms_by_index.iter().enumerate() {
         let start = i * frame_size;
         let end = (start + frame_size).min(samples.len());
-        let frame_rms = frame_rms_by_index[i];
 
         if frame_rms < suppression_threshold {
             // This frame is mostly noise — attenuate.
