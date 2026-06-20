@@ -492,6 +492,10 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"entity": "kitchen light"}),
             "home_control requires string argument 'action'",
         ),
+        (
+            serde_json::json!({"entity": "kitchen light", "action": "turn_on", "value": "hot"}),
+            "home_control 'value' must be a number when provided",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 
@@ -737,6 +741,82 @@ async fn memory_recall_rejects_invalid_arguments_and_audits() {
     );
     for event in &events {
         assert_eq!(event["tool"], "memory_recall");
+        assert_eq!(event["origin"], "dashboard");
+        assert_eq!(event["success"], false);
+    }
+}
+
+#[tokio::test]
+async fn memory_forget_rejects_invalid_arguments_and_audits() {
+    let paths = TestAuditPaths::new();
+    let memory_path = paths.data_dir.join("memory.db");
+    let memory = genie_core::memory::Memory::open(&memory_path).unwrap();
+    memory.store("identity", "User's name is Jared").unwrap();
+    let dispatcher = paths
+        .dispatcher(
+            None,
+            ToolPolicyConfig::default(),
+            ActuationSafetyConfig::default(),
+        )
+        .with_memory(Arc::new(Mutex::new(memory)));
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Dashboard,
+        ..ToolExecutionContext::default()
+    };
+
+    let invalid_calls = [
+        (
+            serde_json::json!({}),
+            "memory_forget requires non-empty string argument 'query'",
+        ),
+        (
+            serde_json::json!({"query": ""}),
+            "memory_forget requires non-empty string argument 'query'",
+        ),
+        (
+            serde_json::json!({"query": "   "}),
+            "memory_forget requires non-empty string argument 'query'",
+        ),
+        (
+            serde_json::json!({"query": 123}),
+            "memory_forget requires non-empty string argument 'query'",
+        ),
+    ];
+    let expected_audit_count = invalid_calls.len();
+
+    for (arguments, expected_snippet) in &invalid_calls {
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "memory_forget".into(),
+                    arguments: arguments.clone(),
+                },
+                ctx,
+            )
+            .await;
+
+        assert!(
+            !result.success,
+            "expected schema rejection, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(expected_snippet),
+            "expected output to contain {expected_snippet:?}, got: {}",
+            result.output
+        );
+    }
+
+    // The stored memory must survive every rejected call — a forget on invalid
+    // input must never reach the delete path.
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(
+        events.len(),
+        expected_audit_count,
+        "each rejected call must be tool-audited"
+    );
+    for event in &events {
+        assert_eq!(event["tool"], "memory_forget");
         assert_eq!(event["origin"], "dashboard");
         assert_eq!(event["success"], false);
     }

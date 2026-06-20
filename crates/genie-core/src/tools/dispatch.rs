@@ -52,7 +52,20 @@ fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Opti
             HOME_CONTROL_ACTIONS.join(", ")
         )
     })?;
-    Ok((entity, action, args.get("value").and_then(|v| v.as_f64())))
+    // `value` stays optional, but a *provided* value must be a number. The old
+    // `args.get("value").and_then(|v| v.as_f64())` silently dropped a non-numeric
+    // value (e.g. a model emitting `"value": "72"` or `"value": true`) to `None`,
+    // so `set_temperature` / `set_brightness` actuated with no value instead of
+    // the user's intent. Reject the malformed value at the boundary the same way
+    // set_timer rejects a non-integer `seconds`; an absent or null value is still
+    // a no-op None.
+    let value = match args.get("value") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(provided) => Some(provided.as_f64().ok_or_else(|| {
+            anyhow::anyhow!("home_control 'value' must be a number when provided")
+        })?),
+    };
+    Ok((entity, action, value))
 }
 
 /// Canonicalize a model-emitted action verb to one of [`HOME_CONTROL_ACTIONS`].
@@ -125,6 +138,14 @@ fn normalize_memory_recall_query(raw: &str) -> String {
     } else {
         raw.to_string()
     }
+}
+
+fn parse_memory_forget_query(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("memory_forget requires non-empty string argument 'query'"))
 }
 
 fn parse_calculate_expression(args: &serde_json::Value) -> Result<&str> {
@@ -1384,6 +1405,14 @@ impl ToolDispatcher {
         args: &serde_json::Value,
         exec_ctx: ToolExecutionContext,
     ) -> Result<String> {
+        // Validate the argument at the execution boundary, before touching the
+        // memory backend, the same way exec_memory_recall does (PR #362). The
+        // previous `unwrap_or("")` silently coerced a missing or non-string
+        // `query` into "", and a whitespace-only query slipped past the
+        // `is_empty()` check straight into `mem.search("   ", ...)` — running a
+        // destructive forget on garbage input instead of being rejected and
+        // audited like its read-side sibling.
+        let query = parse_memory_forget_query(args)?;
         let mem = self
             .memory
             .as_ref()
@@ -1391,11 +1420,6 @@ impl ToolDispatcher {
         let mem = mem
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-
-        if query.is_empty() {
-            return Ok("Please specify what to forget.".to_string());
-        }
 
         // Gate deletes through the same MemoryReadContext that exec_memory_recall
         // uses. Without it, an LLM that cannot READ a person-scoped row could
@@ -2515,6 +2539,42 @@ mod tests {
             parse_home_control_args(&args).expect("'turn off' should canonicalize and parse");
         assert_eq!(entity, "kitchen lights");
         assert_eq!(action, "turn_off");
+    }
+
+    #[test]
+    fn home_control_value_must_be_numeric_when_provided() {
+        // A numeric value parses through to Some(..).
+        let args =
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": 72});
+        let (_, _, value) = parse_home_control_args(&args).expect("numeric value parses");
+        assert_eq!(value, Some(72.0));
+
+        // An absent value is a legitimate no-op None — value stays optional.
+        let args = serde_json::json!({"entity": "kitchen lights", "action": "turn_on"});
+        let (_, _, value) = parse_home_control_args(&args).expect("absent value parses");
+        assert_eq!(value, None);
+
+        // An explicit null is also None, not a rejection.
+        let args =
+            serde_json::json!({"entity": "kitchen lights", "action": "turn_on", "value": null});
+        let (_, _, value) = parse_home_control_args(&args).expect("null value parses");
+        assert_eq!(value, None);
+
+        // The bug: a provided but non-numeric value used to be silently dropped
+        // to None, so the action actuated without it. It must now be rejected.
+        for bad in [
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": "72"}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": true}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": [72]}),
+        ] {
+            let err = parse_home_control_args(&bad)
+                .expect_err("non-numeric value must be rejected")
+                .to_string();
+            assert!(
+                err.contains("home_control 'value' must be a number when provided"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
