@@ -492,6 +492,10 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"entity": "kitchen light"}),
             "home_control requires string argument 'action'",
         ),
+        (
+            serde_json::json!({"entity": "kitchen light", "action": "turn_on", "value": "hot"}),
+            "home_control 'value' must be a number when provided",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 

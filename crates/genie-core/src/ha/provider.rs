@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use super::client::{Entity, HaClient};
+use super::entity_fidelity::{self, DomainArea};
 
 const AREA_TEMPLATE: &str = r#"
 {% set ns = namespace(items=[]) %}
@@ -367,6 +368,24 @@ impl HomeAssistantProvider {
         Self::resolve_named_entity(graph, query, action_hint)
     }
 
+    fn query_rejects_whole_home_fidelity(graph: &HomeGraph, query: &str) -> bool {
+        let query_lower = normalize(query);
+        let area_match = best_area_match(&graph.areas, &query_lower);
+        let domain_match = infer_domain(&query_lower);
+        if area_match.is_some() || domain_match.is_none() {
+            return false;
+        }
+        let entity_views: Vec<DomainArea<'_>> = graph
+            .entities
+            .iter()
+            .map(|entity| DomainArea {
+                domain: entity.domain.as_str(),
+                area: entity.area.as_deref(),
+            })
+            .collect();
+        !entity_fidelity::whole_home_resolution_is_trustworthy(&entity_views, query)
+    }
+
     fn resolve_exact_entity_id(
         graph: &HomeGraph,
         query: &str,
@@ -427,6 +446,18 @@ impl HomeAssistantProvider {
             .collect();
 
         if entity_ids.is_empty() {
+            return None;
+        }
+
+        let entity_views: Vec<DomainArea<'_>> = graph
+            .entities
+            .iter()
+            .map(|entity| DomainArea {
+                domain: entity.domain.as_str(),
+                area: entity.area.as_deref(),
+            })
+            .collect();
+        if !entity_fidelity::whole_home_resolution_is_trustworthy(&entity_views, query) {
             return None;
         }
 
@@ -633,6 +664,10 @@ impl HomeAutomationProvider for HomeAssistantProvider {
                     );
                 }
             }
+        }
+
+        if Self::query_rejects_whole_home_fidelity(&graph, query) {
+            anyhow::bail!("I couldn't find '{}' in this home", query);
         }
 
         anyhow::bail!("no Home Assistant target matched '{}'", query)
@@ -1244,6 +1279,24 @@ mod tests {
         assert_eq!(target.display_name, "All lights");
         assert_eq!(target.domain.as_deref(), Some("light"));
         assert_eq!(target.entity_ids, vec!["light.living_room_lamp"]);
+    }
+
+    #[test]
+    fn resolve_target_rejects_foreign_room_whole_home_fallback() {
+        let graph = sample_graph();
+        assert!(
+            HomeAssistantProvider::resolve_target_in_graph(&graph, "upstairs lights", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn query_rejects_whole_home_fidelity_for_foreign_room() {
+        let graph = sample_graph();
+        assert!(HomeAssistantProvider::query_rejects_whole_home_fidelity(
+            &graph,
+            "upstairs lights"
+        ));
     }
 
     #[test]

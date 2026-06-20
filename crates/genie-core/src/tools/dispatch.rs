@@ -52,7 +52,20 @@ fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Opti
             HOME_CONTROL_ACTIONS.join(", ")
         )
     })?;
-    Ok((entity, action, args.get("value").and_then(|v| v.as_f64())))
+    // `value` stays optional, but a *provided* value must be a number. The old
+    // `args.get("value").and_then(|v| v.as_f64())` silently dropped a non-numeric
+    // value (e.g. a model emitting `"value": "72"` or `"value": true`) to `None`,
+    // so `set_temperature` / `set_brightness` actuated with no value instead of
+    // the user's intent. Reject the malformed value at the boundary the same way
+    // set_timer rejects a non-integer `seconds`; an absent or null value is still
+    // a no-op None.
+    let value = match args.get("value") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(provided) => Some(provided.as_f64().ok_or_else(|| {
+            anyhow::anyhow!("home_control 'value' must be a number when provided")
+        })?),
+    };
+    Ok((entity, action, value))
 }
 
 /// Canonicalize a model-emitted action verb to one of [`HOME_CONTROL_ACTIONS`].
@@ -2535,6 +2548,42 @@ mod tests {
             parse_home_control_args(&args).expect("'turn off' should canonicalize and parse");
         assert_eq!(entity, "kitchen lights");
         assert_eq!(action, "turn_off");
+    }
+
+    #[test]
+    fn home_control_value_must_be_numeric_when_provided() {
+        // A numeric value parses through to Some(..).
+        let args =
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": 72});
+        let (_, _, value) = parse_home_control_args(&args).expect("numeric value parses");
+        assert_eq!(value, Some(72.0));
+
+        // An absent value is a legitimate no-op None — value stays optional.
+        let args = serde_json::json!({"entity": "kitchen lights", "action": "turn_on"});
+        let (_, _, value) = parse_home_control_args(&args).expect("absent value parses");
+        assert_eq!(value, None);
+
+        // An explicit null is also None, not a rejection.
+        let args =
+            serde_json::json!({"entity": "kitchen lights", "action": "turn_on", "value": null});
+        let (_, _, value) = parse_home_control_args(&args).expect("null value parses");
+        assert_eq!(value, None);
+
+        // The bug: a provided but non-numeric value used to be silently dropped
+        // to None, so the action actuated without it. It must now be rejected.
+        for bad in [
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": "72"}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": true}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": [72]}),
+        ] {
+            let err = parse_home_control_args(&bad)
+                .expect_err("non-numeric value must be rejected")
+                .to_string();
+            assert!(
+                err.contains("home_control 'value' must be a number when provided"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
