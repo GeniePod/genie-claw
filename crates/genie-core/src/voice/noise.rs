@@ -365,4 +365,14 @@ mod tests {
         apply_noise_suppression(&mut zero_strength, 0.0, 48000);
         assert_eq!(zero_strength, original);
     }
+
+    #[test]
+    fn noise_suppression_ignores_near_silence() {
+        // A long but near-silent buffer (per-frame RMS ~3.5) sits below the 10.0
+        // noise-floor threshold, so suppression bails and leaves it unchanged.
+        let original: Vec<f32> = (0..9600).map(|i| (i as f32 * 0.3).sin() * 5.0).collect();
+        let mut samples = original.clone();
+        apply_noise_suppression(&mut samples, 0.6, 48000); // 10 frames, noise_floor ~3.5 < 10
+        assert_eq!(samples, original);
+    }
 }
