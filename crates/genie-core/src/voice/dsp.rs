@@ -26,21 +26,11 @@ pub fn process_tts_audio(pcm: &mut [u8], sample_rate: u32) {
         return;
     }
 
-    // Convert S16_LE bytes to i16 samples.
+    // Decode S16_LE bytes to f32 samples in a single pass.
     let num_samples = pcm.len() / 2;
     let mut samples: Vec<f32> = (0..num_samples)
-        .map(|i| {
-            let lo = pcm[i * 2] as i16 as f32;
-            let hi = (pcm[i * 2 + 1] as i8 as i16 as f32) * 256.0;
-            lo + hi
-        })
+        .map(|i| i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]) as f32)
         .collect();
-
-    // Proper S16_LE decoding.
-    for i in 0..num_samples {
-        let sample = i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]);
-        samples[i] = sample as f32;
-    }
 
     // Step 1: AGC — normalize to target RMS.
     apply_agc(&mut samples);
