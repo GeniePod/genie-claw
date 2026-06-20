@@ -552,6 +552,46 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
 }
 
 #[tokio::test]
+async fn home_control_set_brightness_with_value_actuates() {
+    // The missing-value guard (#421) must not reject a valid setpoint.
+    let paths = TestAuditPaths::new();
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = paths.dispatcher(
+        Some(Arc::new(FakeHomeProvider::light(executed.clone()))),
+        ToolPolicyConfig::default(),
+        ActuationSafetyConfig::default(),
+    );
+    let result = dispatcher
+        .execute_with_context(
+            &ToolCall {
+                name: "home_control".into(),
+                arguments: serde_json::json!({
+                    "entity": "kitchen light",
+                    "action": "set_brightness",
+                    "value": 60
+                }),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Dashboard,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
+
+    assert!(
+        result.success,
+        "valid set_brightness must actuate, got: {}",
+        result.output
+    );
+    let exec = executed.lock().unwrap();
+    assert_eq!(exec.len(), 1);
+    assert!(matches!(exec[0], HomeActionKind::SetBrightness));
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(events.last().unwrap()["tool"], "home_control");
+    assert_eq!(events.last().unwrap()["success"], true);
+}
+
+#[tokio::test]
 async fn home_status_rejects_invalid_arguments_and_audits() {
     let paths = TestAuditPaths::new();
     let dispatcher = paths.dispatcher(
