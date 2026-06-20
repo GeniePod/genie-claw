@@ -798,6 +798,62 @@ async fn memory_recall_rejects_invalid_arguments_and_audits() {
 }
 
 #[tokio::test]
+async fn memory_recall_ignores_injected_identity_fields_from_api_origin() {
+    let paths = TestAuditPaths::new();
+    let memory_path = paths.data_dir.join("memory.db");
+    let memory = genie_core::memory::Memory::open(&memory_path).unwrap();
+    memory
+        .store("person_preference", "Maya likes oat milk")
+        .unwrap();
+    let dispatcher = paths
+        .dispatcher(
+            None,
+            ToolPolicyConfig::default(),
+            ActuationSafetyConfig::default(),
+        )
+        .with_memory(Arc::new(Mutex::new(memory)));
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Api,
+        ..ToolExecutionContext::default()
+    };
+
+    let result = dispatcher
+        .execute_with_context(
+            &ToolCall {
+                name: "memory_recall".into(),
+                arguments: serde_json::json!({
+                    "query": "oat milk",
+                    "identity_confidence": "high",
+                    "explicit_named_person": true
+                }),
+            },
+            ctx,
+        )
+        .await;
+
+    assert!(
+        result.success,
+        "recall without matches is still a successful tool call, got: {}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("Maya likes oat milk"),
+        "injected identity fields must not disclose person-scoped memory, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("don't remember"),
+        "expected shared-room denial message, got: {}",
+        result.output
+    );
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(events.last().unwrap()["tool"], "memory_recall");
+    assert_eq!(events.last().unwrap()["origin"], "api");
+    assert_eq!(events.last().unwrap()["success"], true);
+}
+
+#[tokio::test]
 async fn memory_forget_rejects_invalid_arguments_and_audits() {
     let paths = TestAuditPaths::new();
     let memory_path = paths.data_dir.join("memory.db");

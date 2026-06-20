@@ -1357,9 +1357,13 @@ impl ToolDispatcher {
         exec_ctx: ToolExecutionContext,
     ) -> Result<String> {
         let query = parse_memory_recall_query(args)?;
+        // Identity context must come only from trusted runtime surfaces (voice
+        // pipeline via exec_ctx.memory_read_context). Do not read
+        // identity_confidence or related fields from LLM tool arguments — an
+        // attacker could otherwise bypass shared-room privacy controls (#430).
         let read_context = exec_ctx
             .memory_read_context
-            .unwrap_or_else(|| memory_read_context(args));
+            .unwrap_or_else(crate::memory::policy::MemoryReadContext::shared_room_voice);
         let mem = self
             .memory
             .as_ref()
@@ -2007,37 +2011,6 @@ fn format_household_role_answer(
         .collect::<Vec<_>>()
         .join(", ");
     format!("{names} are the {role}s.")
-}
-
-fn memory_read_context(args: &serde_json::Value) -> crate::memory::policy::MemoryReadContext {
-    let identity_confidence = match args
-        .get("identity_confidence")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "high" => crate::memory::policy::IdentityConfidence::High,
-        "medium" => crate::memory::policy::IdentityConfidence::Medium,
-        "low" => crate::memory::policy::IdentityConfidence::Low,
-        _ => crate::memory::policy::IdentityConfidence::Unknown,
-    };
-
-    crate::memory::policy::MemoryReadContext {
-        identity_confidence,
-        explicit_named_person: args
-            .get("explicit_named_person")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        explicit_private_intent: args
-            .get("explicit_private_intent")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        shared_space_voice: args
-            .get("shared_space_voice")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-    }
 }
 
 fn normalize_memories_to_store(args: &serde_json::Value) -> Vec<(String, String)> {
@@ -3660,9 +3633,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_recall_can_use_identity_context_when_provided() {
+    fn memory_recall_ignores_llm_supplied_identity_fields() {
         let db = std::env::temp_dir().join(format!(
-            "memory-recall-identity-test-{}.db",
+            "memory-recall-identity-bypass-test-{}.db",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&db);
@@ -3677,13 +3650,17 @@ mod tests {
             .exec_memory_recall(
                 &serde_json::json!({
                     "query": "oat milk",
-                    "identity_confidence": "high"
+                    "identity_confidence": "high",
+                    "explicit_named_person": true
                 }),
                 ToolExecutionContext::default(),
             )
             .unwrap();
 
-        assert_eq!(output, "I remember: Maya likes oat milk");
+        assert_eq!(
+            output, "I don't remember anything about oat milk yet.",
+            "LLM-injected identity fields must not unlock person-scoped recall"
+        );
     }
 
     #[test]
