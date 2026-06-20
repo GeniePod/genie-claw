@@ -496,6 +496,17 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"entity": "kitchen light", "action": "turn_on", "value": "hot"}),
             "home_control 'value' must be a number when provided",
         ),
+        // issue #421: a value-requiring action with no `value` must be rejected
+        // at the boundary, not silently defaulted (brightness 50 / temp 20) and
+        // executed against the device.
+        (
+            serde_json::json!({"entity": "kitchen light", "action": "set_brightness"}),
+            "home_control 'set_brightness' requires a numeric argument 'value'",
+        ),
+        (
+            serde_json::json!({"entity": "kitchen light", "action": "set_temperature"}),
+            "home_control 'set_temperature' requires a numeric argument 'value'",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 
@@ -538,6 +549,46 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
         assert_eq!(event["origin"], "dashboard");
         assert_eq!(event["success"], false);
     }
+}
+
+#[tokio::test]
+async fn home_control_set_brightness_with_value_actuates() {
+    // The missing-value guard (#421) must not reject a valid setpoint.
+    let paths = TestAuditPaths::new();
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = paths.dispatcher(
+        Some(Arc::new(FakeHomeProvider::light(executed.clone()))),
+        ToolPolicyConfig::default(),
+        ActuationSafetyConfig::default(),
+    );
+    let result = dispatcher
+        .execute_with_context(
+            &ToolCall {
+                name: "home_control".into(),
+                arguments: serde_json::json!({
+                    "entity": "kitchen light",
+                    "action": "set_brightness",
+                    "value": 60
+                }),
+            },
+            ToolExecutionContext {
+                request_origin: RequestOrigin::Dashboard,
+                ..ToolExecutionContext::default()
+            },
+        )
+        .await;
+
+    assert!(
+        result.success,
+        "valid set_brightness must actuate, got: {}",
+        result.output
+    );
+    let exec = executed.lock().unwrap();
+    assert_eq!(exec.len(), 1);
+    assert!(matches!(exec[0], HomeActionKind::SetBrightness));
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(events.last().unwrap()["tool"], "home_control");
+    assert_eq!(events.last().unwrap()["success"], true);
 }
 
 #[tokio::test]
@@ -823,6 +874,97 @@ async fn memory_forget_rejects_invalid_arguments_and_audits() {
 }
 
 #[tokio::test]
+async fn memory_store_rejects_invalid_arguments_and_audits() {
+    let paths = TestAuditPaths::new();
+    let memory_path = paths.data_dir.join("memory.db");
+    let memory = genie_core::memory::Memory::open(&memory_path).unwrap();
+    memory.store("identity", "User's name is Jared").unwrap();
+    let dispatcher = paths
+        .dispatcher(
+            None,
+            ToolPolicyConfig::default(),
+            ActuationSafetyConfig::default(),
+        )
+        .with_memory(Arc::new(Mutex::new(memory)));
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Dashboard,
+        ..ToolExecutionContext::default()
+    };
+
+    let invalid_calls = [
+        (
+            serde_json::json!({}),
+            "memory_store requires non-empty string argument 'content'",
+        ),
+        (
+            serde_json::json!({"content": ""}),
+            "memory_store requires non-empty string argument 'content'",
+        ),
+        (
+            serde_json::json!({"content": "   "}),
+            "memory_store requires non-empty string argument 'content'",
+        ),
+        (
+            serde_json::json!({"content": 123}),
+            "memory_store requires non-empty string argument 'content'",
+        ),
+    ];
+    let expected_audit_count = invalid_calls.len();
+
+    for (arguments, expected_snippet) in &invalid_calls {
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "memory_store".into(),
+                    arguments: arguments.clone(),
+                },
+                ctx,
+            )
+            .await;
+
+        assert!(
+            !result.success,
+            "expected schema rejection, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(expected_snippet),
+            "expected output to contain {expected_snippet:?}, got: {}",
+            result.output
+        );
+    }
+
+    // A valid content must still store (the guard only rejects missing content).
+    let ok = dispatcher
+        .execute_with_context(
+            &ToolCall {
+                name: "memory_store".into(),
+                arguments: serde_json::json!({"content": "the spare key is under the mat"}),
+            },
+            ctx,
+        )
+        .await;
+    assert!(
+        ok.success,
+        "valid memory_store must succeed, got: {}",
+        ok.output
+    );
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(
+        events.len(),
+        expected_audit_count + 1,
+        "each rejected call plus the valid one must be tool-audited"
+    );
+    for event in &events[..expected_audit_count] {
+        assert_eq!(event["tool"], "memory_store");
+        assert_eq!(event["origin"], "dashboard");
+        assert_eq!(event["success"], false);
+    }
+    assert_eq!(events[expected_audit_count]["success"], true);
+}
+
+#[tokio::test]
 async fn calculate_rejects_invalid_arguments_and_audits() {
     let paths = TestAuditPaths::new();
     let dispatcher = paths.dispatcher(
@@ -984,6 +1126,20 @@ async fn web_search_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"query": 42}),
             "web_search requires non-empty string argument 'query'",
         ),
+        // A valid query with a provided-but-malformed `limit` is rejected at the
+        // boundary rather than silently falling back to the default 3.
+        (
+            serde_json::json!({"query": "rust news", "limit": "5"}),
+            "web_search 'limit' must be an integer when provided",
+        ),
+        (
+            serde_json::json!({"query": "rust news", "limit": 2.5}),
+            "web_search 'limit' must be an integer when provided",
+        ),
+        (
+            serde_json::json!({"query": "rust news", "limit": -1}),
+            "web_search 'limit' must be an integer when provided",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 
@@ -1048,6 +1204,16 @@ async fn get_weather_rejects_invalid_arguments_and_audits() {
         (
             serde_json::json!({"location": 42}),
             "get_weather requires non-empty string argument 'location'",
+        ),
+        // A valid location with a provided-but-malformed `forecast` is rejected
+        // at the boundary rather than silently returning current weather.
+        (
+            serde_json::json!({"location": "Denver", "forecast": "true"}),
+            "get_weather 'forecast' must be a boolean when provided",
+        ),
+        (
+            serde_json::json!({"location": "Denver", "forecast": 1}),
+            "get_weather 'forecast' must be a boolean when provided",
         ),
     ];
     let expected_audit_count = invalid_calls.len();

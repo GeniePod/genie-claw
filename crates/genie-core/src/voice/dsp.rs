@@ -26,21 +26,8 @@ pub fn process_tts_audio(pcm: &mut [u8], sample_rate: u32) {
         return;
     }
 
-    // Convert S16_LE bytes to i16 samples.
     let num_samples = pcm.len() / 2;
-    let mut samples: Vec<f32> = (0..num_samples)
-        .map(|i| {
-            let lo = pcm[i * 2] as i16 as f32;
-            let hi = (pcm[i * 2 + 1] as i8 as i16 as f32) * 256.0;
-            lo + hi
-        })
-        .collect();
-
-    // Proper S16_LE decoding.
-    for i in 0..num_samples {
-        let sample = i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]);
-        samples[i] = sample as f32;
-    }
+    let mut samples = decode_s16le(pcm);
 
     // Step 1: AGC — normalize to target RMS.
     apply_agc(&mut samples);
@@ -58,6 +45,13 @@ pub fn process_tts_audio(pcm: &mut [u8], sample_rate: u32) {
         pcm[i * 2] = bytes[0];
         pcm[i * 2 + 1] = bytes[1];
     }
+}
+
+/// Decode an S16_LE byte buffer to f32 samples (a trailing odd byte is dropped).
+fn decode_s16le(pcm: &[u8]) -> Vec<f32> {
+    (0..pcm.len() / 2)
+        .map(|i| i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]) as f32)
+        .collect()
 }
 
 /// Automatic Gain Control — normalize RMS to target level.
@@ -296,6 +290,19 @@ mod tests {
             let magnitude = i32::from(sample).abs();
             assert!(magnitude <= i16::MAX as i32, "Output should be valid S16");
         }
+    }
+
+    #[test]
+    fn decode_s16le_is_little_endian() {
+        // [lo, hi] little-endian -> i16 -> f32.
+        assert_eq!(decode_s16le(&[0x00, 0x80]), vec![-32768.0]); // i16::MIN
+        assert_eq!(decode_s16le(&[0xFF, 0x7F]), vec![32767.0]); // i16::MAX
+        assert_eq!(decode_s16le(&[0x34, 0x12]), vec![4660.0]); // 0x1234
+        assert_eq!(
+            decode_s16le(&[0x34, 0x12, 0xFF, 0x7F]),
+            vec![4660.0, 32767.0]
+        );
+        assert_eq!(decode_s16le(&[0xAB]), Vec::<f32>::new()); // trailing odd byte dropped
     }
 
     fn rms_of(samples: &[f32]) -> f32 {

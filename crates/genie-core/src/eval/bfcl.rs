@@ -472,13 +472,6 @@ const ENTITY_ARG_KEYS: [&str; 4] = ["entity", "name", "target", "device"];
 /// agent executes identically (e.g. `deactivate` == `turn_off`) are credited.
 const ACTION_ARG_KEYS: [&str; 1] = ["action"];
 
-/// Query words that do not pin a request to a specific place. Used by the
-/// whole-home fidelity guard to decide whether leftover tokens name a real area.
-const BENIGN_QUERY_TOKENS: &[&str] = &[
-    "all", "the", "a", "an", "every", "any", "my", "our", "this", "that", "please", "now", "here",
-    "turn", "switch", "set", "get", "status", "of", "to", "in",
-];
-
 /// Reference home that mirrors the HA-Intents reference home used by the BFCL
 /// dataset. It is intentionally minimal and dataset-specific: it contains
 /// exactly the four physical entities needed to unify the eight distinct gold
@@ -594,16 +587,7 @@ fn canonicalize_entity_value(value: &Value, graph: &HomeGraph) -> Value {
     };
 
     match HomeAssistantProvider::resolve_target_in_graph(graph, text, None) {
-        // An area-specific resolution is trusted directly. A whole-home domain
-        // fallback (`area == None`) is only trusted when it passes the fidelity
-        // guard — otherwise a query naming a place the home does not have (e.g.
-        // "upstairs lights", or "living room light" when no light lives there)
-        // would silently collapse to the only device of that domain and be
-        // credited as correct.
-        Some(target)
-            if !target.entity_ids.is_empty()
-                && (target.area.is_some() || whole_home_resolution_is_trustworthy(graph, text)) =>
-        {
+        Some(target) if !target.entity_ids.is_empty() => {
             let mut ids = target.entity_ids;
             ids.sort();
             Value::String(format!("ids:{}", ids.join(",")))
@@ -625,57 +609,6 @@ fn canon_action(text: &str) -> String {
         "activate" | "enable" | "switch_on" | "power_on" | "turn_on" => "turn_on".to_string(),
         _ => normalized,
     }
-}
-
-/// Split a free-text query into lowercase alphanumeric tokens.
-fn query_tokens(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// Map a single query word to a device domain, mirroring the runtime
-/// `infer_domain`. Used only by the fidelity guard.
-fn domain_of_word(word: &str) -> Option<&'static str> {
-    Some(match word {
-        "light" | "lights" | "lamp" | "lamps" => "light",
-        "fan" | "fans" => "fan",
-        "thermostat" | "temperature" | "heat" | "heating" | "cooling" | "ac" => "climate",
-        "blind" | "blinds" | "shade" | "shades" | "curtain" | "curtains" | "cover" | "covers"
-        | "garage" => "cover",
-        "lock" | "locks" | "unlock" => "lock",
-        "switch" | "switches" | "plug" | "outlet" => "switch",
-        _ => return None,
-    })
-}
-
-/// Fidelity guard for whole-home (area-less) resolutions. A query that resolved
-/// only because every device of its domain happens to live in one place is
-/// trustworthy *iff* every place-token it names belongs to an area that actually
-/// contains a device of the inferred domain. This rejects foreign rooms the home
-/// does not have ("upstairs lights") and known rooms lacking the device ("living
-/// room light"), while still crediting bare-domain ("lights") and correctly
-/// room-qualified ("kitchen lights") requests.
-fn whole_home_resolution_is_trustworthy(graph: &HomeGraph, text: &str) -> bool {
-    let tokens = query_tokens(text);
-    let Some(domain) = tokens.iter().find_map(|t| domain_of_word(t)) else {
-        // No recognizable domain word — not a case this guard reasons about.
-        return true;
-    };
-    let valid_place: std::collections::HashSet<String> = graph
-        .entities
-        .iter()
-        .filter(|entity| entity.domain == domain)
-        .filter_map(|entity| entity.area.as_deref())
-        .flat_map(query_tokens)
-        .collect();
-    tokens.iter().all(|token| {
-        domain_of_word(token).is_some()
-            || BENIGN_QUERY_TOKENS.contains(&token.as_str())
-            || valid_place.contains(token)
-    })
 }
 
 struct BfclCatalogHomeStub;

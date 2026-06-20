@@ -3,6 +3,7 @@ use std::sync::Arc;
 use genie_common::config::Config;
 
 mod client;
+pub mod entity_fidelity;
 mod policy;
 mod provider;
 
