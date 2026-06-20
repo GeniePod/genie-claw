@@ -351,4 +351,18 @@ mod tests {
             rms_after
         );
     }
+
+    #[test]
+    fn noise_suppression_ignores_too_short_input() {
+        // Fewer than 3 frames can't estimate a noise floor (and strength <= 0 is a
+        // no-op): the buffer comes back untouched despite carrying suppressible signal.
+        let original: Vec<f32> = (0..1500).map(|i| (i as f32 * 0.3).sin() * 3000.0).collect();
+        let mut samples = original.clone();
+        apply_noise_suppression(&mut samples, 0.6, 48000); // frame_size 960 -> 1 frame < 3
+        assert_eq!(samples, original);
+
+        let mut zero_strength = original.clone();
+        apply_noise_suppression(&mut zero_strength, 0.0, 48000);
+        assert_eq!(zero_strength, original);
+    }
 }
