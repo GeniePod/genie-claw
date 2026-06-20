@@ -140,6 +140,14 @@ fn normalize_memory_recall_query(raw: &str) -> String {
     }
 }
 
+fn parse_memory_forget_query(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("memory_forget requires non-empty string argument 'query'"))
+}
+
 fn parse_calculate_expression(args: &serde_json::Value) -> Result<&str> {
     args.get("expression")
         .and_then(|v| v.as_str())
@@ -154,6 +162,15 @@ fn parse_play_media_query(args: &serde_json::Value) -> Result<&str> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("play_media requires non-empty string argument 'query'"))
+}
+
+fn parse_web_search_query(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
+        .or_else(|| args.get("q"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("web_search requires non-empty string argument 'query'"))
 }
 
 fn parse_get_weather_location(args: &serde_json::Value) -> Result<&str> {
@@ -1388,6 +1405,14 @@ impl ToolDispatcher {
         args: &serde_json::Value,
         exec_ctx: ToolExecutionContext,
     ) -> Result<String> {
+        // Validate the argument at the execution boundary, before touching the
+        // memory backend, the same way exec_memory_recall does (PR #362). The
+        // previous `unwrap_or("")` silently coerced a missing or non-string
+        // `query` into "", and a whitespace-only query slipped past the
+        // `is_empty()` check straight into `mem.search("   ", ...)` — running a
+        // destructive forget on garbage input instead of being rejected and
+        // audited like its read-side sibling.
+        let query = parse_memory_forget_query(args)?;
         let mem = self
             .memory
             .as_ref()
@@ -1395,11 +1420,6 @@ impl ToolDispatcher {
         let mem = mem
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-
-        if query.is_empty() {
-            return Ok("Please specify what to forget.".to_string());
-        }
 
         // Gate deletes through the same MemoryReadContext that exec_memory_recall
         // uses. Without it, an LLM that cannot READ a person-scoped row could
@@ -2100,12 +2120,7 @@ async fn exec_weather(args: &serde_json::Value) -> Result<String> {
 }
 
 async fn exec_web_search(args: &serde_json::Value, config: &WebSearchConfig) -> Result<String> {
-    let query = args
-        .get("query")
-        .or_else(|| args.get("q"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
+    let query = parse_web_search_query(args)?;
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
