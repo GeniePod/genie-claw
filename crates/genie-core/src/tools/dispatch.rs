@@ -2763,6 +2763,19 @@ mod tests {
     }
 
     #[test]
+    fn action_requires_value_only_for_setpoint_actions() {
+        // Only the two numeric-setpoint actions require a value (#421).
+        for a in ["set_brightness", "set_temperature"] {
+            assert!(action_requires_value(a), "{a} should require a value");
+        }
+        for a in [
+            "turn_on", "turn_off", "toggle", "open", "close", "lock", "unlock", "activate",
+        ] {
+            assert!(!action_requires_value(a), "{a} must not require a value");
+        }
+    }
+
+    #[test]
     fn tool_action_class_maps_side_effecting_tools() {
         assert_eq!(
             tool_action_class("home_control"),
