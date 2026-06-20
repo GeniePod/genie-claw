@@ -984,6 +984,20 @@ async fn web_search_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"query": 42}),
             "web_search requires non-empty string argument 'query'",
         ),
+        // A valid query with a provided-but-malformed `limit` is rejected at the
+        // boundary rather than silently falling back to the default 3.
+        (
+            serde_json::json!({"query": "rust news", "limit": "5"}),
+            "web_search 'limit' must be an integer when provided",
+        ),
+        (
+            serde_json::json!({"query": "rust news", "limit": 2.5}),
+            "web_search 'limit' must be an integer when provided",
+        ),
+        (
+            serde_json::json!({"query": "rust news", "limit": -1}),
+            "web_search 'limit' must be an integer when provided",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 
@@ -1048,6 +1062,16 @@ async fn get_weather_rejects_invalid_arguments_and_audits() {
         (
             serde_json::json!({"location": 42}),
             "get_weather requires non-empty string argument 'location'",
+        ),
+        // A valid location with a provided-but-malformed `forecast` is rejected
+        // at the boundary rather than silently returning current weather.
+        (
+            serde_json::json!({"location": "Denver", "forecast": "true"}),
+            "get_weather 'forecast' must be a boolean when provided",
+        ),
+        (
+            serde_json::json!({"location": "Denver", "forecast": 1}),
+            "get_weather 'forecast' must be a boolean when provided",
         ),
     ];
     let expected_audit_count = invalid_calls.len();

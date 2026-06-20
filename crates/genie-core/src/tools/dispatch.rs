@@ -173,12 +173,49 @@ fn parse_web_search_query(args: &serde_json::Value) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("web_search requires non-empty string argument 'query'"))
 }
 
+/// `limit` stays optional — an absent or null value defaults to 3 results. But a
+/// *provided* value must be a non-negative integer. The old
+/// `args.get("limit").and_then(|v| v.as_u64()).unwrap_or(3)` silently coerced a
+/// malformed limit (a stringified `"5"`, a float `2.5`, or a negative) to the
+/// default 3, quietly returning a different result count than the caller asked
+/// for. Reject the malformed value at the boundary the same way home_control
+/// rejects a non-numeric `value` (PR #414); a valid integer outside 1..=5 still
+/// clamps into range rather than erroring.
+fn parse_web_search_limit(args: &serde_json::Value) -> Result<usize> {
+    match args.get("limit") {
+        None | Some(serde_json::Value::Null) => Ok(3),
+        Some(provided) => {
+            let limit = provided.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("web_search 'limit' must be an integer when provided")
+            })?;
+            Ok(limit.clamp(1, 5) as usize)
+        }
+    }
+}
+
 fn parse_get_weather_location(args: &serde_json::Value) -> Result<&str> {
     args.get("location")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("get_weather requires non-empty string argument 'location'"))
+}
+
+/// `forecast` stays optional — an absent or null value means current weather
+/// (the no-op default). But a *provided* value must be a real boolean. The old
+/// `args.get("forecast").and_then(|v| v.as_bool()).unwrap_or(false)` silently
+/// coerced a stringified `"true"` (a form small models routinely emit) to
+/// `false`, returning current weather when the user asked for the 7-day
+/// forecast. Reject the malformed value at the boundary the same way
+/// home_control rejects a non-numeric `value` (PR #414).
+fn parse_get_weather_forecast(args: &serde_json::Value) -> Result<bool> {
+    match args.get("forecast") {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(anyhow::anyhow!(
+            "get_weather 'forecast' must be a boolean when provided"
+        )),
+    }
 }
 
 /// Tool definition for LLM function calling.
@@ -2107,10 +2144,7 @@ fn exec_calculate(args: &serde_json::Value) -> Result<String> {
 
 async fn exec_weather(args: &serde_json::Value) -> Result<String> {
     let location = parse_get_weather_location(args)?;
-    let forecast = args
-        .get("forecast")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let forecast = parse_get_weather_forecast(args)?;
 
     if forecast {
         super::weather::get_forecast(location).await
@@ -2121,11 +2155,7 @@ async fn exec_weather(args: &serde_json::Value) -> Result<String> {
 
 async fn exec_web_search(args: &serde_json::Value, config: &WebSearchConfig) -> Result<String> {
     let query = parse_web_search_query(args)?;
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3)
-        .clamp(1, 5) as usize;
+    let limit = parse_web_search_limit(args)?;
     let fresh = args
         .get("fresh")
         .or_else(|| args.get("cache_bypass"))
@@ -2572,6 +2602,95 @@ mod tests {
                 .to_string();
             assert!(
                 err.contains("home_control 'value' must be a number when provided"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_weather_forecast_must_be_boolean_when_provided() {
+        // A real boolean parses through.
+        let args = serde_json::json!({"location": "Denver", "forecast": true});
+        assert!(parse_get_weather_forecast(&args).expect("bool forecast parses"));
+
+        // Absent and explicit null both default to current weather (false),
+        // not a rejection — forecast stays optional.
+        assert!(
+            !parse_get_weather_forecast(&serde_json::json!({"location": "Denver"}))
+                .expect("absent forecast parses")
+        );
+        assert!(
+            !parse_get_weather_forecast(
+                &serde_json::json!({"location": "Denver", "forecast": null})
+            )
+            .expect("null forecast parses")
+        );
+
+        // The bug: a provided but non-boolean forecast (a stringified "true", a
+        // number) used to be silently dropped to false, returning current
+        // weather when the user asked for the forecast. It must now be rejected.
+        for bad in [
+            serde_json::json!({"location": "Denver", "forecast": "true"}),
+            serde_json::json!({"location": "Denver", "forecast": 1}),
+            serde_json::json!({"location": "Denver", "forecast": "yes"}),
+        ] {
+            let err = parse_get_weather_forecast(&bad)
+                .expect_err("non-boolean forecast must be rejected")
+                .to_string();
+            assert!(
+                err.contains("get_weather 'forecast' must be a boolean when provided"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_limit_must_be_integer_when_provided() {
+        // A valid integer parses through.
+        assert_eq!(
+            parse_web_search_limit(&serde_json::json!({"query": "rust", "limit": 5}))
+                .expect("integer limit parses"),
+            5
+        );
+
+        // Absent and explicit null both default to 3 — limit stays optional.
+        assert_eq!(
+            parse_web_search_limit(&serde_json::json!({"query": "rust"}))
+                .expect("absent limit parses"),
+            3
+        );
+        assert_eq!(
+            parse_web_search_limit(&serde_json::json!({"query": "rust", "limit": null}))
+                .expect("null limit parses"),
+            3
+        );
+
+        // A valid integer outside 1..=5 still clamps into range rather than
+        // erroring, preserving the prior lenient behavior for in-type values.
+        assert_eq!(
+            parse_web_search_limit(&serde_json::json!({"query": "rust", "limit": 0}))
+                .expect("zero clamps up"),
+            1
+        );
+        assert_eq!(
+            parse_web_search_limit(&serde_json::json!({"query": "rust", "limit": 99}))
+                .expect("large clamps down"),
+            5
+        );
+
+        // The bug: a provided but non-integer limit (a stringified "5", a float,
+        // a negative) used to be silently dropped to the default 3. It must now
+        // be rejected.
+        for bad in [
+            serde_json::json!({"query": "rust", "limit": "5"}),
+            serde_json::json!({"query": "rust", "limit": 2.5}),
+            serde_json::json!({"query": "rust", "limit": -1}),
+        ] {
+            let err = parse_web_search_limit(&bad)
+                .expect_err("non-integer limit must be rejected")
+                .to_string();
+            assert!(
+                err.contains("web_search 'limit' must be an integer when provided"),
                 "unexpected error: {err}"
             );
         }
