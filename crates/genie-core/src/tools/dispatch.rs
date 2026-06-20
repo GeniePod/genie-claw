@@ -65,7 +65,23 @@ fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Opti
             anyhow::anyhow!("home_control 'value' must be a number when provided")
         })?),
     };
+    // set_brightness / set_temperature actuate a numeric setpoint, so a call with
+    // no `value` is under-specified. The provider used to substitute a hardcoded
+    // default (brightness 50 / temperature 20) and report success, actuating a
+    // setpoint the user never asked for. Reject the missing value at the boundary
+    // so the agent asks for the number instead of guessing — the same boundary
+    // #414 uses to reject a *non-numeric* value. (issue #421)
+    if value.is_none() && action_requires_value(action) {
+        anyhow::bail!("home_control '{action}' requires a numeric argument 'value'");
+    }
     Ok((entity, action, value))
+}
+
+/// Actions that actuate a numeric setpoint and therefore require a `value`.
+/// Every other action (turn_on, turn_off, toggle, open, close, lock, unlock,
+/// activate) is a no-op for `value` and leaves it `None`.
+fn action_requires_value(action: &str) -> bool {
+    matches!(action, "set_brightness" | "set_temperature")
 }
 
 /// Canonicalize a model-emitted action verb to one of [`HOME_CONTROL_ACTIONS`].
@@ -2702,6 +2718,47 @@ mod tests {
                 err.contains("web_search 'limit' must be an integer when provided"),
                 "unexpected error: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn home_control_set_actions_require_value() {
+        // set_brightness / set_temperature with a value parse through.
+        for ok in [
+            serde_json::json!({"entity": "kitchen light", "action": "set_brightness", "value": 60}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": 21}),
+        ] {
+            let (_, _, value) = parse_home_control_args(&ok).expect("value provided parses");
+            assert!(value.is_some());
+        }
+
+        // The bug (issue #421): a value-requiring action with NO value used to be
+        // silently defaulted by the provider (brightness 50 / temperature 20) and
+        // reported success. It must now be rejected at the boundary. Absent and
+        // explicit null both count as missing.
+        for bad in [
+            serde_json::json!({"entity": "kitchen light", "action": "set_brightness"}),
+            serde_json::json!({"entity": "kitchen light", "action": "set_brightness", "value": null}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature"}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": null}),
+        ] {
+            let err = parse_home_control_args(&bad)
+                .expect_err("missing value must be rejected")
+                .to_string();
+            assert!(
+                err.contains("requires a numeric argument 'value'"),
+                "unexpected error: {err}"
+            );
+        }
+
+        // Non-value actions are unaffected: no value is the correct no-op.
+        for ok in [
+            serde_json::json!({"entity": "kitchen light", "action": "turn_on"}),
+            serde_json::json!({"entity": "front door", "action": "lock"}),
+            serde_json::json!({"entity": "movie night", "action": "activate"}),
+        ] {
+            let (_, _, value) = parse_home_control_args(&ok).expect("no-value action parses");
+            assert_eq!(value, None);
         }
     }
 

@@ -721,7 +721,13 @@ impl HomeAutomationProvider for HomeAssistantProvider {
             ),
             HomeActionKind::SetBrightness => {
                 ensure_domain(&domain, &["light"])?;
-                let brightness = normalize_brightness(action.value.unwrap_or(50.0));
+                // No silent default: a value-less set_brightness is rejected at
+                // the dispatch boundary (issue #421); error here too as defense
+                // in depth rather than actuating an arbitrary brightness.
+                let brightness =
+                    normalize_brightness(action.value.ok_or_else(|| {
+                        anyhow::anyhow!("set_brightness requires a numeric 'value'")
+                    })?);
                 (
                     "light".into(),
                     "turn_on",
@@ -730,7 +736,12 @@ impl HomeAutomationProvider for HomeAssistantProvider {
             }
             HomeActionKind::SetTemperature => {
                 ensure_domain(&domain, &["climate"])?;
-                let temp = action.value.unwrap_or(20.0);
+                // No silent default: a value-less set_temperature is rejected at
+                // the dispatch boundary (issue #421); error here too as defense
+                // in depth rather than actuating an arbitrary temperature.
+                let temp = action
+                    .value
+                    .ok_or_else(|| anyhow::anyhow!("set_temperature requires a numeric 'value'"))?;
                 (
                     "climate".into(),
                     "set_temperature",

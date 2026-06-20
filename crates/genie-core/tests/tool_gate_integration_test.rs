@@ -496,6 +496,17 @@ async fn home_control_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"entity": "kitchen light", "action": "turn_on", "value": "hot"}),
             "home_control 'value' must be a number when provided",
         ),
+        // issue #421: a value-requiring action with no `value` must be rejected
+        // at the boundary, not silently defaulted (brightness 50 / temp 20) and
+        // executed against the device.
+        (
+            serde_json::json!({"entity": "kitchen light", "action": "set_brightness"}),
+            "home_control 'set_brightness' requires a numeric argument 'value'",
+        ),
+        (
+            serde_json::json!({"entity": "kitchen light", "action": "set_temperature"}),
+            "home_control 'set_temperature' requires a numeric argument 'value'",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 
