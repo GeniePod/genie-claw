@@ -110,35 +110,50 @@ pub fn cancel_echo(mic_samples: &mut [f32], mic_sample_rate: u32) {
 
     // Reference buffer for filter input.
     let ref_len = reference.len().min(mic_samples.len());
+    let loop_end = mic_samples.len().min(ref_len);
 
-    for i in filter_len..mic_samples.len().min(ref_len) {
-        // Reference vector: last `filter_len` samples of echo reference.
-        let ref_slice = &reference[i.saturating_sub(filter_len)..i];
+    // The reference window for each step is `reference[i - filter_len .. i]`,
+    // which is always exactly `filter_len` samples (the loop starts at
+    // `filter_len`). That lets the hot loop drop two redundancies the naive form
+    // pays per sample:
+    //   * the per-tap `if j < ref_slice.len()` guard is always true, so taps run
+    //     through `zip(rev())` with no index arithmetic or bounds checks;
+    //   * the normalization energy (sum of squares of the window) is kept with a
+    //     sliding update instead of a full recompute every sample — as the window
+    //     advances by one, subtract the sample that left and add the one that
+    //     entered. That removes a whole O(filter_len) pass per sample (~1/3 of
+    //     the inner work) on the per-recording AEC loop. The echo estimate and
+    //     weight update are unchanged; only the energy is accumulated, and AEC is
+    //     a normalized adaptive filter, so the negligible float drift does not
+    //     change the cancellation.
+    if loop_end > filter_len {
+        let mut ref_energy: f32 = reference[..filter_len].iter().map(|&s| s * s).sum();
 
-        // Estimate echo: convolution of weights with reference.
-        let mut echo_estimate = 0.0f32;
-        for (j, &w) in weights.iter().enumerate() {
-            if j < ref_slice.len() {
-                echo_estimate += w * ref_slice[ref_slice.len() - 1 - j];
+        for i in filter_len..loop_end {
+            let ref_slice = &reference[i - filter_len..i];
+
+            // Estimate echo: convolution of weights with the reference window.
+            let mut echo_estimate = 0.0f32;
+            for (&w, &r) in weights.iter().zip(ref_slice.iter().rev()) {
+                echo_estimate += w * r;
             }
-        }
 
-        // Error: mic signal minus estimated echo = desired signal (user's voice).
-        let error = mic_samples[i] - echo_estimate;
+            // Error: mic signal minus estimated echo = desired signal (voice).
+            let error = mic_samples[i] - echo_estimate;
 
-        // Normalize: energy of reference vector.
-        let ref_energy: f32 = ref_slice.iter().map(|&s| s * s).sum::<f32>() + eps;
-
-        // Update weights (NLMS step).
-        let step = mu / ref_energy;
-        for (j, w) in weights.iter_mut().enumerate() {
-            if j < ref_slice.len() {
-                *w += step * error * ref_slice[ref_slice.len() - 1 - j];
+            // Update weights (NLMS step), normalized by the sliding energy.
+            let step = mu / (ref_energy + eps);
+            for (w, &r) in weights.iter_mut().zip(ref_slice.iter().rev()) {
+                *w += step * error * r;
             }
-        }
 
-        // Replace mic sample with the error signal (echo-cancelled).
-        mic_samples[i] = error;
+            // Replace mic sample with the error signal (echo-cancelled).
+            mic_samples[i] = error;
+
+            // Slide the energy window to `reference[i + 1 - filter_len ..= i]`.
+            ref_energy +=
+                reference[i] * reference[i] - reference[i - filter_len] * reference[i - filter_len];
+        }
     }
 
     tracing::debug!(
