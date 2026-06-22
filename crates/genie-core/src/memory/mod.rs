@@ -16,6 +16,8 @@ use std::time::Duration;
 
 const MAX_QUERY_HASHES: usize = 16;
 
+const DERIVATION_VERSION: i64 = 1;
+
 /// Persistent conversational memory with dreaming-inspired consolidation.
 ///
 /// Architecture (inspired by OpenClaw's memory-core, clean-room Rust):
@@ -561,6 +563,11 @@ impl Memory {
             CREATE INDEX IF NOT EXISTS idx_embedded_memories_type
                 ON embedded_memories(memory_type, updated_ms DESC);
 
+            CREATE TABLE IF NOT EXISTS memory_meta (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content,
                 content='memories',
@@ -671,37 +678,38 @@ impl Memory {
 
         backfill_policy_columns(&conn)?;
 
-        // Every derived table (profiles, aliases, rules, calendar, shopping,
-        // inventory, embeddings, …) is re-derived from the canonical `memories`
-        // rows on every open. Each rebuild_* issues many per-row writes; left as
-        // individual auto-commit statements that is one WAL transaction per row
-        // across the whole set. Run the rebuild pass inside a single transaction
-        // so startup re-derivation commits once instead of thousands of times —
-        // the writes are identical, just batched (the per-recall version of this
-        // is `record_recalls`, PR #431). On a `?` failure `rebuild_tx` is dropped
-        // and the partial rebuild rolls back atomically.
-        let rebuild_tx = conn.unchecked_transaction()?;
-        rebuild_household_profiles(&conn)?;
-        rebuild_device_aliases(&conn)?;
-        rebuild_household_profile_attributes(&conn)?;
-        rebuild_household_rules(&conn)?;
-        rebuild_household_notes(&conn)?;
-        rebuild_app_only_secret_references(&conn)?;
-        rebuild_media_profile_items(&conn)?;
-        rebuild_family_calendar_events(&conn)?;
-        rebuild_shopping_list_items(&conn)?;
-        rebuild_household_inventory_items(&conn)?;
-        rebuild_access_permissions(&conn)?;
-        rebuild_household_task_logs(&conn)?;
-        rebuild_household_schedule_items(&conn)?;
-        rebuild_household_event_logs(&conn)?;
-        rebuild_embedded_memories(&conn)?;
-        rebuild_tx.commit()?;
+        let stored_derivation: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM memory_meta WHERE key = 'derivation_version'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if stored_derivation != Some(DERIVATION_VERSION) {
+            let rebuild_tx = conn.unchecked_transaction()?;
+            rebuild_household_profiles(&conn)?;
+            rebuild_device_aliases(&conn)?;
+            rebuild_household_profile_attributes(&conn)?;
+            rebuild_household_rules(&conn)?;
+            rebuild_household_notes(&conn)?;
+            rebuild_app_only_secret_references(&conn)?;
+            rebuild_media_profile_items(&conn)?;
+            rebuild_family_calendar_events(&conn)?;
+            rebuild_shopping_list_items(&conn)?;
+            rebuild_household_inventory_items(&conn)?;
+            rebuild_access_permissions(&conn)?;
+            rebuild_household_task_logs(&conn)?;
+            rebuild_household_schedule_items(&conn)?;
+            rebuild_household_event_logs(&conn)?;
+            rebuild_embedded_memories(&conn)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_meta (key, value) VALUES ('derivation_version', ?1)",
+                rusqlite::params![DERIVATION_VERSION],
+            )?;
+            rebuild_tx.commit()?;
 
-        // Older databases may predate the FTS update trigger or may have been
-        // edited by a recovery tool. Rebuild once at open so recall and forget
-        // do not silently miss rows.
-        run_open_fts_rebuild(&conn, &mut migration_degraded);
+            run_open_fts_rebuild(&conn, &mut migration_degraded);
+        }
 
         Ok(Self {
             conn,
@@ -16073,6 +16081,22 @@ mod tests {
                 "query {query:?} should recall {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn recall_works_after_reopen_skips_rebuild() {
+        let path = temp_memory_path("reopen-skip");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store("fact", "GenieClaw runs on the Jetson Orin Nano")
+                .unwrap();
+        }
+        let reopened = Memory::open(&path).unwrap();
+        let hits = reopened.search("Jetson Orin", 5).unwrap();
+        assert!(
+            hits.iter()
+                .any(|entry| entry.content.contains("Jetson Orin Nano"))
+        );
     }
 
     #[test]
