@@ -109,14 +109,60 @@ fn action_requires_value(action: &str) -> bool {
 /// silently fails to actuate. Normalize separators + case, map a few
 /// unambiguous synonyms, and accept the result only if it lands on a real
 /// action. `activate` is left as-is (it is its own action for scenes/scripts).
+///
+/// The deterministic quick router also emits BFCL household-scenario verbs
+/// (`apply_scene`, `activate_until_5pm`, `schedule_on_alarm`, …) that must
+/// map to real HA actions before actuation (issue #456).
 fn canon_home_control_action(raw: &str) -> Option<&'static str> {
     let normalized = raw.trim().to_lowercase().replace([' ', '-'], "_");
-    let mapped: &str = match normalized.as_str() {
-        "deactivate" | "disable" | "switch_off" | "power_off" | "shut_off" => "turn_off",
-        "enable" | "switch_on" | "power_on" => "turn_on",
-        other => other,
-    };
+    let mapped = map_home_control_action_synonym(&normalized);
     HOME_CONTROL_ACTIONS.iter().copied().find(|&a| a == mapped)
+}
+
+/// Best-effort map from BFCL scenario / model verbs to a supported HA action.
+fn map_home_control_action_synonym(normalized: &str) -> &str {
+    match normalized {
+        "deactivate" | "disable" | "switch_off" | "power_off" | "shut_off" | "pause"
+        | "pause_until_dinner" | "mute_for_practice" | "cut_power_and_vent" | "turn_off_except" => {
+            "turn_off"
+        }
+        "enable" | "switch_on" | "power_on" | "start" | "remote_start" => "turn_on",
+        "apply_scene" | "activate_scene" => "activate",
+        "set_level" => "set_brightness",
+        "warm_for_minutes" | "cool_down" => "set_temperature",
+        "arm" | "block_until_math_done" | "lock_except" => "lock",
+        "allow_10_to_10_20" | "allow_mom_only" => "unlock",
+        "shut_water_zone" => "close",
+        "run"
+        | "hold"
+        | "show"
+        | "show_agenda"
+        | "show_guest_card"
+        | "check_and_alert"
+        | "check_and_vent"
+        | "verify_and_alert"
+        | "clean"
+        | "test"
+        | "play_low_volume"
+        | "set_preset"
+        | "set_color_blue"
+        | "set_volume"
+        | "privacy_20"
+        | "send_destination"
+        | "start_video_call"
+        | "schedule"
+        | "schedule_on_alarm"
+        | "schedule_on_arrival"
+        | "schedule_after_21"
+        | "schedule_gradual_blinds"
+        | "schedule_pulse"
+        | "set_for_tomorrow"
+        | "create"
+        | "create_threshold_10"
+        | "create_until_21" => "activate",
+        other if other.starts_with("activate_until_") => "activate",
+        other => other,
+    }
 }
 
 fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
@@ -2672,6 +2718,121 @@ mod tests {
             parse_home_control_args(&args).expect("'turn off' should canonicalize and parse");
         assert_eq!(entity, "kitchen lights");
         assert_eq!(action, "turn_off");
+    }
+
+    #[test]
+    fn home_control_canonicalizes_bfcl_quick_router_verbs() {
+        for (raw, want) in [
+            ("apply_scene", "activate"),
+            ("activate_until_5pm", "activate"),
+            ("activate_until_21", "activate"),
+            ("set_level", "set_brightness"),
+            ("schedule_on_alarm", "activate"),
+            ("arm", "lock"),
+            ("start", "turn_on"),
+            ("pause", "turn_off"),
+            ("cool_down", "set_temperature"),
+            ("shut_water_zone", "close"),
+            ("frobnicate", ""),
+        ] {
+            let got = canon_home_control_action(raw).unwrap_or("");
+            assert_eq!(got, want, "action {raw:?}");
+        }
+
+        let args = serde_json::json!({
+            "entity": "low-power mode",
+            "action": "activate_until_5pm"
+        });
+        let (_, action, _) = parse_home_control_args(&args).expect("quick verb should parse");
+        assert_eq!(action, "activate");
+    }
+
+    /// Every BFCL scenario verb emitted by `tools/quick.rs` must canonicalize to a
+    /// supported `home_control` action so the quick path can actuate (#456).
+    #[test]
+    fn all_quick_router_home_verbs_canonicalize_for_dispatch() {
+        const QUICK_ROUTER_SCENARIO_VERBS: &[&str] = &[
+            "activate_until_5pm",
+            "allow_10_to_10_20",
+            "allow_mom_only",
+            "apply_scene",
+            "arm",
+            "block_until_math_done",
+            "check_and_alert",
+            "check_and_vent",
+            "clean",
+            "cool_down",
+            "create",
+            "create_threshold_10",
+            "create_until_21",
+            "cut_power_and_vent",
+            "enable",
+            "hold",
+            "lock_except",
+            "mute_for_practice",
+            "pause",
+            "pause_until_dinner",
+            "play_low_volume",
+            "privacy_20",
+            "remote_start",
+            "run",
+            "schedule",
+            "schedule_after_21",
+            "schedule_gradual_blinds",
+            "schedule_on_alarm",
+            "schedule_on_arrival",
+            "schedule_pulse",
+            "send_destination",
+            "set_color_blue",
+            "set_for_tomorrow",
+            "set_level",
+            "set_preset",
+            "set_volume",
+            "show",
+            "show_agenda",
+            "show_guest_card",
+            "shut_water_zone",
+            "start",
+            "start_video_call",
+            "test",
+            "turn_off_except",
+            "verify_and_alert",
+            "warm_for_minutes",
+        ];
+        for verb in QUICK_ROUTER_SCENARIO_VERBS {
+            assert!(
+                canon_home_control_action(verb).is_some(),
+                "quick-router verb {verb:?} must map to a supported home_control action"
+            );
+        }
+    }
+
+    #[test]
+    fn quick_router_home_control_routes_pass_dispatch_validation() {
+        use super::super::quick;
+        for utterance in [
+            "Jared: Put the house in low-power mode until five.",
+            "Mia: Give me focus mode until five",
+            "Mia: Set my room to sleepover lights.",
+            "Turn on the pool cleaner",
+            "Leo: Make the stairs bright.",
+            "arm the alarm",
+        ] {
+            let call = quick::route(utterance).expect("utterance should route");
+            assert_eq!(call.name, "home_control", "{utterance}");
+            let action = call.arguments["action"].as_str().expect("action");
+            let args = serde_json::json!({
+                "entity": call.arguments["entity"],
+                "action": action,
+                "value": call.arguments.get("value").cloned().unwrap_or(serde_json::Value::Null),
+            });
+            let parsed = parse_home_control_args(&args);
+            assert!(
+                parsed.is_ok(),
+                "{utterance} action {action:?}: {:?}",
+                parsed.err()
+            );
+        }
     }
 
     #[test]
