@@ -748,15 +748,15 @@ async fn memory_recall_rejects_invalid_arguments_and_audits() {
     let invalid_calls = [
         (
             serde_json::json!({}),
-            "memory_recall requires non-empty string argument 'query'",
+            "memory tool requires non-empty string argument (query/topic/what)",
         ),
         (
             serde_json::json!({"query": ""}),
-            "memory_recall requires non-empty string argument 'query'",
+            "memory tool requires non-empty string argument (query/topic/what)",
         ),
         (
             serde_json::json!({"query": 123}),
-            "memory_recall requires non-empty string argument 'query'",
+            "memory tool requires non-empty string argument (query/topic/what)",
         ),
     ];
     let expected_audit_count = invalid_calls.len();
