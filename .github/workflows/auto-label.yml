@@ -1,0 +1,109 @@
+# Auto-label issues and PRs by type and authorship.
+#
+# Type label — at most one, priority optimization > performance > bug:
+#   * optimization — title starts with `perf` AND the PR body has a ticked
+#     "I have verified the change end-to-end on Jetson hardware." box.
+#   * performance  — title starts with `perf` without that box ticked.
+#   * bug          — title starts with `fix` or contains `[bug]`.
+# Author label — exactly one, by GitHub role (author_association):
+#   * maintainer             — OWNER / MEMBER / COLLABORATOR.
+#   * community-contribution — everyone else.
+#
+# Ownership / reconciliation:
+#   * {optimization, performance} and {maintainer, community-contribution} are
+#     fully owned here: the workflow keeps exactly the computed label and removes
+#     its sibling, so edits re-label (ticking the Jetson box flips
+#     performance -> optimization; an empty box flips it back).
+#   * `bug` is ADD-only — the issue forms ([bug]/[audio]/[voice]) and manual
+#     curation also apply it, so the workflow never removes it.
+#   * Every other label (enhancement, audio, voice, jetson, M1, ...) is untouched.
+#
+# Like contribution.yml / pr-limit.yml this uses `pull_request_target` and never
+# checks out or runs PR code — it only reads PR/issue metadata from the event
+# payload and calls the labels API, so the write permissions are safe.
+
+name: Auto Label
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  pull_request_target:
+    types: [opened, edited, reopened, ready_for_review]
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  auto-label:
+    name: Apply type + author labels
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Classify and apply labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          TITLE: ${{ github.event.issue.title || github.event.pull_request.title }}
+          BODY: ${{ github.event.issue.body || github.event.pull_request.body }}
+          ASSOC: ${{ github.event.issue.author_association || github.event.pull_request.author_association }}
+        run: |
+          set -uo pipefail
+
+          title_lc="$(printf '%s' "$TITLE" | tr '[:upper:]' '[:lower:]')"
+
+          # Type detection from the conventional-commit-style title prefix.
+          is_perf=0; is_fix=0; is_bug=0
+          case "$title_lc" in perf:*|"perf("*|perf!*|"perf "*) is_perf=1 ;; esac
+          case "$title_lc" in fix:*|"fix("*|fix!*|"fix "*) is_fix=1 ;; esac
+          [ "$is_fix" = 1 ] && is_bug=1
+          printf '%s' "$TITLE" | grep -qiE '\[bug\]' && is_bug=1
+
+          # Jetson-verified = the PR template's specific box is ticked. The
+          # "I have NOT verified ..." box uses different wording and never matches.
+          jetson=0
+          if printf '%s' "$BODY" | grep -qiE '^[[:space:]]*-[[:space:]]*\[[xX]\][[:space:]]*I have verified the change end-to-end on Jetson hardware'; then
+            jetson=1
+          fi
+
+          type_label=""
+          if [ "$is_perf" = 1 ] && [ "$jetson" = 1 ]; then type_label="optimization"
+          elif [ "$is_perf" = 1 ]; then type_label="performance"
+          elif [ "$is_bug" = 1 ]; then type_label="bug"
+          fi
+
+          case "$ASSOC" in
+            OWNER|MEMBER|COLLABORATOR) author_label="maintainer" ;;
+            *) author_label="community-contribution" ;;
+          esac
+
+          echo "::notice::#${NUMBER} assoc=${ASSOC} type=${type_label:-none} author=${author_label}"
+
+          # Self-bootstrap the two labels this repo doesn't ship yet (no-op if present).
+          gh label create performance --repo "$REPO" --color FEF2C0 \
+            --description "Performance work (not verified on Jetson hardware)" 2>/dev/null || true
+          gh label create maintainer --repo "$REPO" --color 6F42C1 \
+            --description "Authored by a project maintainer" 2>/dev/null || true
+
+          add()    { gh api -X POST "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=$1" >/dev/null 2>&1 || true; }
+          remove() { gh api -X DELETE "repos/$REPO/issues/$NUMBER/labels/$1" >/dev/null 2>&1 || true; }
+
+          # Author label — exactly one.
+          if [ "$author_label" = "maintainer" ]; then
+            add maintainer; remove community-contribution
+          else
+            add community-contribution; remove maintainer
+          fi
+
+          # Perf type — workflow fully owns {optimization, performance}.
+          case "$type_label" in
+            optimization) add optimization; remove performance ;;
+            performance)  add performance; remove optimization ;;
+            *)            remove optimization; remove performance ;;
+          esac
+
+          # bug — add-only (issue forms and manual curation also set it).
+          [ "$type_label" = "bug" ] && add bug || true
