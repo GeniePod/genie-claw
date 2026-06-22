@@ -11,10 +11,11 @@ use std::time::Instant;
 use super::actuation::{
     ActionLedger, AuditError, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager,
     PendingConfirmation, RecordedAction, RequestOrigin, append_json_line, now_ms,
+    undo_restore_from_prior,
 };
 use super::home;
 use super::timer;
-use crate::ha::HomeAutomationProvider;
+use crate::ha::{HomeActionKind, HomeAutomationProvider};
 use crate::skills::SkillLoader;
 
 const ACTUATION_RATE_WINDOW_MS: u64 = 60_000;
@@ -75,6 +76,22 @@ fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Opti
         anyhow::bail!("home_control '{action}' requires a numeric argument 'value'");
     }
     Ok((entity, action, value))
+}
+
+fn home_action_kind(action: &str) -> Result<HomeActionKind> {
+    match action {
+        "turn_on" => Ok(HomeActionKind::TurnOn),
+        "turn_off" => Ok(HomeActionKind::TurnOff),
+        "toggle" => Ok(HomeActionKind::Toggle),
+        "set_brightness" => Ok(HomeActionKind::SetBrightness),
+        "set_temperature" => Ok(HomeActionKind::SetTemperature),
+        "open" => Ok(HomeActionKind::Open),
+        "close" => Ok(HomeActionKind::Close),
+        "lock" => Ok(HomeActionKind::Lock),
+        "unlock" => Ok(HomeActionKind::Unlock),
+        "activate" | "activate_scene" => Ok(HomeActionKind::Activate),
+        other => anyhow::bail!("unknown home action: {other}"),
+    }
 }
 
 /// Actions that actuate a numeric setpoint and therefore require a `value`.
@@ -1110,6 +1127,23 @@ impl ToolDispatcher {
             });
             anyhow::bail!("Home action blocked by rate limit: {}", reason);
         }
+        let undo_restore = if undo_of.is_some() {
+            None
+        } else if matches!(action, "set_brightness" | "set_temperature" | "toggle") {
+            match home_action_kind(action) {
+                Ok(kind) => match ha.resolve_target(&resolved_entity, Some(kind)).await {
+                    Ok(target) => ha
+                        .get_state(&target)
+                        .await
+                        .ok()
+                        .and_then(|prior| undo_restore_from_prior(action, &prior)),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         match home::control(
             ha.as_ref(),
             &resolved_entity,
@@ -1131,6 +1165,7 @@ impl ToolDispatcher {
                         exec_ctx.request_origin,
                         &output,
                         confidence,
+                        None,
                     )
                 } else {
                     self.action_ledger.record(
@@ -1140,6 +1175,7 @@ impl ToolDispatcher {
                         exec_ctx.request_origin,
                         &output,
                         confidence,
+                        undo_restore,
                     )
                 };
                 self.audit_logger.append_or_log(AuditEvent {
@@ -1225,14 +1261,8 @@ impl ToolDispatcher {
             .action_ledger
             .last_undoable()
             .ok_or_else(|| anyhow::anyhow!("No recent reversible home action to undo."))?;
-        let inverse = action
-            .inverse_action
-            .as_deref()
+        let args = ActionLedger::undo_home_control_args(&action)
             .ok_or_else(|| anyhow::anyhow!("No recent reversible home action to undo."))?;
-        let args = serde_json::json!({
-            "entity": action.entity.clone(),
-            "action": inverse,
-        });
         let output = self
             .exec_home_control_inner(&args, exec_ctx, Some(action.id))
             .await?;
@@ -1357,9 +1387,13 @@ impl ToolDispatcher {
         exec_ctx: ToolExecutionContext,
     ) -> Result<String> {
         let query = parse_memory_recall_query(args)?;
+        // Identity context must come only from trusted runtime surfaces (voice
+        // pipeline via exec_ctx.memory_read_context). Do not read
+        // identity_confidence or related fields from LLM tool arguments — an
+        // attacker could otherwise bypass shared-room privacy controls (#430).
         let read_context = exec_ctx
             .memory_read_context
-            .unwrap_or_else(|| memory_read_context(args));
+            .unwrap_or_else(crate::memory::policy::MemoryReadContext::shared_room_voice);
         let mem = self
             .memory
             .as_ref()
@@ -2009,37 +2043,6 @@ fn format_household_role_answer(
     format!("{names} are the {role}s.")
 }
 
-fn memory_read_context(args: &serde_json::Value) -> crate::memory::policy::MemoryReadContext {
-    let identity_confidence = match args
-        .get("identity_confidence")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "high" => crate::memory::policy::IdentityConfidence::High,
-        "medium" => crate::memory::policy::IdentityConfidence::Medium,
-        "low" => crate::memory::policy::IdentityConfidence::Low,
-        _ => crate::memory::policy::IdentityConfidence::Unknown,
-    };
-
-    crate::memory::policy::MemoryReadContext {
-        identity_confidence,
-        explicit_named_person: args
-            .get("explicit_named_person")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        explicit_private_intent: args
-            .get("explicit_private_intent")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        shared_space_voice: args
-            .get("shared_space_voice")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-    }
-}
-
 fn normalize_memories_to_store(args: &serde_json::Value) -> Vec<(String, String)> {
     let category_hint = args
         .get("category")
@@ -2258,8 +2261,8 @@ async fn write_media_request(request: &ResolvedMediaQuery) {
 mod tests {
     use super::*;
     use crate::ha::{
-        ActionResult, DeviceRef, HomeAction, HomeActionKind, HomeAutomationProvider, HomeGraph,
-        HomeState, HomeTarget, HomeTargetKind, IntegrationHealth, SceneRef,
+        ActionResult, DeviceRef, Entity, HomeAction, HomeActionKind, HomeAutomationProvider,
+        HomeGraph, HomeState, HomeTarget, HomeTargetKind, IntegrationHealth, SceneRef,
     };
     use crate::skills::SkillLoader;
     use std::path::{Path, PathBuf};
@@ -2271,6 +2274,38 @@ mod tests {
 
     struct RecordingHomeProvider {
         executed: Arc<std::sync::Mutex<Vec<HomeActionKind>>>,
+        light: Arc<std::sync::Mutex<StubLightState>>,
+    }
+
+    struct StubLightState {
+        power: String,
+        brightness: Option<u64>,
+    }
+
+    impl StubLightState {
+        fn new() -> Self {
+            Self {
+                power: "off".into(),
+                brightness: None,
+            }
+        }
+    }
+
+    impl RecordingHomeProvider {
+        fn new(executed: Arc<std::sync::Mutex<Vec<HomeActionKind>>>) -> Self {
+            Self {
+                executed,
+                light: Arc::new(std::sync::Mutex::new(StubLightState::new())),
+            }
+        }
+
+        fn brightness(&self) -> Option<u64> {
+            self.light.lock().unwrap().brightness
+        }
+
+        fn power(&self) -> String {
+            self.light.lock().unwrap().power.clone()
+        }
     }
 
     fn workspace_root() -> PathBuf {
@@ -2413,17 +2448,60 @@ mod tests {
         }
 
         async fn get_state(&self, target: &HomeTarget) -> Result<HomeState> {
+            let light = self.light.lock().unwrap();
+            let mut attributes = serde_json::Map::new();
+            if let Some(brightness) = light.brightness {
+                attributes.insert("brightness".into(), serde_json::json!(brightness));
+            }
             Ok(HomeState {
                 target_name: target.display_name.clone(),
                 domain: target.domain.clone(),
                 area: target.area.clone(),
-                entities: Vec::new(),
+                entities: vec![Entity {
+                    entity_id: target.entity_ids[0].clone(),
+                    state: light.power.clone(),
+                    attributes: serde_json::Value::Object(attributes),
+                }],
                 available: true,
-                spoken_summary: format!("{} is available", target.display_name),
+                spoken_summary: format!("{} is {}", target.display_name, light.power),
             })
         }
 
         async fn execute(&self, action: HomeAction) -> Result<ActionResult> {
+            {
+                let mut light = self.light.lock().unwrap();
+                match action.kind {
+                    HomeActionKind::TurnOn => {
+                        light.power = "on".into();
+                        if light.brightness.is_none() {
+                            light.brightness = Some(255);
+                        }
+                    }
+                    HomeActionKind::TurnOff => {
+                        light.power = "off".into();
+                        light.brightness = None;
+                    }
+                    HomeActionKind::Toggle => {
+                        if light.power == "on" {
+                            light.power = "off".into();
+                            light.brightness = None;
+                        } else {
+                            light.power = "on".into();
+                            if light.brightness.is_none() {
+                                light.brightness = Some(255);
+                            }
+                        }
+                    }
+                    HomeActionKind::SetBrightness => {
+                        light.power = "on".into();
+                        if let Some(value) = action.value {
+                            light.brightness =
+                                Some(((value * 255.0 / 100.0).round() as u64).min(255));
+                        }
+                    }
+                    other => anyhow::bail!("unsupported stub action: {other:?}"),
+                }
+            }
             self.executed.lock().unwrap().push(action.kind);
             Ok(ActionResult {
                 success: true,
@@ -2899,9 +2977,8 @@ mod tests {
     #[tokio::test]
     async fn home_control_records_action_history() {
         let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
-            executed: executed.clone(),
-        })));
+        let dispatcher =
+            ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider::new(executed.clone()))));
 
         let result = dispatcher
             .execute_with_context(
@@ -2946,10 +3023,9 @@ mod tests {
             .unwrap();
 
         let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
-            executed: executed.clone(),
-        })))
-        .with_memory(Arc::new(std::sync::Mutex::new(memory)));
+        let dispatcher =
+            ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider::new(executed.clone()))))
+                .with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
         let result = dispatcher
             .execute_with_context(
@@ -2982,9 +3058,8 @@ mod tests {
     #[tokio::test]
     async fn home_control_blocks_unknown_origin_by_default() {
         let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
-            executed: executed.clone(),
-        })));
+        let dispatcher =
+            ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider::new(executed.clone()))));
 
         let result = dispatcher
             .execute(&ToolCall {
@@ -3008,10 +3083,9 @@ mod tests {
             allowed_origins: vec!["dashboard".into(), "confirmation".into()],
             ..ActuationSafetyConfig::default()
         };
-        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
-            executed: executed.clone(),
-        })))
-        .with_actuation_safety_config(safety);
+        let dispatcher =
+            ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider::new(executed.clone()))))
+                .with_actuation_safety_config(safety);
 
         let result = dispatcher
             .execute_with_context(
@@ -3041,10 +3115,9 @@ mod tests {
         safety
             .max_actions_per_minute_by_origin
             .insert("dashboard".into(), 1);
-        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
-            executed: executed.clone(),
-        })))
-        .with_actuation_safety_config(safety);
+        let dispatcher =
+            ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider::new(executed.clone()))))
+                .with_actuation_safety_config(safety);
         let call = ToolCall {
             name: "home_control".into(),
             arguments: serde_json::json!({
@@ -3069,9 +3142,8 @@ mod tests {
     #[tokio::test]
     async fn home_undo_reverses_last_reversible_action() {
         let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
-            executed: executed.clone(),
-        })));
+        let dispatcher =
+            ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider::new(executed.clone()))));
 
         let control = ToolCall {
             name: "home_control".into(),
@@ -3130,6 +3202,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn home_undo_restores_prior_brightness_after_dim() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingHomeProvider::new(executed.clone()));
+        let dispatcher = ToolDispatcher::new(Some(provider.clone()));
+        let ctx = || ToolExecutionContext {
+            request_origin: RequestOrigin::Dashboard,
+            ..ToolExecutionContext::default()
+        };
+
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "turn_on"
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "set_brightness",
+                            "value": 30
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+        assert_eq!(provider.brightness(), Some(77));
+
+        let undo = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_undo".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ctx(),
+            )
+            .await;
+
+        assert!(undo.success);
+        assert!(undo.output.contains("Undid the last home action"));
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![
+                HomeActionKind::TurnOn,
+                HomeActionKind::SetBrightness,
+                HomeActionKind::SetBrightness,
+            ]
+        );
+        assert_eq!(provider.power(), "on");
+        assert_eq!(provider.brightness(), Some(255));
+    }
+
+    #[tokio::test]
+    async fn home_undo_restores_prior_state_after_toggle() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingHomeProvider::new(executed.clone()));
+        let dispatcher = ToolDispatcher::new(Some(provider.clone()));
+        let ctx = || ToolExecutionContext {
+            request_origin: RequestOrigin::Dashboard,
+            ..ToolExecutionContext::default()
+        };
+
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "turn_on"
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+        assert_eq!(provider.power(), "on");
+
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "toggle"
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+        assert_eq!(provider.power(), "off");
+
+        let undo = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_undo".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ctx(),
+            )
+            .await;
+
+        assert!(undo.success);
+        assert!(undo.output.contains("Undid the last home action"));
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![
+                HomeActionKind::TurnOn,
+                HomeActionKind::Toggle,
+                HomeActionKind::TurnOn,
+            ]
+        );
+        assert_eq!(provider.power(), "on");
+    }
+
+    #[tokio::test]
     async fn action_history_hydrates_from_audit_log() {
         let path = std::env::temp_dir().join(format!(
             "geniepod-dispatch-audit-test-{}.jsonl",
@@ -3137,9 +3343,9 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
 
-        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
-            executed: Arc::new(std::sync::Mutex::new(Vec::new())),
-        })))
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider::new(Arc::new(
+            std::sync::Mutex::new(Vec::new()),
+        )))))
         .with_actuation_audit_path(path.clone());
         assert!(
             dispatcher
@@ -3160,9 +3366,9 @@ mod tests {
                 .success
         );
 
-        let restarted = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
-            executed: Arc::new(std::sync::Mutex::new(Vec::new())),
-        })))
+        let restarted = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider::new(Arc::new(
+            std::sync::Mutex::new(Vec::new()),
+        )))))
         .with_actuation_audit_path(path.clone());
         let history = restarted
             .execute(&ToolCall {
@@ -3660,9 +3866,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_recall_can_use_identity_context_when_provided() {
+    fn memory_recall_ignores_llm_supplied_identity_fields() {
         let db = std::env::temp_dir().join(format!(
-            "memory-recall-identity-test-{}.db",
+            "memory-recall-identity-bypass-test-{}.db",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&db);
@@ -3677,13 +3883,61 @@ mod tests {
             .exec_memory_recall(
                 &serde_json::json!({
                     "query": "oat milk",
-                    "identity_confidence": "high"
+                    "identity_confidence": "high",
+                    "explicit_named_person": true
                 }),
                 ToolExecutionContext::default(),
             )
             .unwrap();
 
-        assert_eq!(output, "I remember: Maya likes oat milk");
+        assert_eq!(
+            output, "I don't remember anything about oat milk yet.",
+            "LLM-injected identity fields must not unlock person-scoped recall"
+        );
+    }
+
+    #[test]
+    fn memory_recall_allows_person_scope_with_verified_context() {
+        // Positive counterpart to memory_recall_ignores_llm_supplied_identity_fields
+        // (and mirror of memory_forget_allows_person_scope_with_verified_context):
+        // person-scoped recall still works when the voice pipeline sets a trusted
+        // MemoryReadContext on exec_ctx — injected tool-argument identity fields
+        // must not matter either way.
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-verified-context-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({
+                    "query": "oat milk",
+                    "identity_confidence": "high",
+                    "explicit_named_person": true
+                }),
+                ToolExecutionContext {
+                    memory_read_context: Some(crate::memory::policy::MemoryReadContext {
+                        identity_confidence: crate::memory::policy::IdentityConfidence::High,
+                        explicit_named_person: true,
+                        explicit_private_intent: false,
+                        shared_space_voice: true,
+                    }),
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            output, "I remember: Maya likes oat milk",
+            "verified exec_ctx.memory_read_context must unlock person-scoped recall"
+        );
     }
 
     #[test]

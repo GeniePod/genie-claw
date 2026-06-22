@@ -33,7 +33,7 @@ allow_remote_base_url = false
 port = 3000
 bind_host = "127.0.0.1"           # Safer default. Use "0.0.0.0" only behind a trusted gateway/firewall.
 ha_token = ""                     # Only needed when Home Assistant service is enabled below. Or set HA_TOKEN env var.
-llm_model_name = "qwen"           # For prompt optimization. Options: nemotron-4b, tinyllama, llama, qwen, phi
+llm_model_name = "qwen"           # For prompt optimization. Options: nemotron-4b, tinyllama, llama, qwen, phi, gemma
                                   # Jetson default: Qwen3-4B Q4_K_M + genie-ai-runtime.
                                   # Phi-4-mini fallback (issue #44):
                                   #   1) deploy/setup-jetson.sh --model phi-4-mini
@@ -45,6 +45,16 @@ llm_model_name = "qwen"           # For prompt optimization. Options: nemotron-4
                                   #      default, or genie-llm.service for the llama.cpp
                                   #      fallback)
                                   #   4) sudo systemctl restart <active-llm-unit> genie-core
+                                  # Gemma 4 E2B opt-in (issue #415):
+                                  #   1) deploy/setup-jetson.sh --model gemma-4-e2b
+                                  #   2) flip the two lines below:
+                                  #        llm_model_name = "gemma"
+                                  #        llm_model_path = "/opt/geniepod/models/gemma-4-e2b-it-Q4_K_M.gguf"
+                                  #   3) update GENIEPOD_LLM_MODEL in genie-ai-runtime.service
+                                  #   4) sudo systemctl restart genie-ai-runtime genie-core
+                                  #   Requires genie-ai-runtime >= the version that ships
+                                  #   Gemma 4 inference support (SentencePiece tokenizer,
+                                  #   <start_of_turn>/<end_of_turn> chat template).
                                   # (see ARCHITECTURE.md "Current Transitional Adapters".)
 whisper_model = "/opt/geniepod/models/ggml-small.bin"   # With the
                                   # long-running whisper-server (genie-whisper.service)
