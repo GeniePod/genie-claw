@@ -231,6 +231,10 @@ async fn main() -> Result<()> {
 }
 
 fn print_usage() {
+    println!("{}", usage_text());
+}
+
+fn usage_text() -> String {
     // Gated per issue #41: `speaker` is only listed when this build includes
     // the `voice` feature, so the help text matches what the binary can do.
     #[cfg(feature = "voice")]
@@ -238,7 +242,7 @@ fn print_usage() {
     #[cfg(not(feature = "voice"))]
     const SPEAKER_HELP_LINE: &str = "";
 
-    println!(
+    format!(
         "\
 GeniePod CLI v{version}
 
@@ -265,8 +269,7 @@ COMMANDS:
                         Convert Home Assistant Intents into attributed BFCL cases
     connectivity        Inspect ESP32-C6 Thread/Matter sidecar status
     skill <SUBCOMMAND>  Manage loadable skill modules
-{speaker}\
-    health              Service health check
+{speaker}    health              Service health check
     conversations       List all conversations
     update-check        Check for OTA updates
     diag                Full system diagnostics report
@@ -275,7 +278,7 @@ COMMANDS:
     help                Show this help",
         version = env!("CARGO_PKG_VERSION"),
         speaker = SPEAKER_HELP_LINE,
-    );
+    )
 }
 
 #[cfg(feature = "voice")]
@@ -2824,6 +2827,32 @@ mod tests {
         let version = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty());
         assert!(version.contains('.')); // Semver: x.y.z
+    }
+
+    #[test]
+    fn usage_command_lines_are_indented() {
+        // Regression: a `\` line-continuation after the `{speaker}` block used to
+        // strip the four-space indent off the `health` line, leaving it flush-left
+        // while every other command stayed indented.
+        let usage = usage_text();
+        assert!(
+            usage.contains("\n    health              Service health check"),
+            "`health` command should keep its four-space indent:\n{usage}"
+        );
+
+        let in_commands = usage
+            .split_once("COMMANDS:\n")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&usage);
+        for line in in_commands.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            assert!(
+                line.starts_with("    "),
+                "every command/continuation line must be indented, got: {line:?}"
+            );
+        }
     }
 
     #[test]

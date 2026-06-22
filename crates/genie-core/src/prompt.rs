@@ -20,6 +20,8 @@ pub enum ModelFamily {
     Qwen,
     /// Microsoft Phi-4 mini / Phi-family instruct models.
     Phi,
+    /// Google Gemma 4 E2B and other Gemma-family instruction models.
+    Gemma,
     /// TinyLlama or other small models (needs very explicit instructions).
     Small,
     /// Generic fallback.
@@ -38,6 +40,8 @@ impl ModelFamily {
             Self::Qwen
         } else if lower.contains("phi") {
             Self::Phi
+        } else if lower.contains("gemma") {
+            Self::Gemma
         } else if lower.contains("tiny") || lower.contains("small") || lower.contains("1b") {
             Self::Small
         } else {
@@ -64,15 +68,17 @@ impl PromptBuilder {
         let web_search_available = tools.iter().any(|tool| tool.name == "web_search");
 
         match self.model_family {
-            ModelFamily::Nemotron | ModelFamily::Llama | ModelFamily::Qwen | ModelFamily::Phi => {
-                self.prompt_capable_model(
-                    &tool_section,
-                    &memory_section,
-                    home_tools_available,
-                    hello_world_available,
-                    web_search_available,
-                )
-            }
+            ModelFamily::Nemotron
+            | ModelFamily::Llama
+            | ModelFamily::Qwen
+            | ModelFamily::Phi
+            | ModelFamily::Gemma => self.prompt_capable_model(
+                &tool_section,
+                &memory_section,
+                home_tools_available,
+                hello_world_available,
+                web_search_available,
+            ),
             ModelFamily::Small | ModelFamily::Generic => self.prompt_simple_model(
                 &tool_section,
                 &memory_section,
@@ -274,7 +280,11 @@ Assume replies may be heard in a shared room. Do not volunteer secrets or highly
     /// Format tool definitions for the system prompt.
     fn format_tools(&self, tools: &[ToolDef]) -> String {
         match self.model_family {
-            ModelFamily::Nemotron | ModelFamily::Llama | ModelFamily::Qwen | ModelFamily::Phi => {
+            ModelFamily::Nemotron
+            | ModelFamily::Llama
+            | ModelFamily::Qwen
+            | ModelFamily::Phi
+            | ModelFamily::Gemma => {
                 // JSON schema format for capable models.
                 tools
                     .iter()
@@ -538,6 +548,52 @@ mod tests {
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
         let mem_path = std::env::temp_dir().join("prompt-test-phi.db");
+        let _ = std::fs::remove_file(&mem_path);
+        let memory = Memory::open(&mem_path).unwrap();
+
+        let prompt = builder.build(&tools, &memory);
+        assert!(prompt.contains("ONLY a JSON object"));
+        assert!(prompt.contains("Do NOT wrap the JSON in markdown code blocks"));
+        assert!(!prompt.contains("EXAMPLES:"));
+    }
+
+    #[test]
+    fn detect_gemma() {
+        assert!(matches!(
+            ModelFamily::from_model_name("gemma-4-e2b-it-Q4_K_M.gguf"),
+            ModelFamily::Gemma
+        ));
+    }
+
+    // Issue #415: Gemma 4 E2B is the canonical Gemma-family model for issue #415.
+    // Lock the exact filenames setup-jetson.sh writes so a future detector
+    // refactor cannot silently drop them into ModelFamily::Generic and lose
+    // the JSON tool-call instructions.
+    #[test]
+    fn detect_gemma4_e2b_canonical_filename() {
+        assert!(matches!(
+            ModelFamily::from_model_name("gemma-4-e2b-it-Q4_K_M.gguf"),
+            ModelFamily::Gemma
+        ));
+        assert!(matches!(
+            ModelFamily::from_model_name("gemma-4-e2b-Q4_K_M.gguf"),
+            ModelFamily::Gemma
+        ));
+        assert!(matches!(
+            ModelFamily::from_model_name("Gemma-4-E2B-Instruct-Q4_K_M.gguf"),
+            ModelFamily::Gemma
+        ));
+    }
+
+    #[test]
+    fn gemma4_e2b_uses_capable_prompt_shape() {
+        let builder = PromptBuilder::from_model_name("gemma-4-e2b-it-Q4_K_M.gguf");
+        let tools = vec![crate::tools::dispatch::ToolDef {
+            name: "get_time".into(),
+            description: "Get current time".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let mem_path = std::env::temp_dir().join("prompt-test-gemma4-e2b.db");
         let _ = std::fs::remove_file(&mem_path);
         let memory = Memory::open(&mem_path).unwrap();
 
