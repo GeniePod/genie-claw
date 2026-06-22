@@ -3664,6 +3664,50 @@ mod tests {
     }
 
     #[test]
+    fn memory_recall_allows_person_scope_with_verified_context() {
+        // Positive counterpart to memory_recall_ignores_llm_supplied_identity_fields
+        // (and mirror of memory_forget_allows_person_scope_with_verified_context):
+        // person-scoped recall still works when the voice pipeline sets a trusted
+        // MemoryReadContext on exec_ctx — injected tool-argument identity fields
+        // must not matter either way.
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-verified-context-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({
+                    "query": "oat milk",
+                    "identity_confidence": "high",
+                    "explicit_named_person": true
+                }),
+                ToolExecutionContext {
+                    memory_read_context: Some(crate::memory::policy::MemoryReadContext {
+                        identity_confidence: crate::memory::policy::IdentityConfidence::High,
+                        explicit_named_person: true,
+                        explicit_private_intent: false,
+                        shared_space_voice: true,
+                    }),
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            output, "I remember: Maya likes oat milk",
+            "verified exec_ctx.memory_read_context must unlock person-scoped recall"
+        );
+    }
+
+    #[test]
     fn memory_forget_blocks_person_scope_without_verified_context() {
         // Regression for the delete-side analogue of be4a2da (PR #201): without a
         // verified MemoryReadContext, the LLM must not be able to destroy
