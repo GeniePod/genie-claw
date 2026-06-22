@@ -888,27 +888,25 @@ impl Memory {
         values.push((limit * 3).to_string());
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut entries = stmt
+        let mut scored: Vec<(MemoryEntry, f64)> = stmt
             .query_map(params_from_iter(values.iter()), read_entry)?
             .filter_map(|r| r.ok())
-            .collect::<Vec<_>>();
+            .map(|entry| {
+                let score = lexical_overlap_score(query, &entry.content);
+                (entry, score)
+            })
+            .collect();
 
-        entries.sort_by(|a, b| {
-            let a_score = lexical_overlap_score(query, &a.content);
-            let b_score = lexical_overlap_score(query, &b.content);
-            b_score
-                .partial_cmp(&a_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        entries.truncate(limit);
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
 
-        let recalls: Vec<(i64, f64)> = entries
+        let recalls: Vec<(i64, f64)> = scored
             .iter()
-            .map(|entry| (entry.id, lexical_overlap_score(query, &entry.content)))
+            .map(|(entry, score)| (entry.id, *score))
             .collect();
         self.record_recalls(&recalls, now, query_hash);
 
-        Ok(entries)
+        Ok(scored.into_iter().map(|(entry, _)| entry).collect())
     }
 
     fn update_recall_tracking(
