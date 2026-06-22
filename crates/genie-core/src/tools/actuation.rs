@@ -363,27 +363,27 @@ pub fn undo_restore_from_prior(action: &str, prior: &HomeState) -> Option<UndoRe
 fn undo_restore_for_power_state(state: &str) -> Option<UndoRestore> {
     match state {
         "on" => Some(UndoRestore {
-            action: "turn_off".into(),
-            value: None,
-        }),
-        "off" => Some(UndoRestore {
             action: "turn_on".into(),
             value: None,
         }),
-        "open" => Some(UndoRestore {
-            action: "close".into(),
+        "off" => Some(UndoRestore {
+            action: "turn_off".into(),
             value: None,
         }),
-        "closed" => Some(UndoRestore {
+        "open" => Some(UndoRestore {
             action: "open".into(),
             value: None,
         }),
+        "closed" => Some(UndoRestore {
+            action: "close".into(),
+            value: None,
+        }),
         "locked" => Some(UndoRestore {
-            action: "unlock".into(),
+            action: "lock".into(),
             value: None,
         }),
         "unlocked" => Some(UndoRestore {
-            action: "lock".into(),
+            action: "unlock".into(),
             value: None,
         }),
         _ => None,
@@ -1078,6 +1078,39 @@ mod tests {
         let restore = undo_restore_from_prior("set_brightness", &prior).unwrap();
         assert_eq!(restore.action, "set_brightness");
         assert!((restore.value.unwrap() - 76.86).abs() < 0.1);
+    }
+
+    #[test]
+    fn undo_restore_from_prior_toggle_restores_prior_power_state() {
+        use crate::ha::Entity;
+
+        let prior_on = HomeState {
+            target_name: "kitchen light".into(),
+            domain: Some("light".into()),
+            area: None,
+            entities: vec![Entity {
+                entity_id: "light.kitchen".into(),
+                state: "on".into(),
+                attributes: serde_json::json!({}),
+            }],
+            available: true,
+            spoken_summary: "kitchen light is on".into(),
+        };
+
+        let restore = undo_restore_from_prior("toggle", &prior_on).unwrap();
+        assert_eq!(restore.action, "turn_on");
+        assert!(restore.value.is_none());
+
+        let prior_off = HomeState {
+            entities: vec![Entity {
+                entity_id: "light.kitchen".into(),
+                state: "off".into(),
+                attributes: serde_json::json!({}),
+            }],
+            ..prior_on.clone()
+        };
+        let restore = undo_restore_from_prior("toggle", &prior_off).unwrap();
+        assert_eq!(restore.action, "turn_off");
     }
 
     #[test]

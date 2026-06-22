@@ -3296,6 +3296,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn home_undo_restores_prior_state_after_toggle() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingHomeProvider::new(executed.clone()));
+        let dispatcher = ToolDispatcher::new(Some(provider.clone()));
+        let ctx = || ToolExecutionContext {
+            request_origin: RequestOrigin::Dashboard,
+            ..ToolExecutionContext::default()
+        };
+
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "turn_on"
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+        assert_eq!(provider.power(), "on");
+
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "toggle"
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+        assert_eq!(provider.power(), "off");
+
+        let undo = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_undo".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ctx(),
+            )
+            .await;
+
+        assert!(undo.success);
+        assert!(undo.output.contains("Undid the last home action"));
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![
+                HomeActionKind::TurnOn,
+                HomeActionKind::Toggle,
+                HomeActionKind::TurnOn,
+            ]
+        );
+        assert_eq!(provider.power(), "on");
+    }
+
+    #[tokio::test]
     async fn action_history_hydrates_from_audit_log() {
         let path = std::env::temp_dir().join(format!(
             "geniepod-dispatch-audit-test-{}.jsonl",
