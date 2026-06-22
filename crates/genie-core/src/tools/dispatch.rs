@@ -3790,7 +3790,10 @@ mod tests {
         // Verify the memory was deleted
         let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
         let search_result = mem.search("jazz", 5).unwrap();
-        assert!(search_result.is_empty(), "Memory with 'jazz' should be deleted");
+        assert!(
+            search_result.is_empty(),
+            "Memory with 'jazz' should be deleted"
+        );
 
         // Test with "what" alias
         let memory2 = crate::memory::Memory::open(&db).unwrap();
@@ -3807,7 +3810,10 @@ mod tests {
         // Verify the memory was deleted
         let mem2 = dispatcher2.memory.as_ref().unwrap().lock().unwrap();
         let search_result2 = mem2.search("piano", 5).unwrap();
-        assert!(search_result2.is_empty(), "Memory with 'piano' should be deleted");
+        assert!(
+            search_result2.is_empty(),
+            "Memory with 'piano' should be deleted"
+        );
     }
 
     #[tokio::test]
