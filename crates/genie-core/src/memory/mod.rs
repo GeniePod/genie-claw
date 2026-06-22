@@ -670,6 +670,17 @@ impl Memory {
         );
 
         backfill_policy_columns(&conn)?;
+
+        // Every derived table (profiles, aliases, rules, calendar, shopping,
+        // inventory, embeddings, …) is re-derived from the canonical `memories`
+        // rows on every open. Each rebuild_* issues many per-row writes; left as
+        // individual auto-commit statements that is one WAL transaction per row
+        // across the whole set. Run the rebuild pass inside a single transaction
+        // so startup re-derivation commits once instead of thousands of times —
+        // the writes are identical, just batched (the per-recall version of this
+        // is `record_recalls`, PR #431). On a `?` failure `rebuild_tx` is dropped
+        // and the partial rebuild rolls back atomically.
+        let rebuild_tx = conn.unchecked_transaction()?;
         rebuild_household_profiles(&conn)?;
         rebuild_device_aliases(&conn)?;
         rebuild_household_profile_attributes(&conn)?;
@@ -685,6 +696,7 @@ impl Memory {
         rebuild_household_schedule_items(&conn)?;
         rebuild_household_event_logs(&conn)?;
         rebuild_embedded_memories(&conn)?;
+        rebuild_tx.commit()?;
 
         // Older databases may predate the FTS update trigger or may have been
         // edited by a recovery tool. Rebuild once at open so recall and forget

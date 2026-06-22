@@ -187,10 +187,61 @@ pub fn extract_and_store(memory: &Memory, user_text: &str) -> usize {
 
 // --- Pattern helpers ---
 
+/// Phrases that mark where a captured value ends. A fact like "my name is X"
+/// must capture only X, not the conjunction or subordinate clause that follows
+/// it ("...and I love coding", "...but I hate meetings", "...who lives nearby").
+///
+/// Each marker is space-padded and matched as a substring, so it only fires on
+/// a real word boundary — `" and "` never matches inside "android", and
+/// `" or "` never matches inside "doctor".
+const VALUE_BOUNDARY_MARKERS: &[&str] = &[
+    " and ",
+    " but ",
+    " or ",
+    " nor ",
+    " so ",
+    " yet ",
+    " because ",
+    " since ",
+    " while ",
+    " when ",
+    " where ",
+    " who ",
+    " whom ",
+    " whose ",
+    " which ",
+    " that ",
+    " with ",
+    " then ",
+    " though ",
+    " although ",
+    " however ",
+    " also ",
+    " plus ",
+    " too ",
+];
+
+/// Cut a captured value at the first clause boundary so trailing conjunctions
+/// and subordinate clauses are not swallowed into an identity/preference fact.
+///
+/// `value` is expected to already be a single sentence fragment (split on
+/// sentence punctuation by the caller). Returns the slice up to the earliest
+/// boundary marker, right-trimmed.
+fn first_clause(value: &str) -> &str {
+    let mut end = value.len();
+    for marker in VALUE_BOUNDARY_MARKERS {
+        if let Some(pos) = value.find(marker) {
+            end = end.min(pos);
+        }
+    }
+    value[..end].trim_end()
+}
+
 fn extract_pattern(text: &str, prefixes: &[&str]) -> Option<String> {
     for prefix in prefixes {
         if let Some(rest) = text.find(prefix).map(|i| &text[i + prefix.len()..]) {
-            let value = rest.split(['.', ',', '!', '?']).next().unwrap_or("").trim();
+            let sentence = rest.split(['.', ',', '!', '?']).next().unwrap_or("").trim();
+            let value = first_clause(sentence).trim();
             if !value.is_empty() && value.split_whitespace().count() <= 10 {
                 return Some(value.to_string());
             }
@@ -238,7 +289,8 @@ fn extract_favorite(text: &str) -> Option<String> {
         .replace("my favorite ", "")
         .replace("my favourite ", "");
 
-    let value = after_is.split(['.', ',', '!']).next().unwrap_or("").trim();
+    let sentence = after_is.split(['.', ',', '!']).next().unwrap_or("").trim();
+    let value = first_clause(sentence).trim();
 
     if !thing.is_empty() && !value.is_empty() {
         Some(format!("User's favorite {} is {}", thing.trim(), value))
@@ -441,6 +493,80 @@ mod tests {
         // "I'm a bit tired" should NOT extract "bit tired" as occupation
         let facts = extract_facts("I'm a bit tired");
         assert!(facts.iter().all(|f| f.category != "identity"));
+    }
+
+    #[test]
+    fn name_stops_at_conjunction() {
+        // The trailing "and I love coding" must not be swallowed into the name.
+        let facts = extract_facts("My name is Jared and I love coding");
+        let name = facts
+            .iter()
+            .find(|f| f.category == "identity")
+            .expect("name fact");
+        assert_eq!(name.content, "User's name is Jared");
+        assert!(!name.content.to_lowercase().contains("coding"));
+    }
+
+    #[test]
+    fn location_stops_at_conjunction() {
+        let facts = extract_facts("I live in Denver and I work downtown");
+        let loc = facts
+            .iter()
+            .find(|f| f.content.starts_with("User lives in"))
+            .expect("location fact");
+        assert_eq!(loc.content, "User lives in denver");
+    }
+
+    #[test]
+    fn workplace_stops_at_subordinate_clause() {
+        let facts = extract_facts("I work at Google with my friend Bob");
+        let job = facts
+            .iter()
+            .find(|f| f.content.starts_with("User works at"))
+            .expect("workplace fact");
+        assert_eq!(job.content, "User works at google");
+    }
+
+    #[test]
+    fn occupation_stops_at_contrast_clause() {
+        let facts = extract_facts("I'm a software engineer but I hate meetings");
+        let job = facts
+            .iter()
+            .find(|f| f.content.starts_with("User is a"))
+            .expect("occupation fact");
+        assert_eq!(job.content, "User is a software engineer");
+    }
+
+    #[test]
+    fn preference_stops_at_relative_clause() {
+        let facts = extract_facts("I love hiking when the weather is nice");
+        let pref = facts
+            .iter()
+            .find(|f| f.category == "preference")
+            .expect("preference fact");
+        assert_eq!(pref.content, "User likes hiking");
+    }
+
+    #[test]
+    fn favorite_stops_at_conjunction() {
+        let facts = extract_facts("My favorite food is pizza and pasta");
+        let fav = facts
+            .iter()
+            .find(|f| f.category == "preference")
+            .expect("favorite fact");
+        assert_eq!(fav.content, "User's favorite food is pizza");
+    }
+
+    #[test]
+    fn android_is_not_split_on_and() {
+        // The boundary markers are space-padded, so "and" inside a word
+        // (e.g. "android") must not truncate the value.
+        let facts = extract_facts("I work at Android Labs");
+        let job = facts
+            .iter()
+            .find(|f| f.content.starts_with("User works at"))
+            .expect("workplace fact");
+        assert_eq!(job.content, "User works at android labs");
     }
 
     #[test]

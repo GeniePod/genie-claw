@@ -249,4 +249,18 @@ mod tests {
         assert_eq!(messages[0].content, "hello");
         assert!(!decision.applied);
     }
+
+    #[test]
+    fn gemma_family_is_unchanged() {
+        let original = single_user_message("what time is it");
+        let (messages, decision) = apply_reasoning_mode(
+            ModelFamily::Gemma,
+            &original,
+            "what time is it",
+            InteractionKind::Chat,
+        );
+
+        assert_eq!(messages[0].content, "what time is it");
+        assert!(!decision.applied);
+    }
 }

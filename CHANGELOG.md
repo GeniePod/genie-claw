@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **`genie-ctl --help` alignment** (#445): the `health` command no longer
+  prints flush-left. A trailing `\` line-continuation after the voice-gated
+  `speaker` block was stripping the four-space indent off the following line
+  in both `voice`-on and `voice`-off builds. Rendering moved into a pure
+  `usage_text()` helper with a regression test that fails if any command line
+  loses its indent.
+
 ## 1.0.0-alpha.11 - 2026-06-20
 
 Alpha 11 is the **typed-tool contract + grounded BFCL** release. The single

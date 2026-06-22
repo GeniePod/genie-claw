@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::ha::HomeState;
+
 const ACTION_HISTORY_LIMIT: usize = 32;
 const MAX_PENDING_CONFIRMATIONS: usize = 64;
 
@@ -62,6 +64,13 @@ pub struct PendingConfirmation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndoRestore {
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedAction {
     pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,6 +79,8 @@ pub struct RecordedAction {
     pub action: String,
     pub value: Option<f64>,
     pub inverse_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_restore: Option<UndoRestore>,
     pub origin: RequestOrigin,
     pub summary: String,
     pub confidence: Option<f32>,
@@ -169,8 +180,18 @@ impl ActionLedger {
         origin: RequestOrigin,
         summary: &str,
         confidence: Option<f32>,
+        undo_restore: Option<UndoRestore>,
     ) -> RecordedAction {
-        self.record_internal(entity, action, value, origin, summary, confidence, None)
+        self.record_internal(
+            entity,
+            action,
+            value,
+            origin,
+            summary,
+            confidence,
+            None,
+            undo_restore,
+        )
     }
 
     pub fn record_undo(
@@ -182,6 +203,7 @@ impl ActionLedger {
         origin: RequestOrigin,
         summary: &str,
         confidence: Option<f32>,
+        undo_restore: Option<UndoRestore>,
     ) -> RecordedAction {
         self.record_internal(
             entity,
@@ -191,6 +213,7 @@ impl ActionLedger {
             summary,
             confidence,
             Some(original_id),
+            undo_restore,
         )
     }
 
@@ -203,6 +226,7 @@ impl ActionLedger {
         summary: &str,
         confidence: Option<f32>,
         undo_of: Option<u64>,
+        undo_restore: Option<UndoRestore>,
     ) -> RecordedAction {
         let mut state = self.inner.lock().expect("action ledger lock");
         state.next_id += 1;
@@ -213,6 +237,7 @@ impl ActionLedger {
             action: action.to_string(),
             value,
             inverse_action: inverse_action(action).map(str::to_string),
+            undo_restore,
             origin,
             summary: summary.to_string(),
             confidence,
@@ -242,11 +267,30 @@ impl ActionLedger {
             .iter()
             .rev()
             .find(|item| {
-                item.inverse_action.is_some()
-                    && item.undo_of.is_none()
+                item.undo_of.is_none()
                     && !state.undone_action_ids.contains(&item.id)
+                    && (item.undo_restore.is_some() || item.inverse_action.is_some())
             })
             .cloned()
+    }
+
+    /// Build `home_control` arguments that restore the ledger entry's pre-action state.
+    pub fn undo_home_control_args(action: &RecordedAction) -> Option<serde_json::Value> {
+        if let Some(restore) = &action.undo_restore {
+            let mut args = serde_json::json!({
+                "entity": action.entity,
+                "action": restore.action,
+            });
+            if let Some(value) = restore.value {
+                args["value"] = serde_json::json!(value);
+            }
+            return Some(args);
+        }
+        let inverse = action.inverse_action.as_deref()?;
+        Some(serde_json::json!({
+            "entity": action.entity,
+            "action": inverse,
+        }))
     }
 
     pub fn hydrate(&self, actions: Vec<RecordedAction>) {
@@ -273,6 +317,75 @@ fn inverse_action(action: &str) -> Option<&'static str> {
         "close" => Some("open"),
         "lock" => Some("unlock"),
         "unlock" => Some("lock"),
+        _ => None,
+    }
+}
+
+/// Capture the `home_control` call that restores `prior` before `action` ran.
+pub fn undo_restore_from_prior(action: &str, prior: &HomeState) -> Option<UndoRestore> {
+    let entity = prior.entities.first()?;
+    match action {
+        "set_brightness" => {
+            if entity.state == "off" {
+                return Some(UndoRestore {
+                    action: "turn_off".into(),
+                    value: None,
+                });
+            }
+            let brightness = entity.attributes.get("brightness")?.as_u64()?;
+            let percent = (brightness as f64) * 100.0 / 255.0;
+            Some(UndoRestore {
+                action: "set_brightness".into(),
+                value: Some(percent),
+            })
+        }
+        "set_temperature" => {
+            let temp = entity
+                .attributes
+                .get("temperature")
+                .and_then(|v| v.as_f64())
+                .or_else(|| {
+                    entity
+                        .attributes
+                        .get("target_temp")
+                        .and_then(|v| v.as_f64())
+                })?;
+            Some(UndoRestore {
+                action: "set_temperature".into(),
+                value: Some(temp),
+            })
+        }
+        "toggle" => undo_restore_for_power_state(&entity.state),
+        _ => None,
+    }
+}
+
+fn undo_restore_for_power_state(state: &str) -> Option<UndoRestore> {
+    match state {
+        "on" => Some(UndoRestore {
+            action: "turn_on".into(),
+            value: None,
+        }),
+        "off" => Some(UndoRestore {
+            action: "turn_off".into(),
+            value: None,
+        }),
+        "open" => Some(UndoRestore {
+            action: "open".into(),
+            value: None,
+        }),
+        "closed" => Some(UndoRestore {
+            action: "close".into(),
+            value: None,
+        }),
+        "locked" => Some(UndoRestore {
+            action: "lock".into(),
+            value: None,
+        }),
+        "unlocked" => Some(UndoRestore {
+            action: "unlock".into(),
+            value: None,
+        }),
         _ => None,
     }
 }
@@ -447,6 +560,7 @@ fn audit_event_to_recorded_action(event: AuditEvent) -> Option<RecordedAction> {
         action: event.action.clone(),
         value: event.value,
         inverse_action: inverse_action(&event.action).map(str::to_string),
+        undo_restore: None,
         origin: event.origin,
         summary: event.reason,
         confidence: event.confidence,
@@ -665,6 +779,7 @@ mod tests {
             RequestOrigin::Voice,
             "Kitchen light is on",
             Some(0.92),
+            None,
         );
         ledger.record(
             "movie night",
@@ -673,6 +788,7 @@ mod tests {
             RequestOrigin::Dashboard,
             "Scene activated",
             Some(0.99),
+            None,
         );
 
         let history = ledger.list();
@@ -691,6 +807,7 @@ mod tests {
             RequestOrigin::Voice,
             "Kitchen light is off",
             Some(0.92),
+            None,
         );
         assert_eq!(undo_action.undo_of, Some(original.id));
         assert!(ledger.last_undoable().is_none());
@@ -706,6 +823,7 @@ mod tests {
                 None,
                 RequestOrigin::Api,
                 "ok",
+                None,
                 None,
             );
         }
@@ -727,6 +845,7 @@ mod tests {
                 action: "turn_on".into(),
                 value: None,
                 inverse_action: Some("turn_off".into()),
+                undo_restore: None,
                 origin: RequestOrigin::Voice,
                 summary: "home action executed".into(),
                 confidence: Some(0.95),
@@ -739,6 +858,7 @@ mod tests {
                 action: "turn_off".into(),
                 value: None,
                 inverse_action: Some("turn_on".into()),
+                undo_restore: None,
                 origin: RequestOrigin::Voice,
                 summary: "home action executed".into(),
                 confidence: Some(0.95),
@@ -754,6 +874,7 @@ mod tests {
             None,
             RequestOrigin::Dashboard,
             "ok",
+            None,
             None,
         );
         assert_eq!(next.id, 12);
@@ -935,5 +1056,92 @@ mod tests {
         perms.set_mode(0o600);
         let _ = std::fs::set_permissions(&path, perms);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn undo_restore_from_prior_captures_brightness_percent() {
+        use crate::ha::Entity;
+
+        let prior = HomeState {
+            target_name: "kitchen light".into(),
+            domain: Some("light".into()),
+            area: None,
+            entities: vec![Entity {
+                entity_id: "light.kitchen".into(),
+                state: "on".into(),
+                attributes: serde_json::json!({ "brightness": 196 }),
+            }],
+            available: true,
+            spoken_summary: "kitchen light is on".into(),
+        };
+
+        let restore = undo_restore_from_prior("set_brightness", &prior).unwrap();
+        assert_eq!(restore.action, "set_brightness");
+        assert!((restore.value.unwrap() - 76.86).abs() < 0.1);
+    }
+
+    #[test]
+    fn undo_restore_from_prior_toggle_restores_prior_power_state() {
+        use crate::ha::Entity;
+
+        let prior_on = HomeState {
+            target_name: "kitchen light".into(),
+            domain: Some("light".into()),
+            area: None,
+            entities: vec![Entity {
+                entity_id: "light.kitchen".into(),
+                state: "on".into(),
+                attributes: serde_json::json!({}),
+            }],
+            available: true,
+            spoken_summary: "kitchen light is on".into(),
+        };
+
+        let restore = undo_restore_from_prior("toggle", &prior_on).unwrap();
+        assert_eq!(restore.action, "turn_on");
+        assert!(restore.value.is_none());
+
+        let prior_off = HomeState {
+            entities: vec![Entity {
+                entity_id: "light.kitchen".into(),
+                state: "off".into(),
+                attributes: serde_json::json!({}),
+            }],
+            ..prior_on.clone()
+        };
+        let restore = undo_restore_from_prior("toggle", &prior_off).unwrap();
+        assert_eq!(restore.action, "turn_off");
+    }
+
+    #[test]
+    fn action_ledger_undo_targets_latest_brightness_change() {
+        let ledger = ActionLedger::default();
+        ledger.record(
+            "kitchen light",
+            "turn_on",
+            None,
+            RequestOrigin::Voice,
+            "on",
+            None,
+            None,
+        );
+        ledger.record(
+            "kitchen light",
+            "set_brightness",
+            Some(30.0),
+            RequestOrigin::Voice,
+            "dimmed",
+            None,
+            Some(UndoRestore {
+                action: "set_brightness".into(),
+                value: Some(100.0),
+            }),
+        );
+
+        let undo = ledger.last_undoable().unwrap();
+        assert_eq!(undo.action, "set_brightness");
+        let args = ActionLedger::undo_home_control_args(&undo).unwrap();
+        assert_eq!(args["action"], "set_brightness");
+        assert_eq!(args["value"], 100.0);
     }
 }
