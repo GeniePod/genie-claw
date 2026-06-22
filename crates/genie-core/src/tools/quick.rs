@@ -2393,16 +2393,40 @@ fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
         let Some(amount) = parse_number(token) else {
             continue;
         };
-        let unit = tokens.get(idx + 1)?;
+        // Combine a spoken compound cardinal like "forty five" (45) into a
+        // single amount. Worded numbers arrive as separate whitespace tokens,
+        // so the tens word and the ones word must be stitched here.
+        let (amount, unit_index) = match tokens.get(idx + 1).and_then(|next| ones_digit(next)) {
+            Some(ones) if is_tens_word(token) => (amount + ones, idx + 2),
+            _ => (amount, idx + 1),
+        };
+        let unit = tokens.get(unit_index)?;
         let multiplier = match *unit {
             "second" | "seconds" | "sec" | "secs" => 1,
             "minute" | "minutes" | "min" | "mins" => 60,
             "hour" | "hours" | "hr" | "hrs" => 3600,
             _ => continue,
         };
-        return Some((amount * multiplier, idx + 1));
+        return Some((amount * multiplier, unit_index));
     }
     None
+}
+
+/// True when `token` is a spoken tens word that can lead a compound cardinal
+/// such as "forty five".
+fn is_tens_word(token: &str) -> bool {
+    matches!(
+        token,
+        "twenty" | "thirty" | "forty" | "fifty" | "sixty" | "seventy" | "eighty" | "ninety"
+    )
+}
+
+/// The trailing ones digit of a compound cardinal ("forty *five*"), 1-9.
+fn ones_digit(token: &str) -> Option<u64> {
+    match parse_number(token) {
+        Some(value @ 1..=9) => Some(value),
+        _ => None,
+    }
 }
 
 fn parse_number(token: &str) -> Option<u64> {
@@ -2427,7 +2451,11 @@ fn parse_number(token: &str) -> Option<u64> {
         "twenty" => Some(20),
         "thirty" => Some(30),
         "forty" => Some(40),
-        "forty five" => Some(45),
+        "fifty" => Some(50),
+        "sixty" => Some(60),
+        "seventy" => Some(70),
+        "eighty" => Some(80),
+        "ninety" => Some(90),
         _ => None,
     }
 }
@@ -4136,6 +4164,28 @@ mod tests {
         let call = route("set a timer for 15 minutes").unwrap();
         assert_eq!(call.name, "set_timer");
         assert_eq!(call.arguments["seconds"], 900);
+    }
+
+    #[test]
+    fn routes_compound_worded_timer() {
+        // Regression: "forty five" used to parse as the trailing "five" (5 min)
+        // because the compound cardinal was never stitched from its two tokens.
+        let call = route("set a timer for forty five minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 2700);
+
+        // Other tens+ones compounds work the same way.
+        let call = route("set a timer for twenty five seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 25);
+
+        // A bare tens word (no trailing ones) is still parsed on its own.
+        let call = route("set a timer for fifty minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 3000);
+
+        // The compound amount is carried into the reminder label boundary too.
+        let call = route("remind me in forty five minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 2700);
+        assert_eq!(call.arguments["label"], "check the oven");
     }
 
     #[test]
