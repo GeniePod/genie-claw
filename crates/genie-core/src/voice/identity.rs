@@ -412,12 +412,16 @@ fn extract_fingerprint(audio: &WavAudio) -> anyhow::Result<Vec<f32>> {
 
     let frame_len = ((audio.sample_rate as f32 * 0.032).round() as usize).clamp(256, 2048);
     let hop = (frame_len / 2).max(128);
+    // Every frame has the same length, so the Hann window is identical across
+    // them — build it once and share it with every frame's feature extraction.
+    let window = hann_window(frame_len);
     let mut features = Vec::new();
     let mut cursor = 0usize;
     while cursor + frame_len <= voiced.len() && features.len() < 160 {
         features.push(frame_features(
             &voiced[cursor..cursor + frame_len],
             audio.sample_rate,
+            &window,
         ));
         cursor += hop;
     }
@@ -467,10 +471,10 @@ fn voiced_samples(samples: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-fn frame_features(frame: &[f32], sample_rate: u32) -> Vec<f32> {
+fn frame_features(frame: &[f32], sample_rate: u32, window: &[f32]) -> Vec<f32> {
     let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
     let zcr = zero_crossing_rate(frame);
-    let bands = band_powers(frame, sample_rate);
+    let bands = band_powers(frame, sample_rate, window);
     let total_power = bands.iter().sum::<f32>().max(1e-9);
 
     let mut out = Vec::with_capacity(3 + bands.len());
@@ -507,28 +511,54 @@ fn spectral_centroid(bands: &[f32]) -> f32 {
         / total
 }
 
-fn band_powers(frame: &[f32], sample_rate: u32) -> Vec<f32> {
+/// Hann window of length `len`.
+///
+/// The window depends only on the frame length, which is constant across a
+/// fingerprint's frames, so `extract_fingerprint` builds it once and reuses it
+/// for every frame and band rather than recomputing a cos() per sample inside
+/// each `goertzel_power` call.
+fn hann_window(len: usize) -> Vec<f32> {
+    let denom = (len - 1).max(1) as f32;
+    (0..len)
+        .map(|idx| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * idx as f32 / denom).cos())
+        .collect()
+}
+
+fn band_powers(frame: &[f32], sample_rate: u32, window: &[f32]) -> Vec<f32> {
+    // Apply the precomputed Hann window (see `hann_window`) once and reuse the
+    // windowed frame across all bands. Previously each `goertzel_power` call
+    // recomputed the window — a cos() per sample — for every band in
+    // BAND_RANGES_HZ. The per-sample product `sample * window[idx]` is identical
+    // to the previous inline form, so band powers are bit-for-bit unchanged.
+    let windowed: Vec<f32> = frame
+        .iter()
+        .zip(window.iter())
+        .map(|(&sample, &w)| sample * w)
+        .collect();
+
     BAND_RANGES_HZ
         .iter()
         .map(|(low, high)| {
             let center = (low + high) * 0.5;
-            goertzel_power(frame, sample_rate, center)
+            goertzel_power(&windowed, sample_rate, center)
         })
         .collect()
 }
 
-fn goertzel_power(frame: &[f32], sample_rate: u32, frequency_hz: f32) -> f32 {
+/// Goertzel power of a single frequency over an already-windowed frame.
+///
+/// `windowed` must hold the Hann-windowed samples (see `band_powers`); the
+/// window is applied by the caller from a per-fingerprint precomputed table, so
+/// it is no longer recomputed once per band inside this hot loop.
+fn goertzel_power(windowed: &[f32], sample_rate: u32, frequency_hz: f32) -> f32 {
     let omega = 2.0 * std::f32::consts::PI * frequency_hz / sample_rate as f32;
     let coeff = 2.0 * omega.cos();
     let mut q0;
     let mut q1 = 0.0f32;
     let mut q2 = 0.0f32;
 
-    for (idx, sample) in frame.iter().enumerate() {
-        let window = 0.5
-            - 0.5
-                * (2.0 * std::f32::consts::PI * idx as f32 / (frame.len() - 1).max(1) as f32).cos();
-        q0 = coeff * q1 - q2 + sample * window;
+    for &sample in windowed {
+        q0 = coeff * q1 - q2 + sample;
         q2 = q1;
         q1 = q0;
     }

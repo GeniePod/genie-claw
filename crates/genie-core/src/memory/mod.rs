@@ -832,16 +832,13 @@ impl Memory {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
 
-        // Update recall tracking for returned results.
-        for (entry, score) in &scored {
-            if let Err(error) = self.update_recall_tracking(entry.id, now, *score, &query_hash) {
-                tracing::error!(
-                    memory_id = entry.id,
-                    error = %error,
-                    "memory recall tracking update failed"
-                );
-            }
-        }
+        // Update recall tracking for returned results in one transaction (one
+        // fsync for the whole result set instead of one per hit).
+        let recalls: Vec<(i64, f64)> = scored
+            .iter()
+            .map(|(entry, score)| (entry.id, *score))
+            .collect();
+        self.record_recalls(&recalls, now, &query_hash);
 
         Ok(scored.into_iter().map(|(e, _)| e).collect())
     }
@@ -893,16 +890,11 @@ impl Memory {
         });
         entries.truncate(limit);
 
-        for entry in &entries {
-            let score = lexical_overlap_score(query, &entry.content);
-            if let Err(error) = self.update_recall_tracking(entry.id, now, score, query_hash) {
-                tracing::error!(
-                    memory_id = entry.id,
-                    error = %error,
-                    "memory recall tracking update failed"
-                );
-            }
-        }
+        let recalls: Vec<(i64, f64)> = entries
+            .iter()
+            .map(|entry| (entry.id, lexical_overlap_score(query, &entry.content)))
+            .collect();
+        self.record_recalls(&recalls, now, query_hash);
 
         Ok(entries)
     }
@@ -934,6 +926,40 @@ impl Memory {
             rusqlite::params![now, score, hashes_json, id],
         )?;
         Ok(())
+    }
+
+    /// Record recall tracking for a whole result set in a single transaction.
+    ///
+    /// Each recall returns up to `limit` hits, and the tracking write for each
+    /// (`accessed_ms`, `recall_count`, `max_score`, `query_hashes`) was issued as
+    /// its own auto-committed `UPDATE` via [`Self::update_recall_tracking`] — so a
+    /// single `search`/`semantic_search` performed `limit` separate write
+    /// transactions, i.e. `limit` fsyncs. On the Jetson's eMMC/SD storage those
+    /// fsyncs dominate recall latency. Wrapping them in one transaction collapses
+    /// `limit` fsyncs into one; the per-row updates are byte-for-byte unchanged.
+    ///
+    /// Tracking is a best-effort side effect of recall, so a failure is logged
+    /// (and the batch rolls back atomically) without failing the recall itself —
+    /// matching the previous per-row error handling.
+    fn record_recalls(&self, recalls: &[(i64, f64)], now: u64, query_hash: &str) {
+        if recalls.is_empty() {
+            return;
+        }
+        let result = (|| -> Result<()> {
+            let tx = self.conn.unchecked_transaction()?;
+            for &(id, score) in recalls {
+                self.update_recall_tracking(id, now, score, query_hash)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::error!(
+                error = %error,
+                count = recalls.len(),
+                "memory recall tracking batch update failed"
+            );
+        }
     }
 
     fn query_hashes(&self, id: i64) -> Result<Vec<String>> {
@@ -1878,17 +1904,8 @@ impl Memory {
         });
         hits.truncate(limit.max(1));
 
-        for hit in &hits {
-            if let Err(error) =
-                self.update_recall_tracking(hit.entry.id, now, hit.score, &query_hash)
-            {
-                tracing::error!(
-                    memory_id = hit.entry.id,
-                    error = %error,
-                    "semantic memory recall tracking update failed"
-                );
-            }
-        }
+        let recalls: Vec<(i64, f64)> = hits.iter().map(|hit| (hit.entry.id, hit.score)).collect();
+        self.record_recalls(&recalls, now, &query_hash);
 
         Ok(hits)
     }
