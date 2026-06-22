@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **`genie-ctl --help` alignment** (#445): the `health` command no longer
+  prints flush-left. A trailing `\` line-continuation after the voice-gated
+  `speaker` block was stripping the four-space indent off the following line
+  in both `voice`-on and `voice`-off builds. Rendering moved into a pure
+  `usage_text()` helper with a regression test that fails if any command line
+  loses its indent.
+- **Quick-router compound spoken durations** (#449): "set a timer for forty
+  five minutes" now sets a 45-minute timer instead of 5. The deterministic
+  router only ever saw single tokens, so its `"forty five"` number arm was dead
+  code and the trailing "five" bound to the unit. `parse_duration` now stitches
+  a tens word (`twenty`..`ninety`) to a following ones digit, and the missing
+  `fifty`..`ninety` tens words parse on their own.
+
 ## 1.0.0-alpha.11 - 2026-06-20
 
 Alpha 11 is the **typed-tool contract + grounded BFCL** release. The single

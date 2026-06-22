@@ -189,26 +189,99 @@ impl OtaManager {
     }
 }
 
-/// Compare semver strings. Returns true if `latest` is newer than `current`.
-fn version_is_newer(latest: &str, current: &str) -> bool {
-    let parse = |s: &str| -> (u32, u32, u32) {
-        let clean = s
-            .strip_prefix('v')
-            .unwrap_or(s)
-            .split('-')
-            .next()
-            .unwrap_or(s);
-        let parts: Vec<u32> = clean.split('.').filter_map(|p| p.parse().ok()).collect();
-        (
-            parts.first().copied().unwrap_or(0),
-            parts.get(1).copied().unwrap_or(0),
-            parts.get(2).copied().unwrap_or(0),
-        )
+/// A parsed semantic version: the numeric `major.minor.patch` core plus any
+/// pre-release identifiers.
+#[derive(Debug, PartialEq, Eq)]
+struct SemVer {
+    core: (u32, u32, u32),
+    /// Dot-separated pre-release identifiers (the part after `-`). Empty for a
+    /// normal release. A release outranks any pre-release of the same core.
+    pre: Vec<String>,
+}
+
+/// Parse a version string into a [`SemVer`].
+///
+/// Tolerant of a leading `v`. Build metadata (`+...`) is ignored for
+/// precedence, per SemVer §10. Missing core components default to 0.
+fn parse_semver(s: &str) -> SemVer {
+    let s = s.trim();
+    let s = s.strip_prefix('v').unwrap_or(s);
+    // Build metadata never affects precedence — drop anything from '+' on.
+    let s = s.split('+').next().unwrap_or(s);
+    // Core is everything before the first '-'; the rest is the pre-release.
+    let (core_str, pre_str) = match s.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (s, None),
     };
 
-    let l = parse(latest);
-    let c = parse(current);
-    l > c
+    // Positional parse: an unparseable component becomes 0 without shifting the
+    // ones after it (so "1.x.2" is (1, 0, 2), not (1, 2, 0)).
+    let mut nums = core_str
+        .split('.')
+        .map(|p| p.trim().parse::<u32>().unwrap_or(0));
+    let core = (
+        nums.next().unwrap_or(0),
+        nums.next().unwrap_or(0),
+        nums.next().unwrap_or(0),
+    );
+
+    let pre = pre_str
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split('.').map(|id| id.to_string()).collect())
+        .unwrap_or_default();
+
+    SemVer { core, pre }
+}
+
+/// Compare a single pair of pre-release identifiers per SemVer §11:
+/// numeric identifiers compare numerically and always rank below alphanumeric
+/// ones; alphanumeric identifiers compare in ASCII order.
+fn compare_pre_identifier(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(an), Ok(bn)) => an.cmp(&bn),
+        (Ok(_), Err(_)) => Ordering::Less,
+        (Err(_), Ok(_)) => Ordering::Greater,
+        (Err(_), Err(_)) => a.cmp(b),
+    }
+}
+
+/// Full SemVer §11 precedence ordering between two parsed versions.
+fn compare_semver(a: &SemVer, b: &SemVer) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    // 1. Numeric core dominates.
+    match a.core.cmp(&b.core) {
+        Ordering::Equal => {}
+        non_eq => return non_eq,
+    }
+
+    // 2. A release (no pre-release) outranks any pre-release of the same core.
+    match (a.pre.is_empty(), b.pre.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+
+    // 3. Compare pre-release identifiers left to right.
+    for (ai, bi) in a.pre.iter().zip(b.pre.iter()) {
+        match compare_pre_identifier(ai, bi) {
+            Ordering::Equal => {}
+            non_eq => return non_eq,
+        }
+    }
+
+    // 4. When all shared identifiers match, the longer set has higher precedence.
+    a.pre.len().cmp(&b.pre.len())
+}
+
+/// Compare semver strings. Returns true if `latest` is strictly newer than
+/// `current`, with full SemVer §11 pre-release precedence — so
+/// `1.0.0-alpha.12` is newer than `1.0.0-alpha.11`, and `1.0.0` is newer than
+/// any `1.0.0-alpha.N`.
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    compare_semver(&parse_semver(latest), &parse_semver(current)) == std::cmp::Ordering::Greater
 }
 
 /// GET request to GitHub API (api.github.com).
@@ -286,9 +359,66 @@ mod tests {
 
     #[test]
     fn version_comparison_with_prerelease() {
-        // Pre-release suffix is stripped for comparison.
+        // A higher numeric core wins regardless of pre-release tags.
         assert!(version_is_newer("1.1.0-alpha.1", "1.0.0-alpha.1"));
-        assert!(!version_is_newer("1.0.0-alpha.2", "1.0.0-alpha.1"));
+        // Pre-releases of the SAME core order by their identifiers (SemVer §11),
+        // so a later alpha IS newer than an earlier one. This is the case the
+        // OTA checker depends on during the whole `1.0.0-alpha.N` release line —
+        // the previous "strip the suffix" logic made every alpha compare equal,
+        // so the device never saw a new alpha.
+        assert!(version_is_newer("1.0.0-alpha.2", "1.0.0-alpha.1"));
+        assert!(version_is_newer("1.0.0-alpha.11", "1.0.0-alpha.9"));
+        assert!(!version_is_newer("1.0.0-alpha.1", "1.0.0-alpha.2"));
+    }
+
+    #[test]
+    fn prerelease_numeric_identifiers_compare_numerically() {
+        // The exact regression: alpha.11 must beat alpha.9 (string compare would
+        // say "11" < "9"; numeric compare says 11 > 9).
+        assert!(version_is_newer("1.0.0-alpha.12", "1.0.0-alpha.11"));
+        assert!(version_is_newer("1.0.0-alpha.100", "1.0.0-alpha.99"));
+        assert!(!version_is_newer("1.0.0-alpha.9", "1.0.0-alpha.11"));
+    }
+
+    #[test]
+    fn release_outranks_its_prerelease() {
+        // 1.0.0 final is newer than any 1.0.0 pre-release...
+        assert!(version_is_newer("1.0.0", "1.0.0-alpha.11"));
+        assert!(version_is_newer("1.0.0", "1.0.0-rc.1"));
+        // ...and a pre-release is NOT newer than the matching final release.
+        assert!(!version_is_newer("1.0.0-alpha.1", "1.0.0"));
+        assert!(!version_is_newer("1.0.0-rc.1", "1.0.0"));
+    }
+
+    #[test]
+    fn prerelease_stage_ordering() {
+        // alpha < beta < rc (ASCII lexical for alphanumeric identifiers).
+        assert!(version_is_newer("1.0.0-beta.1", "1.0.0-alpha.11"));
+        assert!(version_is_newer("1.0.0-rc.1", "1.0.0-beta.9"));
+        assert!(!version_is_newer("1.0.0-alpha.99", "1.0.0-beta.1"));
+    }
+
+    #[test]
+    fn numeric_identifier_ranks_below_alphanumeric() {
+        // SemVer §11: a numeric identifier has lower precedence than an
+        // alphanumeric one in the same position.
+        assert!(version_is_newer("1.0.0-alpha", "1.0.0-1"));
+        assert!(!version_is_newer("1.0.0-1", "1.0.0-alpha"));
+    }
+
+    #[test]
+    fn longer_prerelease_set_wins_when_prefixes_match() {
+        // SemVer §11: a larger set of pre-release fields outranks a smaller one
+        // when all preceding identifiers are equal.
+        assert!(version_is_newer("1.0.0-alpha.1.1", "1.0.0-alpha.1"));
+        assert!(!version_is_newer("1.0.0-alpha.1", "1.0.0-alpha.1.1"));
+    }
+
+    #[test]
+    fn build_metadata_is_ignored() {
+        // Build metadata (`+...`) does not affect precedence (SemVer §10).
+        assert!(!version_is_newer("1.0.0+build.5", "1.0.0+build.1"));
+        assert!(version_is_newer("1.0.1+build.1", "1.0.0+build.9"));
     }
 
     #[test]
