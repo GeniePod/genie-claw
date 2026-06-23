@@ -2521,6 +2521,90 @@ mod tests {
         }
     }
 
+    /// Group target with heterogeneous member states for #480 regression tests.
+    struct MixedGroupHomeProvider {
+        executed: Arc<std::sync::Mutex<Vec<HomeActionKind>>>,
+    }
+
+    impl MixedGroupHomeProvider {
+        fn new(executed: Arc<std::sync::Mutex<Vec<HomeActionKind>>>) -> Self {
+            Self { executed }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HomeAutomationProvider for MixedGroupHomeProvider {
+        async fn health(&self) -> IntegrationHealth {
+            IntegrationHealth {
+                connected: true,
+                cached_graph: true,
+                message: "ok".into(),
+            }
+        }
+
+        async fn sync_structure(&self) -> Result<HomeGraph> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn resolve_target(
+            &self,
+            query: &str,
+            _action_hint: Option<HomeActionKind>,
+        ) -> Result<HomeTarget> {
+            Ok(HomeTarget {
+                kind: HomeTargetKind::Group,
+                query: query.into(),
+                display_name: query.into(),
+                entity_ids: vec!["light.a".into(), "light.b".into()],
+                domain: Some("light".into()),
+                area: Some("Living Room".into()),
+                confidence: 0.96,
+                voice_safe: true,
+            })
+        }
+
+        async fn get_state(&self, target: &HomeTarget) -> Result<HomeState> {
+            Ok(HomeState {
+                target_name: target.display_name.clone(),
+                domain: target.domain.clone(),
+                area: target.area.clone(),
+                entities: vec![
+                    Entity {
+                        entity_id: "light.a".into(),
+                        state: "off".into(),
+                        attributes: serde_json::json!({}),
+                    },
+                    Entity {
+                        entity_id: "light.b".into(),
+                        state: "on".into(),
+                        attributes: serde_json::json!({ "brightness": 204 }),
+                    },
+                ],
+                available: true,
+                spoken_summary: format!("{} is mixed", target.display_name),
+            })
+        }
+
+        async fn execute(&self, action: HomeAction) -> Result<ActionResult> {
+            self.executed.lock().unwrap().push(action.kind);
+            Ok(ActionResult {
+                success: true,
+                spoken_summary: format!("Executed {:?}", action.kind),
+                affected_targets: vec![action.target.display_name],
+                state_snapshot: None,
+                confidence: Some(action.target.confidence),
+            })
+        }
+
+        async fn list_scenes(&self, _room: Option<&str>) -> Result<Vec<SceneRef>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_devices(&self, _room: Option<&str>) -> Result<Vec<DeviceRef>> {
+            Ok(Vec::new())
+        }
+    }
+
     #[test]
     fn tool_defs_hide_home_tools_when_unavailable() {
         let dispatcher = ToolDispatcher::new(None);
@@ -3512,6 +3596,57 @@ mod tests {
         );
         assert_eq!(provider_restart.brightness(), Some(255));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn home_undo_skips_heterogeneous_group_dim_without_wrong_turn_off() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(MixedGroupHomeProvider::new(
+            executed.clone(),
+        ))));
+        let ctx = || ToolExecutionContext {
+            request_origin: RequestOrigin::Dashboard,
+            ..ToolExecutionContext::default()
+        };
+
+        let dim = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: serde_json::json!({
+                        "entity": "living room lights",
+                        "action": "set_brightness",
+                        "value": 30
+                    }),
+                },
+                ctx(),
+            )
+            .await;
+        assert!(dim.success);
+
+        let history = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "action_history".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ctx(),
+            )
+            .await;
+        assert!(history.output.contains("not undoable"));
+
+        let undo = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_undo".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ctx(),
+            )
+            .await;
+        assert!(!undo.success);
+        assert!(undo.output.contains("No recent reversible"));
+        assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::SetBrightness]);
     }
 
     #[test]

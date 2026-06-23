@@ -63,7 +63,7 @@ pub struct PendingConfirmation {
     pub expires_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UndoRestore {
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -337,9 +337,8 @@ fn inverse_action(action: &str) -> Option<&'static str> {
     }
 }
 
-/// Capture the `home_control` call that restores `prior` before `action` ran.
-pub fn undo_restore_from_prior(action: &str, prior: &HomeState) -> Option<UndoRestore> {
-    let entity = prior.entities.first()?;
+/// Capture the `home_control` call that restores one entity's pre-action state.
+fn undo_restore_from_entity(action: &str, entity: &crate::ha::Entity) -> Option<UndoRestore> {
     match action {
         "set_brightness" => {
             if entity.state == "off" {
@@ -380,6 +379,27 @@ pub fn undo_restore_from_prior(action: &str, prior: &HomeState) -> Option<UndoRe
         "toggle" => undo_restore_for_power_state(&entity.state),
         _ => None,
     }
+}
+
+/// Capture the `home_control` call that restores `prior` before `action` ran.
+///
+/// For group targets with multiple member entities, every member must agree on
+/// the same restore snapshot; heterogeneous member states return `None` so
+/// `home_undo` does not apply a single group-wide action derived from an
+/// arbitrary first entity (#480).
+pub fn undo_restore_from_prior(action: &str, prior: &HomeState) -> Option<UndoRestore> {
+    let first = prior.entities.first()?;
+    let baseline = undo_restore_from_entity(action, first)?;
+    if prior.entities.len() == 1 {
+        return Some(baseline);
+    }
+
+    prior
+        .entities
+        .iter()
+        .skip(1)
+        .all(|entity| undo_restore_from_entity(action, entity).as_ref() == Some(&baseline))
+        .then_some(baseline)
 }
 
 fn undo_restore_for_power_state(state: &str) -> Option<UndoRestore> {
@@ -1240,6 +1260,63 @@ mod tests {
         let restore = undo_restore_from_prior("set_temperature", &prior_on).unwrap();
         assert_eq!(restore.action, "set_temperature");
         assert_eq!(restore.value, Some(68.0));
+    }
+
+    #[test]
+    fn undo_restore_from_prior_mixed_group_brightness_returns_none() {
+        use crate::ha::Entity;
+
+        let prior = HomeState {
+            target_name: "living room lights".into(),
+            domain: Some("light".into()),
+            area: Some("Living Room".into()),
+            entities: vec![
+                Entity {
+                    entity_id: "light.a".into(),
+                    state: "off".into(),
+                    attributes: serde_json::json!({}),
+                },
+                Entity {
+                    entity_id: "light.b".into(),
+                    state: "on".into(),
+                    attributes: serde_json::json!({ "brightness": 204 }),
+                },
+            ],
+            available: true,
+            spoken_summary: "living room lights".into(),
+        };
+
+        assert!(undo_restore_from_prior("set_brightness", &prior).is_none());
+        assert!(undo_restore_from_prior("toggle", &prior).is_none());
+    }
+
+    #[test]
+    fn undo_restore_from_prior_unanimous_group_brightness_succeeds() {
+        use crate::ha::Entity;
+
+        let prior = HomeState {
+            target_name: "living room lights".into(),
+            domain: Some("light".into()),
+            area: Some("Living Room".into()),
+            entities: vec![
+                Entity {
+                    entity_id: "light.a".into(),
+                    state: "on".into(),
+                    attributes: serde_json::json!({ "brightness": 204 }),
+                },
+                Entity {
+                    entity_id: "light.b".into(),
+                    state: "on".into(),
+                    attributes: serde_json::json!({ "brightness": 204 }),
+                },
+            ],
+            available: true,
+            spoken_summary: "living room lights".into(),
+        };
+
+        let restore = undo_restore_from_prior("set_brightness", &prior).unwrap();
+        assert_eq!(restore.action, "set_brightness");
+        assert!((restore.value.unwrap() - 80.0).abs() < 0.1);
     }
 
     #[test]
