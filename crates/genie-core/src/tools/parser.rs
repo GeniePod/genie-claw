@@ -43,14 +43,13 @@ pub const UNPARSED_TOOL_CALL_FALLBACK: &str =
 /// therefore handled by `try_tool_call_with_context`), returns false.
 pub fn is_unparsed_tool_call(response: &str) -> bool {
     let trimmed = response.trim();
-    let looks_toolish = (trimmed.starts_with('{')
-        || trimmed.starts_with('[')
-        || trimmed.starts_with("```"))
-        && (trimmed.contains("\"tool\"")
-            || trimmed.contains("\"arguments\"")
-            || trimmed.contains("\"name\"")
-            || trimmed.contains("\"tool_calls\"")
-            || trimmed.contains("\"function_call\""));
+    let looks_toolish =
+        (trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.starts_with("```"))
+            && (trimmed.contains("\"tool\"")
+                || trimmed.contains("\"arguments\"")
+                || trimmed.contains("\"name\"")
+                || trimmed.contains("\"tool_calls\"")
+                || trimmed.contains("\"function_call\""));
 
     let Some(json_str) = extract_json(response) else {
         return looks_toolish;
@@ -713,7 +712,8 @@ mod tests {
 
     #[test]
     fn malformed_openai_tool_calls_wrapper_is_unparsed() {
-        let broken = r#"{"tool_calls":[{"type":"function","function":{"name":"","arguments":"{}"}}]}"#;
+        let broken =
+            r#"{"tool_calls":[{"type":"function","function":{"name":"","arguments":"{}"}}]}"#;
         assert!(is_unparsed_tool_call(broken));
     }
 
