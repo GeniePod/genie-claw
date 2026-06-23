@@ -16,6 +16,8 @@ use std::time::Duration;
 
 const MAX_QUERY_HASHES: usize = 16;
 
+const DERIVATION_VERSION: i64 = 1;
+
 /// Persistent conversational memory with dreaming-inspired consolidation.
 ///
 /// Architecture (inspired by OpenClaw's memory-core, clean-room Rust):
@@ -554,12 +556,17 @@ impl Memory {
                 memory_type      TEXT NOT NULL,
                 embedding_model  TEXT NOT NULL,
                 dimensions       INTEGER NOT NULL,
-                embedding        TEXT NOT NULL,
+                embedding        BLOB NOT NULL,
                 updated_ms       INTEGER NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_embedded_memories_type
                 ON embedded_memories(memory_type, updated_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS memory_meta (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content,
@@ -671,37 +678,38 @@ impl Memory {
 
         backfill_policy_columns(&conn)?;
 
-        // Every derived table (profiles, aliases, rules, calendar, shopping,
-        // inventory, embeddings, …) is re-derived from the canonical `memories`
-        // rows on every open. Each rebuild_* issues many per-row writes; left as
-        // individual auto-commit statements that is one WAL transaction per row
-        // across the whole set. Run the rebuild pass inside a single transaction
-        // so startup re-derivation commits once instead of thousands of times —
-        // the writes are identical, just batched (the per-recall version of this
-        // is `record_recalls`, PR #431). On a `?` failure `rebuild_tx` is dropped
-        // and the partial rebuild rolls back atomically.
-        let rebuild_tx = conn.unchecked_transaction()?;
-        rebuild_household_profiles(&conn)?;
-        rebuild_device_aliases(&conn)?;
-        rebuild_household_profile_attributes(&conn)?;
-        rebuild_household_rules(&conn)?;
-        rebuild_household_notes(&conn)?;
-        rebuild_app_only_secret_references(&conn)?;
-        rebuild_media_profile_items(&conn)?;
-        rebuild_family_calendar_events(&conn)?;
-        rebuild_shopping_list_items(&conn)?;
-        rebuild_household_inventory_items(&conn)?;
-        rebuild_access_permissions(&conn)?;
-        rebuild_household_task_logs(&conn)?;
-        rebuild_household_schedule_items(&conn)?;
-        rebuild_household_event_logs(&conn)?;
-        rebuild_embedded_memories(&conn)?;
-        rebuild_tx.commit()?;
+        let stored_derivation: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM memory_meta WHERE key = 'derivation_version'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if stored_derivation != Some(DERIVATION_VERSION) {
+            let rebuild_tx = conn.unchecked_transaction()?;
+            rebuild_household_profiles(&conn)?;
+            rebuild_device_aliases(&conn)?;
+            rebuild_household_profile_attributes(&conn)?;
+            rebuild_household_rules(&conn)?;
+            rebuild_household_notes(&conn)?;
+            rebuild_app_only_secret_references(&conn)?;
+            rebuild_media_profile_items(&conn)?;
+            rebuild_family_calendar_events(&conn)?;
+            rebuild_shopping_list_items(&conn)?;
+            rebuild_household_inventory_items(&conn)?;
+            rebuild_access_permissions(&conn)?;
+            rebuild_household_task_logs(&conn)?;
+            rebuild_household_schedule_items(&conn)?;
+            rebuild_household_event_logs(&conn)?;
+            rebuild_embedded_memories(&conn)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_meta (key, value) VALUES ('derivation_version', ?1)",
+                rusqlite::params![DERIVATION_VERSION],
+            )?;
+            rebuild_tx.commit()?;
 
-        // Older databases may predate the FTS update trigger or may have been
-        // edited by a recovery tool. Rebuild once at open so recall and forget
-        // do not silently miss rows.
-        run_open_fts_rebuild(&conn, &mut migration_degraded);
+            run_open_fts_rebuild(&conn, &mut migration_degraded);
+        }
 
         Ok(Self {
             conn,
@@ -1884,12 +1892,12 @@ impl Memory {
                 let entry = read_entry(row)?;
                 let embedding_model: String = row.get(11)?;
                 let dimensions: i64 = row.get(12)?;
-                let embedding_json: String = row.get(13)?;
-                Ok((entry, embedding_model, dimensions as usize, embedding_json))
+                let embedding_blob: Vec<u8> = row.get(13)?;
+                Ok((entry, embedding_model, dimensions as usize, embedding_blob))
             })?
             .filter_map(|row| row.ok())
-            .filter_map(|(entry, embedding_model, dimensions, embedding_json)| {
-                parse_embedding(&embedding_json, dimensions).map(|embedding| {
+            .filter_map(|(entry, embedding_model, dimensions, embedding_blob)| {
+                parse_embedding(&embedding_blob, dimensions).map(|embedding| {
                     let mut score = embedding::cosine_similarity(&query_embedding, &embedding);
                     if query_type.as_deref().is_some_and(|expected| {
                         expected == semantic_memory_type(&entry.kind, &entry.content)
@@ -3529,7 +3537,7 @@ fn upsert_embedded_memory_from_memory(
     let provider = LocalHashEmbeddingProvider;
     let embedding_text = embedding_text_for_memory(kind, content);
     let embedding = provider.embed(&embedding_text);
-    let embedding_json = serde_json::to_string(&embedding)?;
+    let embedding_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
 
     conn.execute(
         "INSERT INTO embedded_memories (
@@ -3540,7 +3548,7 @@ fn upsert_embedded_memory_from_memory(
             semantic_memory_type(kind, content),
             provider.model_name(),
             provider.dimensions() as i64,
-            embedding_json,
+            embedding_blob,
             updated_ms
         ],
     )?;
@@ -7791,13 +7799,18 @@ fn semantic_query_type(query: &str) -> Option<String> {
     }
 }
 
-fn parse_embedding(value: &str, dimensions: usize) -> Option<Vec<f32>> {
-    let embedding = serde_json::from_str::<Vec<f32>>(value).ok()?;
-    if embedding.len() == dimensions {
-        Some(embedding)
-    } else {
-        None
+/// Decode a packed little-endian f32 embedding BLOB (4 bytes per dimension).
+/// Returns `None` if the byte length doesn't match `dimensions * 4`.
+fn parse_embedding(bytes: &[u8], dimensions: usize) -> Option<Vec<f32>> {
+    if bytes.len() != dimensions * 4 {
+        return None;
     }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
 }
 
 fn family_calendar_events_from_memory(kind: &str, content: &str) -> Vec<FamilyCalendarEvent> {
@@ -16074,6 +16087,81 @@ mod tests {
     }
 
     #[test]
+    fn recall_works_after_reopen_skips_rebuild() {
+        let path = temp_memory_path("reopen-skip");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store("fact", "GenieClaw runs on the Jetson Orin Nano")
+                .unwrap();
+        }
+        let reopened = Memory::open(&path).unwrap();
+        let hits = reopened.search("Jetson Orin", 5).unwrap();
+        assert!(
+            hits.iter()
+                .any(|entry| entry.content.contains("Jetson Orin Nano"))
+        );
+    }
+
+    #[test]
+    fn derived_table_survives_reopen_skip() {
+        // The open-time rebuild is skipped when DERIVATION_VERSION matches, so a
+        // non-FTS derived table must be kept live on store (not by the rebuild).
+        // Store a relationship (populates household_profiles), reopen — which
+        // skips the rebuild since the version matches — and confirm the derived
+        // row is still there.
+        let path = temp_memory_path("derived-reopen-skip");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store("relationship", "Jared is the dad").unwrap();
+            assert_eq!(mem.household_profiles_by_role("father").unwrap().len(), 1);
+        }
+        let reopened = Memory::open(&path).unwrap();
+        let profiles = reopened.household_profiles_by_role("father").unwrap();
+        assert_eq!(
+            profiles.len(),
+            1,
+            "household_profiles must survive a rebuild-skipping reopen"
+        );
+        assert_eq!(profiles[0].name, "Jared");
+        assert_eq!(profiles[0].role, "dad");
+    }
+
+    #[test]
+    fn version_mismatch_reopen_rebuilds_derived_tables() {
+        // A derivation-logic change bumps DERIVATION_VERSION; on the next open the
+        // stored version mismatches and the rebuild must re-derive the tables.
+        // Simulate by wiping a derived table and resetting the stored version,
+        // then reopening — the rebuild must restore household_profiles.
+        let path = temp_memory_path("derived-version-rebuild");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store("relationship", "Jared is the dad").unwrap();
+        }
+        {
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            raw.execute("DELETE FROM household_profiles", []).unwrap();
+            raw.execute(
+                "INSERT OR REPLACE INTO memory_meta (key, value) VALUES ('derivation_version', 0)",
+                [],
+            )
+            .unwrap();
+            let remaining: i64 = raw
+                .query_row("SELECT COUNT(*) FROM household_profiles", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(remaining, 0, "precondition: derived table wiped");
+        }
+        // Stored version 0 != DERIVATION_VERSION, so the reopen runs the rebuild.
+        let reopened = Memory::open(&path).unwrap();
+        let profiles = reopened.household_profiles_by_role("father").unwrap();
+        assert_eq!(
+            profiles.len(),
+            1,
+            "version mismatch must rebuild household_profiles from memories"
+        );
+        assert_eq!(profiles[0].name, "Jared");
+    }
+
+    #[test]
     fn semantic_embeddings_rebuild_on_reopen() {
         let path = temp_memory_path("semantic-reopen");
         {
@@ -16089,6 +16177,86 @@ mod tests {
         let hits = reopened.semantic_search("I'm feeling cold", 3).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].entry.content.contains("thermostat"));
+    }
+
+    #[test]
+    fn parse_embedding_blob_roundtrip_is_bit_identical() {
+        use crate::memory::embedding::{EmbeddingProvider, LocalHashEmbeddingProvider};
+        let provider = LocalHashEmbeddingProvider;
+        let original = provider.embed("the family keeps the thermostat warm in the evening");
+        let blob: Vec<u8> = original.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let restored = parse_embedding(&blob, original.len()).expect("parse_embedding failed");
+        assert_eq!(
+            original, restored,
+            "packed f32 BLOB roundtrip must be bit-identical"
+        );
+    }
+
+    #[test]
+    fn parse_embedding_rejects_wrong_length() {
+        // Not a multiple of 4 → None.
+        assert!(parse_embedding(&[0u8; 3], 1).is_none());
+        // Right byte count but wrong declared dimensions.
+        let blob = vec![0u8; 64 * 4];
+        assert!(parse_embedding(&blob, 32).is_none());
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_embedding_decode_json_vs_blob() {
+        // Measures the per-row decode cost in `semantic_search`: the old TEXT
+        // column was decoded with serde_json per scanned row; the new BLOB with
+        // chunks_exact(4). Run on-device to capture the before→after.
+        use crate::memory::embedding::{EmbeddingProvider, LocalHashEmbeddingProvider};
+        use std::time::Instant;
+        let provider = LocalHashEmbeddingProvider;
+        let rows = 4000usize;
+        let embeds: Vec<Vec<f32>> = (0..rows)
+            .map(|i| {
+                provider.embed(&format!(
+                    "household memory {i}: routines, preferences, devices, people"
+                ))
+            })
+            .collect();
+        let dim = embeds[0].len();
+        let jsons: Vec<String> = embeds
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        let blobs: Vec<Vec<u8>> = embeds
+            .iter()
+            .map(|e| e.iter().flat_map(|f| f.to_le_bytes()).collect())
+            .collect();
+
+        let mut sink = 0.0f32;
+        for j in &jsons {
+            sink += serde_json::from_str::<Vec<f32>>(j).unwrap()[0];
+        }
+        for b in &blobs {
+            sink += parse_embedding(b, dim).unwrap()[0];
+        }
+
+        let iters = 20u32;
+        let t = Instant::now();
+        for _ in 0..iters {
+            for j in &jsons {
+                sink += serde_json::from_str::<Vec<f32>>(j).unwrap()[0];
+            }
+        }
+        let json_ns = t.elapsed().as_nanos() as f64 / (iters as f64 * rows as f64);
+
+        let t = Instant::now();
+        for _ in 0..iters {
+            for b in &blobs {
+                sink += parse_embedding(b, dim).unwrap()[0];
+            }
+        }
+        let blob_ns = t.elapsed().as_nanos() as f64 / (iters as f64 * rows as f64);
+
+        eprintln!(
+            "BENCH embedding decode: dim={dim} rows={rows} | JSON {json_ns:.0} ns/row | BLOB {blob_ns:.0} ns/row | speedup {:.1}x (sink={sink})",
+            json_ns / blob_ns
+        );
     }
 
     #[test]
