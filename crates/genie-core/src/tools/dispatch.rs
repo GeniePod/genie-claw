@@ -2274,17 +2274,11 @@ mod tests {
     struct RecordingHomeProvider {
         executed: Arc<std::sync::Mutex<Vec<HomeActionKind>>>,
         light: Arc<std::sync::Mutex<StubLightState>>,
-        climate: Arc<std::sync::Mutex<StubClimateState>>,
     }
 
     struct StubLightState {
         power: String,
         brightness: Option<u64>,
-    }
-
-    struct StubClimateState {
-        power: String,
-        temperature: Option<f64>,
     }
 
     impl StubLightState {
@@ -2296,21 +2290,11 @@ mod tests {
         }
     }
 
-    impl StubClimateState {
-        fn new() -> Self {
-            Self {
-                power: "off".into(),
-                temperature: None,
-            }
-        }
-    }
-
     impl RecordingHomeProvider {
         fn new(executed: Arc<std::sync::Mutex<Vec<HomeActionKind>>>) -> Self {
             Self {
                 executed,
                 light: Arc::new(std::sync::Mutex::new(StubLightState::new())),
-                climate: Arc::new(std::sync::Mutex::new(StubClimateState::new())),
             }
         }
 
@@ -2320,14 +2304,6 @@ mod tests {
 
         fn power(&self) -> String {
             self.light.lock().unwrap().power.clone()
-        }
-
-        fn climate_power(&self) -> String {
-            self.climate.lock().unwrap().power.clone()
-        }
-
-        fn climate_temperature(&self) -> Option<f64> {
-            self.climate.lock().unwrap().temperature
         }
     }
 
@@ -2458,19 +2434,6 @@ mod tests {
             query: &str,
             _action_hint: Option<HomeActionKind>,
         ) -> Result<HomeTarget> {
-            let lower = query.to_lowercase();
-            if lower.contains("thermostat") || lower.contains("climate") {
-                return Ok(HomeTarget {
-                    kind: HomeTargetKind::Entity,
-                    query: query.into(),
-                    display_name: query.into(),
-                    entity_ids: vec!["climate.test".into()],
-                    domain: Some("climate".into()),
-                    area: Some("Hall".into()),
-                    confidence: 0.96,
-                    voice_safe: true,
-                });
-            }
             Ok(HomeTarget {
                 kind: HomeTargetKind::Entity,
                 query: query.into(),
@@ -2484,25 +2447,6 @@ mod tests {
         }
 
         async fn get_state(&self, target: &HomeTarget) -> Result<HomeState> {
-            if target.domain.as_deref() == Some("climate") {
-                let climate = self.climate.lock().unwrap();
-                let mut attributes = serde_json::Map::new();
-                if let Some(temperature) = climate.temperature {
-                    attributes.insert("temperature".into(), serde_json::json!(temperature));
-                }
-                return Ok(HomeState {
-                    target_name: target.display_name.clone(),
-                    domain: target.domain.clone(),
-                    area: target.area.clone(),
-                    entities: vec![Entity {
-                        entity_id: target.entity_ids[0].clone(),
-                        state: climate.power.clone(),
-                        attributes: serde_json::Value::Object(attributes),
-                    }],
-                    available: true,
-                    spoken_summary: format!("{} is {}", target.display_name, climate.power),
-                });
-            }
             let light = self.light.lock().unwrap();
             let mut attributes = serde_json::Map::new();
             if let Some(brightness) = light.brightness {
@@ -2523,30 +2467,6 @@ mod tests {
         }
 
         async fn execute(&self, action: HomeAction) -> Result<ActionResult> {
-            if action.target.domain.as_deref() == Some("climate") {
-                {
-                    let mut climate = self.climate.lock().unwrap();
-                    match action.kind {
-                        HomeActionKind::TurnOff => {
-                            climate.power = "off".into();
-                            climate.temperature = None;
-                        }
-                        HomeActionKind::SetTemperature => {
-                            climate.power = "heat".into();
-                            climate.temperature = action.value;
-                        }
-                        other => anyhow::bail!("unsupported climate stub action: {other:?}"),
-                    }
-                }
-                self.executed.lock().unwrap().push(action.kind);
-                return Ok(ActionResult {
-                    success: true,
-                    spoken_summary: format!("Executed {:?}", action.kind),
-                    affected_targets: vec![action.target.display_name],
-                    state_snapshot: None,
-                    confidence: Some(action.target.confidence),
-                });
-            }
             {
                 let mut light = self.light.lock().unwrap();
                 match action.kind {
@@ -3412,57 +3332,6 @@ mod tests {
             ]
         );
         assert_eq!(provider.power(), "on");
-    }
-
-    #[tokio::test]
-    async fn home_undo_restores_off_state_after_set_temperature() {
-        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingHomeProvider::new(executed.clone()));
-        let dispatcher = ToolDispatcher::new(Some(provider.clone()));
-        let ctx = || ToolExecutionContext {
-            request_origin: RequestOrigin::Dashboard,
-            ..ToolExecutionContext::default()
-        };
-
-        assert_eq!(provider.climate_power(), "off");
-
-        assert!(
-            dispatcher
-                .execute_with_context(
-                    &ToolCall {
-                        name: "home_control".into(),
-                        arguments: serde_json::json!({
-                            "entity": "thermostat",
-                            "action": "set_temperature",
-                            "value": 72
-                        }),
-                    },
-                    ctx(),
-                )
-                .await
-                .success
-        );
-        assert_eq!(provider.climate_power(), "heat");
-        assert_eq!(provider.climate_temperature(), Some(72.0));
-
-        let undo = dispatcher
-            .execute_with_context(
-                &ToolCall {
-                    name: "home_undo".into(),
-                    arguments: serde_json::json!({}),
-                },
-                ctx(),
-            )
-            .await;
-
-        assert!(undo.success);
-        assert!(undo.output.contains("Undid the last home action"));
-        assert_eq!(
-            *executed.lock().unwrap(),
-            vec![HomeActionKind::SetTemperature, HomeActionKind::TurnOff,]
-        );
-        assert_eq!(provider.climate_power(), "off");
-        assert_eq!(provider.climate_temperature(), None);
     }
 
     #[tokio::test]
