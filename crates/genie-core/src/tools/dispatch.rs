@@ -3402,8 +3402,8 @@ mod tests {
             ..ToolExecutionContext::default()
         };
 
-        let dispatcher = ToolDispatcher::new(Some(provider.clone()))
-            .with_actuation_audit_path(path.clone());
+        let dispatcher =
+            ToolDispatcher::new(Some(provider.clone())).with_actuation_audit_path(path.clone());
 
         assert!(
             dispatcher
