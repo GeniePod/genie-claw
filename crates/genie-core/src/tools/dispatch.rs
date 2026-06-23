@@ -3646,7 +3646,10 @@ mod tests {
             .await;
         assert!(!undo.success);
         assert!(undo.output.contains("No recent reversible"));
-        assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::SetBrightness]);
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![HomeActionKind::SetBrightness]
+        );
     }
 
     #[test]
