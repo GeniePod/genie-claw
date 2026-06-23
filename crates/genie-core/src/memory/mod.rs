@@ -16100,6 +16100,30 @@ mod tests {
     }
 
     #[test]
+    fn derived_table_survives_reopen_skip() {
+        // The open-time rebuild is skipped when DERIVATION_VERSION matches, so a
+        // non-FTS derived table must be kept live on store (not by the rebuild).
+        // Store a relationship (populates household_profiles), reopen — which
+        // skips the rebuild since the version matches — and confirm the derived
+        // row is still there.
+        let path = temp_memory_path("derived-reopen-skip");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store("relationship", "Jared is the dad").unwrap();
+            assert_eq!(mem.household_profiles_by_role("father").unwrap().len(), 1);
+        }
+        let reopened = Memory::open(&path).unwrap();
+        let profiles = reopened.household_profiles_by_role("father").unwrap();
+        assert_eq!(
+            profiles.len(),
+            1,
+            "household_profiles must survive a rebuild-skipping reopen"
+        );
+        assert_eq!(profiles[0].name, "Jared");
+        assert_eq!(profiles[0].role, "dad");
+    }
+
+    #[test]
     fn semantic_embeddings_rebuild_on_reopen() {
         let path = temp_memory_path("semantic-reopen");
         {
