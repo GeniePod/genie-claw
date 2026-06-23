@@ -87,6 +87,22 @@ pub struct RecordedAction {
     pub executed_ms: u64,
 }
 
+impl RecordedAction {
+    /// Undo suffix for `action_history` lines — mirrors [`ActionLedger::last_undoable`].
+    pub fn action_history_undo_hint(&self) -> String {
+        if let Some(inverse) = self.inverse_action.as_deref() {
+            format!(" undo: {inverse}")
+        } else if let Some(restore) = &self.undo_restore {
+            match restore.value {
+                Some(value) => format!(" undo: {} {value}", restore.action),
+                None => format!(" undo: {}", restore.action),
+            }
+        } else {
+            " not undoable".into()
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ConfirmationManager {
     inner: Mutex<ConfirmationState>,
@@ -1183,5 +1199,48 @@ mod tests {
         let args = ActionLedger::undo_home_control_args(&undo).unwrap();
         assert_eq!(args["action"], "set_brightness");
         assert_eq!(args["value"], 100.0);
+    }
+
+    #[test]
+    fn action_history_undo_hint_uses_restore_when_no_inverse() {
+        let action = RecordedAction {
+            id: 1,
+            undo_of: None,
+            entity: "kitchen light".into(),
+            action: "set_brightness".into(),
+            value: Some(30.0),
+            inverse_action: None,
+            undo_restore: Some(UndoRestore {
+                action: "set_brightness".into(),
+                value: Some(100.0),
+            }),
+            origin: RequestOrigin::Dashboard,
+            summary: "dimmed".into(),
+            confidence: None,
+            executed_ms: 0,
+        };
+        assert_eq!(
+            action.action_history_undo_hint(),
+            " undo: set_brightness 100"
+        );
+        assert!(!action.action_history_undo_hint().contains("not undoable"));
+    }
+
+    #[test]
+    fn action_history_undo_hint_prefers_inverse_action() {
+        let action = RecordedAction {
+            id: 1,
+            undo_of: None,
+            entity: "kitchen light".into(),
+            action: "turn_on".into(),
+            value: None,
+            inverse_action: Some("turn_off".into()),
+            undo_restore: None,
+            origin: RequestOrigin::Dashboard,
+            summary: "on".into(),
+            confidence: None,
+            executed_ms: 0,
+        };
+        assert_eq!(action.action_history_undo_hint(), " undo: turn_off");
     }
 }

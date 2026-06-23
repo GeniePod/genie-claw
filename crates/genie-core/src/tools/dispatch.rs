@@ -1283,11 +1283,7 @@ impl ToolDispatcher {
         if !actions.is_empty() {
             lines.push("Recent home actions:".to_string());
             for action in actions.iter().take(5) {
-                let undo = action
-                    .inverse_action
-                    .as_deref()
-                    .map(|inverse| format!(" undo: {inverse}"))
-                    .unwrap_or_else(|| " not undoable".into());
+                let undo = action.action_history_undo_hint();
                 lines.push(format!(
                     "- {} {} via {:?};{}",
                     action.action, action.entity, action.origin, undo
@@ -3265,6 +3261,61 @@ mod tests {
         );
         assert_eq!(provider.power(), "on");
         assert_eq!(provider.brightness(), Some(255));
+    }
+
+    #[tokio::test]
+    async fn action_history_shows_undo_restore_hint_after_dim() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher =
+            ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider::new(executed.clone()))));
+        let ctx = || ToolExecutionContext {
+            request_origin: RequestOrigin::Dashboard,
+            ..ToolExecutionContext::default()
+        };
+
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "turn_on"
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "set_brightness",
+                            "value": 30
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+
+        let history = dispatcher
+            .execute(&ToolCall {
+                name: "action_history".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await;
+
+        assert!(history.success);
+        assert!(history.output.contains("set_brightness kitchen light"));
+        assert!(history.output.contains("undo: set_brightness 100"));
+        assert!(!history.output.contains("not undoable"));
     }
 
     #[tokio::test]
