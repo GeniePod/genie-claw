@@ -16124,6 +16124,41 @@ mod tests {
     }
 
     #[test]
+    fn version_mismatch_reopen_rebuilds_derived_tables() {
+        // A derivation-logic change bumps DERIVATION_VERSION; on the next open the
+        // stored version mismatches and the rebuild must re-derive the tables.
+        // Simulate by wiping a derived table and resetting the stored version,
+        // then reopening — the rebuild must restore household_profiles.
+        let path = temp_memory_path("derived-version-rebuild");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store("relationship", "Jared is the dad").unwrap();
+        }
+        {
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            raw.execute("DELETE FROM household_profiles", []).unwrap();
+            raw.execute(
+                "INSERT OR REPLACE INTO memory_meta (key, value) VALUES ('derivation_version', 0)",
+                [],
+            )
+            .unwrap();
+            let remaining: i64 = raw
+                .query_row("SELECT COUNT(*) FROM household_profiles", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(remaining, 0, "precondition: derived table wiped");
+        }
+        // Stored version 0 != DERIVATION_VERSION, so the reopen runs the rebuild.
+        let reopened = Memory::open(&path).unwrap();
+        let profiles = reopened.household_profiles_by_role("father").unwrap();
+        assert_eq!(
+            profiles.len(),
+            1,
+            "version mismatch must rebuild household_profiles from memories"
+        );
+        assert_eq!(profiles[0].name, "Jared");
+    }
+
+    #[test]
     fn semantic_embeddings_rebuild_on_reopen() {
         let path = temp_memory_path("semantic-reopen");
         {
