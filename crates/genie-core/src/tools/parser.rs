@@ -341,6 +341,12 @@ fn extract_balanced_json_candidate(
                     if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
                         return Some(candidate.to_string());
                     }
+                    let repaired = strip_trailing_commas(candidate);
+                    if repaired != candidate
+                        && serde_json::from_str::<serde_json::Value>(&repaired).is_ok()
+                    {
+                        return Some(repaired);
+                    }
                     return None;
                 }
             }
@@ -349,6 +355,44 @@ fn extract_balanced_json_candidate(
     }
 
     None
+}
+
+fn strip_trailing_commas(json: &str) -> String {
+    let chars: Vec<char> = json.chars().collect();
+    let mut out = String::with_capacity(json.len());
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (index, &current) in chars.iter().enumerate() {
+        if escape {
+            out.push(current);
+            escape = false;
+            continue;
+        }
+
+        match current {
+            '\\' if in_string => {
+                out.push(current);
+                escape = true;
+            }
+            '"' => {
+                in_string = !in_string;
+                out.push(current);
+            }
+            ',' if !in_string => {
+                let mut next = index + 1;
+                while next < chars.len() && chars[next].is_whitespace() {
+                    next += 1;
+                }
+                if !(next < chars.len() && matches!(chars[next], '}' | ']')) {
+                    out.push(current);
+                }
+            }
+            _ => out.push(current),
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -613,6 +657,44 @@ mod tests {
         let calls = parse_tool_calls_for_eval(r#"{"answer":"hello"}"#);
 
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn extract_recovers_trailing_comma_object() {
+        let input = r#"{"tool":"set_timer","arguments":{"seconds":300},}"#;
+        let calls = parse_tool_calls_for_eval(input);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "set_timer");
+        assert_eq!(calls[0].arguments["seconds"], 300);
+    }
+
+    #[test]
+    fn extract_recovers_trailing_comma_array() {
+        let input = r#"[{"tool":"get_time","arguments":{}},{"tool":"set_timer","arguments":{"seconds":60}},]"#;
+        let calls = parse_tool_calls_for_eval(input);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "get_time");
+        assert_eq!(calls[1].name, "set_timer");
+        assert_eq!(calls[1].arguments["seconds"], 60);
+    }
+
+    #[test]
+    fn extract_trailing_comma_recovery_preserves_string_commas() {
+        let input = r#"{"tool":"web_search","arguments":{"query":"a, b,}","limit":3},}"#;
+        let json = extract_json(input).unwrap();
+        let call: ToolCall = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "a, b,}");
+        assert_eq!(call.arguments["limit"], 3);
+    }
+
+    #[test]
+    fn extract_leaves_valid_json_untouched() {
+        let input = r#"{"tool":"get_time","arguments":{}}"#;
+        assert_eq!(extract_json(input).unwrap(), input);
     }
 
     // The `system_info` tool reads /proc/meminfo (via tegrastats), /proc/uptime,
