@@ -974,33 +974,13 @@ fn domain_synonyms(domain: &str) -> Vec<String> {
 }
 
 fn infer_domain(query: &str) -> Option<String> {
-    let query = normalize(query);
-    let checks: [(&str, &[&str]); 6] = [
-        ("light", &["light", "lights", "lamp", "lamps"]),
-        ("switch", &["switch", "switches", "plug", "outlet"]),
-        ("fan", &["fan", "fans"]),
-        (
-            "climate",
-            &[
-                "thermostat",
-                "temperature",
-                "warmer",
-                "cooler",
-                "heat",
-                "ac",
-            ],
-        ),
-        (
-            "cover",
-            &[
-                "cover", "covers", "blind", "blinds", "shade", "shades", "curtain", "garage",
-            ],
-        ),
-        ("lock", &["lock", "locks", "unlock", "door lock"]),
-    ];
-
-    for (domain, terms) in checks {
-        if terms.iter().any(|term| query.contains(term)) {
+    let tokens = entity_fidelity::query_tokens(query);
+    for domain in ["light", "switch", "fan", "climate", "cover", "lock"] {
+        let matched = tokens.iter().any(|token| {
+            entity_fidelity::domain_of_word(token) == Some(domain)
+                || (domain == "climate" && matches!(token.as_str(), "warmer" | "cooler"))
+        });
+        if matched {
             return Some(domain.to_string());
         }
     }
@@ -1347,6 +1327,17 @@ mod tests {
             infer_domain("turn off the living room lamps").as_deref(),
             Some("light")
         );
+    }
+
+    #[test]
+    fn infer_domain_matches_whole_words_not_substrings() {
+        assert_eq!(
+            infer_domain("open the back blinds").as_deref(),
+            Some("cover")
+        );
+        assert_eq!(infer_domain("lock the back door").as_deref(), Some("lock"));
+        assert_eq!(infer_domain("set the ac to 70").as_deref(), Some("climate"));
+        assert_eq!(infer_domain("track the package").as_deref(), None);
     }
 
     #[test]

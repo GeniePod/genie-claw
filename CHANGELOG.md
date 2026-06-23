@@ -2,25 +2,107 @@
 
 ## Unreleased
 
-- **`genie-ctl --help` alignment** (#445): the `health` command no longer
-  prints flush-left. A trailing `\` line-continuation after the voice-gated
-  `speaker` block was stripping the four-space indent off the following line
-  in both `voice`-on and `voice`-off builds. Rendering moved into a pure
-  `usage_text()` helper with a regression test that fails if any command line
-  loses its indent.
-- **Quick-router compound spoken durations** (#449): "set a timer for forty
-  five minutes" now sets a 45-minute timer instead of 5. The deterministic
-  router only ever saw single tokens, so its `"forty five"` number arm was dead
-  code and the trailing "five" bound to the unit. `parse_duration` now stitches
-  a tens word (`twenty`..`ninety`) to a following ones digit, and the missing
-  `fifty`..`ninety` tens words parse on their own.
-- **Tool-call parser tolerates trailing commas** (#469): a trailing comma (a
-  common local-model JSON quirk) made the embedded-JSON scanner return an inner
-  fragment of the call — `{"tool":"set_timer","arguments":{"seconds":300},}`
-  parsed as a phantom `"seconds"` tool, and array forms dropped every call after
-  the first. A balanced candidate that fails to parse is now retried once with a
-  string-aware trailing-comma strip, recovering the correct call for both the
-  runtime and BFCL eval paths.
+## 1.0.0-alpha.12 - 2026-06-23
+
+Alpha 12 is a **performance + reliability hardening** release. The memory open
+and query paths and the voice DSP chain get substantially faster on the Jetson
+Orin, the typed-tool boundary rejects more malformed calls, `home_undo` now
+works for value-changing actions and survives a restart, and Gemma 4 E2B joins
+as a first-class local model.
+
+### Security
+
+- **quinn-proto memory-exhaustion advisory** (RUSTSEC-2026-0185): bump
+  `quinn-proto` 0.11.14 → 0.11.15, which bounds out-of-order stream reassembly.
+  It is a platform-gated transitive dependency (not in the default-target
+  build), so exposure was minimal, but the lockfile is now advisory-clean.
+
+### Performance — memory
+
+- **Packed-BLOB embeddings** (#470): `embedded_memories.embedding` is stored as
+  a little-endian f32 BLOB instead of JSON text, dropping per-row decode from
+  6527 ns to 123 ns (~53× faster) on the Jetson — `semantic_search` decodes this
+  for every embedded row per query.
+- **Skip schema-ensure on unchanged opens** (#475): `Memory::open` gates the full
+  schema-ensure + migration pass behind `PRAGMA user_version`, making
+  steady-state reopens ~575× faster on the Jetson; the version is stamped only
+  after a clean migration.
+- **Skip derived-table rebuild when current** (#464): the open-time derived-table
+  rebuild is skipped when the stored derivation version already matches.
+- **Single-pass LIKE fallback scoring** (#468): the substring recall fallback
+  scores each row once (decorate-sort-undecorate) instead of recomputing in the
+  sort comparator and again per kept row — behavior-preserving.
+- **Batched open-time work** (#442, #431): derived-table rebuilds and
+  recall-tracking writes each run in a single transaction.
+
+### Performance — voice DSP
+
+- **No redundant TTS decode** (#426): `process_tts_audio` drops a duplicate
+  S16_LE decode pass (~6.5× faster decode).
+- **Reuse per-frame RMS** (#427): noise suppression reuses the RMS it already
+  computed (~1.6× faster).
+- **Hann window built once** (#432): the voice-identity fingerprint builds its
+  Hann window once per fingerprint rather than once per band.
+- **Leaner echo cancellation** (#440): NLMS AEC uses a sliding-window energy and
+  branchless tap updates.
+
+### Tool-call boundary
+
+- **Reject missing/malformed arguments at execution** (#424, #425): a malformed
+  optional `get_weather` forecast or `web_search` limit, and a missing `value`
+  for `home_control` `set_brightness`/`set_temperature`, now fail and are audited
+  at the dispatch boundary instead of silently defaulting.
+- **Scalar single-key tool calls** (#441): a single-key scalar argument maps to
+  the tool's primary argument.
+
+### Memory correctness & privacy
+
+- **Don't trust LLM-supplied identity** (#433): `memory_recall` no longer trusts
+  identity fields supplied by the model when gating person-scoped reads.
+- **Cleaner auto-capture** (#444): auto-capture stops swallowing trailing clauses
+  into a single fact.
+- **`memory_forget` aliases** (#448): accepts `topic`/`what` aliases like
+  `memory_recall`.
+
+### home_undo for value actions
+
+- **Restore prior value on undo** (#435, #460): `home_undo` restores the prior
+  state for `set_brightness` / value actions and the off-state after
+  `set_temperature`.
+- **History hints + restart-safe** (#473, #474): `action_history` shows
+  `undo_restore` hints for value-changing actions, and `undo_restore` is
+  persisted in the audit log so undo survives a process restart.
+
+### Reliability
+
+- **Tool-call parser tolerates trailing commas** (#469): a trailing comma no
+  longer makes the embedded-JSON scanner return a phantom inner fragment;
+  balanced candidates that fail to parse are retried once with a string-aware
+  trailing-comma strip.
+- **Whole-word entity-domain inference** (#477): `infer_domain` classifies query
+  tokens through the shared whole-word `entity_fidelity::domain_of_word`, so
+  `"ac"` no longer matches inside "b**ac**k" ("open the back blinds" → cover).
+- **Compound spoken durations** (#449): "set a timer for forty five minutes" now
+  parses to 45 minutes; `parse_duration` stitches tens+ones and the missing
+  `fifty`..`ninety` words parse on their own.
+- **OTA pre-release precedence** (#451): full SemVer pre-release ordering so
+  alpha→alpha updates are detected.
+- **Injection scanner punctuation** (#453): the prompt-injection scanner is
+  robust to punctuation separators between trigger words.
+- **BFCL `canon_action`** (#459): stops collapsing `activate` into `turn_on` in
+  the grounded BFCL metric.
+- **`genie-ctl --help` indent** (#445): the `health` command no longer renders
+  flush-left.
+
+### Models
+
+- **Gemma 4 E2B** (#437): added as a first-class local model family with its own
+  prompt formatting.
+
+### Tooling / CI
+
+- **Auto-label** (#447, #476): issues and PRs are auto-labeled by type and
+  authorship; the `community-contribution` label was later retired.
 
 ## 1.0.0-alpha.11 - 2026-06-20
 

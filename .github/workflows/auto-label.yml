@@ -5,15 +5,15 @@
 #     "I have verified the change end-to-end on Jetson hardware." box.
 #   * performance  — title starts with `perf` without that box ticked.
 #   * bug          — title starts with `fix` or contains `[bug]`.
-# Author label — exactly one, by GitHub role (author_association):
-#   * maintainer             — OWNER / MEMBER / COLLABORATOR.
-#   * community-contribution — everyone else.
+# Author label — `maintainer` only, by GitHub role (author_association):
+#   * maintainer — OWNER / MEMBER / COLLABORATOR. Everyone else gets no author label.
 #
 # Ownership / reconciliation:
-#   * {optimization, performance} and {maintainer, community-contribution} are
-#     fully owned here: the workflow keeps exactly the computed label and removes
-#     its sibling, so edits re-label (ticking the Jetson box flips
-#     performance -> optimization; an empty box flips it back).
+#   * {optimization, performance} is fully owned here: the workflow keeps exactly
+#     the computed label and removes its sibling, so edits re-label (ticking the
+#     Jetson box flips performance -> optimization; an empty box flips it back).
+#   * `maintainer` is set for maintainer authors and removed otherwise; the
+#     retired `community-contribution` label is always removed.
 #   * `bug` is ADD-only — the issue forms ([bug]/[audio]/[voice]) and manual
 #     curation also apply it, so the workflow never removes it.
 #   * Every other label (enhancement, audio, voice, jetson, M1, ...) is untouched.
@@ -77,10 +77,10 @@ jobs:
 
           case "$ASSOC" in
             OWNER|MEMBER|COLLABORATOR) author_label="maintainer" ;;
-            *) author_label="community-contribution" ;;
+            *) author_label="" ;;
           esac
 
-          echo "::notice::#${NUMBER} assoc=${ASSOC} type=${type_label:-none} author=${author_label}"
+          echo "::notice::#${NUMBER} assoc=${ASSOC} type=${type_label:-none} author=${author_label:-none}"
 
           # Self-bootstrap the two labels this repo doesn't ship yet (no-op if present).
           gh label create performance --repo "$REPO" --color FEF2C0 \
@@ -91,12 +91,14 @@ jobs:
           add()    { gh api -X POST "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=$1" >/dev/null 2>&1 || true; }
           remove() { gh api -X DELETE "repos/$REPO/issues/$NUMBER/labels/$1" >/dev/null 2>&1 || true; }
 
-          # Author label — exactly one.
+          # Author label — `maintainer` only. The retired `community-contribution`
+          # label is never added and is removed wherever a prior run set it.
           if [ "$author_label" = "maintainer" ]; then
-            add maintainer; remove community-contribution
+            add maintainer
           else
-            add community-contribution; remove maintainer
+            remove maintainer
           fi
+          remove community-contribution
 
           # Perf type — workflow fully owns {optimization, performance}.
           case "$type_label" in
