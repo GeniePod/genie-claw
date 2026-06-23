@@ -17,6 +17,7 @@ use std::time::Duration;
 const MAX_QUERY_HASHES: usize = 16;
 
 const DERIVATION_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 1;
 
 /// Persistent conversational memory with dreaming-inspired consolidation.
 ///
@@ -302,12 +303,19 @@ impl Memory {
         )?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            PRAGMA temp_store = MEMORY;
-            PRAGMA foreign_keys = ON;
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA foreign_keys = ON;",
+        )?;
 
+        let mut migration_degraded = false;
+        let schema_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if schema_version < SCHEMA_VERSION {
+            conn.execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS memories (
                 id            INTEGER PRIMARY KEY,
                 kind          TEXT NOT NULL,
@@ -589,94 +597,97 @@ impl Memory {
             ",
         )?;
 
-        // Migrate: add columns if they don't exist (idempotent).
-        let mut migration_degraded = false;
-        run_open_migration(
-            &conn,
-            "ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0",
-            "add recall_count",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "ALTER TABLE memories ADD COLUMN max_score REAL NOT NULL DEFAULT 0.0",
-            "add max_score",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "ALTER TABLE memories ADD COLUMN promoted INTEGER NOT NULL DEFAULT 0",
-            "add promoted",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "ALTER TABLE memories ADD COLUMN query_hashes TEXT NOT NULL DEFAULT '[]'",
-            "add query_hashes",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "ALTER TABLE memories ADD COLUMN evergreen INTEGER NOT NULL DEFAULT 0",
-            "add evergreen",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'household'",
-            "add scope",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "ALTER TABLE memories ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
-            "add sensitivity",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "ALTER TABLE memories ADD COLUMN spoken_policy TEXT NOT NULL DEFAULT 'allow'",
-            "add spoken_policy",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "ALTER TABLE memories ADD COLUMN display_order INTEGER NOT NULL DEFAULT 2147483647",
-            "add display_order",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "CREATE INDEX IF NOT EXISTS idx_memories_kind_accessed ON memories(kind, accessed_ms DESC)",
-            "create idx_memories_kind_accessed",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "CREATE INDEX IF NOT EXISTS idx_memories_promotion ON memories(promoted, recall_count, max_score)",
-            "create idx_memories_promotion",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "CREATE INDEX IF NOT EXISTS idx_memories_prune ON memories(evergreen, promoted, accessed_ms)",
-            "create idx_memories_prune",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "CREATE INDEX IF NOT EXISTS idx_memories_scope_sensitivity ON memories(scope, sensitivity, spoken_policy)",
-            "create idx_memories_scope_sensitivity",
-            &mut migration_degraded,
-        );
-        run_open_migration(
-            &conn,
-            "CREATE INDEX IF NOT EXISTS idx_memories_display_order ON memories(display_order, accessed_ms DESC, id DESC)",
-            "create idx_memories_display_order",
-            &mut migration_degraded,
-        );
+            // Migrate: add columns if they don't exist (idempotent).
+            run_open_migration(
+                &conn,
+                "ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0",
+                "add recall_count",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "ALTER TABLE memories ADD COLUMN max_score REAL NOT NULL DEFAULT 0.0",
+                "add max_score",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "ALTER TABLE memories ADD COLUMN promoted INTEGER NOT NULL DEFAULT 0",
+                "add promoted",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "ALTER TABLE memories ADD COLUMN query_hashes TEXT NOT NULL DEFAULT '[]'",
+                "add query_hashes",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "ALTER TABLE memories ADD COLUMN evergreen INTEGER NOT NULL DEFAULT 0",
+                "add evergreen",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'household'",
+                "add scope",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "ALTER TABLE memories ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
+                "add sensitivity",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "ALTER TABLE memories ADD COLUMN spoken_policy TEXT NOT NULL DEFAULT 'allow'",
+                "add spoken_policy",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "ALTER TABLE memories ADD COLUMN display_order INTEGER NOT NULL DEFAULT 2147483647",
+                "add display_order",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "CREATE INDEX IF NOT EXISTS idx_memories_kind_accessed ON memories(kind, accessed_ms DESC)",
+                "create idx_memories_kind_accessed",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "CREATE INDEX IF NOT EXISTS idx_memories_promotion ON memories(promoted, recall_count, max_score)",
+                "create idx_memories_promotion",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "CREATE INDEX IF NOT EXISTS idx_memories_prune ON memories(evergreen, promoted, accessed_ms)",
+                "create idx_memories_prune",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope_sensitivity ON memories(scope, sensitivity, spoken_policy)",
+                "create idx_memories_scope_sensitivity",
+                &mut migration_degraded,
+            );
+            run_open_migration(
+                &conn,
+                "CREATE INDEX IF NOT EXISTS idx_memories_display_order ON memories(display_order, accessed_ms DESC, id DESC)",
+                "create idx_memories_display_order",
+                &mut migration_degraded,
+            );
 
-        backfill_policy_columns(&conn)?;
+            backfill_policy_columns(&conn)?;
+            if !migration_degraded {
+                conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            }
+        }
 
         let stored_derivation: Option<i64> = conn
             .query_row(
@@ -16159,6 +16170,56 @@ mod tests {
             "version mismatch must rebuild household_profiles from memories"
         );
         assert_eq!(profiles[0].name, "Jared");
+    }
+
+    #[test]
+    fn stale_schema_version_reopen_reensures_and_restamps() {
+        let path = temp_memory_path("schema-version-reensure");
+        {
+            let mem = Memory::open(&path).unwrap();
+            mem.store("fact", "the kitchen light is warm white")
+                .unwrap();
+        }
+        {
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            let stamped: i64 = raw
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                stamped, SCHEMA_VERSION,
+                "a successful open must stamp user_version"
+            );
+            raw.execute_batch("DROP INDEX idx_memories_display_order; PRAGMA user_version = 0;")
+                .unwrap();
+            let present: i64 = raw
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memories_display_order'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 0, "precondition: index dropped, version reset");
+        }
+        let _reopened = Memory::open(&path).unwrap();
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let present: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memories_display_order'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            present, 1,
+            "stale version must re-run schema-ensure and recreate the index"
+        );
+        let restamped: i64 = raw
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            restamped, SCHEMA_VERSION,
+            "ensure pass must restamp user_version"
+        );
     }
 
     #[test]
