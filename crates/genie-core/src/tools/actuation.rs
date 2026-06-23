@@ -340,6 +340,12 @@ pub fn undo_restore_from_prior(action: &str, prior: &HomeState) -> Option<UndoRe
             })
         }
         "set_temperature" => {
+            if entity.state == "off" {
+                return Some(UndoRestore {
+                    action: "turn_off".into(),
+                    value: None,
+                });
+            }
             let temp = entity
                 .attributes
                 .get("temperature")
@@ -1111,6 +1117,40 @@ mod tests {
         };
         let restore = undo_restore_from_prior("toggle", &prior_off).unwrap();
         assert_eq!(restore.action, "turn_off");
+    }
+
+    #[test]
+    fn undo_restore_from_prior_set_temperature_when_off() {
+        use crate::ha::Entity;
+
+        let prior_off = HomeState {
+            target_name: "thermostat".into(),
+            domain: Some("climate".into()),
+            area: None,
+            entities: vec![Entity {
+                entity_id: "climate.heat".into(),
+                state: "off".into(),
+                attributes: serde_json::json!({}),
+            }],
+            available: true,
+            spoken_summary: "thermostat is off".into(),
+        };
+
+        let restore = undo_restore_from_prior("set_temperature", &prior_off).unwrap();
+        assert_eq!(restore.action, "turn_off");
+        assert!(restore.value.is_none());
+
+        let prior_on = HomeState {
+            entities: vec![Entity {
+                entity_id: "climate.heat".into(),
+                state: "heat".into(),
+                attributes: serde_json::json!({ "temperature": 68.0 }),
+            }],
+            ..prior_off.clone()
+        };
+        let restore = undo_restore_from_prior("set_temperature", &prior_on).unwrap();
+        assert_eq!(restore.action, "set_temperature");
+        assert_eq!(restore.value, Some(68.0));
     }
 
     #[test]

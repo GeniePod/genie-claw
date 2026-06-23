@@ -148,17 +148,20 @@ fn parse_set_timer_args(args: &serde_json::Value) -> Result<(u64, &str)> {
     Ok((seconds, label))
 }
 
-fn parse_memory_recall_query(args: &serde_json::Value) -> Result<String> {
-    let raw = args
-        .get("query")
+fn parse_memory_query_arg(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
         .or_else(|| args.get("topic"))
         .or_else(|| args.get("what"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!("memory_recall requires non-empty string argument 'query'")
-        })?;
+            anyhow::anyhow!("memory tool requires non-empty string argument (query/topic/what)")
+        })
+}
+
+fn parse_memory_recall_query(args: &serde_json::Value) -> Result<String> {
+    let raw = parse_memory_query_arg(args)?;
     Ok(normalize_memory_recall_query(raw))
 }
 
@@ -174,11 +177,7 @@ fn normalize_memory_recall_query(raw: &str) -> String {
 }
 
 fn parse_memory_forget_query(args: &serde_json::Value) -> Result<&str> {
-    args.get("query")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("memory_forget requires non-empty string argument 'query'"))
+    parse_memory_query_arg(args)
 }
 
 /// Reject a `memory_store` call with no usable `content` (#416). Delegates to
@@ -4019,6 +4018,55 @@ mod tests {
         assert!(
             mem.search("Maya", 5).unwrap().is_empty(),
             "person-scoped row must be deleted under a verified context"
+        );
+    }
+
+    #[test]
+    fn memory_forget_accepts_topic_and_what_aliases() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-forget-topic-alias-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("preference", "User likes jazz music").unwrap();
+        memory.store("hobby", "User plays guitar").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        // Test with "topic" alias (same shape memory_recall accepts)
+        let result = dispatcher.exec_memory_forget(
+            &serde_json::json!({"topic": "jazz"}),
+            ToolExecutionContext::default(),
+        );
+        assert!(result.is_ok(), "memory_forget should accept 'topic' alias");
+
+        // Verify the memory was deleted
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        let search_result = mem.search("jazz", 5).unwrap();
+        assert!(
+            search_result.is_empty(),
+            "Memory with 'jazz' should be deleted"
+        );
+
+        // Test with "what" alias
+        let memory2 = crate::memory::Memory::open(&db).unwrap();
+        memory2.store("hobby2", "User plays piano").unwrap();
+        let dispatcher2 =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory2)));
+
+        let result2 = dispatcher2.exec_memory_forget(
+            &serde_json::json!({"what": "piano"}),
+            ToolExecutionContext::default(),
+        );
+        assert!(result2.is_ok(), "memory_forget should accept 'what' alias");
+
+        // Verify the memory was deleted
+        let mem2 = dispatcher2.memory.as_ref().unwrap().lock().unwrap();
+        let search_result2 = mem2.search("piano", 5).unwrap();
+        assert!(
+            search_result2.is_empty(),
+            "Memory with 'piano' should be deleted"
         );
     }
 
