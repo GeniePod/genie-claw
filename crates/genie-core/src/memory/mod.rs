@@ -556,7 +556,7 @@ impl Memory {
                 memory_type      TEXT NOT NULL,
                 embedding_model  TEXT NOT NULL,
                 dimensions       INTEGER NOT NULL,
-                embedding        TEXT NOT NULL,
+                embedding        BLOB NOT NULL,
                 updated_ms       INTEGER NOT NULL
             );
 
@@ -1894,12 +1894,12 @@ impl Memory {
                 let entry = read_entry(row)?;
                 let embedding_model: String = row.get(11)?;
                 let dimensions: i64 = row.get(12)?;
-                let embedding_json: String = row.get(13)?;
-                Ok((entry, embedding_model, dimensions as usize, embedding_json))
+                let embedding_blob: Vec<u8> = row.get(13)?;
+                Ok((entry, embedding_model, dimensions as usize, embedding_blob))
             })?
             .filter_map(|row| row.ok())
-            .filter_map(|(entry, embedding_model, dimensions, embedding_json)| {
-                parse_embedding(&embedding_json, dimensions).map(|embedding| {
+            .filter_map(|(entry, embedding_model, dimensions, embedding_blob)| {
+                parse_embedding(&embedding_blob, dimensions).map(|embedding| {
                     let mut score = embedding::cosine_similarity(&query_embedding, &embedding);
                     if query_type.as_deref().is_some_and(|expected| {
                         expected == semantic_memory_type(&entry.kind, &entry.content)
@@ -3539,7 +3539,7 @@ fn upsert_embedded_memory_from_memory(
     let provider = LocalHashEmbeddingProvider;
     let embedding_text = embedding_text_for_memory(kind, content);
     let embedding = provider.embed(&embedding_text);
-    let embedding_json = serde_json::to_string(&embedding)?;
+    let embedding_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
 
     conn.execute(
         "INSERT INTO embedded_memories (
@@ -3550,7 +3550,7 @@ fn upsert_embedded_memory_from_memory(
             semantic_memory_type(kind, content),
             provider.model_name(),
             provider.dimensions() as i64,
-            embedding_json,
+            embedding_blob,
             updated_ms
         ],
     )?;
@@ -7801,13 +7801,18 @@ fn semantic_query_type(query: &str) -> Option<String> {
     }
 }
 
-fn parse_embedding(value: &str, dimensions: usize) -> Option<Vec<f32>> {
-    let embedding = serde_json::from_str::<Vec<f32>>(value).ok()?;
-    if embedding.len() == dimensions {
-        Some(embedding)
-    } else {
-        None
+/// Decode a packed little-endian f32 embedding BLOB (4 bytes per dimension).
+/// Returns `None` if the byte length doesn't match `dimensions * 4`.
+fn parse_embedding(bytes: &[u8], dimensions: usize) -> Option<Vec<f32>> {
+    if bytes.len() != dimensions * 4 {
+        return None;
     }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
 }
 
 fn family_calendar_events_from_memory(kind: &str, content: &str) -> Vec<FamilyCalendarEvent> {
@@ -16174,6 +16179,86 @@ mod tests {
         let hits = reopened.semantic_search("I'm feeling cold", 3).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].entry.content.contains("thermostat"));
+    }
+
+    #[test]
+    fn parse_embedding_blob_roundtrip_is_bit_identical() {
+        use crate::memory::embedding::{EmbeddingProvider, LocalHashEmbeddingProvider};
+        let provider = LocalHashEmbeddingProvider;
+        let original = provider.embed("the family keeps the thermostat warm in the evening");
+        let blob: Vec<u8> = original.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let restored = parse_embedding(&blob, original.len()).expect("parse_embedding failed");
+        assert_eq!(
+            original, restored,
+            "packed f32 BLOB roundtrip must be bit-identical"
+        );
+    }
+
+    #[test]
+    fn parse_embedding_rejects_wrong_length() {
+        // Not a multiple of 4 → None.
+        assert!(parse_embedding(&[0u8; 3], 1).is_none());
+        // Right byte count but wrong declared dimensions.
+        let blob = vec![0u8; 64 * 4];
+        assert!(parse_embedding(&blob, 32).is_none());
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_embedding_decode_json_vs_blob() {
+        // Measures the per-row decode cost in `semantic_search`: the old TEXT
+        // column was decoded with serde_json per scanned row; the new BLOB with
+        // chunks_exact(4). Run on-device to capture the before→after.
+        use crate::memory::embedding::{EmbeddingProvider, LocalHashEmbeddingProvider};
+        use std::time::Instant;
+        let provider = LocalHashEmbeddingProvider;
+        let rows = 4000usize;
+        let embeds: Vec<Vec<f32>> = (0..rows)
+            .map(|i| {
+                provider.embed(&format!(
+                    "household memory {i}: routines, preferences, devices, people"
+                ))
+            })
+            .collect();
+        let dim = embeds[0].len();
+        let jsons: Vec<String> = embeds
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        let blobs: Vec<Vec<u8>> = embeds
+            .iter()
+            .map(|e| e.iter().flat_map(|f| f.to_le_bytes()).collect())
+            .collect();
+
+        let mut sink = 0.0f32;
+        for j in &jsons {
+            sink += serde_json::from_str::<Vec<f32>>(j).unwrap()[0];
+        }
+        for b in &blobs {
+            sink += parse_embedding(b, dim).unwrap()[0];
+        }
+
+        let iters = 20u32;
+        let t = Instant::now();
+        for _ in 0..iters {
+            for j in &jsons {
+                sink += serde_json::from_str::<Vec<f32>>(j).unwrap()[0];
+            }
+        }
+        let json_ns = t.elapsed().as_nanos() as f64 / (iters as f64 * rows as f64);
+
+        let t = Instant::now();
+        for _ in 0..iters {
+            for b in &blobs {
+                sink += parse_embedding(b, dim).unwrap()[0];
+            }
+        }
+        let blob_ns = t.elapsed().as_nanos() as f64 / (iters as f64 * rows as f64);
+
+        eprintln!(
+            "BENCH embedding decode: dim={dim} rows={rows} | JSON {json_ns:.0} ns/row | BLOB {blob_ns:.0} ns/row | speedup {:.1}x (sink={sink})",
+            json_ns / blob_ns
+        );
     }
 
     #[test]
