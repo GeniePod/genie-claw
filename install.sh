@@ -28,8 +28,8 @@ need uname
 need tar
 need install
 # one of curl/wget for downloads
-if command -v curl >/dev/null 2>&1; then DL="curl -fsSL -o"; DLO="curl -fsSL"
-elif command -v wget >/dev/null 2>&1; then DL="wget -qO";   DLO="wget -qO-"
+if command -v curl >/dev/null 2>&1; then DL="curl -fsSL -o"
+elif command -v wget >/dev/null 2>&1; then DL="wget -qO"
 else err "need curl or wget"; fi
 # one of sha256sum/shasum for verification
 if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"
