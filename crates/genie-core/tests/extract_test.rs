@@ -1,5 +1,95 @@
 use genie_core::Memory;
-use genie_core::memory::extract::{extract_and_store, extract_facts};
+use genie_core::memory::extract::{ExtractedFact, extract_and_store, extract_facts};
+
+fn facts_key(facts: &[ExtractedFact]) -> String {
+    facts
+        .iter()
+        .map(|f| format!("{}:{}", f.category, f.content))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Fixed corpus captured from `main` @ 72b0b28 — guards byte-identical output after
+/// identity/preference early-outs and favorite/remember allocation trims (#495).
+#[test]
+fn extract_facts_corpus_regression() {
+    const CORPUS: &[(&str, &str)] = &[
+        ("My name is Jared", "identity:User's name is Jared"),
+        ("Call me Alex", "identity:User's name is Alex"),
+        ("I'm 25 years old", "identity:User is 25 years old"),
+        ("I work at TrioSpace", "identity:User works at triospace"),
+        (
+            "I'm a software engineer",
+            "identity:User is a software engineer",
+        ),
+        ("I live in Denver", "identity:User lives in denver"),
+        ("I love spicy food", "preference:User likes spicy food"),
+        (
+            "I hate cold weather",
+            "preference:User dislikes cold weather",
+        ),
+        (
+            "My favorite color is blue",
+            "preference:User's favorite color is blue",
+        ),
+        (
+            "My favourite food is pizza",
+            "preference:User's favorite food is pizza",
+        ),
+        (
+            "My dog is named Rex",
+            "relationship:User's dog is named Rex",
+        ),
+        (
+            "My name is Jared and I love coding",
+            "identity:User's name is Jared|preference:User likes coding",
+        ),
+        ("What time is it?", ""),
+        ("Can you help me?", ""),
+        (
+            "Remember that I have a meeting tomorrow",
+            "fact:I have a meeting tomorrow",
+        ),
+        ("Remember I need to buy milk", "fact:I need to buy milk"),
+        ("I'm a bit tired", ""),
+        (
+            "I live in Denver and I work downtown",
+            "identity:User lives in denver",
+        ),
+        (
+            "I work at Google with my friend Bob",
+            "identity:User works at google",
+        ),
+        (
+            "I'm a software engineer but I hate meetings",
+            "identity:User is a software engineer|preference:User dislikes meetings",
+        ),
+        (
+            "I love hiking when the weather is nice",
+            "preference:User likes hiking",
+        ),
+        (
+            "My favorite food is pizza and pasta",
+            "preference:User's favorite food is pizza",
+        ),
+        (
+            "I work at Android Labs",
+            "identity:User works at android labs",
+        ),
+        ("the weather today is nice and i went for a walk", ""),
+        ("my plan today is to relax and read a good book", ""),
+        ("REMEMBER my pin is 1234", "fact:my pin is 1234"),
+        ("Remember that", ""),
+    ];
+
+    for (input, expected) in CORPUS {
+        assert_eq!(
+            facts_key(&extract_facts(input)),
+            *expected,
+            "corpus mismatch for {input:?}"
+        );
+    }
+}
 
 #[test]
 fn extract_name() {

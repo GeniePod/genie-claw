@@ -23,88 +23,93 @@ pub struct ExtractedFact {
 /// - `fact`: explicit "remember" requests, general statements
 pub fn extract_facts(text: &str) -> Vec<ExtractedFact> {
     let mut facts = Vec::new();
-    let lower = text.to_lowercase();
     let trimmed = text.trim();
+    let lower = text.to_lowercase();
 
-    // Identity patterns.
-    if let Some(name) = extract_pattern(&lower, &["my name is ", "call me ", "i'm called "]) {
-        facts.push(ExtractedFact {
-            category: "identity".into(),
-            content: format!("User's name is {}", capitalize(&name)),
-        });
+    if needs_identity_scan(&lower) {
+        if let Some(name) = extract_pattern(&lower, &["my name is ", "call me ", "i'm called "]) {
+            facts.push(ExtractedFact {
+                category: "identity".into(),
+                content: format!("User's name is {}", capitalize(&name)),
+            });
+        }
+
+        if let Some(age) = extract_age(&lower) {
+            facts.push(ExtractedFact {
+                category: "identity".into(),
+                content: format!("User is {} years old", age),
+            });
+        }
+
+        if let Some(job) = extract_pattern(
+            &lower,
+            &[
+                "i work at ",
+                "i work for ",
+                "i'm working at ",
+                "i am working at ",
+            ],
+        ) {
+            facts.push(ExtractedFact {
+                category: "identity".into(),
+                content: format!("User works at {}", job),
+            });
+        }
+
+        if let Some(job) = extract_pattern(
+            &lower,
+            &["i'm a ", "i am a ", "i work as a ", "i work as an "],
+        ) && !job.starts_with("bit ")
+            && !job.starts_with("lot ")
+            && !job.starts_with("fan ")
+        {
+            facts.push(ExtractedFact {
+                category: "identity".into(),
+                content: format!("User is a {}", job),
+            });
+        }
+
+        if let Some(loc) = extract_pattern(
+            &lower,
+            &["i live in ", "i'm from ", "i am from ", "i'm based in "],
+        ) {
+            facts.push(ExtractedFact {
+                category: "identity".into(),
+                content: format!("User lives in {}", loc),
+            });
+        }
     }
 
-    if let Some(age) = extract_age(&lower) {
-        facts.push(ExtractedFact {
-            category: "identity".into(),
-            content: format!("User is {} years old", age),
-        });
-    }
+    if needs_preference_scan(&lower) {
+        if let Some(pref) =
+            extract_pattern(&lower, &["i like ", "i love ", "i enjoy ", "i prefer "])
+            && pref.split_whitespace().count() <= 8
+        {
+            facts.push(ExtractedFact {
+                category: "preference".into(),
+                content: format!("User likes {}", pref),
+            });
+        }
 
-    if let Some(job) = extract_pattern(
-        &lower,
-        &[
-            "i work at ",
-            "i work for ",
-            "i'm working at ",
-            "i am working at ",
-        ],
-    ) {
-        facts.push(ExtractedFact {
-            category: "identity".into(),
-            content: format!("User works at {}", job),
-        });
-    }
+        if let Some(pref) = extract_pattern(
+            &lower,
+            &["i hate ", "i dislike ", "i don't like ", "i can't stand "],
+        ) && pref.split_whitespace().count() <= 8
+        {
+            facts.push(ExtractedFact {
+                category: "preference".into(),
+                content: format!("User dislikes {}", pref),
+            });
+        }
 
-    if let Some(job) = extract_pattern(
-        &lower,
-        &["i'm a ", "i am a ", "i work as a ", "i work as an "],
-    ) && !job.starts_with("bit ")
-        && !job.starts_with("lot ")
-        && !job.starts_with("fan ")
-    {
-        facts.push(ExtractedFact {
-            category: "identity".into(),
-            content: format!("User is a {}", job),
-        });
-    }
-
-    if let Some(loc) = extract_pattern(
-        &lower,
-        &["i live in ", "i'm from ", "i am from ", "i'm based in "],
-    ) {
-        facts.push(ExtractedFact {
-            category: "identity".into(),
-            content: format!("User lives in {}", loc),
-        });
-    }
-
-    // Preference patterns.
-    if let Some(pref) = extract_pattern(&lower, &["i like ", "i love ", "i enjoy ", "i prefer "])
-        && pref.split_whitespace().count() <= 8
-    {
-        facts.push(ExtractedFact {
-            category: "preference".into(),
-            content: format!("User likes {}", pref),
-        });
-    }
-
-    if let Some(pref) = extract_pattern(
-        &lower,
-        &["i hate ", "i dislike ", "i don't like ", "i can't stand "],
-    ) && pref.split_whitespace().count() <= 8
-    {
-        facts.push(ExtractedFact {
-            category: "preference".into(),
-            content: format!("User dislikes {}", pref),
-        });
-    }
-
-    if let Some(fav) = extract_favorite(&lower) {
-        facts.push(ExtractedFact {
-            category: "preference".into(),
-            content: fav,
-        });
+        if lower.contains("favo")
+            && let Some(fav) = extract_favorite(&lower)
+        {
+            facts.push(ExtractedFact {
+                category: "preference".into(),
+                content: fav,
+            });
+        }
     }
 
     // Relationship patterns.
@@ -116,14 +121,15 @@ pub fn extract_facts(text: &str) -> Vec<ExtractedFact> {
     }
 
     // Explicit "remember" requests.
-    if let Some(content) = extract_remember(trimmed) {
-        // Only add if not already captured by a more specific pattern above.
-        if facts.is_empty() {
-            facts.push(ExtractedFact {
-                category: "fact".into(),
-                content,
-            });
-        }
+    if trimmed.len() >= 8
+        && trimmed[..8].eq_ignore_ascii_case("remember")
+        && let Some(content) = extract_remember(trimmed)
+        && facts.is_empty()
+    {
+        facts.push(ExtractedFact {
+            category: "fact".into(),
+            content,
+        });
     }
 
     facts
@@ -275,27 +281,55 @@ fn extract_age(text: &str) -> Option<u32> {
     None
 }
 
+fn needs_identity_scan(lower: &str) -> bool {
+    lower.contains("my name")
+        || lower.contains("call me")
+        || lower.contains("called")
+        || lower.contains("i work")
+        || lower.contains("working at")
+        || lower.contains("work as")
+        || lower.contains("i live")
+        || lower.contains("i'm from")
+        || lower.contains("i am from")
+        || lower.contains("based in")
+        || lower.contains("i'm a")
+        || lower.contains("i am a")
+        || lower.contains("i'm ")
+        || lower.contains("i am ")
+}
+
+fn needs_preference_scan(lower: &str) -> bool {
+    lower.contains("i like")
+        || lower.contains("i love")
+        || lower.contains("i enjoy")
+        || lower.contains("i prefer")
+        || lower.contains("i hate")
+        || lower.contains("i dislike")
+        || lower.contains("i don't like")
+        || lower.contains("i can't stand")
+        || lower.contains("favo")
+}
+
 fn extract_favorite(text: &str) -> Option<String> {
     // "my favorite color is blue" / "my favourite food is pizza"
-    let start = text.find("my favo").or_else(|| text.find("my favo"))?;
+    let start = text.find("my favo")?;
     let rest = &text[start..];
 
-    // Find "is" after "favorite X"
     let is_pos = rest.find(" is ")?;
-    let before_is = &rest[..is_pos]; // "my favorite color"
+    let before_is = &rest[..is_pos];
     let after_is = rest[is_pos + 4..].trim();
 
     let thing = before_is
-        .replace("my favorite ", "")
-        .replace("my favourite ", "");
+        .strip_prefix("my favorite ")
+        .or_else(|| before_is.strip_prefix("my favourite "))?;
 
     let sentence = after_is.split(['.', ',', '!']).next().unwrap_or("").trim();
     let value = first_clause(sentence).trim();
 
-    if !thing.is_empty() && !value.is_empty() {
-        Some(format!("User's favorite {} is {}", thing.trim(), value))
-    } else {
+    if value.is_empty() {
         None
+    } else {
+        Some(format!("User's favorite {} is {}", thing.trim(), value))
     }
 }
 
@@ -456,15 +490,17 @@ fn extract_relationships(text: &str) -> Vec<(String, String)> {
 }
 
 fn extract_remember(text: &str) -> Option<String> {
-    let lower = text.to_lowercase();
-    if lower.starts_with("remember") {
-        let rest = text["remember".len()..].trim();
-        let rest = rest.strip_prefix("that").unwrap_or(rest).trim();
-        if !rest.is_empty() {
-            return Some(rest.to_string());
-        }
+    const PREFIX: &str = "remember";
+    if text.len() < PREFIX.len() || !text[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        return None;
     }
-    None
+    let rest = text[PREFIX.len()..].trim();
+    let rest = rest.strip_prefix("that").unwrap_or(rest).trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
 }
 
 fn capitalize(s: &str) -> String {

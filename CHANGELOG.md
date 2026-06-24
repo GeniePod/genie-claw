@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Full spoken-number durations** (#490): the quick-router only mapped a sparse
+  set of number words, so "set a timer for thirteen minutes" set no timer
+  (thirteen, fourteen, sixteen–nineteen were missing, and hundreds/thousands
+  were unsupported). A real English cardinal parser now folds units, teens,
+  tens, `hundred`, `thousand`, and the `and` connector into one value, so
+  "one hundred and twenty seconds" and the like resolve correctly. Digit forms
+  and the existing "forty five" compound are unchanged.
+
 ## 1.0.0-rc.1 - 2026-06-24
 
 First release candidate — and the first **installable** build. GenieClaw can now
