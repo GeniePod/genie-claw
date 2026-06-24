@@ -211,16 +211,22 @@ fn restricted_decision(reason: &'static str) -> MemoryPolicyDecision {
 /// This is used both when new memories are stored and when older databases are
 /// backfilled into the persisted scope/sensitivity/spoken-policy columns.
 pub fn infer_metadata(kind: &str, content: &str) -> MemoryPolicyMetadata {
-    let kind_lower = kind.to_lowercase();
-    let lower = content.to_lowercase();
-    let private_intent =
-        kind_lower == "private" || kind_lower.starts_with("private_") || has_private_intent(&lower);
+    let kind_lower = kind.trim().to_lowercase();
+    let content_lower = content.to_lowercase();
+    infer_metadata_lower(kind, &kind_lower, &content_lower)
+}
+
+fn infer_metadata_lower(kind: &str, kind_lower: &str, content_lower: &str) -> MemoryPolicyMetadata {
+    let private_intent = kind_lower == "private"
+        || kind_lower.starts_with("private_")
+        || (needs_private_intent_scan(content_lower) && has_private_intent(content_lower));
     let person_linked = kind_lower == "person"
         || kind_lower.starts_with("person_")
         || kind_lower == "person-linked"
         || kind_lower == "person_linked";
-    let restricted = restricted_secret_reason(&lower).is_some();
-    let cautious = is_cautious_memory(kind, &lower);
+    let restricted = needs_restricted_secret_scan(content_lower)
+        && restricted_secret_reason(content_lower).is_some();
+    let cautious = is_cautious_memory(kind, content_lower);
 
     let scope = if private_intent {
         MemoryScope::Private
@@ -254,12 +260,15 @@ pub fn infer_metadata(kind: &str, content: &str) -> MemoryPolicyMetadata {
 
 /// Decide whether a proposed memory may be written by voice/tool flow.
 pub fn assess_memory_write(kind: &str, content: &str) -> MemoryPolicyDecision {
-    let lower = content.to_lowercase();
-    if let Some(reason) = restricted_secret_reason(&lower) {
+    let content_lower = content.to_lowercase();
+    if needs_restricted_secret_scan(&content_lower)
+        && let Some(reason) = restricted_secret_reason(&content_lower)
+    {
         return restricted_decision(reason);
     }
 
-    let metadata = infer_metadata(kind, content);
+    let kind_lower = kind.trim().to_lowercase();
+    let metadata = infer_metadata_lower(kind, &kind_lower, &content_lower);
     if metadata.scope == MemoryScope::Private {
         return decision_for_metadata(
             metadata,
@@ -496,31 +505,118 @@ fn has_private_intent(lower: &str) -> bool {
 
 fn is_cautious_memory(kind: &str, lower: &str) -> bool {
     kind.eq_ignore_ascii_case("private")
-        || contains_any(
-            lower,
-            &[
-                "medical diagnosis",
-                "mental health",
-                "therapy session",
-                "legal problem",
-                "personal secret",
-                // Health data must not reach a cloud proxy even through an anonymizing
-                // gateway; the proxy sees raw content before masking.
-                "medication",
-                "prescription",
-                "diagnosed with",
-                "for diabetes",
-                "for cancer",
-                "for depression",
-                "for anxiety",
-                "for hypertension",
-                "for epilepsy",
-                "for asthma",
-                "insulin",
-                "chemotherapy",
-                "dialysis",
-            ],
-        )
+        || (needs_cautious_scan(lower)
+            && contains_any(
+                lower,
+                &[
+                    "medical diagnosis",
+                    "mental health",
+                    "therapy session",
+                    "legal problem",
+                    "personal secret",
+                    // Health data must not reach a cloud proxy even through an anonymizing
+                    // gateway; the proxy sees raw content before masking.
+                    "medication",
+                    "prescription",
+                    "diagnosed with",
+                    "for diabetes",
+                    "for cancer",
+                    "for depression",
+                    "for anxiety",
+                    "for hypertension",
+                    "for epilepsy",
+                    "for asthma",
+                    "insulin",
+                    "chemotherapy",
+                    "dialysis",
+                ],
+            ))
+}
+
+fn needs_restricted_secret_scan(lower: &str) -> bool {
+    lower.contains("password")
+        || lower.contains("passcode")
+        || lower.contains("pass:")
+        || lower.contains(" pass:")
+        || lower.contains("one-time")
+        || lower.contains("one time")
+        || lower.contains("otp")
+        || lower.contains("2fa")
+        || lower.contains("recovery")
+        || lower.contains("seed phrase")
+        || lower.contains("private key")
+        || lower.contains("secret key")
+        || lower.contains("api key")
+        || lower.contains("access token")
+        || lower.contains("gate code")
+        || lower.contains("door code")
+        || lower.contains("garage code")
+        || lower.contains("alarm code")
+        || lower.contains("security code")
+        || lower.contains("safe code")
+        || lower.contains("combination")
+        || lower.contains(" lock combo")
+        || lower.contains("credit card")
+        || lower.contains("card number")
+        || lower.contains("cvv")
+        || lower.contains("account number")
+        || lower.contains("confirmation number")
+        || lower.contains("bank account")
+        || lower.contains("routing number")
+        || lower.contains("social security")
+        || lower.contains("ssn")
+        || lower.contains("passport")
+        || lower.contains("driver license")
+        || lower.contains("government id")
+        || lower.contains(" is in ")
+        || lower.contains(" are in ")
+        || lower.contains(" is inside ")
+        || lower.contains(" are inside ")
+        || lower.contains(" is kept ")
+        || lower.contains(" are kept ")
+        || lower.contains(" is stored ")
+        || lower.contains(" are stored ")
+        || lower.contains(" is hidden ")
+        || lower.contains(" are hidden ")
+        || lower.contains(" under ")
+        || lower.contains(" behind ")
+        || lower.contains("birth certificate")
+        || lower.contains("house key")
+        || lower.contains("spare key")
+        || lower.contains("safe key")
+        || lower.contains("car title")
+        || lower.contains("property deed")
+        || lower.contains("documents are")
+        || lower.contains("valuables are")
+        || lower.contains("important documents")
+}
+
+fn needs_private_intent_scan(lower: &str) -> bool {
+    lower.contains("private")
+        || lower.contains("for me only")
+        || lower.contains("aloud")
+        || lower.contains("remember this")
+}
+
+fn needs_cautious_scan(lower: &str) -> bool {
+    lower.contains("medical")
+        || lower.contains("mental health")
+        || lower.contains("therapy")
+        || lower.contains("legal")
+        || lower.contains("secret")
+        || lower.contains("medication")
+        || lower.contains("prescription")
+        || lower.contains("diagnosed")
+        || lower.contains("diabetes")
+        || lower.contains("cancer")
+        || lower.contains("depression")
+        || lower.contains("anxiety")
+        || lower.contains("hypertension")
+        || lower.contains("epilepsy")
+        || lower.contains("asthma")
+        || lower.contains("insulin")
+        || lower.contains("chemotherapy")
+        || lower.contains("dialysis")
 }
 
 fn restricted_secret_reason(lower: &str) -> Option<&'static str> {
