@@ -23,7 +23,10 @@ env:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    # Build on 22.04 (glibc 2.35) so the binaries run on the Jetson (L4T 36 /
+    # Ubuntu 22.04, glibc 2.35). ubuntu-latest (24.04, glibc 2.39) produces
+    # binaries that fail with "GLIBC_2.39 not found" on the device.
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: true
       matrix:
