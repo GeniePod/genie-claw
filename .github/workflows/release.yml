@@ -1,0 +1,148 @@
+# Build release binaries for Linux aarch64 (Jetson) + x86_64 and publish them as
+# GitHub Release assets, so GenieClaw can be installed with the curl one-liner in
+# install.sh. Triggered by pushing a `vX.Y.Z[-pre]` tag.
+#
+# Each target produces `genieclaw-<version>-<target>.tar.gz` (the five runtime
+# binaries + a default config + LICENSE), plus a combined `SHA256SUMS`. install.sh
+# is uploaded alongside so the raw URL is stable across releases.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: write
+
+env:
+  BINARIES: genie-core genie-ctl genie-api genie-governor genie-health
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64 cross toolchain
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binaries
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}" -p genie-core
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p genie-ctl -p genie-governor -p genie-health -p genie-api
+
+      - name: Verify binaries
+        run: |
+          set -euo pipefail
+          out="target/${{ matrix.target }}/release"
+          for bin in $BINARIES; do
+            test -f "$out/$bin" || { echo "missing: $out/$bin"; exit 1; }
+          done
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          target="${{ matrix.target }}"
+          name="genieclaw-${version}-${target}"
+          out="target/${target}/release"
+          stage="$(mktemp -d)/${name}"
+          mkdir -p "$stage/bin" "$stage/config"
+          for bin in $BINARIES; do install -m 0755 "$out/$bin" "$stage/bin/$bin"; done
+          install -m 0644 deploy/config/geniepod.toml "$stage/config/geniepod.toml"
+          install -m 0644 LICENSE "$stage/LICENSE"
+          echo "$version" > "$stage/VERSION"
+          tar -C "$(dirname "$stage")" -czf "${name}.tar.gz" "${name}"
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          echo "tarball=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.tarball }}
+          path: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.tarball }}.sha256
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble assets + checksums + notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p out
+          cp dist/*.tar.gz out/
+          cp install.sh out/install.sh
+          ( cd out && sha256sum ./*.tar.gz install.sh > SHA256SUMS )
+          # Release notes = this version's CHANGELOG section, falling back to a stub.
+          notes="out/notes.md"
+          awk -v v="## ${version}" '
+            $0 ~ "^"v {p=1; next}
+            p && /^## [0-9]/ {p=0}
+            p {print}
+          ' CHANGELOG.md > "$notes" || true
+          if [ ! -s "$notes" ]; then echo "GenieClaw ${version}." > "$notes"; fi
+
+      - name: Mark prerelease for -rc / -beta / -alpha tags
+        id: pre
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            *-rc*|*-beta*|*-alpha*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          flag=""
+          [ "${{ steps.pre.outputs.prerelease }}" = "true" ] && flag="--prerelease"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" out/*.tar.gz out/SHA256SUMS out/install.sh --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" out/*.tar.gz out/SHA256SUMS out/install.sh \
+              $flag --title "${version}" --notes-file out/notes.md
+          fi

@@ -258,7 +258,33 @@ The repo now has explicit code-level contract surfaces for the new direction:
   below `[agent].context_window_tokens` unless a specific test intentionally
   proves a larger-context path without weakening the Jetson baseline.
 
-## Quick Start
+## Install
+
+Install the prebuilt runtime binaries (Linux **aarch64** / Jetson and **x86_64**):
+
+```bash
+curl -fsSL https://github.com/GeniePod/genie-claw/releases/latest/download/install.sh | sh
+```
+
+This installs the five runtime binaries to `/usr/local/bin` (or `~/.local/bin`)
+and writes a starter config to `~/.config/geniepod/geniepod.toml`. Then:
+
+```bash
+GENIEPOD_CONFIG=~/.config/geniepod/geniepod.toml genie-core   # agent runtime + HTTP API
+genie-ctl --help
+```
+
+> While GenieClaw is in the release-candidate phase, `releases/latest` has no
+> stable build yet — pin the version:
+> ```bash
+> GENIECLAW_VERSION=v1.0.0-rc.1 \
+>   sh -c "$(curl -fsSL https://github.com/GeniePod/genie-claw/releases/download/v1.0.0-rc.1/install.sh)"
+> ```
+
+The full Jetson voice / Home Assistant deployment stays in
+[`GETTING_STARTED.md`](GETTING_STARTED.md) and `deploy/setup-jetson.sh`.
+
+## Quick Start (from source)
 
 ```bash
 make
