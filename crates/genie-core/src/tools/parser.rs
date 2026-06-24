@@ -7,6 +7,8 @@ use super::dispatch::{ToolCall, ToolDispatcher, ToolExecutionContext, ToolResult
 /// 2. Markdown code block: ````json\n{"tool": "get_time"}\n````
 /// 3. Embedded in text: `I'll check that. {"tool": "get_weather", "arguments": {"location": "Denver"}}`
 /// 4. With extra fields: `{"tool": "set_timer", "arguments": {"seconds": 300}, "reasoning": "..."}`
+/// 5. OpenAI-compatible wrappers: `{"tool_calls": [...]}` or `{"function_call": {...}}` (#479)
+/// 6. Top-level JSON arrays of tool calls (first call only at runtime)
 pub async fn try_tool_call(response: &str, tools: &ToolDispatcher) -> Option<ToolResult> {
     try_tool_call_with_context(response, tools, ToolExecutionContext::default()).await
 }
@@ -41,11 +43,32 @@ pub const UNPARSED_TOOL_CALL_FALLBACK: &str =
 /// therefore handled by `try_tool_call_with_context`), returns false.
 pub fn is_unparsed_tool_call(response: &str) -> bool {
     let trimmed = response.trim();
-    let looks_toolish = (trimmed.starts_with('{') || trimmed.starts_with("```"))
-        && (trimmed.contains("\"tool\"")
-            || trimmed.contains("\"arguments\"")
-            || trimmed.contains("\"name\""));
-    looks_toolish && extract_json(response).is_none()
+    let looks_toolish =
+        (trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.starts_with("```"))
+            && (trimmed.contains("\"tool\"")
+                || trimmed.contains("\"arguments\"")
+                || trimmed.contains("\"name\"")
+                || trimmed.contains("\"tool_calls\"")
+                || trimmed.contains("\"function_call\""));
+
+    let Some(json_str) = extract_json(response) else {
+        return looks_toolish;
+    };
+
+    if serde_json::from_str::<serde_json::Value>(&json_str).is_err() {
+        return looks_toolish;
+    }
+
+    // Malformed OpenAI / array wrappers that still parse as JSON (#479).
+    if (trimmed.contains("\"tool_calls\"")
+        || trimmed.contains("\"function_call\"")
+        || trimmed.starts_with('['))
+        && parse_tool_calls_for_eval(response).is_empty()
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Parse tool calls from model output without executing them.
@@ -66,11 +89,19 @@ pub fn parse_tool_calls_for_eval(response: &str) -> Vec<ToolCall> {
 }
 
 fn parse_tool_call_value(value: serde_json::Value, tools: &ToolDispatcher) -> Option<ToolCall> {
-    if let Ok(call) = serde_json::from_value::<ToolCall>(value.clone()) {
+    if let Ok(call) = serde_json::from_value::<ToolCall>(value.clone())
+        && !call.name.is_empty()
+    {
         return Some(call);
     }
 
-    normalize_single_key_tool_call(value, tools)
+    if let Some(call) = normalize_single_key_tool_call(value.clone(), tools) {
+        return Some(call);
+    }
+
+    // OpenAI `tool_calls` / `function_call` wrappers and JSON arrays — runtime
+    // dispatches the first call only, matching BFCL eval parsing (#479).
+    parse_tool_call_value_for_eval(value).into_iter().next()
 }
 
 fn normalize_single_key_tool_call(
@@ -650,6 +681,40 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "home_control");
         assert_eq!(calls[0].arguments["entity"], "kitchen light");
+    }
+
+    #[tokio::test]
+    async fn try_tool_call_accepts_openai_tool_calls_wrapper() {
+        let dispatcher = ToolDispatcher::new(None);
+        let input = r#"{"tool_calls":[{"type":"function","function":{"name":"calculate","arguments":"{\"expression\":\"2+2\"}"}}]}"#;
+
+        let result = try_tool_call(input, &dispatcher).await.unwrap();
+        assert_eq!(result.tool, "calculate");
+        assert!(result.success);
+        assert!(result.output.contains('4'), "output: {}", result.output);
+    }
+
+    #[tokio::test]
+    async fn try_tool_call_accepts_json_array_first_call_only() {
+        let dispatcher = ToolDispatcher::new(None);
+        let input = r#"[{"tool": "get_time", "arguments": {}}, {"tool": "set_timer", "arguments": {"seconds": 60}}]"#;
+
+        let result = try_tool_call(input, &dispatcher).await.unwrap();
+        assert_eq!(result.tool, "get_time");
+        assert!(result.success);
+    }
+
+    #[test]
+    fn openai_tool_calls_wrapper_is_not_flagged_as_unparsed() {
+        let ok = r#"{"tool_calls":[{"type":"function","function":{"name":"calculate","arguments":"{\"expression\":\"1+1\"}"}}]}"#;
+        assert!(!is_unparsed_tool_call(ok));
+    }
+
+    #[test]
+    fn malformed_openai_tool_calls_wrapper_is_unparsed() {
+        let broken =
+            r#"{"tool_calls":[{"type":"function","function":{"name":"","arguments":"{}"}}]}"#;
+        assert!(is_unparsed_tool_call(broken));
     }
 
     #[test]

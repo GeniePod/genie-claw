@@ -22,6 +22,9 @@ pub struct Config {
     pub optional_ai_provider: OptionalAiProviderConfig,
 
     #[serde(default)]
+    pub privacy_proxy: PrivacyProxyConfig,
+
+    #[serde(default)]
     pub governor: GovernorConfig,
 
     #[serde(default)]
@@ -427,6 +430,72 @@ pub enum OptionalAiProviderKind {
     Anthropic,
     Gemini,
     Custom,
+}
+
+/// Configuration for optional privacy-preserving cloud escalation via PrivacyProxy.
+///
+/// PrivacyProxy is an on-device anonymizing gateway. When the local model fails or
+/// the context overflows, genie-core can route the request through PrivacyProxy, which
+/// masks household identifiers before forwarding to a cloud model, then restores them
+/// in the response. See issue #418.
+///
+/// Safety invariant: `base_url` must always be a localhost endpoint. Remote URLs are
+/// rejected by `endpoint_is_valid()` and flagged in `household_security_summary()`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PrivacyProxyConfig {
+    /// Enable cloud escalation via PrivacyProxy. Disabled by default.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// PrivacyProxy OpenAI-compatible endpoint. Must be a localhost address.
+    #[serde(default = "defaults::privacy_proxy_base_url")]
+    pub base_url: String,
+
+    /// Condition that triggers escalation to PrivacyProxy.
+    #[serde(default)]
+    pub trigger: EscalationTrigger,
+
+    /// Path on the PrivacyProxy server used to seed masking vocabulary (POST).
+    #[serde(default = "defaults::privacy_proxy_vocab_path")]
+    pub vocab_path: String,
+}
+
+impl PrivacyProxyConfig {
+    /// Return true when `base_url` resolves to a localhost address.
+    ///
+    /// PrivacyProxy must always run on-device; a remote URL would defeat the
+    /// privacy guarantee by exposing raw household data before masking.
+    pub fn endpoint_is_valid(&self) -> bool {
+        !self.enabled || is_local_url(&self.base_url)
+    }
+}
+
+impl Default for PrivacyProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: defaults::privacy_proxy_base_url(),
+            trigger: EscalationTrigger::default(),
+            vocab_path: defaults::privacy_proxy_vocab_path(),
+        }
+    }
+}
+
+/// Condition that causes a request to be escalated to PrivacyProxy.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationTrigger {
+    /// Escalate only when the local LLM returns an error or empty response.
+    LocalDecline,
+    /// Escalate only when the limited-context harness flags a context overflow.
+    ContextOverflow,
+    /// Escalate on either condition (default).
+    #[default]
+    LocalDeclineOrContextOverflow,
+}
+
+fn is_local_url(url: &str) -> bool {
+    !is_remote_url(url)
 }
 
 fn is_remote_url(url: &str) -> bool {
@@ -1500,6 +1569,12 @@ impl Config {
         {
             risk_flags.push("optional_ai_provider_remote_url_blocked");
         }
+        if self.privacy_proxy.enabled {
+            risk_flags.push("privacy_proxy_escalation_enabled");
+        }
+        if self.privacy_proxy.enabled && !self.privacy_proxy.endpoint_is_valid() {
+            risk_flags.push("privacy_proxy_endpoint_not_localhost");
+        }
         if !self.core.skill_policy.require_manifest {
             risk_flags.push("skill_manifest_not_required");
         }
@@ -1557,6 +1632,12 @@ impl Config {
                 "base_url_configured": !self.optional_ai_provider.base_url.trim().is_empty(),
                 "api_key_value_exposed": false,
                 "credential_value_exposed": false
+            },
+            "privacy_proxy": {
+                "enabled": self.privacy_proxy.enabled,
+                "trigger": format!("{:?}", self.privacy_proxy.trigger),
+                "endpoint_is_localhost": self.privacy_proxy.endpoint_is_valid(),
+                "base_url_exposed": false
             },
             "policy": {
                 "tool_policy_enabled": self.core.tool_policy.enabled,
@@ -1700,6 +1781,7 @@ mod tests {
             core: CoreConfig::default(),
             agent: AgentConfig::default(),
             optional_ai_provider: OptionalAiProviderConfig::default(),
+            privacy_proxy: PrivacyProxyConfig::default(),
             governor: GovernorConfig::default(),
             health: HealthConfig::default(),
             services: ServicesConfig::default(),
@@ -2583,6 +2665,35 @@ expected_runtime_contract_hash = "abc123"
     }
 
     #[test]
+    fn privacy_proxy_is_disabled_by_default() {
+        let config = test_config();
+        assert!(!config.privacy_proxy.enabled);
+        assert_eq!(
+            config.privacy_proxy.trigger,
+            EscalationTrigger::LocalDeclineOrContextOverflow
+        );
+        assert!(config.privacy_proxy.endpoint_is_valid());
+    }
+
+    #[test]
+    fn privacy_proxy_config_parses() {
+        let config: PrivacyProxyConfig = toml::from_str(
+            r#"
+enabled = true
+base_url = "http://127.0.0.1:8180/v1"
+trigger = "local_decline"
+vocab_path = "/vocab/seed"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.enabled);
+        assert_eq!(config.trigger, EscalationTrigger::LocalDecline);
+        assert_eq!(config.vocab_path, "/vocab/seed");
+        assert!(config.endpoint_is_valid());
+    }
+
+    #[test]
     fn http_server_config_defaults_are_bounded() {
         let config = test_config();
         assert_eq!(config.http.max_request_line_bytes, 8 * 1024);
@@ -2610,8 +2721,25 @@ systemd_unit = "genie-ai-runtime.service"
         )
         .unwrap();
 
+        assert_eq!(config.http.max_request_line_bytes, 8 * 1024);
+        assert_eq!(config.http.max_header_line_bytes, 8 * 1024);
+        assert_eq!(config.http.max_header_count, 100);
         assert_eq!(config.http.max_header_bytes, 64 * 1024);
+        assert_eq!(config.http.read_timeout_secs, 15);
         assert_eq!(config.http.max_connections, 256);
+    }
+
+    #[test]
+    fn privacy_proxy_rejects_remote_endpoint() {
+        let config: PrivacyProxyConfig = toml::from_str(
+            r#"
+enabled = true
+base_url = "http://proxy.example.com/v1"
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.endpoint_is_valid());
     }
 
     #[test]
@@ -2634,6 +2762,52 @@ max_connections = 16
         assert_eq!(config.max_header_bytes, 16384);
         assert_eq!(config.read_timeout_secs, 5);
         assert_eq!(config.max_connections, 16);
+    }
+
+    #[test]
+    fn privacy_proxy_localhost_variants_are_valid() {
+        for url in &[
+            "http://127.0.0.1:8180/v1",
+            "http://localhost:8180/v1",
+            "http://[::1]:8180/v1",
+        ] {
+            let config = PrivacyProxyConfig {
+                enabled: true,
+                base_url: url.to_string(),
+                ..PrivacyProxyConfig::default()
+            };
+            assert!(
+                config.endpoint_is_valid(),
+                "{url} should be accepted as localhost"
+            );
+        }
+    }
+
+    #[test]
+    fn household_security_summary_flags_privacy_proxy_when_enabled() {
+        let mut config = test_config();
+        config.privacy_proxy.enabled = true;
+
+        let summary = config.household_security_summary();
+        let flags = summary["risk_flags"].to_string();
+
+        assert!(flags.contains("privacy_proxy_escalation_enabled"));
+        assert!(!flags.contains("privacy_proxy_endpoint_not_localhost"));
+        assert_eq!(summary["privacy_proxy"]["enabled"], true);
+        assert_eq!(summary["privacy_proxy"]["endpoint_is_localhost"], true);
+        assert_eq!(summary["privacy_proxy"]["base_url_exposed"], false);
+    }
+
+    #[test]
+    fn household_security_summary_flags_remote_privacy_proxy_endpoint() {
+        let mut config = test_config();
+        config.privacy_proxy.enabled = true;
+        config.privacy_proxy.base_url = "http://proxy.example.com/v1".into();
+
+        let summary = config.household_security_summary();
+        let flags = summary["risk_flags"].to_string();
+
+        assert!(flags.contains("privacy_proxy_endpoint_not_localhost"));
     }
 
     #[test]
@@ -2902,6 +3076,12 @@ mod defaults {
     }
     pub fn web_search_cache_max_entries() -> usize {
         64
+    }
+    pub fn privacy_proxy_base_url() -> String {
+        "http://127.0.0.1:8180/v1".into()
+    }
+    pub fn privacy_proxy_vocab_path() -> String {
+        "/vocab/seed".into()
     }
     pub fn connectivity_device() -> String {
         "esp32c6".into()

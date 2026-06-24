@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use genie_common::config::HttpServerConfig;
+use genie_common::config::{EscalationTrigger, HttpServerConfig, PrivacyProxyConfig};
 use genie_common::http::{GuardRejection, HttpLimits, OriginDecision, RequestGuard, read_request};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
-use crate::llm::{LlmClient, LlmRequestHints, Message};
+use crate::llm::{LlmBackendClient, LlmClient, LlmRequestHints, Message, PrivacyProxyBackend};
 use crate::memory::{Memory, SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
 use crate::prompt::ModelFamily;
@@ -98,6 +98,9 @@ pub struct ChatServer {
     /// Trusted resolution of the request origin from the (forgeable) header,
     /// the peer transport, and any authenticated token (issue #232).
     origin_resolver: OriginResolver,
+    /// Optional on-device anonymising gateway for cloud escalation (issue #418).
+    /// `None` means escalation is disabled and every turn is handled locally.
+    privacy_proxy: Option<PrivacyProxyConfig>,
 }
 
 pub struct ChatTurnResult {
@@ -140,6 +143,7 @@ impl ChatServer {
             boot_harness,
             http_config: HttpServerConfig::default(),
             origin_resolver: OriginResolver::default(),
+            privacy_proxy: None,
         })
     }
 
@@ -156,6 +160,17 @@ impl ChatServer {
     /// non-loopback peer to `api` (issue #232).
     pub fn with_origin_auth(mut self, origin_resolver: OriginResolver) -> Self {
         self.origin_resolver = origin_resolver;
+        self
+    }
+
+    /// Enable optional PrivacyProxy cloud escalation (issue #418).
+    ///
+    /// When set, failed local LLM calls or context-overflow turns are routed
+    /// through the on-device anonymising gateway at `cfg.base_url` before
+    /// reaching any cloud model. Only `Anonymized`-policy memory terms are
+    /// seeded; `Private`/`Restricted` facts are never forwarded.
+    pub fn with_privacy_proxy(mut self, cfg: PrivacyProxyConfig) -> Self {
+        self.privacy_proxy = Some(cfg);
         self
     }
 
@@ -578,6 +593,7 @@ async fn handle_request(
     let max_history = ctx.max_history;
     let model_family = ctx.model_family;
     let expected_runtime_contract_hash = &ctx.expected_runtime_contract_hash;
+    let privacy_proxy = ctx.privacy_proxy.as_ref();
     // Capture the peer address before splitting the stream: it is the
     // transport-level proof used to gate privileged origin claims (issue #232).
     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
@@ -680,6 +696,7 @@ async fn handle_request(
                     max_history,
                     model_family,
                     request_origin,
+                    privacy_proxy,
                 )
                 .await
             }
@@ -1118,6 +1135,7 @@ pub async fn process_chat_turn(
     max_history: usize,
     model_family: ModelFamily,
     request_origin: RequestOrigin,
+    privacy_proxy: Option<&PrivacyProxyConfig>,
 ) -> Result<ChatTurnResult> {
     conversations.ensure(conv_id, "New conversation")?;
     conversations.append(conv_id, "user", user_text, None)?;
@@ -1174,9 +1192,74 @@ pub async fn process_chat_turn(
     );
 
     let request_hints = LlmRequestHints::agent_turn(conv_id, 512);
-    let llm_response = llm
-        .chat_with_hints(&messages, Some(512), &request_hints)
-        .await?;
+
+    // Rough token estimate (4 chars ≈ 1 token). Reserve response budget.
+    let estimated_tokens: usize = messages.iter().map(|m| m.content.len() / 4).sum();
+    let context_overflowed = estimated_tokens + crate::agent_harness::RESPONSE_RESERVE_TOKENS
+        > crate::runtime_boundary::JETSON_BASELINE_CONTEXT_TOKENS as usize;
+
+    // Escalate on overflow before attempting the local model — sending a
+    // context-length request to the local model would just error anyway.
+    let triggers_overflow = privacy_proxy.is_some()
+        && context_overflowed
+        && matches!(
+            privacy_proxy.map(|p| &p.trigger),
+            Some(EscalationTrigger::ContextOverflow)
+                | Some(EscalationTrigger::LocalDeclineOrContextOverflow)
+        );
+
+    let llm_response = if triggers_overflow {
+        tracing::info!(
+            estimated_tokens,
+            "context overflow; escalating via PrivacyProxy"
+        );
+        match escalate_via_privacy_proxy(privacy_proxy.unwrap(), &messages, memory).await {
+            Ok(r) => r,
+            Err(proxy_err) => {
+                tracing::warn!(
+                    error = %proxy_err,
+                    "PrivacyProxy escalation failed; falling back to local model"
+                );
+                llm.chat_with_hints(&messages, Some(512), &request_hints)
+                    .await?
+            }
+        }
+    } else {
+        match llm
+            .chat_with_hints(&messages, Some(512), &request_hints)
+            .await
+        {
+            Ok(r) => r,
+            Err(local_err) => {
+                let triggers_decline = privacy_proxy.is_some()
+                    && matches!(
+                        privacy_proxy.map(|p| &p.trigger),
+                        Some(EscalationTrigger::LocalDecline)
+                            | Some(EscalationTrigger::LocalDeclineOrContextOverflow)
+                    );
+                if triggers_decline {
+                    tracing::info!(
+                        error = %local_err,
+                        "local LLM declined; escalating via PrivacyProxy"
+                    );
+                    match escalate_via_privacy_proxy(privacy_proxy.unwrap(), &messages, memory)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(proxy_err) => {
+                            tracing::warn!(
+                                error = %proxy_err,
+                                "PrivacyProxy escalation failed; returning local error"
+                            );
+                            return Err(local_err);
+                        }
+                    }
+                } else {
+                    return Err(local_err);
+                }
+            }
+        }
+    };
 
     let mut tool_name: Option<String> = None;
     let final_response = if let Some(tool_result) = crate::tools::try_tool_call_with_context(
@@ -1218,6 +1301,42 @@ pub async fn process_chat_turn(
         tool: tool_name,
         conversation_id: conv_id.to_string(),
     })
+}
+
+/// Route a chat turn through the on-device PrivacyProxy.
+///
+/// Seeds the proxy with anonymization-eligible memory terms (those whose
+/// `EscalationPolicy` is `Anonymized`). Terms with `Private` scope or
+/// `Restricted` sensitivity are never forwarded. A seed failure is logged
+/// but does not abort the request; the proxy will still mask what it can
+/// from its prior session vocabulary.
+async fn escalate_via_privacy_proxy(
+    proxy: &PrivacyProxyConfig,
+    messages: &[Message],
+    memory: &SharedMemory,
+) -> Result<String> {
+    let backend = PrivacyProxyBackend::from_url(&proxy.base_url, &proxy.vocab_path);
+
+    let terms: Vec<String> = with_shared_memory(memory, |mem| {
+        let entries = mem.recent(500)?;
+        Ok::<Vec<String>, anyhow::Error>(
+            entries
+                .into_iter()
+                .filter(|e| crate::memory::policy::eligible_for_escalation(&e.kind, &e.content))
+                .flat_map(|e| crate::memory::policy::extract_vocab_terms(&e.kind, &e.content))
+                .filter(|t| !t.is_empty())
+                .collect::<std::collections::HashSet<String>>()
+                .into_iter()
+                .collect(),
+        )
+    })
+    .unwrap_or_default();
+
+    if let Err(e) = backend.seed_vocab(&terms).await {
+        tracing::warn!(error = %e, terms = terms.len(), "vocab seed failed; continuing");
+    }
+
+    backend.chat_with_format(messages, Some(512), None).await
 }
 
 fn finalize_direct_tool_turn(
@@ -1399,6 +1518,7 @@ async fn handle_chat(
     max_history: usize,
     model_family: ModelFamily,
     request_origin: RequestOrigin,
+    privacy_proxy: Option<&PrivacyProxyConfig>,
 ) -> (u16, &'static str, String) {
     let Some(body) = body else {
         return (
@@ -1451,6 +1571,7 @@ async fn handle_chat(
         max_history,
         model_family,
         request_origin,
+        privacy_proxy,
     )
     .await
     {
@@ -2590,6 +2711,7 @@ mod tests {
                     12,
                     ModelFamily::Phi,
                     RequestOrigin::Api,
+                    None,
                 )
                 .await;
             });
