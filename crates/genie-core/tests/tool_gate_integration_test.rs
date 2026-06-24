@@ -1244,6 +1244,10 @@ async fn web_search_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"query": "rust news", "limit": -1}),
             "web_search 'limit' must be an integer when provided",
         ),
+        (
+            serde_json::json!({"query": "rust news", "fresh": "true"}),
+            "web_search 'fresh' must be a boolean when provided",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 

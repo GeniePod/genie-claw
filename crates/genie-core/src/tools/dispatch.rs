@@ -236,6 +236,26 @@ fn parse_web_search_limit(args: &serde_json::Value) -> Result<usize> {
     }
 }
 
+/// `fresh` / `cache_bypass` stay optional — absent or null defaults to false. A
+/// provided value must be a real boolean (same boundary as `get_weather` forecast).
+fn parse_web_search_fresh(args: &serde_json::Value) -> Result<bool> {
+    match args.get("fresh").or_else(|| args.get("cache_bypass")) {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(anyhow::anyhow!(
+            "web_search 'fresh' must be a boolean when provided"
+        )),
+    }
+}
+
+pub(crate) fn parse_web_search_args(args: &serde_json::Value) -> Result<(String, usize, bool)> {
+    Ok((
+        parse_web_search_query(args)?.to_string(),
+        parse_web_search_limit(args)?,
+        parse_web_search_fresh(args)?,
+    ))
+}
+
 fn parse_get_weather_location(args: &serde_json::Value) -> Result<&str> {
     args.get("location")
         .and_then(|v| v.as_str())
@@ -2182,15 +2202,8 @@ async fn exec_weather(args: &serde_json::Value) -> Result<String> {
 }
 
 async fn exec_web_search(args: &serde_json::Value, config: &WebSearchConfig) -> Result<String> {
-    let query = parse_web_search_query(args)?;
-    let limit = parse_web_search_limit(args)?;
-    let fresh = args
-        .get("fresh")
-        .or_else(|| args.get("cache_bypass"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    super::web_search::search_with_options(query, limit, config, fresh).await
+    let (query, limit, fresh) = parse_web_search_args(args)?;
+    super::web_search::search_with_options(&query, limit, config, fresh).await
 }
 
 fn get_current_time() -> String {
@@ -2797,6 +2810,43 @@ mod tests {
                 "unexpected error: {err}"
             );
         }
+    }
+
+    #[test]
+    fn web_search_fresh_must_be_boolean_when_provided() {
+        assert!(!parse_web_search_fresh(&serde_json::json!({"query": "rust"})).unwrap());
+        assert!(
+            parse_web_search_fresh(&serde_json::json!({"query": "rust", "fresh": true})).unwrap()
+        );
+        assert_eq!(
+            parse_web_search_fresh(&serde_json::json!({"query": "rust", "cache_bypass": false}))
+                .unwrap(),
+            false
+        );
+
+        for bad in [
+            serde_json::json!({"query": "rust", "fresh": "true"}),
+            serde_json::json!({"query": "rust", "fresh": 1}),
+        ] {
+            let err = parse_web_search_fresh(&bad)
+                .expect_err("non-boolean fresh must be rejected")
+                .to_string();
+            assert!(
+                err.contains("web_search 'fresh' must be a boolean when provided"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_web_search_args_rejects_string_limit() {
+        let err = parse_web_search_args(&serde_json::json!({"query": "rust", "limit": "5"}))
+            .expect_err("string limit must be rejected")
+            .to_string();
+        assert!(
+            err.contains("web_search 'limit' must be an integer when provided"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
