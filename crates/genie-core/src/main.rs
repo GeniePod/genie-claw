@@ -15,6 +15,17 @@ use tracing_subscriber::EnvFilter;
 /// 3. Voice pipeline (wake word → STT → LLM → TTS → speaker)
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // `--version` must work on a fresh install before any config exists, so
+    // handle it before Config::load() (which would otherwise fail to read
+    // /etc/geniepod/geniepod.toml).
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-v")
+    {
+        println!("genie-core v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
