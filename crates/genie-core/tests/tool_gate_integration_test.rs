@@ -1578,3 +1578,63 @@ async fn gate_tool_call_rejects_denied_origin_and_audits() {
     assert_eq!(events[0]["origin"], "voice");
     assert_eq!(events[0]["tool"], "web_search");
 }
+
+#[tokio::test]
+async fn memory_store_rejects_person_scoped_without_identity_context_and_audits() {
+    // Issue #454: an API-origin memory_store with category=person_preference must be
+    // rejected the same way a person-scoped recall would be — write/read symmetry.
+    let paths = TestAuditPaths::new();
+    let memory_path = paths.data_dir.join("memory.db");
+    let memory = genie_core::memory::Memory::open(&memory_path).unwrap();
+    let dispatcher = paths
+        .dispatcher(
+            None,
+            ToolPolicyConfig::default(),
+            ActuationSafetyConfig::default(),
+        )
+        .with_memory(Arc::new(Mutex::new(memory)));
+
+    // API origin — no verified MemoryReadContext.
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Api,
+        ..ToolExecutionContext::default()
+    };
+
+    let result = dispatcher
+        .execute_with_context(
+            &ToolCall {
+                name: "memory_store".into(),
+                arguments: serde_json::json!({
+                    "category": "person_preference",
+                    "content": "Maya likes oat milk"
+                }),
+            },
+            ctx,
+        )
+        .await;
+
+    assert!(
+        !result.success,
+        "person-scoped write without identity context must be rejected, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("verified identity context")
+            || result.output.contains("person-linked category"),
+        "rejection message must mention identity context, got: {}",
+        result.output
+    );
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(events.len(), 1, "rejected call must be tool-audited");
+    assert_eq!(events[0]["tool"], "memory_store");
+    assert_eq!(events[0]["origin"], "api");
+    assert_eq!(events[0]["success"], false);
+
+    // The fact must not be persisted.
+    let mem_check = genie_core::memory::Memory::open(&memory_path).unwrap();
+    assert!(
+        mem_check.search("Maya", 5).unwrap().is_empty(),
+        "person-scoped fact must not reach the database"
+    );
+}

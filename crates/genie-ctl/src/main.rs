@@ -328,7 +328,7 @@ fn cmd_version() {
     println!("genie-ctl v{}", env!("CARGO_PKG_VERSION"));
     match load_core_addr() {
         Ok(addr) => println!("  core: {}", addr),
-        Err(err) => println!("  core: (config error: {err})"),
+        Err(_) => println!("  core: (not configured; set GENIEPOD_CONFIG)"),
     }
     println!("  governor: {}", GOVERNOR_SOCK);
 }
@@ -2871,6 +2871,7 @@ mod tests {
             },
             agent: Default::default(),
             optional_ai_provider: Default::default(),
+            privacy_proxy: Default::default(),
             governor: GovernorConfig::default(),
             health: HealthConfig::default(),
             services: ServicesConfig::default(),
@@ -2899,6 +2900,7 @@ mod tests {
             },
             agent: Default::default(),
             optional_ai_provider: Default::default(),
+            privacy_proxy: Default::default(),
             governor: GovernorConfig::default(),
             health: HealthConfig::default(),
             services: ServicesConfig::default(),

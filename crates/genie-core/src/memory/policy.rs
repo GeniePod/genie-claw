@@ -359,6 +359,122 @@ pub fn assess_memory_read(
     }
 }
 
+/// Escalation policy for cloud routing via PrivacyProxy (issue #418).
+///
+/// Determines whether a memory fact may be included in a request forwarded
+/// through the on-device anonymizing proxy to a cloud model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationPolicy {
+    /// Fact must remain on-device. Never send it even through an anonymizing proxy.
+    LocalOnly,
+    /// Fact is eligible for cloud escalation via PrivacyProxy.
+    /// PrivacyProxy applies deterministic identifier masking before forwarding.
+    Anonymized,
+}
+
+/// Determine the escalation policy for a memory fact based on its policy metadata.
+///
+/// `Private` scope, `Restricted` sensitivity, and `Cautious` sensitivity facts are
+/// always `LocalOnly`: they must not travel through any proxy, even an anonymizing
+/// one, because the proxy sees the raw content before masking. Health data, identity
+/// entries, and other cautious content fall into this bucket.
+pub fn escalation_policy(metadata: MemoryPolicyMetadata) -> EscalationPolicy {
+    match (metadata.scope, metadata.sensitivity) {
+        (MemoryScope::Private, _)
+        | (_, MemorySensitivity::Restricted)
+        | (_, MemorySensitivity::Cautious) => EscalationPolicy::LocalOnly,
+        _ => EscalationPolicy::Anonymized,
+    }
+}
+
+/// Return true when a memory fact (by kind + content) is eligible for cloud escalation.
+///
+/// Identity entries are always `LocalOnly` regardless of sensitivity: the person's
+/// name is the primary identifier the proxy is trying to mask, so it must not appear
+/// in any forwarded payload — not even through an anonymising gateway.
+pub fn eligible_for_escalation(kind: &str, content: &str) -> bool {
+    if kind.eq_ignore_ascii_case("identity") {
+        return false;
+    }
+    escalation_policy(infer_metadata(kind, content)) == EscalationPolicy::Anonymized
+}
+
+/// Extract entity-level vocabulary terms from a memory entry for PrivacyProxy seeding.
+///
+/// PrivacyProxy builds its substitution map ("Alex" → "__PERSON_1__") from individual
+/// entity names, not from full sentences. Seeding whole content strings prevents the
+/// proxy from constructing a usable substitution table.
+///
+/// Returns deduplicated runs of consecutive title-cased words, skipping common
+/// sentence-initial words that are capitalised by convention rather than by being
+/// proper nouns. Multi-word names ("Alex Morgan") are emitted in full and the first
+/// token alone ("Alex") is also included so that first-name references in chat are
+/// masked correctly.
+///
+/// Only call this on entries whose [`eligible_for_escalation`] returned `true`;
+/// `LocalOnly` entries must never be seeded.
+pub fn extract_vocab_terms(_kind: &str, content: &str) -> Vec<String> {
+    // Common sentence-initial words that appear Title-Cased but are not proper nouns.
+    const STOP_WORDS: &[&str] = &[
+        "User", "Users", "The", "A", "An", "My", "Our", "Your", "His", "Her", "Their", "Its",
+        "This", "That", "These", "Those", "There", "Here", "We", "You", "He", "She", "They", "It",
+        "I",
+    ];
+
+    let mut terms: Vec<String> = Vec::new();
+    let words: Vec<&str> = content.split_whitespace().collect();
+    let mut i = 0;
+
+    while i < words.len() {
+        let alpha: String = words[i].chars().filter(|c| c.is_alphabetic()).collect();
+        let is_proper = alpha.len() > 1
+            && alpha
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
+            && !STOP_WORDS.contains(&alpha.as_str());
+
+        if is_proper {
+            let run_start = i;
+            i += 1;
+            while i < words.len() {
+                let next_alpha: String = words[i].chars().filter(|c| c.is_alphabetic()).collect();
+                if next_alpha.len() > 1
+                    && next_alpha
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false)
+                    && !STOP_WORDS.contains(&next_alpha.as_str())
+                {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let run: Vec<String> = words[run_start..i]
+                .iter()
+                .map(|w| w.chars().filter(|c| c.is_alphabetic()).collect())
+                .collect();
+            let full = run.join(" ");
+            if !terms.contains(&full) {
+                terms.push(full);
+            }
+            // For multi-word names also include the first token alone so that
+            // first-name-only references in chat are masked ("Alex" as well as
+            // "Alex Morgan").
+            if run.len() > 1 && !terms.contains(&run[0]) {
+                terms.push(run[0].clone());
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    terms
+}
+
 pub fn may_inject_into_shared_prompt(kind: &str, content: &str) -> bool {
     let metadata = infer_metadata(kind, content);
     assess_memory_read(metadata, MemoryReadContext::shared_room_voice()).allowed
@@ -388,6 +504,21 @@ fn is_cautious_memory(kind: &str, lower: &str) -> bool {
                 "therapy session",
                 "legal problem",
                 "personal secret",
+                // Health data must not reach a cloud proxy even through an anonymizing
+                // gateway; the proxy sees raw content before masking.
+                "medication",
+                "prescription",
+                "diagnosed with",
+                "for diabetes",
+                "for cancer",
+                "for depression",
+                "for anxiety",
+                "for hypertension",
+                "for epilepsy",
+                "for asthma",
+                "insulin",
+                "chemotherapy",
+                "dialysis",
             ],
         )
 }
@@ -630,6 +761,118 @@ mod tests {
         );
         assert!(medium.allowed);
         assert_eq!(medium.class, MemoryDisclosureClass::Person);
+    }
+
+    #[test]
+    fn household_normal_memory_is_anonymized_eligible() {
+        let metadata = infer_metadata("preference", "User likes jazz music");
+        assert_eq!(escalation_policy(metadata), EscalationPolicy::Anonymized);
+        assert!(eligible_for_escalation(
+            "preference",
+            "User likes jazz music"
+        ));
+    }
+
+    #[test]
+    fn private_scope_memory_is_local_only() {
+        let metadata = MemoryPolicyMetadata {
+            scope: MemoryScope::Private,
+            sensitivity: MemorySensitivity::Normal,
+            spoken_policy: SpokenMemoryPolicy::AppOnly,
+        };
+        assert_eq!(escalation_policy(metadata), EscalationPolicy::LocalOnly);
+    }
+
+    #[test]
+    fn restricted_sensitivity_is_local_only_regardless_of_scope() {
+        for scope in [
+            MemoryScope::Session,
+            MemoryScope::Household,
+            MemoryScope::Person,
+            MemoryScope::Private,
+        ] {
+            let metadata = MemoryPolicyMetadata {
+                scope,
+                sensitivity: MemorySensitivity::Restricted,
+                spoken_policy: SpokenMemoryPolicy::Deny,
+            };
+            assert_eq!(
+                escalation_policy(metadata),
+                EscalationPolicy::LocalOnly,
+                "scope {scope:?} with Restricted sensitivity must be LocalOnly"
+            );
+        }
+    }
+
+    #[test]
+    fn password_content_is_not_eligible_for_escalation() {
+        assert!(!eligible_for_escalation("fact", "my password is swordfish"));
+    }
+
+    #[test]
+    fn person_linked_normal_memory_is_anonymized_eligible() {
+        assert!(eligible_for_escalation(
+            "person_preference",
+            "Maya likes oat milk"
+        ));
+    }
+
+    #[test]
+    fn health_content_is_not_eligible_for_escalation() {
+        assert!(!eligible_for_escalation(
+            "person_preference",
+            "Grandma takes metformin at 8am for diabetes"
+        ));
+    }
+
+    #[test]
+    fn identity_content_is_not_eligible_for_escalation() {
+        assert!(!eligible_for_escalation(
+            "identity",
+            "my name is Alex Morgan"
+        ));
+    }
+
+    #[test]
+    fn cautious_sensitivity_is_local_only() {
+        let metadata = MemoryPolicyMetadata {
+            scope: MemoryScope::Household,
+            sensitivity: MemorySensitivity::Cautious,
+            spoken_policy: SpokenMemoryPolicy::Confirm,
+        };
+        assert_eq!(escalation_policy(metadata), EscalationPolicy::LocalOnly);
+    }
+
+    #[test]
+    fn extract_vocab_terms_single_name() {
+        let terms = extract_vocab_terms("person_preference", "Maya likes oat milk");
+        assert_eq!(terms, vec!["Maya"]);
+    }
+
+    #[test]
+    fn extract_vocab_terms_multi_word_name() {
+        let terms = extract_vocab_terms("identity", "my name is Alex Morgan");
+        assert!(
+            terms.contains(&"Alex Morgan".to_string()),
+            "full name missing"
+        );
+        assert!(terms.contains(&"Alex".to_string()), "first name missing");
+        assert!(
+            !terms.iter().any(|t| t == "Morgan"),
+            "surname alone should not be added"
+        );
+    }
+
+    #[test]
+    fn extract_vocab_terms_skips_stop_words() {
+        let terms = extract_vocab_terms("preference", "User likes jazz music");
+        assert!(terms.is_empty(), "stop-word 'User' must not be extracted");
+    }
+
+    #[test]
+    fn extract_vocab_terms_no_proper_nouns() {
+        let terms = extract_vocab_terms("fact", "kitchen light is the ceiling lamp");
+        assert!(terms.is_empty(), "all-lowercase content yields no terms");
     }
 
     #[test]

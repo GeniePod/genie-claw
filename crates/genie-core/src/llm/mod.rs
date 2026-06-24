@@ -3,6 +3,7 @@ mod llama_cpp;
 mod mock;
 mod openai_compat;
 mod openai_compatible;
+pub mod privacy_proxy;
 mod provider;
 
 use anyhow::Result;
@@ -14,6 +15,7 @@ pub use llama_cpp::LlamaCppBackend;
 pub use mock::MockLlmBackend;
 pub use openai_compat::{LlmTimeouts, Message, ResponseFormat};
 pub use openai_compatible::OpenAiCompatibleBackend;
+pub use privacy_proxy::PrivacyProxyBackend;
 pub use provider::{OptionalProviderPlan, ProviderReadiness};
 
 #[async_trait]
@@ -233,6 +235,17 @@ impl LlmClient {
         }
     }
 
+    /// Build a client that routes through the on-device PrivacyProxy.
+    ///
+    /// `base_url` must be a localhost endpoint (e.g. `"http://127.0.0.1:8180/v1"`).
+    /// The caller is responsible for pre-seeding the proxy's vocabulary via
+    /// [`PrivacyProxyBackend::seed_vocab`] before the first chat call.
+    pub fn from_privacy_proxy_url(base_url: &str, vocab_path: &str) -> Self {
+        Self {
+            backend: Box::new(PrivacyProxyBackend::from_url(base_url, vocab_path)),
+        }
+    }
+
     /// Wrap any `LlmBackendClient` implementation in a client facade.
     /// Primarily useful in tests that need a custom backend (e.g. a slow
     /// streaming backend for client-disconnect smoke tests).
@@ -336,6 +349,12 @@ mod tests {
     fn can_construct_genie_ai_runtime_client() {
         let client = LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:8080/health");
         assert_eq!(client.backend_name(), "genie-ai-runtime");
+    }
+
+    #[test]
+    fn privacy_proxy_client_has_correct_backend_name() {
+        let client = LlmClient::from_privacy_proxy_url("http://127.0.0.1:8180/v1", "/vocab/seed");
+        assert_eq!(client.backend_name(), "privacy-proxy");
     }
 
     #[test]

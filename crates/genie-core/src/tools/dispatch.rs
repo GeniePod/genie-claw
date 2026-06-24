@@ -890,7 +890,7 @@ impl ToolDispatcher {
             "memory_recall" => self.exec_memory_recall(&call.arguments, exec_ctx),
             "memory_status" => self.exec_memory_status(),
             "memory_forget" => self.exec_memory_forget(&call.arguments, exec_ctx),
-            "memory_store" => self.exec_memory_store(&call.arguments),
+            "memory_store" => self.exec_memory_store(&call.arguments, exec_ctx),
             other => self.exec_skill(other, &call.arguments).await,
         };
 
@@ -1563,7 +1563,11 @@ impl ToolDispatcher {
         }
     }
 
-    fn exec_memory_store(&self, args: &serde_json::Value) -> Result<String> {
+    fn exec_memory_store(
+        &self,
+        args: &serde_json::Value,
+        exec_ctx: ToolExecutionContext,
+    ) -> Result<String> {
         // Validate content before the lock; previously a soft Ok() audited as success (#416).
         let memories = parse_memory_store_content(args)?;
         let mem = self
@@ -1574,6 +1578,15 @@ impl ToolDispatcher {
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
 
+        // Mirror the read-side context gate from exec_memory_recall/exec_memory_forget
+        // (issue #454): person-scoped writes require the same verified identity that
+        // person-scoped reads do. Without this, an API/REPL path with no trusted
+        // MemoryReadContext could plant person-attributed facts that the voice
+        // pipeline would later surface as authoritative.
+        let write_context = exec_ctx
+            .memory_read_context
+            .unwrap_or_else(crate::memory::policy::MemoryReadContext::shared_room_voice);
+
         let mut stored = Vec::new();
         let mut stored_categories = Vec::new();
         let mut rejected = Vec::new();
@@ -1583,6 +1596,18 @@ impl ToolDispatcher {
             if !policy.allowed {
                 rejected.push(policy.reason);
                 continue;
+            }
+            let metadata = crate::memory::policy::infer_metadata(&category, &content);
+            if metadata.scope == crate::memory::policy::MemoryScope::Person
+                && !write_context.explicit_named_person
+                && write_context.identity_confidence
+                    < crate::memory::policy::IdentityConfidence::Medium
+            {
+                anyhow::bail!(
+                    "memory_store: person-linked category '{category}' requires a \
+                     verified identity context; use the voice pipeline or supply \
+                     an authenticated person context."
+                );
             }
             let outcome = mem.store_resolved(&category, &content)?;
             replaced += outcome.replaced;
@@ -3600,10 +3625,13 @@ mod tests {
             ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
         let result = dispatcher
-            .exec_memory_store(&serde_json::json!({
-                "content": "my name is Jared",
-                "category": "identity"
-            }))
+            .exec_memory_store(
+                &serde_json::json!({
+                    "content": "my name is Jared",
+                    "category": "identity"
+                }),
+                ToolExecutionContext::default(),
+            )
             .unwrap();
 
         assert!(result.to_lowercase().contains("remember"));
@@ -3626,10 +3654,13 @@ mod tests {
             ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
         let result = dispatcher
-            .exec_memory_store(&serde_json::json!({
-                "content": "my name is Alice",
-                "category": "identity"
-            }))
+            .exec_memory_store(
+                &serde_json::json!({
+                    "content": "my name is Alice",
+                    "category": "identity"
+                }),
+                ToolExecutionContext::default(),
+            )
             .unwrap();
 
         assert!(result.to_lowercase().contains("updated"));
@@ -3652,10 +3683,13 @@ mod tests {
             ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
         let result = dispatcher
-            .exec_memory_store(&serde_json::json!({
-                "content": "shopping list pending: milk, eggs",
-                "category": "shopping"
-            }))
+            .exec_memory_store(
+                &serde_json::json!({
+                    "content": "shopping list pending: milk, eggs",
+                    "category": "shopping"
+                }),
+                ToolExecutionContext::default(),
+            )
             .unwrap();
 
         assert!(result.contains("Added milk, eggs"));
@@ -3667,10 +3701,13 @@ mod tests {
         }
 
         let result = dispatcher
-            .exec_memory_store(&serde_json::json!({
-                "content": "shopping list removed: milk",
-                "category": "shopping"
-            }))
+            .exec_memory_store(
+                &serde_json::json!({
+                    "content": "shopping list removed: milk",
+                    "category": "shopping"
+                }),
+                ToolExecutionContext::default(),
+            )
             .unwrap();
         assert!(result.contains("Removed milk"));
         assert!(result.contains("1 item"));
@@ -3691,10 +3728,13 @@ mod tests {
             ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
         let result = dispatcher
-            .exec_memory_store(&serde_json::json!({
-                "content": "remember that my password is swordfish",
-                "category": "fact"
-            }))
+            .exec_memory_store(
+                &serde_json::json!({
+                    "content": "remember that my password is swordfish",
+                    "category": "fact"
+                }),
+                ToolExecutionContext::default(),
+            )
             .unwrap();
 
         assert!(result.contains("should not store passwords"));
@@ -3715,16 +3755,105 @@ mod tests {
             ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
 
         let result = dispatcher
-            .exec_memory_store(&serde_json::json!({
-                "content": "remember that the gate code is 5829",
-                "category": "fact"
-            }))
+            .exec_memory_store(
+                &serde_json::json!({
+                    "content": "remember that the gate code is 5829",
+                    "category": "fact"
+                }),
+                ToolExecutionContext::default(),
+            )
             .unwrap();
 
         assert!(result.contains("should not store household access codes"));
 
         let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
         assert!(mem.search("gate", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn memory_store_rejects_person_scoped_without_identity_context() {
+        // Reproduce the issue #454 attack vector: an API/REPL call with no
+        // verified MemoryReadContext must not be able to write person-scoped
+        // facts, mirroring the read-side guard on exec_memory_recall.
+        let db = std::env::temp_dir().join(format!(
+            "memory-store-person-gate-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        // Default context has no memory_read_context — simulates an API/REPL origin.
+        let err = dispatcher
+            .exec_memory_store(
+                &serde_json::json!({
+                    "category": "person_preference",
+                    "content": "Maya likes oat milk"
+                }),
+                ToolExecutionContext::default(),
+            )
+            .expect_err("person-scoped write without identity context must be rejected");
+
+        assert!(
+            err.to_string().contains("verified identity context"),
+            "expected person-scope rejection, got: {err}"
+        );
+
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert!(
+            mem.search("Maya", 5).unwrap().is_empty(),
+            "person-scoped fact must not be persisted without identity context"
+        );
+    }
+
+    #[test]
+    fn memory_store_allows_person_scoped_with_verified_context() {
+        // The voice pipeline sets a verified MemoryReadContext on exec_ctx;
+        // person-scoped writes must be allowed when identity confidence is
+        // sufficient, just as person-scoped reads are.
+        let db = std::env::temp_dir().join(format!(
+            "memory-store-person-verified-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let ctx = ToolExecutionContext {
+            memory_read_context: Some(crate::memory::policy::MemoryReadContext {
+                identity_confidence: crate::memory::policy::IdentityConfidence::Medium,
+                explicit_named_person: true,
+                explicit_private_intent: false,
+                shared_space_voice: true,
+            }),
+            ..ToolExecutionContext::default()
+        };
+
+        let result = dispatcher
+            .exec_memory_store(
+                &serde_json::json!({
+                    "category": "person_preference",
+                    "content": "Maya likes oat milk"
+                }),
+                ctx,
+            )
+            .unwrap();
+
+        assert!(
+            result.to_lowercase().contains("remember"),
+            "verified context must allow person-scoped write, got: {result}"
+        );
+
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert!(
+            mem.search("Maya", 5)
+                .unwrap()
+                .iter()
+                .any(|e| e.content.contains("oat milk")),
+            "person-scoped fact must be persisted with verified identity context"
+        );
     }
 
     #[test]

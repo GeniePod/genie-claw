@@ -15,6 +15,17 @@ use tracing_subscriber::EnvFilter;
 /// 3. Voice pipeline (wake word → STT → LLM → TTS → speaker)
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // `--version` must work on a fresh install before any config exists, so
+    // handle it before Config::load() (which would otherwise fail to read
+    // /etc/geniepod/geniepod.toml).
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-v")
+    {
+        println!("genie-core v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -27,6 +38,18 @@ async fn main() -> Result<()> {
     let port = config.core.port;
     let bind_host = config.core.bind_host.clone();
     tracing::info!("GeniePod core starting");
+
+    // Refuse to start if the PrivacyProxy endpoint is not localhost (issue #418).
+    // A remote URL would forward raw household identifiers before the proxy can
+    // mask them, violating the privacy invariant the feature is designed to uphold.
+    if config.privacy_proxy.enabled && !config.privacy_proxy.endpoint_is_valid() {
+        anyhow::bail!(
+            "privacy_proxy.base_url must be a localhost address (got {:?}); \
+             a non-localhost URL would expose raw household identifiers to the network \
+             before PrivacyProxy masking. Update [privacy_proxy] base_url in your config.",
+            config.privacy_proxy.base_url
+        );
+    }
 
     // Security audit on startup.
     let config_path = std::env::var("GENIEPOD_CONFIG")
@@ -331,6 +354,12 @@ async fn main() -> Result<()> {
         )?
         .with_http_config(config.http.clone())
         .with_origin_auth(origin_resolver);
+
+        let chat_server = if config.privacy_proxy.enabled {
+            chat_server.with_privacy_proxy(config.privacy_proxy.clone())
+        } else {
+            chat_server
+        };
 
         tracing::info!(port, "starting HTTP chat API");
         if config.telegram.enabled {
