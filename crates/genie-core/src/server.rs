@@ -2120,20 +2120,13 @@ async fn handle_web_search(
         );
     }
 
-    let limit = parsed
-        .get("limit")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(3)
-        .clamp(1, 5);
-    let fresh = parsed
-        .get("fresh")
-        .or_else(|| parsed.get("cache_bypass"))
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    match tools
-        .web_search_response(query, limit as usize, fresh)
-        .await
-    {
+    let (query, limit, fresh) = match crate::tools::dispatch::parse_web_search_args(&parsed) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return (400, "application/json", format!(r#"{{"error":"{error}"}}"#));
+        }
+    };
+    match tools.web_search_response(&query, limit, fresh).await {
         Ok(result) => {
             let body = serde_json::json!({
                 "tool": "web_search",
@@ -2885,6 +2878,16 @@ mod tests {
 
         assert_eq!(status, 400);
         assert!(body.contains("missing query"));
+    }
+
+    #[tokio::test]
+    async fn web_search_endpoint_rejects_string_limit() {
+        let tools = ToolDispatcher::new(None);
+        let (status, _, body) =
+            handle_web_search(Some(r#"{"query":"rust","limit":"5"}"#), &tools).await;
+
+        assert_eq!(status, 400);
+        assert!(body.contains("web_search 'limit' must be an integer when provided"));
     }
 
     #[tokio::test]

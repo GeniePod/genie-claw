@@ -726,26 +726,28 @@ async fn handle_quick_tool_for_voice(
             return Some(response);
         }
 
-        let query = call
-            .arguments
-            .get("query")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .trim();
-        let limit = call
-            .arguments
-            .get("limit")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(3) as usize;
-        let fresh = call
-            .arguments
-            .get("fresh")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
+        let (query, limit, fresh) =
+            match crate::tools::dispatch::parse_web_search_args(&call.arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let response =
+                        crate::security::sandbox::sanitize_output(&format!("Tool error: {error}"));
+                    let started = std::time::Instant::now();
+                    tools.audit_gated_tool(&call, exec_ctx, started, false, &response);
+                    conversations.append_or_log(conv_id, "assistant", &response, None);
+                    let tts_engine =
+                        tts_engine_for_language(voice_cfg, audio_device, response_language);
+                    let voice_text = format::for_voice(&response);
+                    if !voice_text.is_empty() {
+                        let _ = tts_engine.speak(&voice_text).await;
+                    }
+                    return Some(response);
+                }
+            };
 
         let started = std::time::Instant::now();
         let (response, voice_response, success) =
-            match tools.web_search_response(query, limit, fresh).await {
+            match tools.web_search_response(&query, limit, fresh).await {
                 Ok(result) => {
                     let voice_response = result.render_voice();
                     (result.response, voice_response, true)

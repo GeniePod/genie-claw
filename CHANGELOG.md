@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+## 1.0.0-rc.1 - 2026-06-24
+
+First release candidate — and the first **installable** build. GenieClaw can now
+be installed with a single `curl … | sh` (prebuilt aarch64/Jetson + x86_64
+binaries). This release also adds opt-in, privacy-preserving cloud escalation
+and continues the security + performance hardening from the alpha series.
+
+### Install / release
+
+- **Curl installer + release pipeline** (#489): a tag-triggered workflow
+  cross-builds the runtime binaries for `aarch64-unknown-linux-gnu` (Jetson) and
+  `x86_64-unknown-linux-gnu` and publishes them as GitHub Release assets;
+  `install.sh` arch-detects, sha256-verifies, and installs them plus a starter
+  config. See the README **Install** section.
+
+### Features
+
+- **Opt-in cloud escalation via PrivacyProxy** (#436): when the local model
+  declines or a turn overflows the 4096-token budget, the agent can escalate
+  through a localhost anonymizing gateway. Only escalation-eligible entity names
+  are seeded for masking; `Private` / `Cautious` / health / identity memory is
+  `LocalOnly` and is never seeded or forwarded — even to the localhost proxy.
+  Disabled by default; a localhost `base_url` is enforced at startup.
+
+### Security
+
+- **Person-scoped `memory_store` gate** (#467): `memory_store` now requires the
+  same verified-identity context that `memory_recall` / `memory_forget` already
+  require before writing person-scoped facts, closing the write-side asymmetry
+  left by #433.
+
+### Reliability
+
+- **Runtime accepts OpenAI `tool_calls` wrappers** (#482): runtime dispatch now
+  parses the `tool_calls` / `function_call` wrappers and top-level JSON arrays
+  the eval path already handled (the first call is dispatched); malformed
+  wrappers route to the unparsed fallback instead of leaking raw JSON.
+
+### Performance
+
+- **Single-pass TTS text cleanup** (#483): `for_voice` collapses the 12-replace
+  TTS cleanup and the `Vec`+`join` passes into single passes — byte-for-byte
+  identical output, fewer allocations.
+- **Const relationship patterns + early-out** (#484): `extract_facts` replaces
+  57 per-call `format!` allocations with a `const` table and skips the entire
+  19-relation scan when an utterance contains no `"my "`.
+
 ## 1.0.0-alpha.12 - 2026-06-23
 
 Alpha 12 is a **performance + reliability hardening** release. The memory open
