@@ -529,6 +529,18 @@ mod tests {
         Governor::new(config, store)
     }
 
+    fn test_store(label: &str) -> Store {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = std::env::temp_dir().join(format!(
+            "geniepod-test-gov-{}-{}-{}.db",
+            label,
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        Store::open(&db_path).unwrap()
+    }
+
     #[test]
     fn determine_mode_day_with_plenty_of_memory() {
         let gov = make_governor();
@@ -588,8 +600,7 @@ mod tests {
     fn night_model_swap_config() {
         let mut config = test_config();
         config.governor.night_model_swap = true;
-        let db_path = std::env::temp_dir().join("geniepod-test-gov2.db");
-        let store = Store::open(&db_path).unwrap();
+        let store = test_store("night-swap");
         let mut gov = Governor::new(config, store);
         gov.config.governor.night_start_hour = 0;
         gov.config.governor.day_start_hour = 0;
@@ -629,8 +640,7 @@ mod tests {
     fn resolves_llm_alias_to_configured_service_unit() {
         let mut config = test_config();
         config.services.llm.systemd_unit = "genie-ai-runtime.service".into();
-        let db_path = std::env::temp_dir().join("geniepod-test-gov-llm-unit.db");
-        let store = Store::open(&db_path).unwrap();
+        let store = test_store("llm-unit");
         let gov = Governor::new(config, store);
 
         assert_eq!(
