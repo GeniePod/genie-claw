@@ -69,8 +69,10 @@ state, not asserted.
   `genie-ctl bfcl-score-llm`, `genie-ctl bfcl-predict-quick`, and
   `genie-ctl bfcl-predict-llm`
 - Jetson aarch64 cross-compile CI
+- one-line install of prebuilt runtime binaries (Linux aarch64 / Jetson + x86_64)
+  via `curl … | sh` — see [Install](#install)
 
-Current workspace version: `v1.0.0-alpha.10`.
+Current workspace version: `v1.0.0-rc.1` — the first installable release (see [Install](#install)).
 
 ## Current Focus
 
@@ -94,7 +96,7 @@ identical to the GitHub milestone descriptions and the milestone cards on
 opening an issue or PR, the milestone it belongs to (or doesn't) decides
 whether it lands.
 
-### [M1 — Jetson 4096-token BFCL Agent Harness](https://github.com/GeniePod/genie-claw/milestone/1) · in progress
+### [M1 — Jetson 4096-token BFCL Agent Harness](https://github.com/GeniePod/genie-claw/milestone/1) · complete
 
 Keep GenieClaw fast, reliable, and measurable on NVIDIA Jetson Orin Nano 8 GB
 with a 4096-token local context.
@@ -118,7 +120,7 @@ with a 4096-token local context.
 - Untested native or runtime changes
 - PRs that make the agent less native, slower, less deterministic, or harder to test
 
-### [M2 — Portable Providers and Channel Boundaries](https://github.com/GeniePod/genie-claw/milestone/2) · next
+### [M2 — Portable Providers and Channel Boundaries](https://github.com/GeniePod/genie-claw/milestone/2) · in progress
 
 Make GenieClaw portable without weakening the 4096-token Jetson baseline.
 
@@ -159,8 +161,9 @@ Harden the smart-home agent boundary.
 
 ### Active Contribution Gate
 
-We are working M1 now. A PR that is technically correct but outside the M1
-in-scope list is noise for this phase and will be closed.
+M1 is complete (shipped as `v1.0.0-rc.1`); we are working M2 now. A PR that is
+technically correct but outside the M2 in-scope list is noise for this phase and
+will be closed.
 
 Valuable contributions are the ones that help this repository become what it
 is intended to be: a private, local, deterministic household agent that can
