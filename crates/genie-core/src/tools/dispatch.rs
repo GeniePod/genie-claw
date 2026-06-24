@@ -2818,10 +2818,9 @@ mod tests {
         assert!(
             parse_web_search_fresh(&serde_json::json!({"query": "rust", "fresh": true})).unwrap()
         );
-        assert_eq!(
-            parse_web_search_fresh(&serde_json::json!({"query": "rust", "cache_bypass": false}))
-                .unwrap(),
-            false
+        assert!(
+            !parse_web_search_fresh(&serde_json::json!({"query": "rust", "cache_bypass": false}))
+                .unwrap()
         );
 
         for bad in [
