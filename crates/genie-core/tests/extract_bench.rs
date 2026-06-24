@@ -21,24 +21,35 @@ fn run(label: &str, input: &str, iters: u32) {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn bench_extract_facts() {
-    // Common case: a normal utterance with no relationship phrase. The old code
-    // still built all 57 `format!` pattern strings here; the new code skips the
-    // scan entirely via the "my " early-out.
+    // Common case: no relationship, identity, or preference phrase — skips all
+    // prefix scans after the single to_lowercase (see #495 early-outs).
     run(
-        "no-my",
+        "no-match",
         "the weather today is nice and i went for a walk",
         300_000,
     );
-    // Has "my " but no relationship match: exercises the full 57-pattern scan.
+    // Has "my " but no relationship match: exercises the 57-pattern scan only.
     run(
         "my-no-match",
         "my plan today is to relax and read a good book",
         300_000,
     );
-    // A real relationship hit.
+    // Real relationship hit.
     run(
         "relationship",
         "my dog is named rex and we play fetch",
+        300_000,
+    );
+    // Identity phrases without "my " or preference markers.
+    run(
+        "identity-hit",
+        "i work at google and i live in seattle",
+        300_000,
+    );
+    // Preference phrases only.
+    run(
+        "preference-hit",
+        "i love hiking and i hate cold mornings",
         300_000,
     );
 }
