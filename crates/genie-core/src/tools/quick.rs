@@ -2389,75 +2389,105 @@ fn parse_decimal_token(token: &str) -> Option<f64> {
 }
 
 fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
-    for (idx, token) in tokens.iter().enumerate() {
-        let Some(amount) = parse_number(token) else {
+    let mut start = 0;
+    while start < tokens.len() {
+        let Some((amount, unit_index)) = parse_spoken_number(tokens, start) else {
+            start += 1;
             continue;
         };
-        // Combine a spoken compound cardinal like "forty five" (45) into a
-        // single amount. Worded numbers arrive as separate whitespace tokens,
-        // so the tens word and the ones word must be stitched here.
-        let (amount, unit_index) = match tokens.get(idx + 1).and_then(|next| ones_digit(next)) {
-            Some(ones) if is_tens_word(token) => (amount + ones, idx + 2),
-            _ => (amount, idx + 1),
+        let multiplier = match tokens.get(unit_index).copied() {
+            Some("second" | "seconds" | "sec" | "secs") => 1,
+            Some("minute" | "minutes" | "min" | "mins") => 60,
+            Some("hour" | "hours" | "hr" | "hrs") => 3600,
+            _ => {
+                start += 1;
+                continue;
+            }
         };
-        let unit = tokens.get(unit_index)?;
-        let multiplier = match *unit {
-            "second" | "seconds" | "sec" | "secs" => 1,
-            "minute" | "minutes" | "min" | "mins" => 60,
-            "hour" | "hours" | "hr" | "hrs" => 3600,
-            _ => continue,
-        };
-        return Some((amount * multiplier, unit_index));
+        return Some((amount.saturating_mul(multiplier), unit_index));
     }
     None
 }
 
-/// True when `token` is a spoken tens word that can lead a compound cardinal
-/// such as "forty five".
-fn is_tens_word(token: &str) -> bool {
-    matches!(
-        token,
-        "twenty" | "thirty" | "forty" | "fifty" | "sixty" | "seventy" | "eighty" | "ninety"
-    )
+enum CardinalWord {
+    Value(u64),
+    Hundred,
+    Thousand,
 }
 
-/// The trailing ones digit of a compound cardinal ("forty *five*"), 1-9.
-fn ones_digit(token: &str) -> Option<u64> {
-    match parse_number(token) {
-        Some(value @ 1..=9) => Some(value),
-        _ => None,
+fn parse_spoken_number(tokens: &[&str], start: usize) -> Option<(u64, usize)> {
+    if let Some(Ok(value)) = tokens.get(start).map(|token| token.parse::<u64>()) {
+        return Some((value, start + 1));
     }
+
+    let mut total: u64 = 0;
+    let mut group: u64 = 0;
+    let mut index = start;
+    let mut matched = false;
+
+    while let Some(&token) = tokens.get(index) {
+        if matched
+            && token == "and"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|next| cardinal_word(next).is_some())
+        {
+            index += 1;
+            continue;
+        }
+        let Some(word) = cardinal_word(token) else {
+            break;
+        };
+        match word {
+            CardinalWord::Value(value) => group = group.saturating_add(value),
+            CardinalWord::Hundred => group = group.max(1).saturating_mul(100),
+            CardinalWord::Thousand => {
+                total = total.saturating_add(group.max(1).saturating_mul(1000));
+                group = 0;
+            }
+        }
+        matched = true;
+        index += 1;
+    }
+
+    matched.then(|| (total.saturating_add(group), index))
 }
 
-fn parse_number(token: &str) -> Option<u64> {
-    if let Ok(value) = token.parse::<u64>() {
-        return Some(value);
-    }
-
-    match token {
-        "one" | "a" | "an" => Some(1),
-        "two" => Some(2),
-        "three" => Some(3),
-        "four" => Some(4),
-        "five" => Some(5),
-        "six" => Some(6),
-        "seven" => Some(7),
-        "eight" => Some(8),
-        "nine" => Some(9),
-        "ten" => Some(10),
-        "eleven" => Some(11),
-        "twelve" => Some(12),
-        "fifteen" => Some(15),
-        "twenty" => Some(20),
-        "thirty" => Some(30),
-        "forty" => Some(40),
-        "fifty" => Some(50),
-        "sixty" => Some(60),
-        "seventy" => Some(70),
-        "eighty" => Some(80),
-        "ninety" => Some(90),
-        _ => None,
-    }
+fn cardinal_word(token: &str) -> Option<CardinalWord> {
+    use CardinalWord::{Hundred, Thousand, Value};
+    Some(match token {
+        "zero" => Value(0),
+        "one" | "a" | "an" => Value(1),
+        "two" => Value(2),
+        "three" => Value(3),
+        "four" => Value(4),
+        "five" => Value(5),
+        "six" => Value(6),
+        "seven" => Value(7),
+        "eight" => Value(8),
+        "nine" => Value(9),
+        "ten" => Value(10),
+        "eleven" => Value(11),
+        "twelve" => Value(12),
+        "thirteen" => Value(13),
+        "fourteen" => Value(14),
+        "fifteen" => Value(15),
+        "sixteen" => Value(16),
+        "seventeen" => Value(17),
+        "eighteen" => Value(18),
+        "nineteen" => Value(19),
+        "twenty" => Value(20),
+        "thirty" => Value(30),
+        "forty" => Value(40),
+        "fifty" => Value(50),
+        "sixty" => Value(60),
+        "seventy" => Value(70),
+        "eighty" => Value(80),
+        "ninety" => Value(90),
+        "hundred" => Hundred,
+        "thousand" => Thousand,
+        _ => return None,
+    })
 }
 
 fn reminder_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
@@ -4186,6 +4216,45 @@ mod tests {
         let call = route("remind me in forty five minutes to check the oven").unwrap();
         assert_eq!(call.arguments["seconds"], 2700);
         assert_eq!(call.arguments["label"], "check the oven");
+    }
+
+    #[test]
+    fn routes_teen_worded_durations() {
+        for (word, value) in [
+            ("thirteen", 13),
+            ("fourteen", 14),
+            ("sixteen", 16),
+            ("seventeen", 17),
+            ("eighteen", 18),
+            ("nineteen", 19),
+        ] {
+            let call = route(&format!("set a timer for {word} minutes"))
+                .unwrap_or_else(|| panic!("'{word} minutes' should route"));
+            assert_eq!(call.name, "set_timer");
+            assert_eq!(call.arguments["seconds"], value * 60, "{word}");
+        }
+    }
+
+    #[test]
+    fn routes_hundreds_and_thousands_worded_durations() {
+        let call = route("set a timer for one hundred seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 100);
+
+        let call = route("set a timer for two hundred thirty seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 230);
+
+        let call = route("set a timer for one hundred twenty minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 120 * 60);
+
+        let call = route("set a timer for one thousand seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 1000);
+
+        let call = route("set a timer for one hundred and twenty seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 120);
+
+        let call = route("remind me in ninety nine seconds to stretch").unwrap();
+        assert_eq!(call.arguments["seconds"], 99);
+        assert_eq!(call.arguments["label"], "stretch");
     }
 
     #[test]

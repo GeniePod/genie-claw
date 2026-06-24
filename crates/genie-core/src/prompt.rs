@@ -321,6 +321,27 @@ fn format_memories(memory: &Memory) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static PROMPT_TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// Unique temp dir per test — avoids readonly SQLite flakes from fixed paths (#487).
+    fn prompt_test_memory() -> Memory {
+        let id = PROMPT_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "geniepod-prompt-mem-{}-{}-{}",
+            std::process::id(),
+            id,
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create prompt test memory dir");
+        Memory::open(&dir.join("memory.db")).unwrap()
+    }
 
     #[test]
     fn detect_nemotron() {
@@ -379,9 +400,7 @@ mod tests {
             description: "Get current time".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
-        let mem_path = std::env::temp_dir().join("prompt-test-qwen3-4b.db");
-        let _ = std::fs::remove_file(&mem_path);
-        let memory = Memory::open(&mem_path).unwrap();
+        let memory = prompt_test_memory();
 
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("ONLY a JSON object"));
@@ -413,9 +432,7 @@ mod tests {
             description: "Get current time".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
-        let mem_path = std::env::temp_dir().join("prompt-test.db");
-        let _ = std::fs::remove_file(&mem_path);
-        let memory = Memory::open(&mem_path).unwrap();
+        let memory = prompt_test_memory();
 
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("ONLY a JSON object"));
@@ -430,9 +447,7 @@ mod tests {
             description: "Get system status".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
-        let mem_path = std::env::temp_dir().join("prompt-test-system-info.db");
-        let _ = std::fs::remove_file(&mem_path);
-        let memory = Memory::open(&mem_path).unwrap();
+        let memory = prompt_test_memory();
 
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("always use the system_info tool"));
@@ -454,9 +469,7 @@ mod tests {
                 parameters: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
             },
         ];
-        let mem_path = std::env::temp_dir().join("prompt-test-small.db");
-        let _ = std::fs::remove_file(&mem_path);
-        let memory = Memory::open(&mem_path).unwrap();
+        let memory = prompt_test_memory();
 
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("EXAMPLES:"));
@@ -476,9 +489,7 @@ mod tests {
             description: "Get current time".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
-        let mem_path = std::env::temp_dir().join("prompt-test-no-home.db");
-        let _ = std::fs::remove_file(&mem_path);
-        let memory = Memory::open(&mem_path).unwrap();
+        let memory = prompt_test_memory();
 
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("Home control is currently unavailable"));
@@ -493,9 +504,7 @@ mod tests {
             description: "Demo greeting skill".into(),
             parameters: serde_json::json!({"type": "object", "properties": {"name": {"type": "string"}}}),
         }];
-        let mem_path = std::env::temp_dir().join("prompt-test-hello-world.db");
-        let _ = std::fs::remove_file(&mem_path);
-        let memory = Memory::open(&mem_path).unwrap();
+        let memory = prompt_test_memory();
 
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("Only use hello_world when the user explicitly asks"));
@@ -525,9 +534,7 @@ mod tests {
                 parameters: serde_json::json!({"type": "object", "properties": {"content": {"type": "string"}}}),
             },
         ];
-        let mem_path = std::env::temp_dir().join("prompt-test-memory-tools.db");
-        let _ = std::fs::remove_file(&mem_path);
-        let memory = Memory::open(&mem_path).unwrap();
+        let memory = prompt_test_memory();
 
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("did you remember my name?"));
@@ -547,9 +554,7 @@ mod tests {
             description: "Get current time".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
-        let mem_path = std::env::temp_dir().join("prompt-test-phi.db");
-        let _ = std::fs::remove_file(&mem_path);
-        let memory = Memory::open(&mem_path).unwrap();
+        let memory = prompt_test_memory();
 
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("ONLY a JSON object"));
@@ -593,9 +598,7 @@ mod tests {
             description: "Get current time".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
-        let mem_path = std::env::temp_dir().join("prompt-test-gemma4-e2b.db");
-        let _ = std::fs::remove_file(&mem_path);
-        let memory = Memory::open(&mem_path).unwrap();
+        let memory = prompt_test_memory();
 
         let prompt = builder.build(&tools, &memory);
         assert!(prompt.contains("ONLY a JSON object"));
@@ -611,9 +614,7 @@ mod tests {
             description: "Get current time".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
-        let mem_path = std::env::temp_dir().join("prompt-test-policy-filter.db");
-        let _ = std::fs::remove_file(&mem_path);
-        let memory = Memory::open(&mem_path).unwrap();
+        let memory = prompt_test_memory();
         memory
             .store("person_preference", "Maya likes oat milk")
             .unwrap();
