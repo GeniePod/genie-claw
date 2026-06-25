@@ -63,7 +63,7 @@ pub struct PendingConfirmation {
     pub expires_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UndoRestore {
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -339,7 +339,17 @@ fn inverse_action(action: &str) -> Option<&'static str> {
 
 /// Capture the `home_control` call that restores `prior` before `action` ran.
 pub fn undo_restore_from_prior(action: &str, prior: &HomeState) -> Option<UndoRestore> {
-    let entity = prior.entities.first()?;
+    let mut entities = prior.entities.iter();
+    let restore = restore_for_entity(action, entities.next()?);
+    for entity in entities {
+        if restore_for_entity(action, entity) != restore {
+            return None;
+        }
+    }
+    restore
+}
+
+fn restore_for_entity(action: &str, entity: &crate::ha::Entity) -> Option<UndoRestore> {
     match action {
         "set_brightness" => {
             if entity.state == "off" {
@@ -1173,6 +1183,89 @@ mod tests {
         let restore = undo_restore_from_prior("set_brightness", &prior).unwrap();
         assert_eq!(restore.action, "set_brightness");
         assert!((restore.value.unwrap() - 76.86).abs() < 0.1);
+    }
+
+    #[test]
+    fn undo_restore_from_prior_group_mixed_brightness_returns_none() {
+        use crate::ha::Entity;
+
+        let prior = HomeState {
+            target_name: "living room lights".into(),
+            domain: Some("light".into()),
+            area: None,
+            entities: vec![
+                Entity {
+                    entity_id: "light.a".into(),
+                    state: "off".into(),
+                    attributes: serde_json::json!({}),
+                },
+                Entity {
+                    entity_id: "light.b".into(),
+                    state: "on".into(),
+                    attributes: serde_json::json!({ "brightness": 204 }),
+                },
+            ],
+            available: true,
+            spoken_summary: "living room lights".into(),
+        };
+
+        assert!(undo_restore_from_prior("set_brightness", &prior).is_none());
+    }
+
+    #[test]
+    fn undo_restore_from_prior_group_mixed_power_toggle_returns_none() {
+        use crate::ha::Entity;
+
+        let prior = HomeState {
+            target_name: "living room lights".into(),
+            domain: Some("light".into()),
+            area: None,
+            entities: vec![
+                Entity {
+                    entity_id: "light.a".into(),
+                    state: "on".into(),
+                    attributes: serde_json::json!({}),
+                },
+                Entity {
+                    entity_id: "light.b".into(),
+                    state: "off".into(),
+                    attributes: serde_json::json!({}),
+                },
+            ],
+            available: true,
+            spoken_summary: "living room lights".into(),
+        };
+
+        assert!(undo_restore_from_prior("toggle", &prior).is_none());
+    }
+
+    #[test]
+    fn undo_restore_from_prior_group_uniform_brightness_restores() {
+        use crate::ha::Entity;
+
+        let prior = HomeState {
+            target_name: "living room lights".into(),
+            domain: Some("light".into()),
+            area: None,
+            entities: vec![
+                Entity {
+                    entity_id: "light.a".into(),
+                    state: "on".into(),
+                    attributes: serde_json::json!({ "brightness": 204 }),
+                },
+                Entity {
+                    entity_id: "light.b".into(),
+                    state: "on".into(),
+                    attributes: serde_json::json!({ "brightness": 204 }),
+                },
+            ],
+            available: true,
+            spoken_summary: "living room lights".into(),
+        };
+
+        let restore = undo_restore_from_prior("set_brightness", &prior).unwrap();
+        assert_eq!(restore.action, "set_brightness");
+        assert!((restore.value.unwrap() - 80.0).abs() < 0.1);
     }
 
     #[test]
