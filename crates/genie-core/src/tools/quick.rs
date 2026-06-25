@@ -184,12 +184,24 @@ fn tool(name: &str, arguments: serde_json::Value) -> ToolCall {
 }
 
 fn normalize(text: &str) -> String {
-    text.trim()
-        .to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && !c.is_whitespace(), " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for ch in text.trim().chars() {
+        if ch.is_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.extend(ch.to_lowercase());
+        } else if !ch.is_whitespace() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+        } else if !out.is_empty() {
+            pending_space = true;
+        }
+    }
+    out
 }
 
 fn strip_household_speaker_prefix(text: &str) -> String {
