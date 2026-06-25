@@ -1,5 +1,6 @@
 pub mod actuation;
 pub mod calc;
+pub(crate) mod calc_input;
 pub mod dispatch;
 mod home;
 pub mod parser;

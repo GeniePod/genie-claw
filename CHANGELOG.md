@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Calculator handles decimals** (#504): the deterministic quick-router fed the
+  calculator text from the integer-only normalizer, which stripped the decimal
+  point — "what is 3.5 plus 2.5" became "3 5 + 2 5" and "12.5 percent of 80"
+  picked the stray "5". A new decimal-aware `calc_input::prepare` keeps a `.`
+  between digits, folds "3 point 5" into "3.5", and is used only by the
+  calculator branch, so other routing is unchanged.
 - **Full spoken-number durations** (#490): the quick-router only mapped a sparse
   set of number words, so "set a timer for thirteen minutes" set no timer
   (thirteen, fourteen, sixteen–nineteen were missing, and hundreds/thousands

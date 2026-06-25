@@ -137,7 +137,9 @@ pub fn route(text: &str) -> Option<ToolCall> {
         return Some(tool("home_control", args));
     }
 
-    if let Some(expression) = calculation_request(&normalized) {
+    if let Some(expression) = calculation_request(&strip_household_speaker_prefix(
+        &super::calc_input::prepare(text),
+    )) {
         return Some(tool(
             "calculate",
             serde_json::json!({ "expression": expression }),
