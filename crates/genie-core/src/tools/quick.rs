@@ -1708,13 +1708,7 @@ fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
     if entity.is_empty() {
         return None;
     }
-    let value_token = value_text
-        .split_whitespace()
-        .find(|token| token.chars().any(|ch| ch.is_ascii_digit()))?;
-    let value = value_token
-        .trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.')
-        .parse::<f64>()
-        .ok()?;
+    let value = super::number_words::parse_amount(value_text)?;
     if value.is_finite() {
         Some((entity.to_string(), value))
     } else {
@@ -2393,7 +2387,8 @@ fn parse_decimal_token(token: &str) -> Option<f64> {
 fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
     let mut start = 0;
     while start < tokens.len() {
-        let Some((amount, unit_index)) = parse_spoken_number(tokens, start) else {
+        let Some((amount, unit_index)) = super::number_words::parse_spoken_number(tokens, start)
+        else {
             start += 1;
             continue;
         };
@@ -2409,87 +2404,6 @@ fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
         return Some((amount.saturating_mul(multiplier), unit_index));
     }
     None
-}
-
-enum CardinalWord {
-    Value(u64),
-    Hundred,
-    Thousand,
-}
-
-fn parse_spoken_number(tokens: &[&str], start: usize) -> Option<(u64, usize)> {
-    if let Some(Ok(value)) = tokens.get(start).map(|token| token.parse::<u64>()) {
-        return Some((value, start + 1));
-    }
-
-    let mut total: u64 = 0;
-    let mut group: u64 = 0;
-    let mut index = start;
-    let mut matched = false;
-
-    while let Some(&token) = tokens.get(index) {
-        if matched
-            && token == "and"
-            && tokens
-                .get(index + 1)
-                .is_some_and(|next| cardinal_word(next).is_some())
-        {
-            index += 1;
-            continue;
-        }
-        let Some(word) = cardinal_word(token) else {
-            break;
-        };
-        match word {
-            CardinalWord::Value(value) => group = group.saturating_add(value),
-            CardinalWord::Hundred => group = group.max(1).saturating_mul(100),
-            CardinalWord::Thousand => {
-                total = total.saturating_add(group.max(1).saturating_mul(1000));
-                group = 0;
-            }
-        }
-        matched = true;
-        index += 1;
-    }
-
-    matched.then(|| (total.saturating_add(group), index))
-}
-
-fn cardinal_word(token: &str) -> Option<CardinalWord> {
-    use CardinalWord::{Hundred, Thousand, Value};
-    Some(match token {
-        "zero" => Value(0),
-        "one" | "a" | "an" => Value(1),
-        "two" => Value(2),
-        "three" => Value(3),
-        "four" => Value(4),
-        "five" => Value(5),
-        "six" => Value(6),
-        "seven" => Value(7),
-        "eight" => Value(8),
-        "nine" => Value(9),
-        "ten" => Value(10),
-        "eleven" => Value(11),
-        "twelve" => Value(12),
-        "thirteen" => Value(13),
-        "fourteen" => Value(14),
-        "fifteen" => Value(15),
-        "sixteen" => Value(16),
-        "seventeen" => Value(17),
-        "eighteen" => Value(18),
-        "nineteen" => Value(19),
-        "twenty" => Value(20),
-        "thirty" => Value(30),
-        "forty" => Value(40),
-        "fifty" => Value(50),
-        "sixty" => Value(60),
-        "seventy" => Value(70),
-        "eighty" => Value(80),
-        "ninety" => Value(90),
-        "hundred" => Hundred,
-        "thousand" => Thousand,
-        _ => return None,
-    })
 }
 
 fn reminder_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
