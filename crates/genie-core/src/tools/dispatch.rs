@@ -33,6 +33,16 @@ const HOME_CONTROL_ACTIONS: &[&str] = &[
     "activate",
 ];
 
+const TOO_MANY_PENDING_CONFIRMATIONS: &str = "Too many pending home confirmations; confirm or wait for existing ones to expire before requesting another.";
+
+fn format_undo_output(output: String) -> String {
+    if output.starts_with("Confirmation required") || output == TOO_MANY_PENDING_CONFIRMATIONS {
+        output
+    } else {
+        format!("Undid the last home action. {}", output)
+    }
+}
+
 fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Option<f64>)> {
     let entity = args
         .get("entity")
@@ -1223,9 +1233,7 @@ impl ToolDispatcher {
                     &reason,
                     exec_ctx.request_origin,
                 ) else {
-                    return Ok(
-                        "Too many pending home confirmations; confirm or wait for existing ones to expire before requesting another.".into(),
-                    );
+                    return Ok(TOO_MANY_PENDING_CONFIRMATIONS.into());
                 };
                 self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
@@ -1290,11 +1298,7 @@ impl ToolDispatcher {
         let output = self
             .exec_home_control_inner(&args, exec_ctx, Some(action.id))
             .await?;
-        if output.starts_with("Confirmation required") {
-            Ok(output)
-        } else {
-            Ok(format!("Undid the last home action. {}", output))
-        }
+        Ok(format_undo_output(output))
     }
 
     fn exec_action_history(&self) -> String {
@@ -3211,6 +3215,22 @@ mod tests {
         assert!(!second.success);
         assert!(second.output.contains("rate limit"));
         assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::TurnOn]);
+    }
+
+    #[test]
+    fn format_undo_output_does_not_claim_success_when_undo_did_not_run() {
+        assert_eq!(
+            format_undo_output(TOO_MANY_PENDING_CONFIRMATIONS.to_string()),
+            TOO_MANY_PENDING_CONFIRMATIONS,
+        );
+        assert!(
+            format_undo_output("Confirmation required to unlock the door.".to_string())
+                .starts_with("Confirmation required")
+        );
+        assert!(
+            format_undo_output("Turned off the lamp.".to_string())
+                .starts_with("Undid the last home action.")
+        );
     }
 
     #[tokio::test]
