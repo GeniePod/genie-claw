@@ -137,23 +137,36 @@ fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("home_status requires non-empty string argument 'entity'"))
 }
 
+fn parse_positive_integer_seconds(value: &serde_json::Value) -> Result<u64> {
+    if let Some(seconds) = value.as_u64() {
+        if seconds == 0 {
+            anyhow::bail!("set_timer seconds must be at least 1");
+        }
+        return Ok(seconds);
+    }
+    if let Some(float) = value.as_f64() {
+        if !float.is_finite() || float.fract() != 0.0 || float < 1.0 {
+            anyhow::bail!("set_timer requires integer argument 'seconds'");
+        }
+        let seconds = float as u64;
+        if (seconds as f64) != float {
+            anyhow::bail!("set_timer requires integer argument 'seconds'");
+        }
+        return Ok(seconds);
+    }
+    anyhow::bail!("set_timer requires integer argument 'seconds'")
+}
+
 fn parse_set_timer_args(args: &serde_json::Value) -> Result<(u64, &str)> {
     let seconds = match args.get("seconds") {
-        Some(value) => value
-            .as_u64()
-            .filter(|seconds| *seconds >= 1)
-            .ok_or_else(|| {
-                if value.as_u64() == Some(0) {
-                    anyhow::anyhow!("set_timer seconds must be at least 1")
-                } else {
-                    anyhow::anyhow!("set_timer requires integer argument 'seconds'")
-                }
-            })?,
+        Some(value) => parse_positive_integer_seconds(value)?,
         None => anyhow::bail!("set_timer requires integer argument 'seconds'"),
     };
     let label = args
         .get("label")
         .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .unwrap_or("timer");
     Ok((seconds, label))
 }
@@ -2750,6 +2763,40 @@ mod tests {
                 "unexpected error: {err}"
             );
         }
+    }
+
+    #[test]
+    fn set_timer_accepts_whole_number_float_seconds() {
+        let args = serde_json::json!({"seconds": 300.0, "label": "pasta"});
+        let (seconds, label) =
+            parse_set_timer_args(&args).expect("whole-number float seconds must parse");
+        assert_eq!(seconds, 300);
+        assert_eq!(label, "pasta");
+    }
+
+    #[test]
+    fn set_timer_rejects_fractional_float_seconds() {
+        let args = serde_json::json!({"seconds": 300.5});
+        let err = parse_set_timer_args(&args)
+            .expect_err("fractional seconds must be rejected")
+            .to_string();
+        assert!(
+            err.contains("set_timer requires integer argument 'seconds'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn set_timer_label_defaults_when_blank() {
+        let args = serde_json::json!({"seconds": 60, "label": "   "});
+        let (_, label) =
+            parse_set_timer_args(&args).expect("blank label should fall back to default");
+        assert_eq!(label, "timer");
+
+        let args2 = serde_json::json!({"seconds": 60, "label": ""});
+        let (_, label2) =
+            parse_set_timer_args(&args2).expect("empty label should fall back to default");
+        assert_eq!(label2, "timer");
     }
 
     #[test]
