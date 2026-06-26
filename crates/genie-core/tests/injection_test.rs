@@ -139,6 +139,24 @@ mod reference {
         }
         out
     }
+
+    pub fn word_pattern_texts() -> Vec<&'static str> {
+        PATTERNS
+            .iter()
+            .filter(|pattern| matches!(pattern.mode, MatchMode::Words))
+            .map(|pattern| pattern.text)
+            .collect()
+    }
+}
+
+#[test]
+fn every_word_pattern_is_detected_through_the_early_out_gate() {
+    for text in reference::word_pattern_texts() {
+        assert!(
+            matches!(scan(text), InjectionCheck::Suspicious(_)),
+            "word pattern not detected through the early-out gate: {text:?}"
+        );
+    }
 }
 
 #[test]

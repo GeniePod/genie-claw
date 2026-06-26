@@ -30,13 +30,22 @@ pub enum InjectionCheck {
 ///   symbols, so the punctuation that makes them meaningful is not folded away
 ///   and benign words like "evaluate" are not flagged.
 pub fn scan(text: &str) -> InjectionCheck {
-    let words = normalize_words(text);
-    let mut raw: Option<String> = None;
+    let scan_words = needs_word_pattern_scan(text);
     let scan_raw = needs_raw_pattern_scan(text);
+    if !scan_words && !scan_raw {
+        return InjectionCheck::Clean;
+    }
+
+    let words = if scan_words {
+        normalize_words(text)
+    } else {
+        String::new()
+    };
+    let mut raw: Option<String> = None;
 
     for pattern in PATTERNS {
         let matched = match pattern.mode {
-            MatchMode::Words => words.contains(pattern.text),
+            MatchMode::Words => scan_words && words.contains(pattern.text),
             MatchMode::Raw if scan_raw => {
                 let raw = raw.get_or_insert_with(|| normalize_raw(text));
                 raw.contains(pattern.text)
@@ -117,6 +126,35 @@ fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
 fn needs_raw_pattern_scan(text: &str) -> bool {
     const CORES: &[&str] = &["rm", "chmod", "sudo", "curl", "wget", "eval("];
     CORES.iter().any(|core| contains_ascii_ci(text, core))
+}
+
+fn needs_word_pattern_scan(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "ignore",
+        "disregard",
+        "forget",
+        "now",
+        "role",
+        "override",
+        "pretend",
+        "jailbreak",
+        "developer",
+        "restrictions",
+        "send",
+        "exfiltrate",
+        "base64",
+        "upload",
+        "post",
+        "forward",
+        "prompt",
+        "instructions",
+        "rules",
+        "configuration",
+        "api",
+        "secret",
+        "password",
+    ];
+    MARKERS.iter().any(|marker| contains_ascii_ci(text, marker))
 }
 
 /// Lowercase + collapse runs of ASCII whitespace to a single space. Preserves
