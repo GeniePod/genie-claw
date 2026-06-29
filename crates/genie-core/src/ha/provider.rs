@@ -672,7 +672,7 @@ impl HomeAutomationProvider for HomeAssistantProvider {
             anyhow::bail!(
                 "'{}' is ambiguous between {} — please say which one you mean",
                 query,
-                candidates.join(" or ")
+                format_disambiguation_candidates(&candidates)
             );
         }
 
@@ -1055,6 +1055,21 @@ fn top_named_entity_match<'a>(
     }
 }
 
+/// Format tied candidate names for a disambiguation prompt: two items use
+/// "A or B"; three or more use an Oxford comma ("A, B, or C").
+fn format_disambiguation_candidates(candidates: &[String]) -> String {
+    match candidates.len() {
+        0 => String::new(),
+        1 => candidates[0].clone(),
+        2 => format!("{} or {}", candidates[0], candidates[1]),
+        len => format!(
+            "{}, or {}",
+            candidates[..len - 1].join(", "),
+            candidates[len - 1]
+        ),
+    }
+}
+
 /// Candidate display names when `query` ambiguously matches several distinct
 /// named entities at the top score, for surfacing a disambiguation prompt. (#511)
 fn ambiguous_named_entity_candidates(graph: &HomeGraph, query: &str) -> Option<Vec<String>> {
@@ -1379,6 +1394,75 @@ mod tests {
             domains: vec!["light".into()],
             capabilities: vec![],
         }
+    }
+
+    fn three_lamp_graph() -> HomeGraph {
+        let mut graph = two_lamp_graph();
+        graph.areas.push(AreaRef {
+            id: "office".into(),
+            name: "Office".into(),
+            aliases: vec!["office".into()],
+        });
+        graph.entities.push(EntityRef {
+            entity_id: "light.desk_lamp".into(),
+            name: "Desk Lamp".into(),
+            domain: "light".into(),
+            area: Some("Office".into()),
+            aliases: vec![
+                "desk lamp".into(),
+                "reading lamp".into(),
+                "lamp".into(),
+                "light".into(),
+                "lights".into(),
+            ],
+            state: "off".into(),
+            capabilities: vec!["turn_on".into()],
+        });
+        graph
+    }
+
+    #[test]
+    fn format_disambiguation_candidates_reads_cleanly_for_three_or_more() {
+        assert_eq!(
+            format_disambiguation_candidates(&[
+                "Desk Lamp".into(),
+                "Sofa Lamp".into(),
+                "Bed Lamp".into(),
+            ]),
+            "Desk Lamp, Sofa Lamp, or Bed Lamp"
+        );
+        assert_eq!(
+            format_disambiguation_candidates(&["Sofa Lamp".into(), "Bed Lamp".into()]),
+            "Sofa Lamp or Bed Lamp"
+        );
+    }
+
+    #[test]
+    fn ambiguous_three_way_tie_names_all_candidates_with_oxford_comma() {
+        let graph = three_lamp_graph();
+        let mut candidates = ambiguous_named_entity_candidates(&graph, "reading lamp")
+            .expect("'reading lamp' ties across three devices");
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec![
+                "Bed Lamp".to_string(),
+                "Desk Lamp".to_string(),
+                "Sofa Lamp".to_string(),
+            ]
+        );
+        assert_eq!(
+            format_disambiguation_candidates(&candidates),
+            "Bed Lamp, Desk Lamp, or Sofa Lamp"
+        );
+        assert!(
+            HomeAssistantProvider::resolve_target_in_graph(
+                &graph,
+                "reading lamp",
+                Some(HomeActionKind::TurnOn)
+            )
+            .is_none()
+        );
     }
 
     #[test]
