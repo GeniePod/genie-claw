@@ -688,6 +688,10 @@ async fn set_timer_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"seconds": "five"}),
             "set_timer requires integer argument 'seconds'",
         ),
+        (
+            serde_json::json!({"seconds": 300.5}),
+            "set_timer requires integer argument 'seconds'",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 
@@ -725,6 +729,46 @@ async fn set_timer_rejects_invalid_arguments_and_audits() {
         assert_eq!(event["origin"], "dashboard");
         assert_eq!(event["success"], false);
     }
+}
+
+#[tokio::test]
+async fn set_timer_accepts_whole_number_float_seconds_and_audits() {
+    let paths = TestAuditPaths::new();
+    let dispatcher = paths.dispatcher(
+        None,
+        ToolPolicyConfig::default(),
+        ActuationSafetyConfig::default(),
+    );
+    let ctx = ToolExecutionContext {
+        request_origin: RequestOrigin::Dashboard,
+        ..ToolExecutionContext::default()
+    };
+
+    let result = dispatcher
+        .execute_with_context(
+            &ToolCall {
+                name: "set_timer".into(),
+                arguments: serde_json::json!({"seconds": 300.0, "label": "pasta"}),
+            },
+            ctx,
+        )
+        .await;
+
+    assert!(
+        result.success,
+        "whole-number float seconds must succeed, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("300"),
+        "output should mention duration, got: {}",
+        result.output
+    );
+
+    let events = read_jsonl(&paths.tool_audit);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["tool"], "set_timer");
+    assert_eq!(events[0]["success"], true);
 }
 
 #[tokio::test]
