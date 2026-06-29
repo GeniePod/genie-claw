@@ -37,49 +37,28 @@ pub fn detect_language_from_text(text: &str) -> Option<String> {
 
     let lower = trimmed.to_lowercase();
 
-    let spanish_hits = [
-        " el ",
-        " la ",
-        " los ",
-        " las ",
-        " un ",
-        " una ",
-        " por ",
-        " para ",
-        " gracias ",
-        "hola",
-        "qué",
-        "como ",
-        "está",
-        "estoy",
-        "buenos",
-        "buenas",
-    ]
-    .iter()
-    .filter(|pattern| lower.contains(**pattern))
-    .count()
-        + lower.matches('ñ').count()
-        + lower.matches('á').count()
-        + lower.matches('é').count()
-        + lower.matches('í').count()
-        + lower.matches('ó').count()
-        + lower.matches('ú').count();
+    // Tally every Spanish and German accent mark in a single pass over the
+    // lowercased text, instead of ten separate full-string `matches()` scans
+    // (six Spanish + four German). Each accent is a distinct character, so a
+    // combined per-character count is identical to summing the individual
+    // `matches(c).count()` values the previous implementation computed.
+    let (spanish_accents, german_accents) = count_accent_marks(&lower);
+
+    let spanish_hits = SPANISH_MARKERS
+        .iter()
+        .filter(|pattern| lower.contains(**pattern))
+        .count()
+        + spanish_accents;
 
     if spanish_hits >= 2 {
         return Some("es".into());
     }
 
-    let german_hits = [
-        " der ", " die ", " das ", " und ", " nicht ", " ich ", " ist ", " wie ", " danke ",
-        "hallo", "guten", "bitte",
-    ]
-    .iter()
-    .filter(|pattern| lower.contains(**pattern))
-    .count()
-        + lower.matches('ä').count()
-        + lower.matches('ö').count()
-        + lower.matches('ü').count()
-        + lower.matches('ß').count();
+    let german_hits = GERMAN_MARKERS
+        .iter()
+        .filter(|pattern| lower.contains(**pattern))
+        .count()
+        + german_accents;
 
     if german_hits >= 2 {
         return Some("de".into());
@@ -90,6 +69,50 @@ pub fn detect_language_from_text(text: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Spanish function words / greetings whose presence (substring match on the
+/// lowercased text) is one detection hit each.
+const SPANISH_MARKERS: [&str; 16] = [
+    " el ",
+    " la ",
+    " los ",
+    " las ",
+    " un ",
+    " una ",
+    " por ",
+    " para ",
+    " gracias ",
+    "hola",
+    "qué",
+    "como ",
+    "está",
+    "estoy",
+    "buenos",
+    "buenas",
+];
+
+/// German function words / greetings, one detection hit each.
+const GERMAN_MARKERS: [&str; 12] = [
+    " der ", " die ", " das ", " und ", " nicht ", " ich ", " ist ", " wie ", " danke ", "hallo",
+    "guten", "bitte",
+];
+
+/// Count Spanish (`ñ á é í ó ú`) and German (`ä ö ü ß`) accent marks in one
+/// traversal of the already-lowercased text. The two character sets are
+/// disjoint, so each returned count equals the sum of the per-character
+/// `matches(c).count()` the previous six/four-scan implementation produced.
+fn count_accent_marks(lower: &str) -> (usize, usize) {
+    let mut spanish = 0;
+    let mut german = 0;
+    for ch in lower.chars() {
+        match ch {
+            'ñ' | 'á' | 'é' | 'í' | 'ó' | 'ú' => spanish += 1,
+            'ä' | 'ö' | 'ü' | 'ß' => german += 1,
+            _ => {}
+        }
+    }
+    (spanish, german)
 }
 
 pub fn select_tts_model<'a>(
