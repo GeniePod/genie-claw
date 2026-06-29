@@ -1671,15 +1671,26 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
             text.strip_prefix("turn off ")
                 .map(|rest| (rest, "turn_off"))
         })?;
-    if !(rest.contains("fan") || rest.contains("fireplace")) {
-        return None;
-    }
     let entity = clean_control_entity(rest);
     if entity.is_empty() {
-        None
-    } else {
-        Some((entity, action))
+        return None;
     }
+    // Only emit a deterministic call for device classes the router can name
+    // unambiguously: fans, fireplaces, and lights (#523, e.g. "turn on the
+    // kitchen lights"). The light gate matches the device itself (a trailing
+    // "light"/"lights" or the bare word) so it stays clear of conditional or
+    // multi-clause phrasings ("...lights only when I pull in"), which abstain
+    // so the LLM can ground the entity.
+    let known_device = entity.contains("fan")
+        || entity.contains("fireplace")
+        || entity == "light"
+        || entity == "lights"
+        || entity.ends_with(" light")
+        || entity.ends_with(" lights");
+    if !known_device {
+        return None;
+    }
+    Some((entity, action))
 }
 
 fn clean_control_entity(text: &str) -> String {
@@ -4264,7 +4275,26 @@ mod tests {
 
     #[test]
     fn does_not_route_home_control_commands_as_status() {
-        assert!(route("turn on the kitchen light").is_none());
+        // A light on/off command is a home_control action, not a status query —
+        // it must route to home_control (turn_on), never home_status (#523).
+        let call = route("turn on the kitchen light").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "kitchen light");
+        assert_eq!(call.arguments["action"], "turn_on");
+    }
+
+    #[test]
+    fn routes_basic_light_command_to_home_control() {
+        // BFCL home-light-kitchen-on: "Turn on the kitchen lights." (#523)
+        let call = route("Sarah: Turn on the kitchen lights.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "kitchen lights");
+        assert_eq!(call.arguments["action"], "turn_on");
+
+        let call = route("Turn off the lights").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "lights");
+        assert_eq!(call.arguments["action"], "turn_off");
     }
 
     #[test]
