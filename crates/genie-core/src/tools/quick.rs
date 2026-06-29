@@ -92,6 +92,10 @@ pub fn route(text: &str) -> Option<ToolCall> {
         return Some(tool("home_control", args));
     }
 
+    if let Some(query) = memory_forget_query(&normalized) {
+        return Some(tool("memory_forget", serde_json::json!({ "query": query })));
+    }
+
     if let Some(query) = memory_recall_query(&normalized) {
         return Some(tool("memory_recall", serde_json::json!({ "query": query })));
     }
@@ -290,6 +294,26 @@ fn memory_recall_query(text: &str) -> Option<String> {
         return Some("me".into());
     }
 
+    None
+}
+
+fn memory_forget_query(text: &str) -> Option<String> {
+    for prefix in ["forget my ", "forget the ", "forget "] {
+        if let Some(query) = text.strip_prefix(prefix) {
+            let query = query.trim();
+            if !query.is_empty() {
+                return Some(query.to_string());
+            }
+        }
+    }
+    for prefix in ["delete my ", "delete the ", "delete "] {
+        if let Some(query) = text.strip_prefix(prefix) {
+            let query = query.trim_end_matches(" note").trim();
+            if !query.is_empty() {
+                return Some(query.to_string());
+            }
+        }
+    }
     None
 }
 
@@ -1760,19 +1784,20 @@ fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
 }
 
 fn asks_home_undo(text: &str) -> bool {
-    matches!(
-        text,
-        "undo"
-            | "undo that"
-            | "undo last action"
-            | "undo the last action"
-            | "revert that"
-            | "revert last action"
-            | "put it back"
-            | "put that back"
-            | "reverse that"
-            | "reverse last action"
-    )
+    text.starts_with("undo that last ")
+        || matches!(
+            text,
+            "undo"
+                | "undo that"
+                | "undo last action"
+                | "undo the last action"
+                | "revert that"
+                | "revert last action"
+                | "put it back"
+                | "put that back"
+                | "reverse that"
+                | "reverse last action"
+        )
 }
 
 fn asks_action_history(text: &str) -> bool {
@@ -1809,17 +1834,18 @@ fn asks_home_assistant_status(text: &str) -> bool {
 }
 
 fn asks_system_status(text: &str) -> bool {
-    matches!(
-        text,
-        "system status"
-            | "geniepod status"
-            | "genie status"
-            | "status of geniepod"
-            | "status of genie"
-            | "uptime"
-            | "load average"
-            | "governor status"
-    )
+    text.contains("memory pressure")
+        || matches!(
+            text,
+            "system status"
+                | "geniepod status"
+                | "genie status"
+                | "status of geniepod"
+                | "status of genie"
+                | "uptime"
+                | "load average"
+                | "governor status"
+        )
 }
 
 fn home_status_target(text: &str) -> Option<String> {
@@ -4121,5 +4147,51 @@ mod tests {
 
         let call = route_for_available_tools("what is 15 percent of 200", false, false).unwrap();
         assert_eq!(call.name, "calculate");
+    }
+
+    #[test]
+    fn routes_home_undo_last_change_variants() {
+        // BFCL home-undo-last-action: "undo that last light change"
+        let call = route("Undo that last light change.").unwrap();
+        assert_eq!(call.name, "home_undo");
+
+        let call = route("undo that last temperature change").unwrap();
+        assert_eq!(call.name, "home_undo");
+
+        // existing variants must still work
+        let call = route("undo that").unwrap();
+        assert_eq!(call.name, "home_undo");
+        let call = route("revert that").unwrap();
+        assert_eq!(call.name, "home_undo");
+    }
+
+    #[test]
+    fn routes_jetson_memory_pressure_to_system_info() {
+        // BFCL system-info-jetson-memory: "How is the Jetson memory pressure?"
+        let call = route("How is the Jetson memory pressure?").unwrap();
+        assert_eq!(call.name, "system_info");
+
+        let call = route("check memory pressure").unwrap();
+        assert_eq!(call.name, "system_info");
+
+        // existing system_info routes must still work
+        let call = route("system status").unwrap();
+        assert_eq!(call.name, "system_info");
+    }
+
+    #[test]
+    fn routes_memory_forget() {
+        // BFCL memory-forget-old-combo: "Forget my old locker combination."
+        let call = route("Forget my old locker combination.").unwrap();
+        assert_eq!(call.name, "memory_forget");
+        assert_eq!(call.arguments["query"], "old locker combination");
+
+        let call = route("forget the grocery list").unwrap();
+        assert_eq!(call.name, "memory_forget");
+        assert_eq!(call.arguments["query"], "grocery list");
+
+        let call = route("delete my grocery note").unwrap();
+        assert_eq!(call.name, "memory_forget");
+        assert_eq!(call.arguments["query"], "grocery");
     }
 }
