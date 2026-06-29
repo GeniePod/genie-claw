@@ -87,13 +87,16 @@ pub fn route(text: &str) -> Option<ToolCall> {
     {
         let mut args = serde_json::json!({ "entity": entity, "action": action });
         if let Some(value) = value {
-            args["value"] = serde_json::json!(value);
+            args["value"] = coerce_numeric_value(value);
         }
         return Some(tool("home_control", args));
     }
 
     if let Some(query) = memory_recall_query(&normalized) {
-        return Some(tool("memory_recall", serde_json::json!({ "query": query })));
+        return Some(tool(
+            "memory_recall",
+            serde_json::json!({ "query": query, "limit": 3 }),
+        ));
     }
 
     if asks_system_status(&normalized) || asks_home_assistant_status(&normalized) {
@@ -101,10 +104,11 @@ pub fn route(text: &str) -> Option<ToolCall> {
     }
 
     if let Some(query) = web_search_request(&normalized) {
-        return Some(tool(
-            "web_search",
-            serde_json::json!({ "query": query, "limit": 3 }),
-        ));
+        let mut args = serde_json::json!({ "query": query, "limit": 3 });
+        if is_freshness_sensitive(&normalized) {
+            args["fresh"] = serde_json::json!(true);
+        }
+        return Some(tool("web_search", args));
     }
 
     if let Some((seconds, label)) = timer_request(&normalized) {
@@ -138,7 +142,7 @@ pub fn route(text: &str) -> Option<ToolCall> {
     {
         let mut args = serde_json::json!({ "entity": entity, "action": action });
         if let Some(value) = value {
-            args["value"] = serde_json::json!(value);
+            args["value"] = coerce_numeric_value(value);
         }
         return Some(tool("home_control", args));
     }
@@ -187,6 +191,23 @@ fn tool(name: &str, arguments: serde_json::Value) -> ToolCall {
         name: name.to_string(),
         arguments,
     }
+}
+
+fn coerce_numeric_value(value: f64) -> serde_json::Value {
+    if value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+        serde_json::json!(value as i64)
+    } else {
+        serde_json::json!(value)
+    }
+}
+
+fn is_freshness_sensitive(text: &str) -> bool {
+    text.contains("stock price")
+        || text.contains("current price")
+        || text.contains("price of")
+        || text.starts_with("current ")
+        || text.contains(" current ")
+        || contains_any(text, &["today", "latest", " now "])
 }
 
 fn normalize(text: &str) -> String {
@@ -4121,5 +4142,45 @@ mod tests {
 
         let call = route_for_available_tools("what is 15 percent of 200", false, false).unwrap();
         assert_eq!(call.name, "calculate");
+    }
+
+    #[test]
+    fn memory_recall_includes_default_limit() {
+        // BFCL memory-grandma-wifi: limit must be present in the emitted args
+        let call = route("Find Grandma's Wi-Fi note.").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["limit"], 3);
+
+        let call = route("what do you know about the router password").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["limit"], 3);
+    }
+
+    #[test]
+    fn web_search_sets_fresh_for_price_and_current_queries() {
+        // BFCL web-search-stock: "What is the current stock price of Apple?"
+        let call = route("What is the current stock price of Apple?").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["fresh"], true);
+
+        // non-freshness-sensitive query must NOT have fresh flag
+        let call = route("look up ESP32 C6 thread support").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert!(call.arguments.get("fresh").is_none());
+    }
+
+    #[test]
+    fn set_temperature_emits_integer_value_for_whole_number() {
+        // BFCL home-thermostat-set: value:72.0 must serialize as 72 (integer), not 72.0 (float)
+        let call = route("Set the living room thermostat to 72.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["action"], "set_temperature");
+        assert_eq!(call.arguments["value"], 72);
+        assert!(call.arguments["value"].is_i64());
+
+        let call = route("set the bedroom thermostat to 68").unwrap();
+        assert_eq!(call.arguments["action"], "set_temperature");
+        assert_eq!(call.arguments["value"], 68);
+        assert!(call.arguments["value"].is_i64());
     }
 }
