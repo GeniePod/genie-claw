@@ -361,6 +361,8 @@ async fn main() -> Result<()> {
             chat_server
         };
 
+        let chat_server = chat_server.with_storage_config(config.storage.clone());
+
         tracing::info!(port, "starting HTTP chat API");
         if config.telegram.enabled {
             #[cfg(not(feature = "telegram"))]
