@@ -1,0 +1,303 @@
+//! Behavioural + differential coverage for `apply_reasoning_mode`.
+//!
+//! The shared `to_lowercase()` + marker early-outs replaced up to three
+//! independent lowers per Qwen utterance. A verbatim reference copy of the
+//! pre-refactor helpers proves output is byte-identical across a corpus.
+
+use genie_core::llm::Message;
+use genie_core::prompt::ModelFamily;
+use genie_core::reasoning::{
+    InteractionKind, ReasoningDecision, ReasoningMode, apply_reasoning_mode,
+};
+
+fn decision_key(decision: &ReasoningDecision) -> String {
+    format!(
+        "mode={:?};explicit={};applied={}",
+        decision.mode, decision.explicit, decision.applied
+    )
+}
+
+fn apply_reference(
+    model_family: ModelFamily,
+    messages: &[Message],
+    user_text: &str,
+    interaction: InteractionKind,
+) -> (Vec<Message>, ReasoningDecision) {
+    if !matches!(model_family, ModelFamily::Qwen) {
+        return (
+            messages.to_vec(),
+            ReasoningDecision {
+                mode: ReasoningMode::Normal,
+                explicit: false,
+                applied: false,
+            },
+        );
+    }
+
+    let explicit_mode = explicit_reasoning_mode_ref(user_text);
+    let mode = explicit_mode.unwrap_or_else(|| auto_reasoning_mode_ref(user_text, interaction));
+    let explicit = explicit_mode.is_some();
+    let cleaned_user_text = user_text.replace("/no_think", "").replace("/think", "");
+
+    let Some(last_user_idx) = messages.iter().rposition(|m| m.role == "user") else {
+        return (
+            messages.to_vec(),
+            ReasoningDecision {
+                mode,
+                explicit,
+                applied: false,
+            },
+        );
+    };
+
+    let mut adjusted = messages.to_vec();
+    let base = if cleaned_user_text.trim().is_empty() {
+        adjusted[last_user_idx].content.trim().to_string()
+    } else {
+        cleaned_user_text.trim().to_string()
+    };
+
+    adjusted[last_user_idx].content = match mode {
+        ReasoningMode::Normal => {
+            if base.is_empty() {
+                "/no_think".into()
+            } else {
+                format!("{base}\n/no_think")
+            }
+        }
+        ReasoningMode::Deep => {
+            if base.is_empty() {
+                "/think".into()
+            } else {
+                format!("{base}\n/think")
+            }
+        }
+    };
+
+    (
+        adjusted,
+        ReasoningDecision {
+            mode,
+            explicit,
+            applied: true,
+        },
+    )
+}
+
+fn explicit_reasoning_mode_ref(user_text: &str) -> Option<ReasoningMode> {
+    let lower = user_text.to_lowercase();
+    if lower.contains("/no_think") {
+        Some(ReasoningMode::Normal)
+    } else if lower.contains("/think")
+        || lower.contains("think deeply")
+        || lower.contains("reason carefully")
+        || lower.contains("step by step")
+    {
+        Some(ReasoningMode::Deep)
+    } else {
+        None
+    }
+}
+
+fn auto_reasoning_mode_ref(user_text: &str, interaction: InteractionKind) -> ReasoningMode {
+    if matches!(interaction, InteractionKind::ToolSummary) {
+        return ReasoningMode::Normal;
+    }
+    if is_simple_request_ref(user_text) {
+        return ReasoningMode::Normal;
+    }
+    if looks_like_deep_reasoning_request_ref(user_text) {
+        return ReasoningMode::Deep;
+    }
+    let _ = interaction;
+    ReasoningMode::Normal
+}
+
+fn is_simple_request_ref(user_text: &str) -> bool {
+    let lower = user_text.to_lowercase();
+    let words = lower.split_whitespace().count();
+
+    words <= 10
+        && (lower.contains("what time")
+            || lower.contains("weather")
+            || lower.starts_with("hi")
+            || lower.starts_with("hello")
+            || lower.starts_with("hey")
+            || lower.contains("turn on")
+            || lower.contains("turn off")
+            || lower.starts_with("set ")
+            || lower.contains("remember")
+            || lower.contains("my name")
+            || lower.contains("what's up")
+            || lower.contains("whats up"))
+}
+
+fn looks_like_deep_reasoning_request_ref(user_text: &str) -> bool {
+    let lower = user_text.to_lowercase();
+    let complex_markers = [
+        "analy",
+        "compare",
+        "tradeoff",
+        "trade-off",
+        "architecture",
+        "design",
+        "plan",
+        "debug",
+        "review",
+        "refactor",
+        "prove",
+        "derive",
+        "why does",
+        "what is wrong",
+        "what's wrong",
+        "optimiz",
+        "algorithm",
+        "complexity",
+        "step by step",
+        "pros and cons",
+        "should we",
+        "write code",
+        "rust",
+        "explain in detail",
+    ];
+
+    lower.len() > 140
+        || lower.contains('\n')
+        || lower.contains("1.")
+        || lower.contains("2.")
+        || lower.contains("```")
+        || complex_markers.iter().any(|marker| lower.contains(marker))
+}
+
+fn single_user_message(text: &str) -> Vec<Message> {
+    vec![Message {
+        role: "user".into(),
+        content: text.into(),
+    }]
+}
+
+#[test]
+fn qwen_defaults_to_no_think() {
+    let (messages, decision) = apply_reasoning_mode(
+        ModelFamily::Qwen,
+        &single_user_message("hi there"),
+        "hi there",
+        InteractionKind::Chat,
+    );
+
+    assert!(decision.applied);
+    assert_eq!(decision.mode, ReasoningMode::Normal);
+    assert!(messages[0].content.ends_with("/no_think"));
+}
+
+#[test]
+fn explicit_think_overrides_default() {
+    let (messages, decision) = apply_reasoning_mode(
+        ModelFamily::Qwen,
+        &single_user_message("debug this crash /think"),
+        "debug this crash /think",
+        InteractionKind::Chat,
+    );
+
+    assert!(decision.explicit);
+    assert_eq!(decision.mode, ReasoningMode::Deep);
+    assert!(messages[0].content.ends_with("/think"));
+    assert!(!messages[0].content.contains("/no_think"));
+}
+
+#[test]
+fn complex_prompt_escalates_to_think() {
+    let text = "Compare these two Rust designs, explain the tradeoffs, and recommend the safer refactor step by step.";
+    let (messages, decision) = apply_reasoning_mode(
+        ModelFamily::Qwen,
+        &single_user_message(text),
+        text,
+        InteractionKind::Chat,
+    );
+
+    assert_eq!(decision.mode, ReasoningMode::Deep);
+    assert!(messages[0].content.ends_with("/think"));
+}
+
+#[test]
+fn phi_family_is_unchanged() {
+    let original = single_user_message("hello");
+    let (messages, decision) =
+        apply_reasoning_mode(ModelFamily::Phi, &original, "hello", InteractionKind::Chat);
+
+    assert_eq!(messages[0].content, "hello");
+    assert!(!decision.applied);
+}
+
+#[test]
+fn gemma_family_is_unchanged() {
+    let original = single_user_message("what time is it");
+    let (messages, decision) = apply_reasoning_mode(
+        ModelFamily::Gemma,
+        &original,
+        "what time is it",
+        InteractionKind::Chat,
+    );
+
+    assert_eq!(messages[0].content, "what time is it");
+    assert!(!decision.applied);
+}
+
+#[test]
+fn tool_summary_stays_normal() {
+    let (messages, decision) = apply_reasoning_mode(
+        ModelFamily::Qwen,
+        &single_user_message("Compare these architectures in detail."),
+        "Compare these architectures in detail.",
+        InteractionKind::ToolSummary,
+    );
+
+    assert_eq!(decision.mode, ReasoningMode::Normal);
+    assert!(messages[0].content.ends_with("/no_think"));
+}
+
+const CORPUS: &[(&str, InteractionKind)] = &[
+    ("hi there", InteractionKind::Chat),
+    ("what time is it?", InteractionKind::Voice),
+    ("turn on the kitchen light", InteractionKind::Voice),
+    ("debug this crash /think", InteractionKind::Chat),
+    (
+        "Compare these two Rust designs, explain the tradeoffs, and recommend the safer refactor step by step.",
+        InteractionKind::Chat,
+    ),
+    (
+        "write me a long essay about nothing in particular",
+        InteractionKind::Chat,
+    ),
+    ("/no_think", InteractionKind::Repl),
+    (
+        "just chatting about the weather today",
+        InteractionKind::Chat,
+    ),
+    (
+        "should we refactor the memory layer?",
+        InteractionKind::OpenAiBridge,
+    ),
+];
+
+#[test]
+fn apply_reasoning_mode_matches_reference_corpus() {
+    for (text, interaction) in CORPUS {
+        let messages = single_user_message(text);
+        let (got_msgs, got_decision) =
+            apply_reasoning_mode(ModelFamily::Qwen, &messages, text, *interaction);
+        let (ref_msgs, ref_decision) =
+            apply_reference(ModelFamily::Qwen, &messages, text, *interaction);
+
+        assert_eq!(
+            decision_key(&got_decision),
+            decision_key(&ref_decision),
+            "decision mismatch for {text:?}"
+        );
+        assert_eq!(
+            got_msgs.last().map(|m| m.content.as_str()),
+            ref_msgs.last().map(|m| m.content.as_str()),
+            "content mismatch for {text:?}"
+        );
+    }
+}

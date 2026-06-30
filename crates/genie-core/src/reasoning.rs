@@ -40,8 +40,9 @@ pub fn apply_reasoning_mode(
         );
     }
 
-    let explicit_mode = explicit_reasoning_mode(user_text);
-    let mode = explicit_mode.unwrap_or_else(|| auto_reasoning_mode(user_text, interaction));
+    let lower = user_text.to_lowercase();
+    let explicit_mode = explicit_reasoning_mode(&lower);
+    let mode = explicit_mode.unwrap_or_else(|| auto_reasoning_mode(&lower, user_text, interaction));
     let explicit = explicit_mode.is_some();
     let cleaned_user_text = strip_reasoning_directives(user_text);
 
@@ -94,8 +95,7 @@ fn supports_reasoning_toggle(model_family: ModelFamily) -> bool {
     matches!(model_family, ModelFamily::Qwen)
 }
 
-fn explicit_reasoning_mode(user_text: &str) -> Option<ReasoningMode> {
-    let lower = user_text.to_lowercase();
+fn explicit_reasoning_mode(lower: &str) -> Option<ReasoningMode> {
     if lower.contains("/no_think") {
         Some(ReasoningMode::Normal)
     } else if lower.contains("/think")
@@ -109,16 +109,20 @@ fn explicit_reasoning_mode(user_text: &str) -> Option<ReasoningMode> {
     }
 }
 
-fn auto_reasoning_mode(user_text: &str, interaction: InteractionKind) -> ReasoningMode {
+fn auto_reasoning_mode(
+    lower: &str,
+    user_text: &str,
+    interaction: InteractionKind,
+) -> ReasoningMode {
     if matches!(interaction, InteractionKind::ToolSummary) {
         return ReasoningMode::Normal;
     }
 
-    if is_simple_request(user_text) {
+    if is_simple_request(lower, user_text) {
         return ReasoningMode::Normal;
     }
 
-    if looks_like_deep_reasoning_request(user_text) {
+    if looks_like_deep_reasoning_request(lower, user_text) {
         return ReasoningMode::Deep;
     }
 
@@ -126,9 +130,14 @@ fn auto_reasoning_mode(user_text: &str, interaction: InteractionKind) -> Reasoni
     ReasoningMode::Normal
 }
 
-fn is_simple_request(user_text: &str) -> bool {
-    let lower = user_text.to_lowercase();
+fn is_simple_request(lower: &str, user_text: &str) -> bool {
     let words = lower.split_whitespace().count();
+    if words > 10 {
+        return false;
+    }
+    if !needs_simple_request_scan(user_text) {
+        return false;
+    }
 
     words <= 10
         && (lower.contains("what time")
@@ -145,122 +154,100 @@ fn is_simple_request(user_text: &str) -> bool {
             || lower.contains("whats up"))
 }
 
-fn looks_like_deep_reasoning_request(user_text: &str) -> bool {
-    let lower = user_text.to_lowercase();
-    let complex_markers = [
-        "analy",
-        "compare",
-        "tradeoff",
-        "trade-off",
-        "architecture",
-        "design",
-        "plan",
-        "debug",
-        "review",
-        "refactor",
-        "prove",
-        "derive",
-        "why does",
-        "what is wrong",
-        "what's wrong",
-        "optimiz",
-        "algorithm",
-        "complexity",
-        "step by step",
-        "pros and cons",
-        "should we",
-        "write code",
-        "rust",
-        "explain in detail",
-    ];
+const DEEP_REASONING_MARKERS: &[&str] = &[
+    "analy",
+    "compare",
+    "tradeoff",
+    "trade-off",
+    "architecture",
+    "design",
+    "plan",
+    "debug",
+    "review",
+    "refactor",
+    "prove",
+    "derive",
+    "why does",
+    "what is wrong",
+    "what's wrong",
+    "optimiz",
+    "algorithm",
+    "complexity",
+    "step by step",
+    "pros and cons",
+    "should we",
+    "write code",
+    "rust",
+    "explain in detail",
+];
 
-    lower.len() > 140
+fn looks_like_deep_reasoning_request(lower: &str, user_text: &str) -> bool {
+    if lower.len() > 140
         || lower.contains('\n')
         || lower.contains("1.")
         || lower.contains("2.")
         || lower.contains("```")
-        || complex_markers.iter().any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    if !needs_deep_reasoning_scan(user_text) {
+        return false;
+    }
+
+    DEEP_REASONING_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Conservative gate before the simple-request marker checks on the lowered view.
+fn needs_simple_request_scan(text: &str) -> bool {
+    const CONTAINS: &[&str] = &[
+        "what time",
+        "weather",
+        "turn on",
+        "turn off",
+        "remember",
+        "my name",
+        "what's up",
+        "whats up",
+    ];
+    if CONTAINS
+        .iter()
+        .any(|marker| contains_ascii_ci(text, marker))
+    {
+        return true;
+    }
+
+    let trimmed = text.trim_start();
+    const PREFIXES: &[&str] = &["hi", "hello", "hey", "set "];
+    PREFIXES.iter().any(|prefix| {
+        trimmed.len() >= prefix.len()
+            && trimmed
+                .as_bytes()
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    })
+}
+
+/// Conservative gate before the deep-reasoning marker loop on the lowered view.
+fn needs_deep_reasoning_scan(text: &str) -> bool {
+    DEEP_REASONING_MARKERS
+        .iter()
+        .any(|marker| contains_ascii_ci(text, marker))
+}
+
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.as_bytes().windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle.bytes())
+            .all(|(left, right)| left.eq_ignore_ascii_case(&right))
+    })
 }
 
 fn strip_reasoning_directives(user_text: &str) -> String {
     user_text.replace("/no_think", "").replace("/think", "")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn single_user_message(text: &str) -> Vec<Message> {
-        vec![Message {
-            role: "user".into(),
-            content: text.into(),
-        }]
-    }
-
-    #[test]
-    fn qwen_defaults_to_no_think() {
-        let (messages, decision) = apply_reasoning_mode(
-            ModelFamily::Qwen,
-            &single_user_message("hi there"),
-            "hi there",
-            InteractionKind::Chat,
-        );
-
-        assert!(decision.applied);
-        assert_eq!(decision.mode, ReasoningMode::Normal);
-        assert!(messages[0].content.ends_with("/no_think"));
-    }
-
-    #[test]
-    fn explicit_think_overrides_default() {
-        let (messages, decision) = apply_reasoning_mode(
-            ModelFamily::Qwen,
-            &single_user_message("debug this crash /think"),
-            "debug this crash /think",
-            InteractionKind::Chat,
-        );
-
-        assert!(decision.explicit);
-        assert_eq!(decision.mode, ReasoningMode::Deep);
-        assert!(messages[0].content.ends_with("/think"));
-        assert!(!messages[0].content.contains("/no_think"));
-    }
-
-    #[test]
-    fn complex_prompt_escalates_to_think() {
-        let text = "Compare these two Rust designs, explain the tradeoffs, and recommend the safer refactor step by step.";
-        let (messages, decision) = apply_reasoning_mode(
-            ModelFamily::Qwen,
-            &single_user_message(text),
-            text,
-            InteractionKind::Chat,
-        );
-
-        assert_eq!(decision.mode, ReasoningMode::Deep);
-        assert!(messages[0].content.ends_with("/think"));
-    }
-
-    #[test]
-    fn phi_family_is_unchanged() {
-        let original = single_user_message("hello");
-        let (messages, decision) =
-            apply_reasoning_mode(ModelFamily::Phi, &original, "hello", InteractionKind::Chat);
-
-        assert_eq!(messages[0].content, "hello");
-        assert!(!decision.applied);
-    }
-
-    #[test]
-    fn gemma_family_is_unchanged() {
-        let original = single_user_message("what time is it");
-        let (messages, decision) = apply_reasoning_mode(
-            ModelFamily::Gemma,
-            &original,
-            "what time is it",
-            InteractionKind::Chat,
-        );
-
-        assert_eq!(messages[0].content, "what time is it");
-        assert!(!decision.applied);
-    }
 }
