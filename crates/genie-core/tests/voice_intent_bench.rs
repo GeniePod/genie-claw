@@ -1,3 +1,4 @@
+#![cfg(feature = "voice")]
 use genie_core::voice::intent::assess_transcript;
 use std::hint::black_box;
 

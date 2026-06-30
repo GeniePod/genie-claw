@@ -1,3 +1,4 @@
+#![cfg(feature = "voice")]
 use genie_core::voice::intent::{VoiceIntentDecision, assess_transcript};
 
 const CORPUS: &[(&str, VoiceIntentDecision)] = &[
