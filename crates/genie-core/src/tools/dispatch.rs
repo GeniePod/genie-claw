@@ -180,6 +180,18 @@ fn parse_memory_store_content(args: &serde_json::Value) -> Result<Vec<(String, S
     Ok(memories)
 }
 
+/// Format a count with the grammatically correct noun form for user-facing
+/// answers, e.g. `count_noun(1, "item", "items")` -> "1 item" and
+/// `count_noun(2, "item", "items")` -> "2 items". Avoids the "1 item(s)"
+/// lazy-plural antipattern in tool responses.
+fn count_noun(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
 fn parse_calculate_expression(args: &serde_json::Value) -> Result<&str> {
     args.get("expression")
         .and_then(|v| v.as_str())
@@ -1542,7 +1554,11 @@ impl ToolDispatcher {
         if deleted == 0 {
             Ok(format!("No memories found matching '{}'.", query))
         } else {
-            Ok(format!("Forgot {} memory(ies) about '{}'.", deleted, query))
+            Ok(format!(
+                "Forgot {} about '{}'.",
+                count_noun(deleted, "memory", "memories"),
+                query
+            ))
         }
     }
 
@@ -1628,13 +1644,14 @@ impl ToolDispatcher {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            let total = count_noun(count, "item", "items");
             if removed {
                 return Ok(format!(
-                    "Removed {added} from the shopping list. You have {count} item(s) total."
+                    "Removed {added} from the shopping list. You have {total} total."
                 ));
             }
             return Ok(format!(
-                "Added {added} to the shopping list. You have {count} item(s) total."
+                "Added {added} to the shopping list. You have {total} total."
             ));
         }
 
@@ -1871,9 +1888,9 @@ impl ActuationRateLimiter {
         }
         if bucket.len() >= limit {
             anyhow::bail!(
-                "actuation from '{}' exceeded {} action(s) per minute",
+                "actuation from '{}' exceeded {} per minute",
                 origin.as_policy_key(),
-                limit
+                count_noun(limit, "action", "actions")
             );
         }
         bucket.push_back(now);
@@ -1907,7 +1924,11 @@ impl ToolRateLimiter {
             bucket.pop_front();
         }
         if bucket.len() >= limit {
-            anyhow::bail!("tool '{}' exceeded {} call(s) per minute", tool, limit);
+            anyhow::bail!(
+                "tool '{}' exceeded {} per minute",
+                tool,
+                count_noun(limit, "call", "calls")
+            );
         }
         bucket.push_back(now);
         Ok(())
@@ -3757,7 +3778,8 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("Added milk, eggs"));
-        assert!(result.contains("2 item"));
+        assert!(result.contains("You have 2 items total."));
+        assert!(!result.contains("item(s)"));
 
         {
             let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
@@ -3774,10 +3796,20 @@ mod tests {
             )
             .unwrap();
         assert!(result.contains("Removed milk"));
-        assert!(result.contains("1 item"));
+        assert!(result.contains("You have 1 item total."));
+        assert!(!result.contains("item(s)"));
 
         let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
         assert_eq!(mem.shopping_list_pending_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn count_noun_uses_singular_only_for_one() {
+        assert_eq!(count_noun(0, "item", "items"), "0 items");
+        assert_eq!(count_noun(1, "item", "items"), "1 item");
+        assert_eq!(count_noun(2, "item", "items"), "2 items");
+        assert_eq!(count_noun(1, "memory", "memories"), "1 memory");
+        assert_eq!(count_noun(3, "memory", "memories"), "3 memories");
     }
 
     #[test]
