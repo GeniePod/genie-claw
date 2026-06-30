@@ -102,6 +102,17 @@ pub fn route(text: &str) -> Option<ToolCall> {
         return Some(tool("home_control", args));
     }
 
+    if let Some((location, forecast)) = weather_request(&normalized) {
+        return Some(tool(
+            "get_weather",
+            serde_json::json!({ "location": location, "forecast": forecast }),
+        ));
+    }
+
+    if let Some(entity) = priority_home_status_target(&normalized) {
+        return Some(tool("home_status", serde_json::json!({ "entity": entity })));
+    }
+
     if let Some(query) = memory_recall_query(&normalized) {
         return Some(tool(
             "memory_recall",
@@ -124,13 +135,6 @@ pub fn route(text: &str) -> Option<ToolCall> {
         return Some(tool(
             "set_timer",
             serde_json::json!({ "seconds": seconds, "label": label }),
-        ));
-    }
-
-    if let Some((location, forecast)) = weather_request(&normalized) {
-        return Some(tool(
-            "get_weather",
-            serde_json::json!({ "location": location, "forecast": forecast }),
         ));
     }
 
@@ -428,7 +432,9 @@ fn is_structured_household_question(text: &str) -> bool {
         || text.contains("turned off the security system")
         || text.contains("disarmed the security system")
         || text.contains("picking up the kids")
-        || text.contains("school pickup")
+        || (text.contains("school pickup")
+            && !text.contains("raining")
+            && !text.starts_with("is it rain"))
         || text.contains("shopping list")
         || (text.contains("allergic") || text.contains("allergy"))
         || text.contains("homework rule")
@@ -781,7 +787,7 @@ fn is_semantic_household_memory_question(text: &str) -> bool {
         || text.contains("spider")
         || text.contains("can t find the remote")
         || text.contains("can't find the remote")
-        || text.contains("garage freezer")
+        || (text.contains("garage freezer") && !text.contains("too warm"))
 }
 
 fn is_app_only_secret_question(text: &str) -> bool {
@@ -1925,6 +1931,15 @@ fn asks_system_status(text: &str) -> bool {
     )
 }
 
+/// Home-status queries currently shadowed by broad `memory_recall` matchers.
+/// Checked before `memory_recall_query` so device-state questions route correctly.
+fn priority_home_status_target(text: &str) -> Option<String> {
+    if text.contains("garage freezer") && text.contains("too warm") {
+        return Some("garage freezer".into());
+    }
+    None
+}
+
 fn home_status_target(text: &str) -> Option<String> {
     if text.contains("lights are still on upstairs")
         || (text.contains("which lights") && text.contains("upstairs"))
@@ -2120,7 +2135,11 @@ fn home_status_target(text: &str) -> Option<String> {
     }
 
     if text.contains("freezer") && text.contains("too warm") {
-        return Some("freezer".into());
+        return Some(if text.contains("garage") {
+            "garage freezer".into()
+        } else {
+            "freezer".into()
+        });
     }
 
     if text.contains("speed limit") {
@@ -2341,6 +2360,23 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
 }
 
 fn weather_request(text: &str) -> Option<(String, bool)> {
+    if text.starts_with("is it rain") || text.starts_with("will it rain") {
+        if text.contains("school pickup") {
+            return Some(("home".into(), false));
+        }
+        if let Some(location) = extract_location_after_marker(text, " for ")
+            && !location.is_empty()
+            && location != "today"
+            && location != "tomorrow"
+        {
+            if location.contains("school pickup") {
+                return Some(("home".into(), false));
+            }
+            return Some((location, false));
+        }
+        return Some(("home".into(), false));
+    }
+
     if !(text.contains("weather") || text.contains("forecast")) {
         return None;
     }
@@ -4073,6 +4109,21 @@ mod tests {
         let call = route("What is the stock price of Apple?").unwrap();
         assert_eq!(call.name, "web_search");
         assert!(call.arguments["query"].as_str().unwrap().contains("apple"));
+    }
+
+    #[test]
+    fn routes_weather_and_home_status_before_memory_recall() {
+        let call = route("Jared: Is it raining for school pickup?").unwrap();
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["location"], "home");
+
+        let call = route("Sarah: Is the garage freezer too warm?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "garage freezer");
+
+        // Still a memory question — not a live device-state check.
+        let call = route("Is the garage freezer cold enough?").unwrap();
+        assert_eq!(call.name, "memory_recall");
     }
 
     #[test]

@@ -692,6 +692,18 @@ async fn set_timer_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"seconds": 300.5}),
             "set_timer requires integer argument 'seconds'",
         ),
+        (
+            serde_json::json!({"seconds": 60, "label": 123}),
+            "set_timer 'label' must be a string when provided",
+        ),
+        (
+            serde_json::json!({"seconds": 60, "label": true}),
+            "set_timer 'label' must be a string when provided",
+        ),
+        (
+            serde_json::json!({"seconds": 60, "label": ["pasta"]}),
+            "set_timer 'label' must be a string when provided",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 
