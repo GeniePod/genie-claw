@@ -129,6 +129,9 @@ fn needs_raw_pattern_scan(text: &str) -> bool {
 }
 
 fn needs_word_pattern_scan(text: &str) -> bool {
+    if !text.is_ascii() {
+        return true;
+    }
     const MARKERS: &[&str] = &[
         "ignore",
         "disregard",
