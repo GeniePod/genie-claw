@@ -2220,7 +2220,7 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
 
     let label = reminder_label(&tokens, unit_end_index)
         .filter(|label| !label.is_empty())
-        .or_else(|| extract_named_timer_label(&tokens))
+        .or_else(|| extract_named_timer_label(&tokens, unit_end_index))
         .unwrap_or_else(|| {
             if text.starts_with("remind ") {
                 "reminder".into()
@@ -2232,20 +2232,38 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     Some((seconds, label))
 }
 
-/// Extract a label from the \"<label> timer for …\" form — e.g. \"set a cookie
-/// timer for 12 minutes\" → \"cookies\". Skips leading stop words before the
-/// noun phrase immediately preceding `timer`.
-fn extract_named_timer_label(tokens: &[&str]) -> Option<String> {
+/// Extract a label from timer phrasing the reminder path does not cover:
+/// - `"<label> timer for <duration>"` → `"cookie"` (e.g. cookie timer for 12 minutes)
+/// - `"<duration> timer for <label>"` → `"eggs"` (e.g. 5 minute timer for the eggs)
+///
+/// Skips the parsed duration span so `"5 minute timer"` does not label as `"5 minute"`.
+fn extract_named_timer_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
     let timer_index = tokens.iter().position(|token| *token == "timer")?;
     if timer_index == 0 {
         return None;
+    }
+
+    if let Some(label) = timer_for_label_after(tokens, timer_index) {
+        return Some(label);
+    }
+
+    let mut before_timer = &tokens[..timer_index];
+    if unit_end_index < timer_index {
+        // Duration sits immediately before `timer` (e.g. "5 minute timer").
+        if unit_end_index + 1 == timer_index {
+            return None;
+        }
+        // Duration is later in the utterance; drop any trailing duration tokens anyway.
+        before_timer = strip_trailing_duration_prefix(before_timer);
+    } else {
+        before_timer = strip_trailing_duration_prefix(before_timer);
     }
 
     const STOP: &[&str] = &[
         "set", "start", "create", "make", "a", "an", "the", "my", "our", "your", "new",
     ];
     let mut label_parts: Vec<&str> = Vec::new();
-    for &token in tokens[..timer_index].iter().rev() {
+    for &token in before_timer.iter().rev() {
         if STOP.contains(&token) {
             break;
         }
@@ -2256,12 +2274,52 @@ fn extract_named_timer_label(tokens: &[&str]) -> Option<String> {
         return None;
     }
 
-    let label = label_parts.join(" ");
-    Some(if label_parts.len() == 1 && !label.ends_with('s') {
-        format!("{label}s")
-    } else {
-        label
-    })
+    Some(label_parts.join(" "))
+}
+
+fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> {
+    let after = tokens.get(timer_index + 1..)?;
+    let (first, rest) = after.split_first()?;
+    if *first != "for" || rest.is_empty() {
+        return None;
+    }
+    // `"cookie timer for 12 minutes"` — duration after `for`, not a label.
+    if parse_duration(rest).is_some() {
+        return None;
+    }
+    let mut label = rest.join(" ");
+    if let Some(stripped) = label.strip_prefix("the ") {
+        label = stripped.to_string();
+    }
+    if label.is_empty() {
+        return None;
+    }
+    Some(label)
+}
+
+fn strip_trailing_duration_prefix<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    if tokens.len() < 2 || !is_time_unit(tokens[tokens.len() - 1]) {
+        return tokens;
+    }
+    if tokens[tokens.len() - 2].parse::<u64>().is_ok() {
+        return &tokens[..tokens.len() - 2];
+    }
+    for start in (0..tokens.len().saturating_sub(1)).rev() {
+        if let Some((_, unit_index)) = super::number_words::parse_spoken_number(tokens, start)
+            && unit_index == tokens.len() - 1
+        {
+            return &tokens[..start];
+        }
+    }
+    tokens
+}
+
+fn is_time_unit(token: &str) -> bool {
+    matches!(
+        token,
+        "second" | "seconds" | "sec" | "secs" | "minute" | "minutes" | "min" | "mins" | "hour"
+            | "hours" | "hr" | "hrs"
+    )
 }
 
 fn weather_request(text: &str) -> Option<(String, bool)> {
@@ -4138,7 +4196,13 @@ mod tests {
         let call = route("Leo: Set a cookie timer for 12 minutes.").unwrap();
         assert_eq!(call.name, "set_timer");
         assert_eq!(call.arguments["seconds"], 720);
-        assert_eq!(call.arguments["label"], "cookies");
+        assert_eq!(call.arguments["label"], "cookie");
+
+        let call = route("set a 5 minute timer").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+
+        let call = route("set a 5 minute timer for the eggs").unwrap();
+        assert_eq!(call.arguments["label"], "eggs");
 
         // Plain timer still defaults; reminder "to …" path unchanged.
         let call = route("set a timer for 10 minutes").unwrap();
