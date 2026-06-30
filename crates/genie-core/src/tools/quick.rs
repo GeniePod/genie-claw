@@ -1869,19 +1869,21 @@ fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
 }
 
 fn asks_home_undo(text: &str) -> bool {
-    matches!(
+    if matches!(
         text,
-        "undo"
-            | "undo that"
-            | "undo last action"
-            | "undo the last action"
-            | "revert that"
-            | "revert last action"
-            | "put it back"
-            | "put that back"
-            | "reverse that"
-            | "reverse last action"
-    )
+        "undo" | "undo that" | "revert that" | "put it back" | "put that back" | "reverse that"
+    ) {
+        return true;
+    }
+
+    // "Undo that last light change", "revert the last change", "undo last action",
+    // etc. (#525): an undo/revert/reverse verb referring to the last change or
+    // action. Requiring both "last" and a change/action noun keeps unrelated
+    // "undo …" phrasings (which lack a clear last-action referent) abstaining for
+    // the LLM. This also subsumes the former exact "<verb> last action" arms.
+    let undo_verb =
+        text.starts_with("undo ") || text.starts_with("revert ") || text.starts_with("reverse ");
+    undo_verb && text.contains("last") && (text.contains("change") || text.contains("action"))
 }
 
 fn asks_action_history(text: &str) -> bool {
@@ -4138,6 +4140,32 @@ mod tests {
     fn routes_undo_to_home_undo() {
         let call = route("undo that").unwrap();
         assert_eq!(call.name, "home_undo");
+    }
+
+    #[test]
+    fn routes_undo_last_change_to_home_undo() {
+        // BFCL home-undo-last-action: "Undo that last light change." (#525)
+        let call = route("Jared: Undo that last light change.").unwrap();
+        assert_eq!(call.name, "home_undo");
+        assert_eq!(call.arguments, serde_json::json!({}));
+
+        let call = route("revert the last change").unwrap();
+        assert_eq!(call.name, "home_undo");
+
+        // The structural fallback subsumes the former exact "<verb> last action"
+        // arms, so these must keep routing to home_undo.
+        for phrase in [
+            "undo last action",
+            "undo the last action",
+            "revert last action",
+            "reverse last action",
+        ] {
+            let call = route(phrase).unwrap_or_else(|| panic!("{phrase} should route"));
+            assert_eq!(call.name, "home_undo", "{phrase}");
+        }
+
+        // Still abstains without a clear last-action referent.
+        assert!(route("undo my grocery order").is_none());
     }
 
     #[test]
