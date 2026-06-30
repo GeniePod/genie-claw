@@ -36,9 +36,12 @@ fn core_binary_builds() {
 /// tracing::warn! error paths added for namespace data-loss prevention.
 /// Raised to 6.4 MB after removing panic=abort from skill-sdk to restore
 /// catch_unwind fault isolation (unwind tables re-included, ~30 KB growth).
+/// Raised to 6.6 MB after the quick-router BFCL accuracy work: the deterministic
+/// tool-call matchers and helpers merged across #509/#512/#521/#534/#537 grew
+/// genie-core to 6.43 MB.
 /// Keep it tight enough that another large dependency or module forces a
 /// deliberate decision.
-const RELEASE_BINARY_SIZE_BUDGET_MB: f64 = 6.4;
+const RELEASE_BINARY_SIZE_BUDGET_MB: f64 = 6.6;
 
 /// Verify release binary stays within the release size budget.
 #[test]
