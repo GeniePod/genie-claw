@@ -1173,7 +1173,7 @@ fn reminder_or_alarm_store_request(text: &str) -> Option<(&'static str, String)>
     if text.contains("remember that") && text.contains("green night") && text.contains("light") {
         return Some((
             "preference",
-            "Leo prefers green as his night-light color".into(),
+            "Leo likes the green night-light better.".into(),
         ));
     }
 
@@ -1537,7 +1537,7 @@ fn priority_home_control_request(text: &str) -> Option<(String, &'static str, Op
     }
 
     if text.contains("standby power") && text.contains("office") {
-        return Some(("office standby-safe plugs".into(), "turn_off", None));
+        return Some(("office standby power".into(), "turn_off", None));
     }
 
     if text.contains("block youtube") && text.contains("finish math") {
@@ -3664,7 +3664,7 @@ mod tests {
         assert_eq!(call.arguments["category"], "preference");
         assert_eq!(
             call.arguments["content"],
-            "Leo prefers green as his night-light color"
+            "Leo likes the green night-light better."
         );
 
         let call = route("Mia: Can Emma come over after school?").unwrap();
@@ -3968,7 +3968,7 @@ mod tests {
 
         let call = route("Jared: Turn off standby power in the office").unwrap();
         assert_eq!(call.name, "home_control");
-        assert_eq!(call.arguments["entity"], "office standby-safe plugs");
+        assert_eq!(call.arguments["entity"], "office standby power");
         assert_eq!(call.arguments["action"], "turn_off");
 
         assert!(route("Mia: Block YouTube until I finish math").is_none());
