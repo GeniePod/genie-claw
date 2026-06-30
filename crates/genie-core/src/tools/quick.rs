@@ -2684,6 +2684,12 @@ fn arithmetic_expression(text: &str) -> Option<String> {
         .replace(" divided by ", " / ")
         .replace(" over ", " / ");
 
+    // Fold spelled-out cardinals to digits so natural-language math like
+    // "what is two plus two" -> "2 + 2" routes to `calculate` (BFCL
+    // single-key-calculate), not just digit forms. Operators and existing
+    // numbers pass through untouched.
+    let expression = fold_number_words(&expression);
+
     if !expression.chars().any(|c| c.is_ascii_digit())
         || !expression
             .chars()
@@ -2700,6 +2706,29 @@ fn arithmetic_expression(text: &str) -> Option<String> {
     }
 
     Some(expression.trim().to_string())
+}
+
+/// Replace spelled-out cardinal numbers in an arithmetic expression with their
+/// digit form ("two + twenty five" -> "2 + 25"), reusing the shared spoken-number
+/// parser so multi-word numbers fold correctly. Operators, decimals, and tokens
+/// that are not number words pass through verbatim.
+fn fold_number_words(expression: &str) -> String {
+    let tokens: Vec<&str> = expression.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        match super::number_words::parse_spoken_number(&tokens, index) {
+            Some((value, next)) if next > index => {
+                out.push(value.to_string());
+                index = next;
+            }
+            _ => {
+                out.push(tokens[index].to_string());
+                index += 1;
+            }
+        }
+    }
+    out.join(" ")
 }
 
 fn parse_decimal_token(token: &str) -> Option<f64> {
@@ -4542,6 +4571,22 @@ mod tests {
         let call = route("what is 12 plus 30").unwrap();
         assert_eq!(call.name, "calculate");
         assert_eq!(call.arguments["expression"], "12 + 30");
+    }
+
+    #[test]
+    fn routes_spelled_out_arithmetic() {
+        // BFCL single-key-calculate: "What is two plus two?" -> calculate{2 + 2}.
+        let call = route("Leo: What is two plus two?").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "2 + 2");
+
+        // Multi-word cardinals and a mix of words/digits fold too.
+        let call = route("what is twenty five minus 3").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "25 - 3");
+
+        // A spelled number with no operator is not a calculation.
+        assert!(route("what is two").is_none());
     }
 
     #[test]
