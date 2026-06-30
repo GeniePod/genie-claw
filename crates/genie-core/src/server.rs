@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use genie_common::config::{EscalationTrigger, HttpServerConfig, PrivacyProxyConfig};
+use genie_common::config::{
+    EscalationTrigger, HttpServerConfig, PrivacyProxyConfig, StorageConfig,
+};
 use genie_common::http::{GuardRejection, HttpLimits, OriginDecision, RequestGuard, read_request};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -101,6 +103,9 @@ pub struct ChatServer {
     /// Optional on-device anonymising gateway for cloud escalation (issue #418).
     /// `None` means escalation is disabled and every turn is handled locally.
     privacy_proxy: Option<PrivacyProxyConfig>,
+    /// Storage lifecycle config — pruning intervals, retention limits, and the
+    /// disk-size threshold that surfaces as `degraded` in `/api/health`.
+    storage_config: StorageConfig,
 }
 
 pub struct ChatTurnResult {
@@ -144,6 +149,7 @@ impl ChatServer {
             http_config: HttpServerConfig::default(),
             origin_resolver: OriginResolver::default(),
             privacy_proxy: None,
+            storage_config: StorageConfig::default(),
         })
     }
 
@@ -171,6 +177,14 @@ impl ChatServer {
     /// seeded; `Private`/`Restricted` facts are never forwarded.
     pub fn with_privacy_proxy(mut self, cfg: PrivacyProxyConfig) -> Self {
         self.privacy_proxy = Some(cfg);
+        self
+    }
+
+    /// Override the storage lifecycle config (pruning intervals, retention
+    /// limits, and the disk-size warning threshold for `/api/health`).
+    /// Defaults to [`StorageConfig::default`].
+    pub fn with_storage_config(mut self, cfg: StorageConfig) -> Self {
+        self.storage_config = cfg;
         self
     }
 
@@ -240,6 +254,48 @@ impl ChatServer {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async move {
+                // Background pruning task: runs on an interval and removes
+                // decayed/stale memory entries and old conversation messages.
+                // Disabled when memory_prune_interval_hours == 0.
+                let pruner_ctx = Rc::clone(&ctx);
+                tokio::task::spawn_local(async move {
+                    let interval_hours = pruner_ctx.storage_config.memory_prune_interval_hours;
+                    if interval_hours == 0 {
+                        return;
+                    }
+                    let interval = Duration::from_secs(interval_hours * 3600);
+                    loop {
+                        tokio::time::sleep(interval).await;
+                        let mem_result = with_shared_memory(&pruner_ctx.memory, |mem| {
+                            mem.prune_and_checkpoint(
+                                pruner_ctx.storage_config.memory_decay_threshold,
+                                pruner_ctx.storage_config.memory_stale_days,
+                            )
+                        });
+                        match mem_result {
+                            Ok((decayed, stale)) => {
+                                tracing::info!(decayed, stale, "auto-prune: memory entries removed")
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "auto-prune: memory prune failed")
+                            }
+                        }
+                        let conv_result = pruner_ctx.conversations.prune_old_turns(
+                            pruner_ctx.storage_config.conversation_retention_days,
+                            pruner_ctx.storage_config.max_messages_per_conversation,
+                        );
+                        match conv_result {
+                            Ok(deleted) => {
+                                tracing::info!(deleted, "auto-prune: conversation messages removed")
+                            }
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "auto-prune: conversation prune failed"
+                            ),
+                        }
+                    }
+                });
+
                 loop {
                     // Reserve a slot *before* accepting; connections beyond the
                     // ceiling stay parked in the OS backlog rather than being
@@ -735,6 +791,7 @@ async fn handle_request(
                 expected_runtime_contract_hash,
                 chat_gate,
                 &ctx.boot_harness,
+                ctx.storage_config.warn_threshold_mb,
             )
             .await
         }
@@ -1634,13 +1691,19 @@ async fn handle_health(
     expected_runtime_contract_hash: &str,
     chat_gate: &ChatTurnGate,
     boot_harness: &crate::agent_harness::LimitedContextHarnessReport,
+    warn_threshold_mb: u64,
 ) -> (u16, &'static str, String) {
     let llm_ok = llm.health().await;
     let connectivity_health = connectivity.health().await;
-    let (mem_count, memory_health) = with_shared_memory(memory, |memory| {
-        (memory.count().unwrap_or(0), memory.health().ok())
+    let (mem_count, memory_health, memory_db_bytes) = with_shared_memory(memory, |memory| {
+        (
+            memory.count().unwrap_or(0),
+            memory.health().ok(),
+            memory.db_size_bytes().unwrap_or(0),
+        )
     });
     let conv_count = conversations.list().map(|l| l.len()).unwrap_or(0);
+    let conversation_db_bytes = conversations.db_size_bytes().unwrap_or(0);
     let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
     let chat = chat_gate.snapshot();
     let runtime_contract = with_shared_memory(memory, |memory| {
@@ -1657,11 +1720,16 @@ async fn handle_health(
     let runtime_contract =
         runtime_contract_summary_json(&runtime_contract, expected_runtime_contract_hash);
 
+    let storage_ok = warn_threshold_mb == 0
+        || (memory_db_bytes / (1024 * 1024) < warn_threshold_mb
+            && conversation_db_bytes / (1024 * 1024) < warn_threshold_mb);
+
     let status = overall_health_status(
         llm_ok,
         connectivity_health.state,
         chat.wedged,
         boot_harness.pass,
+        storage_ok,
     );
 
     let resp = serde_json::json!({
@@ -1679,6 +1747,12 @@ async fn handle_health(
                 .as_ref()
                 .map(|health| health.fts_consistent)
                 .unwrap_or(false),
+        },
+        "storage": {
+            "memory_db_bytes": memory_db_bytes,
+            "conversation_db_bytes": conversation_db_bytes,
+            "warn_threshold_mb": warn_threshold_mb,
+            "over_threshold": !storage_ok,
         },
         "conversations": conv_count,
         "mem_available_mb": mem_avail,
@@ -1699,10 +1773,12 @@ fn overall_health_status(
     connectivity_state: ConnectivityState,
     chat_wedged: bool,
     harness_pass: bool,
+    storage_ok: bool,
 ) -> &'static str {
     if llm_ok
         && !chat_wedged
         && harness_pass
+        && storage_ok
         && matches!(
             connectivity_state,
             ConnectivityState::Disabled | ConnectivityState::Ready
@@ -2775,7 +2851,7 @@ mod tests {
     #[test]
     fn overall_health_is_ok_when_llm_is_up_and_connectivity_is_disabled() {
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Disabled, false, true),
+            overall_health_status(true, ConnectivityState::Disabled, false, true, true),
             "ok"
         );
     }
@@ -2783,7 +2859,7 @@ mod tests {
     #[test]
     fn overall_health_is_ok_when_llm_is_up_and_connectivity_is_ready() {
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Ready, false, true),
+            overall_health_status(true, ConnectivityState::Ready, false, true, true),
             "ok"
         );
     }
@@ -2791,7 +2867,7 @@ mod tests {
     #[test]
     fn overall_health_is_degraded_when_connectivity_is_offline() {
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Offline, false, true),
+            overall_health_status(true, ConnectivityState::Offline, false, true, true),
             "degraded"
         );
     }
@@ -2801,7 +2877,7 @@ mod tests {
         // Even with the LLM reachable and connectivity ready, a stuck chat turn
         // must surface as degraded so monitoring can't stay green (issue #181).
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Ready, true, true),
+            overall_health_status(true, ConnectivityState::Ready, true, true, true),
             "degraded"
         );
     }
@@ -2809,7 +2885,15 @@ mod tests {
     #[test]
     fn overall_health_is_degraded_when_agent_harness_fails() {
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Ready, false, false),
+            overall_health_status(true, ConnectivityState::Ready, false, false, true),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn overall_health_is_degraded_when_storage_over_threshold() {
+        assert_eq!(
+            overall_health_status(true, ConnectivityState::Ready, false, true, false),
             "degraded"
         );
     }
@@ -2852,6 +2936,7 @@ mod tests {
             "",
             &gate,
             &boot_harness,
+            0,
         )
         .await;
 
@@ -3235,7 +3320,7 @@ mod tests {
         let snap = gate.snapshot();
         assert!(!snap.wedged);
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Ready, snap.wedged, true),
+            overall_health_status(true, ConnectivityState::Ready, snap.wedged, true, true),
             "ok",
             "healthy before any turn"
         );
@@ -3247,7 +3332,7 @@ mod tests {
             assert!(snap.in_flight, "stuck turn is in flight");
             assert!(snap.wedged, "a turn held past wedge_after reports wedged");
             assert_eq!(
-                overall_health_status(true, ConnectivityState::Ready, snap.wedged, true),
+                overall_health_status(true, ConnectivityState::Ready, snap.wedged, true, true),
                 "degraded",
                 "a wedged chat turn must surface as degraded even with the LLM reachable"
             );
@@ -3268,7 +3353,7 @@ mod tests {
         );
         assert_eq!(snap.completed_turns, 1);
         assert_eq!(
-            overall_health_status(true, ConnectivityState::Ready, snap.wedged, true),
+            overall_health_status(true, ConnectivityState::Ready, snap.wedged, true, true),
             "ok",
             "overall health recovers to ok once the wedged turn completes"
         );

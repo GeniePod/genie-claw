@@ -944,6 +944,7 @@ mod tests {
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
             http: Default::default(),
+            storage: Default::default(),
         }
     }
 

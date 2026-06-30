@@ -19,3 +19,8 @@
 {"id":"multi-homework-timer","category":"multi_tool","prompt":"Sarah: Start homework mode and set a 45 minute focus timer.","expected_tool_calls":[{"tool":"home_control","arguments":{"entity":"homework mode","action":"activate"}},{"tool":"set_timer","arguments":{"seconds":2700,"label":"homework focus"}}]}
 {"id":"function-call-memory-status","category":"memory","prompt":"Jared: Check memory health.","expected_tool_calls":[{"tool":"memory_status","arguments":{}}]}
 {"id":"single-key-calculate","category":"calculate","prompt":"Leo: What is two plus two?","expected_tool_calls":[{"tool":"calculate","arguments":{"expression":"2 + 2"}}]}
+{"id":"memory-store-allergy-statement","category":"memory","prompt":"I'm allergic to peanuts","expected_tool_calls":[{"tool":"memory_store","arguments":{"category":"health_tracker"}}],"allow_extra_arguments":true}
+{"id":"memory-store-meeting-statement","category":"memory","prompt":"I have a meeting on Saturday 10AM","expected_tool_calls":[{"tool":"memory_store","arguments":{"category":"reminders"}}],"allow_extra_arguments":true}
+{"id":"memory-store-remember-appointment","category":"memory","prompt":"Remember my dentist appointment is next Tuesday 3pm","expected_tool_calls":[{"tool":"memory_store","arguments":{"category":"reminders"}}],"allow_extra_arguments":true}
+{"id":"memory-store-remember-fact","category":"memory","prompt":"Remember that the wifi password is hunter2","expected_tool_calls":[{"tool":"memory_store","arguments":{"category":"fact"}}],"allow_extra_arguments":true}
+{"id":"memory-recall-allergy-question","category":"memory","prompt":"Is anyone allergic to peanuts?","expected_tool_calls":[{"tool":"memory_recall","arguments":{}}],"allow_extra_arguments":true}

@@ -1127,22 +1127,34 @@ impl Memory {
             .filter_map(|r| r.ok())
             .collect();
 
-        let mut deleted = 0;
-        for (id, accessed_ms) in candidates {
-            // Decay from last access (recency-of-use), consistent with search
-            // ranking — a long-unused memory decays and is pruned; a recently
-            // recalled one survives regardless of how long ago it was created.
-            let age_days = (now as f64 - accessed_ms as f64) / 86_400_000.0;
-            let multiplier = decay::exponential_decay(age_days, self.half_life_days);
+        // Decide deletions in Rust (decay math unchanged), then remove them in a
+        // few batched `IN (...)` statements instead of one auto-committed DELETE
+        // per row. Same rows removed and same count returned; the batching is the
+        // same write-coalescing pattern as recall-tracking (#431) and scales with
+        // the number of decayed rows. Contributes under #402 (performance bucket).
+        let to_delete: Vec<i64> = candidates
+            .into_iter()
+            .filter_map(|(id, accessed_ms)| {
+                // Decay from last access (recency-of-use), consistent with search
+                // ranking — a long-unused memory decays and is pruned; a recently
+                // recalled one survives regardless of how long ago it was created.
+                let age_days = (now as f64 - accessed_ms as f64) / 86_400_000.0;
+                let multiplier = decay::exponential_decay(age_days, self.half_life_days);
+                (multiplier < min_decay_threshold).then_some(id)
+            })
+            .collect();
 
-            if multiplier < min_decay_threshold {
-                self.conn
-                    .execute("DELETE FROM memories WHERE id = ?1", [id])?;
-                deleted += 1;
-            }
+        // SQLite's default bound-variable limit is 999; stay safely under it.
+        const DELETE_CHUNK: usize = 900;
+        for chunk in to_delete.chunks(DELETE_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            self.conn.execute(
+                &format!("DELETE FROM memories WHERE id IN ({placeholders})"),
+                params_from_iter(chunk.iter()),
+            )?;
         }
 
-        Ok(deleted)
+        Ok(to_delete.len())
     }
 
     /// Prune memories older than max_age_days (simple cutoff).
@@ -1153,6 +1165,43 @@ impl Memory {
             [cutoff],
         )?;
         Ok(deleted)
+    }
+
+    /// Combined pruning operation for scheduled background runs.
+    ///
+    /// 1. Calls [`prune_decayed`](Self::prune_decayed) with `decay_threshold` to
+    ///    remove entries whose exponential decay multiplier has fallen below the
+    ///    threshold (non-evergreen, non-promoted entries only).
+    /// 2. Calls [`prune_stale`](Self::prune_stale) with `stale_days` to remove
+    ///    entries not accessed within that many days.
+    /// 3. Issues `PRAGMA wal_checkpoint(TRUNCATE)` so freed pages are returned
+    ///    to the OS.
+    ///
+    /// Returns `(decay_pruned, stale_pruned)` row counts.
+    pub fn prune_and_checkpoint(
+        &self,
+        decay_threshold: f64,
+        stale_days: u32,
+    ) -> Result<(usize, usize)> {
+        let decayed = self.prune_decayed(decay_threshold)?;
+        let stale = self.prune_stale(stale_days)?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok((decayed, stale))
+    }
+
+    /// Return the on-disk size of the memory database in bytes, estimated from
+    /// SQLite's `PRAGMA page_count` × `PRAGMA page_size`.
+    pub fn db_size_bytes(&self) -> Option<u64> {
+        let pages: u64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .ok()?;
+        let page_size: u64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .ok()?;
+        Some(pages * page_size)
     }
 
     /// Get all memories of a specific category (e.g. "identity").
@@ -16723,5 +16772,65 @@ mod tests {
         assert!(!mem.canonical_dir.join("namespaces.tmp").exists());
         assert!(!mem.canonical_dir.join("MEMORY.md.tmp").exists());
         assert!(!mem.canonical_dir.join("INDEX.md.tmp").exists());
+    }
+
+    #[test]
+    #[ignore = "microbench; run with --ignored --nocapture"]
+    fn bench_prune_decayed_batched_vs_per_row() {
+        use std::time::Instant;
+        let n = 400usize;
+        let reps = 20u32;
+
+        fn populate_stale(n: usize) -> Memory {
+            let mem = Memory::open_with_half_life(&temp_memory_path("bench-prune"), 0.001).unwrap();
+            for i in 0..n {
+                mem.store("fact", &format!("decayed fact {i}")).unwrap();
+            }
+            // Force every row stale (epoch access time decays below threshold).
+            mem.conn
+                .execute("UPDATE memories SET accessed_ms = 0", [])
+                .unwrap();
+            mem
+        }
+
+        // NEW: the batched prune_decayed (production fn).
+        let mut new_total = 0u128;
+        for _ in 0..reps {
+            let mem = populate_stale(n);
+            let t = Instant::now();
+            let deleted = mem.prune_decayed(0.5).unwrap();
+            new_total += t.elapsed().as_nanos();
+            assert_eq!(deleted, n, "all stale rows should prune");
+        }
+
+        // OLD: the previous per-row auto-committed DELETE loop, inlined.
+        let mut old_total = 0u128;
+        for _ in 0..reps {
+            let mem = populate_stale(n);
+            let ids: Vec<i64> = {
+                let mut s = mem
+                    .conn
+                    .prepare("SELECT id FROM memories WHERE evergreen = 0 AND promoted = 0")
+                    .unwrap();
+                s.query_map([], |r| r.get::<_, i64>(0))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
+            let t = Instant::now();
+            for id in &ids {
+                mem.conn
+                    .execute("DELETE FROM memories WHERE id = ?1", [id])
+                    .unwrap();
+            }
+            old_total += t.elapsed().as_nanos();
+        }
+
+        let new_ns = new_total / u128::from(reps);
+        let old_ns = old_total / u128::from(reps);
+        eprintln!(
+            "prune_decayed deleting {n} rows: old(per-row) {old_ns} ns -> new(batched) {new_ns} ns ({:.2}x)",
+            old_ns as f64 / new_ns as f64
+        );
     }
 }

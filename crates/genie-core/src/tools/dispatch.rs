@@ -15,23 +15,14 @@ use super::actuation::{
 };
 use super::home;
 use super::timer;
-use crate::ha::{HomeActionKind, HomeAutomationProvider};
+use crate::ha::HomeAutomationProvider;
 use crate::skills::SkillLoader;
 
 const ACTUATION_RATE_WINDOW_MS: u64 = 60_000;
 
-const HOME_CONTROL_ACTIONS: &[&str] = &[
-    "turn_on",
-    "turn_off",
-    "toggle",
-    "set_brightness",
-    "set_temperature",
-    "open",
-    "close",
-    "lock",
-    "unlock",
-    "activate",
-];
+use super::home_action::{
+    HOME_CONTROL_ACTIONS, action_requires_value, canon_home_control_action, home_action_kind,
+};
 
 const TOO_MANY_PENDING_CONFIRMATIONS: &str = "Too many pending home confirmations; confirm or wait for existing ones to expire before requesting another.";
 
@@ -88,47 +79,6 @@ fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Opti
     Ok((entity, action, value))
 }
 
-fn home_action_kind(action: &str) -> Result<HomeActionKind> {
-    match action {
-        "turn_on" => Ok(HomeActionKind::TurnOn),
-        "turn_off" => Ok(HomeActionKind::TurnOff),
-        "toggle" => Ok(HomeActionKind::Toggle),
-        "set_brightness" => Ok(HomeActionKind::SetBrightness),
-        "set_temperature" => Ok(HomeActionKind::SetTemperature),
-        "open" => Ok(HomeActionKind::Open),
-        "close" => Ok(HomeActionKind::Close),
-        "lock" => Ok(HomeActionKind::Lock),
-        "unlock" => Ok(HomeActionKind::Unlock),
-        "activate" | "activate_scene" => Ok(HomeActionKind::Activate),
-        other => anyhow::bail!("unknown home action: {other}"),
-    }
-}
-
-/// Actions that actuate a numeric setpoint and therefore require a `value`.
-/// Every other action (turn_on, turn_off, toggle, open, close, lock, unlock,
-/// activate) is a no-op for `value` and leaves it `None`.
-fn action_requires_value(action: &str) -> bool {
-    matches!(action, "set_brightness" | "set_temperature")
-}
-
-/// Canonicalize a model-emitted action verb to one of [`HOME_CONTROL_ACTIONS`].
-///
-/// Small models routinely emit the natural-language form ("turn off"),
-/// hyphenated/cased variants ("Turn-Off"), or a synonym ("deactivate") rather
-/// than the exact enum value `turn_off`. Rejecting those means a correct intent
-/// silently fails to actuate. Normalize separators + case, map a few
-/// unambiguous synonyms, and accept the result only if it lands on a real
-/// action. `activate` is left as-is (it is its own action for scenes/scripts).
-fn canon_home_control_action(raw: &str) -> Option<&'static str> {
-    let normalized = raw.trim().to_lowercase().replace([' ', '-'], "_");
-    let mapped: &str = match normalized.as_str() {
-        "deactivate" | "disable" | "switch_off" | "power_off" | "shut_off" => "turn_off",
-        "enable" | "switch_on" | "power_on" => "turn_on",
-        other => other,
-    };
-    HOME_CONTROL_ACTIONS.iter().copied().find(|&a| a == mapped)
-}
-
 fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
     args.get("entity")
         .and_then(|v| v.as_str())
@@ -137,24 +87,53 @@ fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("home_status requires non-empty string argument 'entity'"))
 }
 
+fn parse_positive_integer_seconds(value: &serde_json::Value) -> Result<u64> {
+    if let Some(seconds) = value.as_u64() {
+        if seconds == 0 {
+            anyhow::bail!("set_timer seconds must be at least 1");
+        }
+        return Ok(seconds);
+    }
+    if let Some(float) = value.as_f64() {
+        if !float.is_finite() || float.fract() != 0.0 || float < 1.0 {
+            anyhow::bail!("set_timer requires integer argument 'seconds'");
+        }
+        let seconds = float as u64;
+        if (seconds as f64) != float {
+            anyhow::bail!("set_timer requires integer argument 'seconds'");
+        }
+        return Ok(seconds);
+    }
+    anyhow::bail!("set_timer requires integer argument 'seconds'")
+}
+
+/// `label` stays optional — absent or null defaults to `"timer"`. But a *provided*
+/// value must be a real string; the old `and_then(|v| v.as_str()).unwrap_or("timer")`
+/// silently dropped a number/boolean/array to the default, reporting success when
+/// the model emitted a schema-invalid label.
+fn parse_set_timer_label(args: &serde_json::Value) -> Result<&str> {
+    match args.get("label") {
+        None | Some(serde_json::Value::Null) => Ok("timer"),
+        Some(serde_json::Value::String(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok("timer")
+            } else {
+                Ok(trimmed)
+            }
+        }
+        Some(_) => Err(anyhow::anyhow!(
+            "set_timer 'label' must be a string when provided"
+        )),
+    }
+}
+
 fn parse_set_timer_args(args: &serde_json::Value) -> Result<(u64, &str)> {
     let seconds = match args.get("seconds") {
-        Some(value) => value
-            .as_u64()
-            .filter(|seconds| *seconds >= 1)
-            .ok_or_else(|| {
-                if value.as_u64() == Some(0) {
-                    anyhow::anyhow!("set_timer seconds must be at least 1")
-                } else {
-                    anyhow::anyhow!("set_timer requires integer argument 'seconds'")
-                }
-            })?,
+        Some(value) => parse_positive_integer_seconds(value)?,
         None => anyhow::bail!("set_timer requires integer argument 'seconds'"),
     };
-    let label = args
-        .get("label")
-        .and_then(|v| v.as_str())
-        .unwrap_or("timer");
+    let label = parse_set_timer_label(args)?;
     Ok((seconds, label))
 }
 
@@ -2747,6 +2726,71 @@ mod tests {
                 .to_string();
             assert!(
                 err.contains("home_control 'value' must be a number when provided"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_timer_accepts_whole_number_float_seconds() {
+        let args = serde_json::json!({"seconds": 300.0, "label": "pasta"});
+        let (seconds, label) =
+            parse_set_timer_args(&args).expect("whole-number float seconds must parse");
+        assert_eq!(seconds, 300);
+        assert_eq!(label, "pasta");
+    }
+
+    #[test]
+    fn set_timer_rejects_fractional_float_seconds() {
+        let args = serde_json::json!({"seconds": 300.5});
+        let err = parse_set_timer_args(&args)
+            .expect_err("fractional seconds must be rejected")
+            .to_string();
+        assert!(
+            err.contains("set_timer requires integer argument 'seconds'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn set_timer_label_must_be_string_when_provided() {
+        assert_eq!(
+            parse_set_timer_label(&serde_json::json!({"seconds": 60}))
+                .expect("absent label defaults"),
+            "timer"
+        );
+        assert_eq!(
+            parse_set_timer_label(&serde_json::json!({"seconds": 60, "label": null}))
+                .expect("null label defaults"),
+            "timer"
+        );
+        assert_eq!(
+            parse_set_timer_label(&serde_json::json!({"seconds": 60, "label": "pasta"}))
+                .expect("string label parses"),
+            "pasta"
+        );
+        assert_eq!(
+            parse_set_timer_label(&serde_json::json!({"seconds": 60, "label": "  rice  "}))
+                .expect("trimmed label parses"),
+            "rice"
+        );
+        assert_eq!(
+            parse_set_timer_label(&serde_json::json!({"seconds": 60, "label": "   "}))
+                .expect("blank label defaults"),
+            "timer"
+        );
+
+        for bad in [
+            serde_json::json!({"seconds": 60, "label": 123}),
+            serde_json::json!({"seconds": 60, "label": true}),
+            serde_json::json!({"seconds": 60, "label": ["pasta"]}),
+            serde_json::json!({"seconds": 60, "label": {"name": "pasta"}}),
+        ] {
+            let err = parse_set_timer_label(&bad)
+                .expect_err("non-string label must be rejected")
+                .to_string();
+            assert!(
+                err.contains("set_timer 'label' must be a string when provided"),
                 "unexpected error: {err}"
             );
         }

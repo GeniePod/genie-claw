@@ -514,7 +514,6 @@ impl HomeAssistantProvider {
         let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
         let mut best_scene: Option<(f32, HomeTarget)> = None;
-        let mut best_entity: Option<(f32, HomeTarget)> = None;
 
         if matches!(action_hint, Some(HomeActionKind::Activate)) {
             for scene in &graph.scenes {
@@ -559,27 +558,27 @@ impl HomeAssistantProvider {
             }
         }
 
-        for entity in &graph.entities {
-            if matches!(entity.domain.as_str(), "scene" | "script") {
-                continue;
-            }
-
-            let score = best_alias_score(&query_words, &query_lower, &entity.aliases);
-            if score > 0.42 && best_entity.as_ref().is_none_or(|(s, _)| score > *s) {
-                best_entity = Some((
-                    score,
-                    HomeTarget {
-                        kind: HomeTargetKind::Entity,
-                        query: query.to_string(),
-                        display_name: entity.name.clone(),
-                        entity_ids: vec![entity.entity_id.clone()],
-                        domain: Some(entity.domain.clone()),
-                        area: entity.area.clone(),
-                        confidence: score,
-                        voice_safe: entity.domain != "lock",
-                    },
-                ));
-            }
+        // Resolve the best-matching named entity, but refuse to silently pick one
+        // when several distinct devices tie at the top score (e.g. two "… Lamp"s
+        // both matching the bare query "lamp", since every light shares the
+        // "lamp"/"lights" domain aliases). Guessing here actuates an arbitrary
+        // device chosen by graph iteration order; decline so `resolve_target` can
+        // ask the user which one they meant. (#511)
+        let mut best_entity: Option<(f32, HomeTarget)> = None;
+        if let Some((score, entity)) = top_named_entity_match(graph, &query_lower, &query_words) {
+            best_entity = Some((
+                score,
+                HomeTarget {
+                    kind: HomeTargetKind::Entity,
+                    query: query.to_string(),
+                    display_name: entity.name.clone(),
+                    entity_ids: vec![entity.entity_id.clone()],
+                    domain: Some(entity.domain.clone()),
+                    area: entity.area.clone(),
+                    confidence: score,
+                    voice_safe: entity.domain != "lock",
+                },
+            ));
         }
 
         best_scene.or(best_entity).map(|(_, target)| target)
@@ -664,6 +663,17 @@ impl HomeAutomationProvider for HomeAssistantProvider {
                     );
                 }
             }
+        }
+
+        // Several distinct devices matched equally well (e.g. "lamp" against two
+        // different lamps). Decline to guess and name the candidates so the caller
+        // can disambiguate instead of actuating an arbitrary one. (#511)
+        if let Some(candidates) = ambiguous_named_entity_candidates(&graph, query) {
+            anyhow::bail!(
+                "'{}' is ambiguous between {} — please say which one you mean",
+                query,
+                format_disambiguation_candidates(&candidates)
+            );
         }
 
         if Self::query_rejects_whole_home_fidelity(&graph, query) {
@@ -988,6 +998,91 @@ fn infer_domain(query: &str) -> Option<String> {
     None
 }
 
+/// Minimum alias score for a named entity to be considered a match. Mirrors the
+/// `> 0.42` threshold the scene/script resolution loops use.
+const NAMED_ENTITY_MATCH_THRESHOLD: f32 = 0.42;
+
+/// Scores within this margin are treated as equal. Shared domain aliases
+/// (`lamp`/`lights`/…) make distinct devices score an identical `1.0`, so the
+/// epsilon only needs to absorb float noise, not bridge genuinely different
+/// matches.
+const NAMED_ENTITY_TIE_EPSILON: f32 = 1e-3;
+
+/// All named (non scene/script) entities whose alias score ties for the best,
+/// above [`NAMED_ENTITY_MATCH_THRESHOLD`], paired with that best score.
+///
+/// Returns an empty list when nothing matches; a length greater than one means
+/// the query is genuinely ambiguous across distinct devices and must not be
+/// silently collapsed to whichever entity the graph happened to list first. (#511)
+fn tied_named_entity_matches<'a>(
+    graph: &'a HomeGraph,
+    query_lower: &str,
+    query_words: &[&str],
+) -> (f32, Vec<&'a EntityRef>) {
+    let mut best = 0.0_f32;
+    let mut tied: Vec<&EntityRef> = Vec::new();
+    for entity in &graph.entities {
+        if matches!(entity.domain.as_str(), "scene" | "script") {
+            continue;
+        }
+        let score = best_alias_score(query_words, query_lower, &entity.aliases);
+        if score <= NAMED_ENTITY_MATCH_THRESHOLD {
+            continue;
+        }
+        if score > best + NAMED_ENTITY_TIE_EPSILON {
+            best = score;
+            tied.clear();
+            tied.push(entity);
+        } else if (score - best).abs() <= NAMED_ENTITY_TIE_EPSILON {
+            best = best.max(score);
+            tied.push(entity);
+        }
+    }
+    (best, tied)
+}
+
+/// The single best named entity for `query`, or `None` when nothing matches or
+/// when several distinct devices tie for the top score (an ambiguous query that
+/// the caller should disambiguate rather than guess). (#511)
+fn top_named_entity_match<'a>(
+    graph: &'a HomeGraph,
+    query_lower: &str,
+    query_words: &[&str],
+) -> Option<(f32, &'a EntityRef)> {
+    match tied_named_entity_matches(graph, query_lower, query_words) {
+        (score, tied) if tied.len() == 1 => Some((score, tied[0])),
+        _ => None,
+    }
+}
+
+/// Format tied candidate names for a disambiguation prompt: two items use
+/// "A or B"; three or more use an Oxford comma ("A, B, or C").
+fn format_disambiguation_candidates(candidates: &[String]) -> String {
+    match candidates.len() {
+        0 => String::new(),
+        1 => candidates[0].clone(),
+        2 => format!("{} or {}", candidates[0], candidates[1]),
+        len => format!(
+            "{}, or {}",
+            candidates[..len - 1].join(", "),
+            candidates[len - 1]
+        ),
+    }
+}
+
+/// Candidate display names when `query` ambiguously matches several distinct
+/// named entities at the top score, for surfacing a disambiguation prompt. (#511)
+fn ambiguous_named_entity_candidates(graph: &HomeGraph, query: &str) -> Option<Vec<String>> {
+    let query_lower = normalize(query);
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+    let (_, tied) = tied_named_entity_matches(graph, &query_lower, &query_words);
+    if tied.len() > 1 {
+        Some(tied.iter().map(|entity| entity.name.clone()).collect())
+    } else {
+        None
+    }
+}
+
 fn best_area_match(areas: &[AreaRef], query: &str) -> Option<(String, f32)> {
     let query_words: Vec<&str> = query.split_whitespace().collect();
     let mut best: Option<(String, f32)> = None;
@@ -1241,6 +1336,192 @@ mod tests {
             domains: vec!["light".into(), "climate".into(), "scene".into()],
             capabilities: vec![],
         }
+    }
+
+    fn two_lamp_graph() -> HomeGraph {
+        // Two distinct lamps in different rooms. Both carry the shared "lamp"
+        // domain alias and a shared custom "reading lamp" alias, so an
+        // under-specified query ties at the top score across both devices.
+        HomeGraph {
+            areas: vec![
+                AreaRef {
+                    id: "living_room".into(),
+                    name: "Living Room".into(),
+                    aliases: vec!["living room".into()],
+                },
+                AreaRef {
+                    id: "bedroom".into(),
+                    name: "Bedroom".into(),
+                    aliases: vec!["bedroom".into()],
+                },
+            ],
+            devices: vec![],
+            entities: vec![
+                EntityRef {
+                    entity_id: "light.sofa_lamp".into(),
+                    name: "Sofa Lamp".into(),
+                    domain: "light".into(),
+                    area: Some("Living Room".into()),
+                    aliases: vec![
+                        "sofa lamp".into(),
+                        "reading lamp".into(),
+                        "lamp".into(),
+                        "light".into(),
+                        "lights".into(),
+                    ],
+                    state: "off".into(),
+                    capabilities: vec!["turn_on".into()],
+                },
+                EntityRef {
+                    entity_id: "light.bed_lamp".into(),
+                    name: "Bed Lamp".into(),
+                    domain: "light".into(),
+                    area: Some("Bedroom".into()),
+                    aliases: vec![
+                        "bed lamp".into(),
+                        "reading lamp".into(),
+                        "lamp".into(),
+                        "light".into(),
+                        "lights".into(),
+                    ],
+                    state: "off".into(),
+                    capabilities: vec!["turn_on".into()],
+                },
+            ],
+            scenes: vec![],
+            scripts: vec![],
+            aliases: vec![],
+            domains: vec!["light".into()],
+            capabilities: vec![],
+        }
+    }
+
+    fn three_lamp_graph() -> HomeGraph {
+        let mut graph = two_lamp_graph();
+        graph.areas.push(AreaRef {
+            id: "office".into(),
+            name: "Office".into(),
+            aliases: vec!["office".into()],
+        });
+        graph.entities.push(EntityRef {
+            entity_id: "light.desk_lamp".into(),
+            name: "Desk Lamp".into(),
+            domain: "light".into(),
+            area: Some("Office".into()),
+            aliases: vec![
+                "desk lamp".into(),
+                "reading lamp".into(),
+                "lamp".into(),
+                "light".into(),
+                "lights".into(),
+            ],
+            state: "off".into(),
+            capabilities: vec!["turn_on".into()],
+        });
+        graph
+    }
+
+    #[test]
+    fn format_disambiguation_candidates_reads_cleanly_for_three_or_more() {
+        assert_eq!(
+            format_disambiguation_candidates(&[
+                "Desk Lamp".into(),
+                "Sofa Lamp".into(),
+                "Bed Lamp".into(),
+            ]),
+            "Desk Lamp, Sofa Lamp, or Bed Lamp"
+        );
+        assert_eq!(
+            format_disambiguation_candidates(&["Sofa Lamp".into(), "Bed Lamp".into()]),
+            "Sofa Lamp or Bed Lamp"
+        );
+    }
+
+    #[test]
+    fn ambiguous_three_way_tie_names_all_candidates_with_oxford_comma() {
+        let graph = three_lamp_graph();
+        let mut candidates = ambiguous_named_entity_candidates(&graph, "reading lamp")
+            .expect("'reading lamp' ties across three devices");
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec![
+                "Bed Lamp".to_string(),
+                "Desk Lamp".to_string(),
+                "Sofa Lamp".to_string(),
+            ]
+        );
+        assert_eq!(
+            format_disambiguation_candidates(&candidates),
+            "Bed Lamp, Desk Lamp, or Sofa Lamp"
+        );
+        assert!(
+            HomeAssistantProvider::resolve_target_in_graph(
+                &graph,
+                "reading lamp",
+                Some(HomeActionKind::TurnOn)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ambiguous_named_entity_tie_declines_instead_of_guessing() {
+        // Regression for #511: both lamps score 1.0 on the shared "lamp" alias.
+        // The resolver must not silently actuate whichever the graph listed first.
+        let graph = two_lamp_graph();
+        assert!(
+            HomeAssistantProvider::resolve_named_entity(
+                &graph,
+                "lamp",
+                Some(HomeActionKind::TurnOn)
+            )
+            .is_none(),
+            "ambiguous 'lamp' must decline rather than resolve to the first lamp"
+        );
+    }
+
+    #[test]
+    fn unique_named_entity_still_resolves_after_tie_guard() {
+        // A query that uniquely identifies one device is unaffected by the guard.
+        let graph = two_lamp_graph();
+        let target = HomeAssistantProvider::resolve_named_entity(
+            &graph,
+            "sofa lamp",
+            Some(HomeActionKind::TurnOn),
+        )
+        .expect("'sofa lamp' uniquely identifies one device");
+        assert_eq!(target.entity_ids, vec!["light.sofa_lamp"]);
+    }
+
+    #[test]
+    fn resolve_target_declines_ambiguous_shared_alias_end_to_end() {
+        // "reading lamp" is a custom alias on both lamps. The area-less domain
+        // group declines (the "reading" token names no real place), so resolution
+        // reaches the named path and must decline the tie instead of guessing.
+        let graph = two_lamp_graph();
+        assert!(
+            HomeAssistantProvider::resolve_target_in_graph(
+                &graph,
+                "reading lamp",
+                Some(HomeActionKind::TurnOn)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ambiguous_candidates_name_the_tied_devices() {
+        let graph = two_lamp_graph();
+        let mut candidates = ambiguous_named_entity_candidates(&graph, "reading lamp")
+            .expect("'reading lamp' is ambiguous across both lamps");
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec!["Bed Lamp".to_string(), "Sofa Lamp".to_string()]
+        );
+        // A uniquely-identifying query reports no ambiguity.
+        assert!(ambiguous_named_entity_candidates(&graph, "sofa lamp").is_none());
     }
 
     #[test]
