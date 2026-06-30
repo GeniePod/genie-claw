@@ -1100,6 +1100,85 @@ mod tests {
     }
 
     #[test]
+    fn grounded_metric_declines_ambiguous_entity_tie() {
+        // Two-lamp home: bare "lamp" ties across distinct devices at 1.0. Before
+        // #511, canonicalize_entity_value credited whichever entity sorted first
+        // — a false grounded match when the prediction underspecified the device.
+        // After #511, ambiguous queries decline to ground.
+        let graph = two_lamp_bfcl_graph();
+        let expected = serde_json::json!({"action": "turn_on", "entity": "sofa lamp"});
+        let actual = serde_json::json!({"action": "turn_on", "entity": "reading lamp"});
+
+        let expected_grounded = canonicalize_entity_args(&expected, &graph);
+        let actual_grounded = canonicalize_entity_args(&actual, &graph);
+
+        assert_eq!(
+            expected_grounded["entity"],
+            serde_json::json!("ids:light.sofa_lamp")
+        );
+        assert_eq!(
+            actual_grounded["entity"], "reading lamp",
+            "ambiguous 'reading lamp' must not ground to an arbitrary device"
+        );
+        assert_ne!(expected_grounded, actual_grounded);
+    }
+
+    fn two_lamp_bfcl_graph() -> HomeGraph {
+        HomeGraph {
+            areas: vec![
+                AreaRef {
+                    id: "living_room".into(),
+                    name: "Living Room".into(),
+                    aliases: vec!["living room".into()],
+                },
+                AreaRef {
+                    id: "bedroom".into(),
+                    name: "Bedroom".into(),
+                    aliases: vec!["bedroom".into()],
+                },
+            ],
+            devices: vec![],
+            entities: vec![
+                EntityRef {
+                    entity_id: "light.sofa_lamp".into(),
+                    name: "Sofa Lamp".into(),
+                    domain: "light".into(),
+                    area: Some("Living Room".into()),
+                    aliases: vec![
+                        "sofa lamp".into(),
+                        "reading lamp".into(),
+                        "lamp".into(),
+                        "light".into(),
+                        "lights".into(),
+                    ],
+                    state: "off".into(),
+                    capabilities: vec!["turn_on".into()],
+                },
+                EntityRef {
+                    entity_id: "light.bed_lamp".into(),
+                    name: "Bed Lamp".into(),
+                    domain: "light".into(),
+                    area: Some("Bedroom".into()),
+                    aliases: vec![
+                        "bed lamp".into(),
+                        "reading lamp".into(),
+                        "lamp".into(),
+                        "light".into(),
+                        "lights".into(),
+                    ],
+                    state: "off".into(),
+                    capabilities: vec!["turn_on".into()],
+                },
+            ],
+            scenes: vec![],
+            scripts: vec![],
+            aliases: vec![],
+            domains: vec!["light".into()],
+            capabilities: vec![],
+        }
+    }
+
+    #[test]
     fn loads_jsonl_fixture_and_scores_report() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let cases = load_cases_jsonl(root.join("tests/bfcl/home_tool_cases.jsonl")).unwrap();
@@ -1110,8 +1189,10 @@ mod tests {
 
         assert_eq!(report.total_cases, 21);
         assert_eq!(report.strict_matches, 21);
+        assert_eq!(report.grounded_argument_matches, 21);
         assert_eq!(report.failure_count, 0);
         assert!((report.strict_accuracy - 1.0).abs() < f64::EPSILON);
+        assert!((report.grounded_argument_accuracy - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
