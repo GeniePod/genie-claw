@@ -2317,8 +2317,18 @@ fn strip_trailing_duration_prefix<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
 fn is_time_unit(token: &str) -> bool {
     matches!(
         token,
-        "second" | "seconds" | "sec" | "secs" | "minute" | "minutes" | "min" | "mins" | "hour"
-            | "hours" | "hr" | "hrs"
+        "second"
+            | "seconds"
+            | "sec"
+            | "secs"
+            | "minute"
+            | "minutes"
+            | "min"
+            | "mins"
+            | "hour"
+            | "hours"
+            | "hr"
+            | "hrs"
     )
 }
 
