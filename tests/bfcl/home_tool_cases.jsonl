@@ -1,5 +1,5 @@
 {"id":"home-light-kitchen-on","category":"home_control","prompt":"Sarah: Turn on the kitchen lights.","expected_tool_calls":[{"tool":"home_control","arguments":{"entity":"kitchen lights","action":"turn_on"}}]}
-{"id":"timer-cookies","category":"timer","prompt":"Leo: Set a cookie timer for 12 minutes.","expected_tool_calls":[{"tool":"set_timer","arguments":{"seconds":720,"label":"cookies"}}]}
+{"id":"timer-cookies","category":"timer","prompt":"Leo: Set a cookie timer for 12 minutes.","expected_tool_calls":[{"tool":"set_timer","arguments":{"seconds":720,"label":"cookie"}}]}
 {"id":"time-current","category":"time","prompt":"Mia: What time is it?","expected_tool_calls":[{"tool":"get_time","arguments":{}}]}
 {"id":"memory-grandma-wifi","category":"memory","prompt":"Sarah: Find Grandma's Wi-Fi note.","expected_tool_calls":[{"tool":"memory_recall","arguments":{"query":"Grandma Wi-Fi note","limit":3}}]}
 {"id":"weather-school-pickup","category":"weather","prompt":"Jared: Is it raining for school pickup?","expected_tool_calls":[{"tool":"get_weather","arguments":{"location":"home"}}],"allow_extra_arguments":true}

@@ -7,7 +7,9 @@
 use super::ToolCall;
 
 pub fn route(text: &str) -> Option<ToolCall> {
-    let normalized = strip_household_speaker_prefix(&normalize(text));
+    let prenormalized = normalize(text);
+    let speaker = household_speaker(&prenormalized);
+    let normalized = strip_household_speaker_prefix(&prenormalized);
     if normalized.is_empty() {
         return None;
     }
@@ -150,6 +152,7 @@ pub fn route(text: &str) -> Option<ToolCall> {
     }
 
     if let Some(query) = play_media_request(&normalized) {
+        let query = resolve_speaker_possessive(&query, speaker);
         return Some(tool("play_media", serde_json::json!({ "query": query })));
     }
 
@@ -232,6 +235,38 @@ fn strip_household_speaker_prefix(text: &str) -> String {
         }
     }
     text.to_string()
+}
+
+/// The capitalized household speaker named in a `"<Name>: …"` prefix — e.g.
+/// `normalize("Mia: Play my playlist")` → `Some("Mia")`. Recognizes the same
+/// names as `strip_household_speaker_prefix`.
+fn household_speaker(text: &str) -> Option<&'static str> {
+    for (lower, name) in [
+        ("jared", "Jared"),
+        ("sarah", "Sarah"),
+        ("leo", "Leo"),
+        ("mia", "Mia"),
+    ] {
+        if text
+            .strip_prefix(lower)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .is_some_and(|rest| !rest.trim().is_empty())
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Resolve a leading possessive `"my "` against the known speaker, so a media
+/// query like `"my study playlist"` spoken by `"Mia: …"` becomes
+/// `"Mia study playlist"` (#532). With no speaker the query is unchanged, so
+/// speaker-less requests like `"Play my playlist"` keep the literal possessive.
+fn resolve_speaker_possessive(query: &str, speaker: Option<&str>) -> String {
+    match (speaker, query.strip_prefix("my ")) {
+        (Some(name), Some(rest)) => format!("{name} {rest}"),
+        _ => query.to_string(),
+    }
 }
 
 fn asks_memory_status(text: &str) -> bool {
@@ -2393,6 +2428,7 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
 
     let label = reminder_label(&tokens, unit_end_index)
         .filter(|label| !label.is_empty())
+        .or_else(|| extract_named_timer_label(&tokens, unit_end_index))
         .unwrap_or_else(|| {
             if text.starts_with("remind ") {
                 "reminder".into()
@@ -2402,6 +2438,106 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
         });
 
     Some((seconds, label))
+}
+
+/// Extract a label from timer phrasing the reminder path does not cover:
+/// - `"<label> timer for <duration>"` → `"cookie"` (e.g. cookie timer for 12 minutes)
+/// - `"<duration> timer for <label>"` → `"eggs"` (e.g. 5 minute timer for the eggs)
+///
+/// Skips the parsed duration span so `"5 minute timer"` does not label as `"5 minute"`.
+fn extract_named_timer_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
+    let timer_index = tokens.iter().position(|token| *token == "timer")?;
+    if timer_index == 0 {
+        return None;
+    }
+
+    if let Some(label) = timer_for_label_after(tokens, timer_index) {
+        return Some(label);
+    }
+
+    let mut before_timer = &tokens[..timer_index];
+    if unit_end_index < timer_index {
+        // Duration sits immediately before `timer` (e.g. "5 minute timer").
+        if unit_end_index + 1 == timer_index {
+            return None;
+        }
+        // Duration is later in the utterance; drop any trailing duration tokens anyway.
+        before_timer = strip_trailing_duration_prefix(before_timer);
+    } else {
+        before_timer = strip_trailing_duration_prefix(before_timer);
+    }
+
+    const STOP: &[&str] = &[
+        "set", "start", "create", "make", "a", "an", "the", "my", "our", "your", "new",
+    ];
+    let mut label_parts: Vec<&str> = Vec::new();
+    for &token in before_timer.iter().rev() {
+        if STOP.contains(&token) {
+            break;
+        }
+        label_parts.push(token);
+    }
+    label_parts.reverse();
+    if label_parts.is_empty() {
+        return None;
+    }
+
+    Some(label_parts.join(" "))
+}
+
+fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> {
+    let after = tokens.get(timer_index + 1..)?;
+    let (first, rest) = after.split_first()?;
+    if *first != "for" || rest.is_empty() {
+        return None;
+    }
+    // `"cookie timer for 12 minutes"` — duration after `for`, not a label.
+    if parse_duration(rest).is_some() {
+        return None;
+    }
+    let mut label = rest.join(" ");
+    if let Some(stripped) = label.strip_prefix("the ") {
+        label = stripped.to_string();
+    }
+    if label.is_empty() {
+        return None;
+    }
+    Some(label)
+}
+
+fn strip_trailing_duration_prefix<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    if tokens.len() < 2 || !is_time_unit(tokens[tokens.len() - 1]) {
+        return tokens;
+    }
+    if tokens[tokens.len() - 2].parse::<u64>().is_ok() {
+        return &tokens[..tokens.len() - 2];
+    }
+    for start in (0..tokens.len().saturating_sub(1)).rev() {
+        if let Some((_, unit_index)) = super::number_words::parse_spoken_number(tokens, start)
+            && unit_index == tokens.len() - 1
+        {
+            return &tokens[..start];
+        }
+    }
+    tokens
+}
+
+fn is_time_unit(token: &str) -> bool {
+    matches!(
+        token,
+        "second"
+            | "seconds"
+            | "sec"
+            | "secs"
+            | "minute"
+            | "minutes"
+            | "min"
+            | "mins"
+            | "hour"
+            | "hours"
+            | "hr"
+            | "hrs"
+    )
 }
 
 fn weather_request(text: &str) -> Option<(String, bool)> {
@@ -3306,6 +3442,18 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "all off");
         assert_eq!(call.arguments["action"], "activate");
+    }
+
+    #[test]
+    fn resolves_speaker_possessive_in_media_query() {
+        // BFCL play-media-study: "Mia: Play my study playlist." -> "Mia study playlist" (#532).
+        let call = route("Mia: Play my study playlist.").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "Mia study playlist");
+
+        // No speaker prefix -> the literal possessive is preserved (unchanged).
+        let call = route("Play my Morning Boost playlist").unwrap();
+        assert_eq!(call.arguments["query"], "my morning boost playlist");
     }
 
     #[test]
@@ -4254,6 +4402,24 @@ mod tests {
     fn routes_time_question_to_get_time() {
         let call = route("what time is it?").unwrap();
         assert_eq!(call.name, "get_time");
+    }
+
+    #[test]
+    fn routes_named_timer_label_before_duration() {
+        let call = route("Leo: Set a cookie timer for 12 minutes.").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 720);
+        assert_eq!(call.arguments["label"], "cookie");
+
+        let call = route("set a 5 minute timer").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+
+        let call = route("set a 5 minute timer for the eggs").unwrap();
+        assert_eq!(call.arguments["label"], "eggs");
+
+        // Plain timer still defaults; reminder "to …" path unchanged.
+        let call = route("set a timer for 10 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
     }
 
     #[test]

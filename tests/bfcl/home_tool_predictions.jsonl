@@ -1,5 +1,5 @@
 {"id":"home-light-kitchen-on","response":"{\"tool\":\"home_control\",\"arguments\":{\"action\":\"turn_on\",\"entity\":\"kitchen lights\"}}"}
-{"id":"timer-cookies","response":"```json\n{\"tool\":\"set_timer\",\"arguments\":{\"seconds\":720,\"label\":\"cookies\"}}\n```"}
+{"id":"timer-cookies","response":"```json\n{\"tool\":\"set_timer\",\"arguments\":{\"seconds\":720,\"label\":\"cookie\"}}\n```"}
 {"id":"time-current","response":"{\"tool\":\"get_time\",\"arguments\":{}}"}
 {"id":"memory-grandma-wifi","response":"I'll search the local family notes. {\"tool\":\"memory_recall\",\"arguments\":{\"query\":\"Grandma Wi-Fi note\",\"limit\":3}}"}
 {"id":"weather-school-pickup","response":"{\"tool\":\"get_weather\",\"arguments\":{\"location\":\"home\",\"fresh\":true}}"}
