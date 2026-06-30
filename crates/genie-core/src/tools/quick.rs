@@ -1920,17 +1920,20 @@ fn asks_home_assistant_status(text: &str) -> bool {
 }
 
 fn asks_system_status(text: &str) -> bool {
-    matches!(
-        text,
-        "system status"
-            | "geniepod status"
-            | "genie status"
-            | "status of geniepod"
-            | "status of genie"
-            | "uptime"
-            | "load average"
-            | "governor status"
-    )
+    // "How is the Jetson memory pressure?" / "check memory pressure" (#526) — a
+    // system-resource question; matched by phrase since the framing varies.
+    text.contains("memory pressure")
+        || matches!(
+            text,
+            "system status"
+                | "geniepod status"
+                | "genie status"
+                | "status of geniepod"
+                | "status of genie"
+                | "uptime"
+                | "load average"
+                | "governor status"
+        )
 }
 
 /// Home-status queries currently shadowed by broad `memory_recall` matchers.
@@ -2768,6 +2771,16 @@ mod tests {
     #[test]
     fn routes_home_assistant_status_to_system_info() {
         let call = route("home assistant status").unwrap();
+        assert_eq!(call.name, "system_info");
+    }
+
+    #[test]
+    fn routes_memory_pressure_to_system_info() {
+        // BFCL system-info-jetson-memory: "How is the Jetson memory pressure?" (#526)
+        let call = route("Jared: How is the Jetson memory pressure?").unwrap();
+        assert_eq!(call.name, "system_info");
+
+        let call = route("check memory pressure").unwrap();
         assert_eq!(call.name, "system_info");
     }
 
