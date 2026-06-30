@@ -1155,6 +1155,43 @@ impl Memory {
         Ok(deleted)
     }
 
+    /// Combined pruning operation for scheduled background runs.
+    ///
+    /// 1. Calls [`prune_decayed`](Self::prune_decayed) with `decay_threshold` to
+    ///    remove entries whose exponential decay multiplier has fallen below the
+    ///    threshold (non-evergreen, non-promoted entries only).
+    /// 2. Calls [`prune_stale`](Self::prune_stale) with `stale_days` to remove
+    ///    entries not accessed within that many days.
+    /// 3. Issues `PRAGMA wal_checkpoint(TRUNCATE)` so freed pages are returned
+    ///    to the OS.
+    ///
+    /// Returns `(decay_pruned, stale_pruned)` row counts.
+    pub fn prune_and_checkpoint(
+        &self,
+        decay_threshold: f64,
+        stale_days: u32,
+    ) -> Result<(usize, usize)> {
+        let decayed = self.prune_decayed(decay_threshold)?;
+        let stale = self.prune_stale(stale_days)?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok((decayed, stale))
+    }
+
+    /// Return the on-disk size of the memory database in bytes, estimated from
+    /// SQLite's `PRAGMA page_count` × `PRAGMA page_size`.
+    pub fn db_size_bytes(&self) -> Option<u64> {
+        let pages: u64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .ok()?;
+        let page_size: u64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .ok()?;
+        Some(pages * page_size)
+    }
+
     /// Get all memories of a specific category (e.g. "identity").
     pub fn get_by_kind(&self, kind: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
         let mut stmt = self.conn.prepare(

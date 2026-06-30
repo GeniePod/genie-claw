@@ -74,6 +74,16 @@ pub fn route(text: &str) -> Option<ToolCall> {
         ));
     }
 
+    if let Some((category, content)) = personal_fact_store_request(&normalized) {
+        return Some(tool(
+            "memory_store",
+            serde_json::json!({
+                "category": category,
+                "content": content
+            }),
+        ));
+    }
+
     if let Some((seconds, label)) = preferred_timer_request(&normalized) {
         return Some(tool(
             "set_timer",
@@ -87,7 +97,7 @@ pub fn route(text: &str) -> Option<ToolCall> {
     {
         let mut args = serde_json::json!({ "entity": entity, "action": action });
         if let Some(value) = value {
-            args["value"] = serde_json::json!(value);
+            args["value"] = home_control_value_argument(action, value);
         }
         return Some(tool("home_control", args));
     }
@@ -97,7 +107,10 @@ pub fn route(text: &str) -> Option<ToolCall> {
     }
 
     if let Some(query) = memory_recall_query(&normalized) {
-        return Some(tool("memory_recall", serde_json::json!({ "query": query })));
+        return Some(tool(
+            "memory_recall",
+            serde_json::json!({ "query": query, "limit": 3 }),
+        ));
     }
 
     if asks_system_status(&normalized) || asks_home_assistant_status(&normalized) {
@@ -142,7 +155,7 @@ pub fn route(text: &str) -> Option<ToolCall> {
     {
         let mut args = serde_json::json!({ "entity": entity, "action": action });
         if let Some(value) = value {
-            args["value"] = serde_json::json!(value);
+            args["value"] = home_control_value_argument(action, value);
         }
         return Some(tool("home_control", args));
     }
@@ -1109,6 +1122,62 @@ fn reminder_or_alarm_store_request(text: &str) -> Option<(&'static str, String)>
     None
 }
 
+/// Route first-person *write* statements about personal facts and appointments
+/// to `memory_store` (#379). The deterministic router previously abstained on
+/// these, so the local model picked the wrong tool — `set_timer` for "I'm
+/// allergic to peanuts", `memory_recall` for "remember my dentist appointment
+/// is next Tuesday". Question forms ("is anyone allergic to peanuts?", "when is
+/// my dentist appointment?") are intentionally left for `memory_recall`: every
+/// matcher here keys off a first-person *assertion* prefix the question forms do
+/// not have. Returns `(category, content)` like the sibling `*_store_request`
+/// helpers and runs after them, so their curated mappings still win.
+fn personal_fact_store_request(text: &str) -> Option<(&'static str, String)> {
+    // "I'm allergic to peanuts" / "I am allergic to shellfish" — a dietary fact,
+    // not the recall question "is anyone allergic to peanuts?".
+    for prefix in ["i m allergic to ", "i am allergic to "] {
+        if let Some(allergen) = text.strip_prefix(prefix).map(str::trim)
+            && !allergen.is_empty()
+        {
+            return Some((
+                "health_tracker",
+                format!("dietary allergy: allergic to {allergen}"),
+            ));
+        }
+    }
+
+    // "I have a meeting on Saturday" / "I have a dentist appointment on Friday" —
+    // a calendar event the user is stating, not the recall question "when is my
+    // dentist appointment?".
+    if let Some(rest) = text
+        .strip_prefix("i have a ")
+        .or_else(|| text.strip_prefix("i have an "))
+        && (rest.contains("appointment") || rest.contains("meeting"))
+    {
+        return Some(("reminders", format!("calendar event: {}", rest.trim())));
+    }
+
+    // "remember my dentist appointment is next Tuesday 3pm" / "remember that the
+    // wifi password is hunter2" — an explicit assertion of a new fact. The
+    // required " is " keeps identity recalls ("remember my name", which has no
+    // " is ") on the `memory_recall` path. Content keeps the descriptive
+    // "label: detail" shape the sibling `*_store_request` helpers use.
+    if (text.starts_with("remember my ") || text.starts_with("remember that "))
+        && text.contains(" is ")
+    {
+        let fact = text
+            .strip_prefix("remember ")
+            .map(|rest| rest.strip_prefix("that ").unwrap_or(rest))
+            .unwrap_or(text)
+            .trim();
+        if text.contains("appointment") || text.contains("meeting") {
+            return Some(("reminders", format!("calendar event: {fact}")));
+        }
+        return Some(("fact", format!("note: {fact}")));
+    }
+
+    None
+}
+
 fn preferred_timer_request(text: &str) -> Option<(u64, String)> {
     if text.contains("lego cleanup timer") {
         return Some((600, "lego cleanup".into()));
@@ -1701,15 +1770,37 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
             text.strip_prefix("turn off ")
                 .map(|rest| (rest, "turn_off"))
         })?;
-    if !(rest.contains("fan") || rest.contains("fireplace")) {
-        return None;
-    }
     let entity = clean_control_entity(rest);
     if entity.is_empty() {
-        None
-    } else {
-        Some((entity, action))
+        return None;
     }
+    // Abstain on conditional, multi-clause, or whole-house phrasings ("turn off
+    // everything downstairs except the kitchen lights", "...lights only when I
+    // pull in"): these aren't a single named device, so the LLM grounds them.
+    let scoped = format!(" {rest} ");
+    let is_multi_clause = scoped.contains(" everything ")
+        || scoped.contains(" except ")
+        || scoped.contains(" only ")
+        || scoped.contains(" when ")
+        || scoped.contains(" unless ")
+        || scoped.contains(" if ");
+    if is_multi_clause {
+        return None;
+    }
+    // Only emit a deterministic call for device classes the router can name
+    // unambiguously: fans, fireplaces, and lights (#523, e.g. "turn on the
+    // kitchen lights"). The light gate matches the device itself (a trailing
+    // "light"/"lights" or the bare word).
+    let known_device = entity.contains("fan")
+        || entity.contains("fireplace")
+        || entity == "light"
+        || entity == "lights"
+        || entity.ends_with(" light")
+        || entity.ends_with(" lights");
+    if !known_device {
+        return None;
+    }
+    Some((entity, action))
 }
 
 fn clean_control_entity(text: &str) -> String {
@@ -1743,6 +1834,18 @@ fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
         Some((entity.to_string(), value))
     } else {
         None
+    }
+}
+
+fn home_control_value_argument(action: &str, value: f64) -> serde_json::Value {
+    if action == "set_temperature"
+        && value.fract() == 0.0
+        && value >= i64::MIN as f64
+        && value <= i64::MAX as f64
+    {
+        serde_json::Value::from(value as i64)
+    } else {
+        serde_json::json!(value)
     }
 }
 
@@ -2566,10 +2669,12 @@ mod tests {
         let call = route("What is my name?").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "name");
+        assert_eq!(call.arguments["limit"], 3);
 
         let call = route("do you remember my name").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "name");
+        assert_eq!(call.arguments["limit"], 3);
     }
 
     #[test]
@@ -3267,7 +3372,13 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "oven");
         assert_eq!(call.arguments["action"], "set_temperature");
-        assert_eq!(call.arguments["value"], 400.0);
+        assert_eq!(call.arguments["value"], 400);
+
+        let call = route("Set the thermostat to 72").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "thermostat");
+        assert_eq!(call.arguments["action"], "set_temperature");
+        assert_eq!(call.arguments["value"], 72);
 
         let call = route("Is the garage door closed?").unwrap();
         assert_eq!(call.name, "home_status");
@@ -3920,6 +4031,64 @@ mod tests {
     }
 
     #[test]
+    fn routes_personal_write_statements_to_memory_store() {
+        // #379: first-person fact/appointment statements the deterministic router
+        // used to abstain on, so the local model misrouted them.
+        let call = route("I'm allergic to peanuts").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "health_tracker");
+        assert_eq!(
+            call.arguments["content"],
+            "dietary allergy: allergic to peanuts"
+        );
+
+        let call = route("I am allergic to shellfish").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(
+            call.arguments["content"],
+            "dietary allergy: allergic to shellfish"
+        );
+
+        let call = route("I have a meeting on Saturday 10AM").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "reminders");
+        assert_eq!(
+            call.arguments["content"],
+            "calendar event: meeting on saturday 10am"
+        );
+
+        let call = route("Remember my dentist appointment is next Tuesday 3pm").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "reminders");
+        assert_eq!(
+            call.arguments["content"],
+            "calendar event: my dentist appointment is next tuesday 3pm"
+        );
+
+        let call = route("Remember that the wifi password is hunter2").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "fact");
+        assert_eq!(
+            call.arguments["content"],
+            "note: the wifi password is hunter2"
+        );
+    }
+
+    #[test]
+    fn personal_write_routing_does_not_steal_recall_questions() {
+        // Question forms and identity recalls must still reach memory_recall —
+        // the write matchers key off first-person assertion prefixes these lack.
+        let call = route("Is anyone allergic to peanuts?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("When is Mia's next dentist appointment?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("remember my name").unwrap();
+        assert_eq!(call.name, "memory_recall");
+    }
+
+    #[test]
     fn routes_left_home_delta_to_action_history() {
         let call = route("Jared: What changed since we left?").unwrap();
         assert_eq!(call.name, "action_history");
@@ -3937,6 +4106,7 @@ mod tests {
         let call = route("search memory for Jared").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "jared");
+        assert_eq!(call.arguments["limit"], 3);
     }
 
     #[test]
@@ -4121,7 +4291,26 @@ mod tests {
 
     #[test]
     fn does_not_route_home_control_commands_as_status() {
-        assert!(route("turn on the kitchen light").is_none());
+        // A light on/off command is a home_control action, not a status query —
+        // it must route to home_control (turn_on), never home_status (#523).
+        let call = route("turn on the kitchen light").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "kitchen light");
+        assert_eq!(call.arguments["action"], "turn_on");
+    }
+
+    #[test]
+    fn routes_basic_light_command_to_home_control() {
+        // BFCL home-light-kitchen-on: "Turn on the kitchen lights." (#523)
+        let call = route("Sarah: Turn on the kitchen lights.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "kitchen lights");
+        assert_eq!(call.arguments["action"], "turn_on");
+
+        let call = route("Turn off the lights").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "lights");
+        assert_eq!(call.arguments["action"], "turn_off");
     }
 
     #[test]

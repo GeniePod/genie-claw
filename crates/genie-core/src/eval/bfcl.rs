@@ -1187,9 +1187,9 @@ mod tests {
 
         let report = score_cases(&cases, &predictions);
 
-        assert_eq!(report.total_cases, 21);
-        assert_eq!(report.strict_matches, 21);
-        assert_eq!(report.grounded_argument_matches, 21);
+        assert_eq!(report.total_cases, 26);
+        assert_eq!(report.strict_matches, 26);
+        assert_eq!(report.grounded_argument_matches, 26);
         assert_eq!(report.failure_count, 0);
         assert!((report.strict_accuracy - 1.0).abs() < f64::EPSILON);
         assert!((report.grounded_argument_accuracy - 1.0).abs() < f64::EPSILON);

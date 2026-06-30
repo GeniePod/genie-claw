@@ -107,17 +107,33 @@ fn parse_positive_integer_seconds(value: &serde_json::Value) -> Result<u64> {
     anyhow::bail!("set_timer requires integer argument 'seconds'")
 }
 
+/// `label` stays optional — absent or null defaults to `"timer"`. But a *provided*
+/// value must be a real string; the old `and_then(|v| v.as_str()).unwrap_or("timer")`
+/// silently dropped a number/boolean/array to the default, reporting success when
+/// the model emitted a schema-invalid label.
+fn parse_set_timer_label(args: &serde_json::Value) -> Result<&str> {
+    match args.get("label") {
+        None | Some(serde_json::Value::Null) => Ok("timer"),
+        Some(serde_json::Value::String(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok("timer")
+            } else {
+                Ok(trimmed)
+            }
+        }
+        Some(_) => Err(anyhow::anyhow!(
+            "set_timer 'label' must be a string when provided"
+        )),
+    }
+}
+
 fn parse_set_timer_args(args: &serde_json::Value) -> Result<(u64, &str)> {
     let seconds = match args.get("seconds") {
         Some(value) => parse_positive_integer_seconds(value)?,
         None => anyhow::bail!("set_timer requires integer argument 'seconds'"),
     };
-    let label = args
-        .get("label")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("timer");
+    let label = parse_set_timer_label(args)?;
     Ok((seconds, label))
 }
 
@@ -2737,16 +2753,47 @@ mod tests {
     }
 
     #[test]
-    fn set_timer_label_defaults_when_blank() {
-        let args = serde_json::json!({"seconds": 60, "label": "   "});
-        let (_, label) =
-            parse_set_timer_args(&args).expect("blank label should fall back to default");
-        assert_eq!(label, "timer");
+    fn set_timer_label_must_be_string_when_provided() {
+        assert_eq!(
+            parse_set_timer_label(&serde_json::json!({"seconds": 60}))
+                .expect("absent label defaults"),
+            "timer"
+        );
+        assert_eq!(
+            parse_set_timer_label(&serde_json::json!({"seconds": 60, "label": null}))
+                .expect("null label defaults"),
+            "timer"
+        );
+        assert_eq!(
+            parse_set_timer_label(&serde_json::json!({"seconds": 60, "label": "pasta"}))
+                .expect("string label parses"),
+            "pasta"
+        );
+        assert_eq!(
+            parse_set_timer_label(&serde_json::json!({"seconds": 60, "label": "  rice  "}))
+                .expect("trimmed label parses"),
+            "rice"
+        );
+        assert_eq!(
+            parse_set_timer_label(&serde_json::json!({"seconds": 60, "label": "   "}))
+                .expect("blank label defaults"),
+            "timer"
+        );
 
-        let args2 = serde_json::json!({"seconds": 60, "label": ""});
-        let (_, label2) =
-            parse_set_timer_args(&args2).expect("empty label should fall back to default");
-        assert_eq!(label2, "timer");
+        for bad in [
+            serde_json::json!({"seconds": 60, "label": 123}),
+            serde_json::json!({"seconds": 60, "label": true}),
+            serde_json::json!({"seconds": 60, "label": ["pasta"]}),
+            serde_json::json!({"seconds": 60, "label": {"name": "pasta"}}),
+        ] {
+            let err = parse_set_timer_label(&bad)
+                .expect_err("non-string label must be rejected")
+                .to_string();
+            assert!(
+                err.contains("set_timer 'label' must be a string when provided"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

@@ -44,6 +44,9 @@ pub struct Config {
 
     #[serde(default)]
     pub http: HttpServerConfig,
+
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1004,6 +1007,60 @@ pub enum WebSearchProvider {
 ///
 /// It also carries the cross-origin request gate (issue #228): both servers
 /// reflect only allowlisted `Origin`s (never the old wildcard), reject
+/// Storage lifecycle configuration — automatic pruning and growth alerts.
+///
+/// Both the conversation database and the memory database grow without bound
+/// unless pruned. On Jetson hardware (32–64 GB eMMC) continuous household use
+/// can exhaust the filesystem within weeks to months if pruning is disabled.
+#[derive(Debug, Deserialize, Clone)]
+pub struct StorageConfig {
+    /// Retain conversation messages for this many days. Messages older than this
+    /// threshold are deleted on each pruning pass. Set to 0 to disable age-based
+    /// conversation pruning.
+    #[serde(default = "defaults::storage_conversation_retention_days")]
+    pub conversation_retention_days: u32,
+
+    /// Maximum messages to keep per conversation. When a conversation exceeds
+    /// this limit, the oldest messages are deleted. Set to 0 to disable per-
+    /// conversation message capping.
+    #[serde(default = "defaults::storage_max_messages_per_conversation")]
+    pub max_messages_per_conversation: usize,
+
+    /// How often to run automatic memory pruning, in hours. The pruning task
+    /// runs in the background and removes decayed and stale entries. Set to 0
+    /// to disable automatic pruning entirely.
+    #[serde(default = "defaults::storage_memory_prune_interval_hours")]
+    pub memory_prune_interval_hours: u64,
+
+    /// Memory entries whose exponential decay multiplier falls below this value
+    /// are eligible for pruning. Range: 0.0–1.0; lower values keep more entries.
+    #[serde(default = "defaults::storage_memory_decay_threshold")]
+    pub memory_decay_threshold: f64,
+
+    /// Memory entries not accessed within this many days are considered stale
+    /// and eligible for pruning (unless `evergreen` or `promoted`).
+    #[serde(default = "defaults::storage_memory_stale_days")]
+    pub memory_stale_days: u32,
+
+    /// Log a warning in `/api/health` when either database exceeds this size in
+    /// mebibytes. Set to 0 to disable the threshold alert.
+    #[serde(default = "defaults::storage_warn_threshold_mb")]
+    pub warn_threshold_mb: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            conversation_retention_days: defaults::storage_conversation_retention_days(),
+            max_messages_per_conversation: defaults::storage_max_messages_per_conversation(),
+            memory_prune_interval_hours: defaults::storage_memory_prune_interval_hours(),
+            memory_decay_threshold: defaults::storage_memory_decay_threshold(),
+            memory_stale_days: defaults::storage_memory_stale_days(),
+            warn_threshold_mb: defaults::storage_warn_threshold_mb(),
+        }
+    }
+}
+
 /// non-allowlisted `Host`s (DNS-rebinding), and — when `local_api_token` is
 /// set — require that token on mutating/actuating endpoints.
 #[derive(Debug, Deserialize, Clone)]
@@ -1789,6 +1846,7 @@ mod tests {
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
             http: HttpServerConfig::default(),
+            storage: StorageConfig::default(),
         }
     }
 
@@ -2870,6 +2928,24 @@ mod defaults {
     }
     pub fn health_alert_enabled() -> bool {
         false
+    }
+    pub fn storage_conversation_retention_days() -> u32 {
+        90
+    }
+    pub fn storage_max_messages_per_conversation() -> usize {
+        500
+    }
+    pub fn storage_memory_prune_interval_hours() -> u64 {
+        24
+    }
+    pub fn storage_memory_decay_threshold() -> f64 {
+        0.05
+    }
+    pub fn storage_memory_stale_days() -> u32 {
+        365
+    }
+    pub fn storage_warn_threshold_mb() -> u64 {
+        512
     }
     pub fn alert_webhook_url() -> String {
         String::new()
