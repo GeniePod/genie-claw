@@ -2068,7 +2068,19 @@ fn format_household_role_answer(
         .map(|profile| profile.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{names} are the {role}s.")
+    format!("{names} are the {}.", pluralize_household_role(role))
+}
+
+/// Pluralize a canonical household role. Roles come from
+/// `normalize_household_role_query_token`, whose set is regular `+s` except for
+/// the two irregular plurals `child` -> `children` and `wife` -> `wives`.
+/// Without this, the multi-profile answer produced "childs"/"wifes".
+fn pluralize_household_role(role: &str) -> String {
+    match role {
+        "child" => "children".to_string(),
+        "wife" => "wives".to_string(),
+        other => format!("{other}s"),
+    }
 }
 
 fn normalize_memories_to_store(args: &serde_json::Value) -> Vec<(String, String)> {
@@ -3979,6 +3991,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "Jared is the dad.");
+    }
+
+    #[test]
+    fn household_role_answer_pluralizes_irregular_roles() {
+        let profile = |name: &str, role: &str| crate::memory::HouseholdProfile {
+            source_memory_id: 0,
+            name: name.to_string(),
+            role: role.to_string(),
+        };
+
+        // "who are the kids" canonicalizes to role "child"; the plural must be
+        // "children", not the previous naive "childs".
+        assert_eq!(
+            format_household_role_answer(
+                "child",
+                &[profile("Leo", "child"), profile("Mia", "child")],
+            ),
+            "Leo, Mia are the children."
+        );
+
+        // The other irregular canonical role.
+        assert_eq!(
+            format_household_role_answer("wife", &[profile("Ada", "wife"), profile("Bea", "wife")],),
+            "Ada, Bea are the wives."
+        );
+
+        // Regular roles still pluralize with +s.
+        assert_eq!(
+            format_household_role_answer("son", &[profile("Leo", "son"), profile("Sam", "son")]),
+            "Leo, Sam are the sons."
+        );
+
+        // Single-profile phrasing is unchanged.
+        assert_eq!(
+            format_household_role_answer("child", &[profile("Leo", "child")]),
+            "Leo is the child."
+        );
+    }
+
+    #[test]
+    fn memory_recall_pluralizes_multiple_children() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-children-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("relationship", "Leo is my child").unwrap();
+        memory.store("relationship", "Mia is my child").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "who are the kids in this house"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        // End-to-end: "kids" canonicalizes to role "child" and the two stored
+        // profiles must read "children", not "childs".
+        assert!(
+            output.contains("are the children."),
+            "expected a 'children' plural, got: {output}"
+        );
+        assert!(
+            output.contains("Leo") && output.contains("Mia"),
+            "got: {output}"
+        );
     }
 
     #[test]
