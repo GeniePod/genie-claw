@@ -97,13 +97,16 @@ pub fn route(text: &str) -> Option<ToolCall> {
     {
         let mut args = serde_json::json!({ "entity": entity, "action": action });
         if let Some(value) = value {
-            args["value"] = serde_json::json!(value);
+            args["value"] = home_control_value_argument(action, value);
         }
         return Some(tool("home_control", args));
     }
 
     if let Some(query) = memory_recall_query(&normalized) {
-        return Some(tool("memory_recall", serde_json::json!({ "query": query })));
+        return Some(tool(
+            "memory_recall",
+            serde_json::json!({ "query": query, "limit": 3 }),
+        ));
     }
 
     if asks_system_status(&normalized) || asks_home_assistant_status(&normalized) {
@@ -148,7 +151,7 @@ pub fn route(text: &str) -> Option<ToolCall> {
     {
         let mut args = serde_json::json!({ "entity": entity, "action": action });
         if let Some(value) = value {
-            args["value"] = serde_json::json!(value);
+            args["value"] = home_control_value_argument(action, value);
         }
         return Some(tool("home_control", args));
     }
@@ -1810,6 +1813,18 @@ fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
     }
 }
 
+fn home_control_value_argument(action: &str, value: f64) -> serde_json::Value {
+    if action == "set_temperature"
+        && value.fract() == 0.0
+        && value >= i64::MIN as f64
+        && value <= i64::MAX as f64
+    {
+        serde_json::Value::from(value as i64)
+    } else {
+        serde_json::json!(value)
+    }
+}
+
 fn household_role_query(text: &str) -> Option<&'static str> {
     if !(text.starts_with("who is ")
         || text.starts_with("who are ")
@@ -2628,10 +2643,12 @@ mod tests {
         let call = route("What is my name?").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "name");
+        assert_eq!(call.arguments["limit"], 3);
 
         let call = route("do you remember my name").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "name");
+        assert_eq!(call.arguments["limit"], 3);
     }
 
     #[test]
@@ -3329,7 +3346,13 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "oven");
         assert_eq!(call.arguments["action"], "set_temperature");
-        assert_eq!(call.arguments["value"], 400.0);
+        assert_eq!(call.arguments["value"], 400);
+
+        let call = route("Set the thermostat to 72").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "thermostat");
+        assert_eq!(call.arguments["action"], "set_temperature");
+        assert_eq!(call.arguments["value"], 72);
 
         let call = route("Is the garage door closed?").unwrap();
         assert_eq!(call.name, "home_status");
@@ -4057,6 +4080,7 @@ mod tests {
         let call = route("search memory for Jared").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "jared");
+        assert_eq!(call.arguments["limit"], 3);
     }
 
     #[test]
