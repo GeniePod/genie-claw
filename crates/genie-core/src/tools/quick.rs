@@ -7,7 +7,9 @@
 use super::ToolCall;
 
 pub fn route(text: &str) -> Option<ToolCall> {
-    let normalized = strip_household_speaker_prefix(&normalize(text));
+    let prenormalized = normalize(text);
+    let speaker = household_speaker(&prenormalized);
+    let normalized = strip_household_speaker_prefix(&prenormalized);
     if normalized.is_empty() {
         return None;
     }
@@ -146,6 +148,7 @@ pub fn route(text: &str) -> Option<ToolCall> {
     }
 
     if let Some(query) = play_media_request(&normalized) {
+        let query = resolve_speaker_possessive(&query, speaker);
         return Some(tool("play_media", serde_json::json!({ "query": query })));
     }
 
@@ -228,6 +231,38 @@ fn strip_household_speaker_prefix(text: &str) -> String {
         }
     }
     text.to_string()
+}
+
+/// The capitalized household speaker named in a `"<Name>: …"` prefix — e.g.
+/// `normalize("Mia: Play my playlist")` → `Some("Mia")`. Recognizes the same
+/// names as `strip_household_speaker_prefix`.
+fn household_speaker(text: &str) -> Option<&'static str> {
+    for (lower, name) in [
+        ("jared", "Jared"),
+        ("sarah", "Sarah"),
+        ("leo", "Leo"),
+        ("mia", "Mia"),
+    ] {
+        if text
+            .strip_prefix(lower)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .is_some_and(|rest| !rest.trim().is_empty())
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Resolve a leading possessive `"my "` against the known speaker, so a media
+/// query like `"my study playlist"` spoken by `"Mia: …"` becomes
+/// `"Mia study playlist"` (#532). With no speaker the query is unchanged, so
+/// speaker-less requests like `"Play my playlist"` keep the literal possessive.
+fn resolve_speaker_possessive(query: &str, speaker: Option<&str>) -> String {
+    match (speaker, query.strip_prefix("my ")) {
+        (Some(name), Some(rest)) => format!("{name} {rest}"),
+        _ => query.to_string(),
+    }
 }
 
 fn asks_memory_status(text: &str) -> bool {
@@ -3331,6 +3366,18 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "all off");
         assert_eq!(call.arguments["action"], "activate");
+    }
+
+    #[test]
+    fn resolves_speaker_possessive_in_media_query() {
+        // BFCL play-media-study: "Mia: Play my study playlist." -> "Mia study playlist" (#532).
+        let call = route("Mia: Play my study playlist.").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "Mia study playlist");
+
+        // No speaker prefix -> the literal possessive is preserved (unchanged).
+        let call = route("Play my Morning Boost playlist").unwrap();
+        assert_eq!(call.arguments["query"], "my morning boost playlist");
     }
 
     #[test]
