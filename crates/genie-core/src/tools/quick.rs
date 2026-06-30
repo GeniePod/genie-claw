@@ -120,6 +120,11 @@ pub fn route(text: &str) -> Option<ToolCall> {
     }
 
     if let Some(query) = memory_recall_query(&normalized) {
+        // For "find … note" recalls, rebuild the query from the original text to
+        // preserve the casing/hyphenation/possessive that normalize() discards
+        // ("Find Grandma's Wi-Fi note" -> "Grandma Wi-Fi note"). Non-note recalls
+        // keep the normalized query.
+        let query = note_recall_query_from_original(text, speaker).unwrap_or(query);
         return Some(tool(
             "memory_recall",
             serde_json::json!({ "query": query, "limit": 3 }),
@@ -518,6 +523,31 @@ fn is_structured_household_question(text: &str) -> bool {
         || (text.contains("allergic") || text.contains("allergy"))
         || text.contains("homework rule")
         || text.contains("homework rules")
+}
+
+/// Rebuild a "find … note" recall query from the ORIGINAL text so the stored
+/// note name keeps its casing/hyphenation and drops the possessive — e.g.
+/// "Sarah: Find Grandma's Wi-Fi note." -> "Grandma Wi-Fi note" (#529). normalize()
+/// lowercases and strips those, so the normalized query can't. Returns None for
+/// anything but an explicit "find/show/pull up … note" recall, which then keeps
+/// the normalized query.
+fn note_recall_query_from_original(original: &str, speaker: Option<&str>) -> Option<String> {
+    let body = if speaker.is_some() {
+        original.split_once(": ").map(|(_, rest)| rest).unwrap_or(original)
+    } else {
+        original
+    }
+    .trim();
+    if !body.to_lowercase().contains("note") {
+        return None;
+    }
+    let rest = ["Find ", "find ", "Show me ", "show me ", "Pull up ", "pull up "]
+        .iter()
+        .find_map(|verb| body.strip_prefix(verb))?;
+    let cleaned = rest.trim_end_matches(['.', '?', '!']).trim();
+    let result = cleaned.replace("'s ", " ").replace("\u{2019}s ", " ");
+    let result = result.trim();
+    (!result.is_empty()).then(|| result.to_string())
 }
 
 fn is_household_note_question(text: &str) -> bool {
@@ -3136,8 +3166,15 @@ mod tests {
         assert_eq!(call.name, "memory_recall");
         assert_eq!(
             call.arguments["query"],
-            "find my note about the bicycle lock code"
+            "my note about the bicycle lock code"
         );
+
+        // BFCL memory-grandma-wifi: rebuilt from the original text so the note
+        // name keeps its casing/hyphenation and drops the possessive (#529).
+        let call = route("Sarah: Find Grandma's Wi-Fi note.").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "Grandma Wi-Fi note");
+        assert_eq!(call.arguments["limit"], 3);
 
         let call = route("Where are the extra batteries kept?").unwrap();
         assert_eq!(call.name, "memory_recall");
