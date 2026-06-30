@@ -113,6 +113,10 @@ pub fn route(text: &str) -> Option<ToolCall> {
         return Some(tool("home_status", serde_json::json!({ "entity": entity })));
     }
 
+    if let Some(query) = memory_forget_query(&normalized) {
+        return Some(tool("memory_forget", serde_json::json!({ "query": query })));
+    }
+
     if let Some(query) = memory_recall_query(&normalized) {
         return Some(tool(
             "memory_recall",
@@ -305,6 +309,45 @@ fn memory_recall_query(text: &str) -> Option<String> {
             | "what do you remember about us"
     ) {
         return Some("me".into());
+    }
+
+    None
+}
+
+/// Explicit "forget"/"delete" memory commands (#527). The quick router had no
+/// `memory_forget` path, so "Forget my old locker combination." abstained and
+/// the BFCL `memory-forget-old-combo` case (expected
+/// `memory_forget{query:"old locker combination"}`) produced no tool call.
+///
+/// Mirrors [`memory_recall_query`]: strip a leading forget verb (and an optional
+/// possessive/article) and return the remainder as `query`. Conservative by
+/// design — `delete` is matched only in an explicit note/memory context so that
+/// device, timer, and list deletions ("delete the alarm") keep their own routes,
+/// and a bare "forget it"/"forget that" abstains for the LLM.
+fn memory_forget_query(text: &str) -> Option<String> {
+    // Prefixes are longest-first; the first match wins so that, e.g.,
+    // "forget about it" resolves on "forget about " (a bare-pronoun remainder ->
+    // abstain) rather than falling through to "forget " and yielding "about it".
+    for prefix in [
+        "forget about my ",
+        "forget about the ",
+        "forget about ",
+        "forget my ",
+        "forget the ",
+        "forget ",
+        "delete what you know about ",
+        "delete everything you know about ",
+        "delete my note about ",
+        "delete the note about ",
+        "delete my note on ",
+        "delete the note on ",
+    ] {
+        if let Some(query) = text.strip_prefix(prefix).map(str::trim) {
+            if query.is_empty() || matches!(query, "that" | "it" | "this") {
+                return None;
+            }
+            return Some(query.to_string());
+        }
     }
 
     None
@@ -2674,6 +2717,39 @@ mod tests {
     fn routes_memory_health_to_memory_status() {
         let call = route("check memory health").unwrap();
         assert_eq!(call.name, "memory_status");
+    }
+
+    #[test]
+    fn routes_forget_command_to_memory_forget() {
+        // BFCL memory-forget-old-combo: "Forget my old locker combination." (#527)
+        let call = route("Forget my old locker combination.").unwrap();
+        assert_eq!(call.name, "memory_forget");
+        assert_eq!(
+            call.arguments,
+            serde_json::json!({ "query": "old locker combination" })
+        );
+
+        // Strips the forget verb and an optional possessive/article.
+        for (utterance, query) in [
+            ("forget my age", "age"),
+            ("forget the wifi password", "wifi password"),
+            ("forget about my dentist appointment", "dentist appointment"),
+            ("Sarah: forget my gym schedule", "gym schedule"),
+            ("delete the note about the spare key", "the spare key"),
+            ("delete what you know about my car", "my car"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("{utterance} should route"));
+            assert_eq!(call.name, "memory_forget", "{utterance}");
+            assert_eq!(call.arguments["query"], query, "{utterance}");
+        }
+    }
+
+    #[test]
+    fn forget_without_referent_abstains_for_llm() {
+        // Bare pronoun forgets carry no query — leave them for the LLM.
+        for utterance in ["forget it", "forget that", "forget about it", "delete that"] {
+            assert!(route(utterance).is_none(), "{utterance} should abstain");
+        }
     }
 
     #[test]
