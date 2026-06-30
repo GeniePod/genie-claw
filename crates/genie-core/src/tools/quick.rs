@@ -2599,7 +2599,8 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
         let query = if subject.is_empty() {
             "stock price".to_string()
         } else {
-            format!("{subject} stock price")
+            let symbol = company_ticker(subject).unwrap_or(subject);
+            format!("{symbol} stock price")
         };
         return Some((query, web_search_is_fresh_request(text)));
     }
@@ -2643,6 +2644,23 @@ fn web_search_is_fresh_request(text: &str) -> bool {
             " current ",
         ],
     )
+}
+
+/// Map a well-known company name to its stock ticker, so a price query reads
+/// "AAPL stock price" rather than "apple stock price" (#532). Unknown names
+/// fall through unchanged.
+fn company_ticker(subject: &str) -> Option<&'static str> {
+    match subject.trim() {
+        "apple" => Some("AAPL"),
+        "microsoft" => Some("MSFT"),
+        "google" | "alphabet" => Some("GOOGL"),
+        "amazon" => Some("AMZN"),
+        "tesla" => Some("TSLA"),
+        "meta" | "facebook" => Some("META"),
+        "nvidia" => Some("NVDA"),
+        "netflix" => Some("NFLX"),
+        _ => None,
+    }
 }
 
 fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
@@ -2704,6 +2722,7 @@ fn arithmetic_expression(text: &str) -> Option<String> {
         .replace(" multiplied by ", " * ")
         .replace(" divided by ", " / ")
         .replace(" over ", " / ");
+    let expression = words_to_digits(&expression);
 
     if !expression.chars().any(|c| c.is_ascii_digit())
         || !expression
@@ -2721,6 +2740,23 @@ fn arithmetic_expression(text: &str) -> Option<String> {
     }
 
     Some(expression.trim().to_string())
+}
+
+/// Convert standalone cardinal words to digits in a calculator expression, so
+/// "two plus two" -> "two + two" -> "2 + 2" (#532-adjacent: word-form arithmetic).
+/// Operator symbols and non-number words are left as-is; compound cardinals
+/// across multiple tokens are out of scope (rare in a calculation).
+fn words_to_digits(expression: &str) -> String {
+    expression
+        .split(' ')
+        .map(|token| {
+            super::number_words::parse_amount(token)
+                .filter(|value| value.fract() == 0.0)
+                .map(|value| (value as i64).to_string())
+                .unwrap_or_else(|| token.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_decimal_token(token: &str) -> Option<f64> {
@@ -4363,14 +4399,30 @@ mod tests {
 
     #[test]
     fn routes_market_queries_to_web_search() {
-        let call = route("What is the stock price of Apple?").unwrap();
-        assert_eq!(call.name, "web_search");
-        assert!(call.arguments["query"].as_str().unwrap().contains("apple"));
-        assert_eq!(call.arguments["fresh"], true);
-
+        // BFCL web-search-stock: a known company resolves to its ticker (#532).
         let call = route("What is the current stock price of Apple?").unwrap();
         assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "AAPL stock price");
         assert_eq!(call.arguments["fresh"], true);
+
+        let call = route("What is the stock price of Apple?").unwrap();
+        assert_eq!(call.arguments["query"], "AAPL stock price");
+
+        // Unknown company falls through unchanged.
+        let call = route("What is the stock price of Wendys?").unwrap();
+        assert_eq!(call.arguments["query"], "wendys stock price");
+    }
+
+    #[test]
+    fn routes_word_form_arithmetic_to_calculate() {
+        // BFCL single-key-calculate: "two plus two" -> "2 + 2".
+        let call = route("Leo: What is two plus two?").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "2 + 2");
+
+        // Digit forms still work.
+        let call = route("what is 3 times 4").unwrap();
+        assert_eq!(call.arguments["expression"], "3 * 4");
     }
 
     #[test]
