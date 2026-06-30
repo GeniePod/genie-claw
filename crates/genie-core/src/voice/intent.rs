@@ -11,13 +11,11 @@ pub enum VoiceIntentDecision {
 }
 
 pub fn assess_transcript(text: &str) -> VoiceIntentDecision {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
+    let lower = normalize_transcript(text);
+    if lower.is_empty() {
         return VoiceIntentDecision::Reject("empty transcript");
     }
 
-    let lower = trimmed.to_ascii_lowercase();
     let words = word_count(&lower);
 
     if is_low_signal_filler(&lower) {
@@ -35,7 +33,32 @@ pub fn assess_transcript(text: &str) -> VoiceIntentDecision {
     VoiceIntentDecision::Accept
 }
 
+/// Collapse ASCII whitespace and lowercase in one pass (no `Vec` + `join`).
+fn normalize_transcript(text: &str) -> String {
+    let trimmed = text.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut pending_space = false;
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() && !pending_space {
+                pending_space = true;
+            }
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
 fn looks_like_direct_request(text: &str) -> bool {
+    if !might_be_direct_request(text) {
+        return false;
+    }
+
     text.ends_with('?')
         || starts_with_any(
             text,
@@ -110,36 +133,116 @@ fn looks_like_direct_request(text: &str) -> bool {
         )
 }
 
+/// Conservative superset of markers checked by [`looks_like_direct_request`].
+fn might_be_direct_request(text: &str) -> bool {
+    if text.ends_with('?') {
+        return true;
+    }
+    const MARKERS: &[&str] = &[
+        "what",
+        "who",
+        "when",
+        "where",
+        "why",
+        "how",
+        "can you",
+        "could you",
+        "would you",
+        "will you",
+        "please",
+        "turn ",
+        "set ",
+        "play ",
+        "search",
+        "look up",
+        "remember",
+        "forget",
+        "open ",
+        "close ",
+        "lock ",
+        "unlock",
+        "dim ",
+        "brighten",
+        "check ",
+        "tell me",
+        "show me",
+        "is ",
+        "are ",
+        "do ",
+        "did ",
+        "weather",
+        "timer",
+        "remind",
+        "calculate",
+        "call ",
+        "text ",
+        "genie",
+        "jarvis",
+        "assistant",
+        " light",
+        "lights",
+        "thermostat",
+        "temperature",
+        "home assistant",
+        "music",
+        " tv",
+        "volume",
+        "alarm",
+        "reminder",
+        "kitchen",
+        "bedroom",
+        "living room",
+        "garage",
+        "front door",
+        "time is it",
+        "status",
+        "search the web",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
 fn looks_like_ambient_narration(text: &str, words: usize) -> bool {
-    words >= 9
-        && starts_with_any(
-            text,
-            &[
-                "the ", "a ", "an ", "he ", "she ", "they ", "it ", "we ", "this ", "that ",
-            ],
-        )
-        && !text.ends_with('?')
-        && !contains_any(
-            text,
-            &[
-                "please",
-                "can you",
-                "could you",
-                "would you",
-                "turn",
-                "set",
-                "play",
-                "search",
-                "remember",
-                "forget",
-                "weather",
-                "timer",
-                "remind",
-                "assistant",
-                "genie",
-                "jarvis",
-            ],
-        )
+    if words < 9 {
+        return false;
+    }
+
+    if !starts_with_any(
+        text,
+        &[
+            "the ", "a ", "an ", "he ", "she ", "they ", "it ", "we ", "this ", "that ",
+        ],
+    ) {
+        return false;
+    }
+
+    if text.ends_with('?') {
+        return false;
+    }
+
+    !might_be_ambient_command(text)
+}
+
+/// Superset of command markers that prevent an ambient-narration rejection.
+fn might_be_ambient_command(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "please",
+        "can you",
+        "could you",
+        "would you",
+        "turn",
+        "set",
+        "play",
+        "search",
+        "remember",
+        "forget",
+        "weather",
+        "timer",
+        "remind",
+        "assistant",
+        "genie",
+        "jarvis",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
 }
 
 fn is_low_signal_filler(text: &str) -> bool {
@@ -216,6 +319,14 @@ mod tests {
         assert_eq!(
             assess_transcript("weather in Tokyo"),
             VoiceIntentDecision::Accept
+        );
+    }
+
+    #[test]
+    fn normalize_transcript_collapses_whitespace() {
+        assert_eq!(
+            normalize_transcript("  turn   on   the   light  "),
+            "turn on the light"
         );
     }
 }
