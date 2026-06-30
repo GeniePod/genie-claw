@@ -108,6 +108,14 @@ pub fn score_candidates(
 
     let mut candidates = Vec::new();
 
+    // Fetch query diversity for every candidate in ONE query instead of a
+    // `SELECT query_hashes WHERE id = ?` per entry — the N+1 that scaled with the
+    // up-to-1000-row candidate set. Same per-id counts, so same scores/ordering.
+    let candidate_ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
+    let diversity_by_id = memory
+        .query_diversity_for_ids(&candidate_ids)
+        .unwrap_or_default();
+
     for entry in entries {
         // Frequency: normalized recall count (asymptotic to 1.0).
         let frequency_score = (entry.recall_count as f64 / 10.0).min(1.0);
@@ -126,7 +134,7 @@ pub fn score_candidates(
         // Diversity: repeated daily usefulness matters more when the fact
         // is recalled from different prompts, not only the same phrase.
         let diversity_score =
-            diversity_from_unique_queries(memory.query_diversity(entry.id).unwrap_or(0));
+            diversity_from_unique_queries(diversity_by_id.get(&entry.id).copied().unwrap_or(0));
 
         // Weighted sum.
         let score = weights.frequency * frequency_score
