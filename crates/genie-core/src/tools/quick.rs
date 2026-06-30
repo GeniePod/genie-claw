@@ -2220,6 +2220,7 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
 
     let label = reminder_label(&tokens, unit_end_index)
         .filter(|label| !label.is_empty())
+        .or_else(|| extract_named_timer_label(&tokens))
         .unwrap_or_else(|| {
             if text.starts_with("remind ") {
                 "reminder".into()
@@ -2229,6 +2230,38 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
         });
 
     Some((seconds, label))
+}
+
+/// Extract a label from the \"<label> timer for …\" form — e.g. \"set a cookie
+/// timer for 12 minutes\" → \"cookies\". Skips leading stop words before the
+/// noun phrase immediately preceding `timer`.
+fn extract_named_timer_label(tokens: &[&str]) -> Option<String> {
+    let timer_index = tokens.iter().position(|token| *token == "timer")?;
+    if timer_index == 0 {
+        return None;
+    }
+
+    const STOP: &[&str] = &[
+        "set", "start", "create", "make", "a", "an", "the", "my", "our", "your", "new",
+    ];
+    let mut label_parts: Vec<&str> = Vec::new();
+    for &token in tokens[..timer_index].iter().rev() {
+        if STOP.contains(&token) {
+            break;
+        }
+        label_parts.push(token);
+    }
+    label_parts.reverse();
+    if label_parts.is_empty() {
+        return None;
+    }
+
+    let label = label_parts.join(" ");
+    Some(if label_parts.len() == 1 && !label.ends_with('s') {
+        format!("{label}s")
+    } else {
+        label
+    })
 }
 
 fn weather_request(text: &str) -> Option<(String, bool)> {
@@ -4098,6 +4131,18 @@ mod tests {
     fn routes_time_question_to_get_time() {
         let call = route("what time is it?").unwrap();
         assert_eq!(call.name, "get_time");
+    }
+
+    #[test]
+    fn routes_named_timer_label_before_duration() {
+        let call = route("Leo: Set a cookie timer for 12 minutes.").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 720);
+        assert_eq!(call.arguments["label"], "cookies");
+
+        // Plain timer still defaults; reminder "to …" path unchanged.
+        let call = route("set a timer for 10 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
     }
 
     #[test]
