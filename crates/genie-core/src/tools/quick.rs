@@ -1965,6 +1965,28 @@ fn asks_system_status(text: &str) -> bool {
             | "uptime"
             | "load average"
             | "governor status"
+    ) || asks_system_resource_status(text)
+}
+
+/// Hardware resource-pressure diagnostics (#526): "How is the Jetson memory
+/// pressure?" abstained because no `system_info` matcher covered it. These are
+/// OS/kernel resource metrics (RAM / CPU / disk / swap) and are intentionally
+/// kept distinct from the AI memory-subsystem checks in `asks_memory_status`
+/// ("memory status/health/index/database/diagnostics") — "memory pressure" is an
+/// unambiguous RAM term, so it routes to `system_info`, not `memory_status`.
+fn asks_system_resource_status(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "memory pressure",
+            "ram pressure",
+            "ram usage",
+            "cpu usage",
+            "cpu load",
+            "swap usage",
+            "disk usage",
+            "disk space",
+        ],
     )
 }
 
@@ -2804,6 +2826,27 @@ mod tests {
     fn routes_home_assistant_status_to_system_info() {
         let call = route("home assistant status").unwrap();
         assert_eq!(call.name, "system_info");
+    }
+
+    #[test]
+    fn routes_resource_pressure_to_system_info() {
+        // BFCL system-info-jetson-memory: "How is the Jetson memory pressure?" (#526)
+        let call = route("Jared: How is the Jetson memory pressure?").unwrap();
+        assert_eq!(call.name, "system_info");
+        assert_eq!(call.arguments, serde_json::json!({}));
+
+        for utterance in [
+            "what's the cpu usage",
+            "check disk space",
+            "how is swap usage looking",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("{utterance} should route"));
+            assert_eq!(call.name, "system_info", "{utterance}");
+        }
+
+        // The AI memory subsystem checks still route to memory_status, not system_info.
+        assert_eq!(route("check memory health").unwrap().name, "memory_status");
+        assert_eq!(route("memory status").unwrap().name, "memory_status");
     }
 
     #[test]
