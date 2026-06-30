@@ -19,3 +19,8 @@
 {"id":"multi-homework-timer","response":"[{\"tool\":\"home_control\",\"arguments\":{\"entity\":\"homework mode\",\"action\":\"activate\"}},{\"tool\":\"set_timer\",\"arguments\":{\"seconds\":2700,\"label\":\"homework focus\"}}]"}
 {"id":"function-call-memory-status","response":"{\"function_call\":{\"name\":\"memory_status\",\"arguments\":\"{}\"}}"}
 {"id":"single-key-calculate","response":"{\"calculate\":{\"expression\":\"2 + 2\"}}"}
+{"id":"memory-store-allergy-statement","response":"{\"arguments\":{\"category\":\"health_tracker\",\"content\":\"dietary allergy: allergic to peanuts\"},\"tool\":\"memory_store\"}"}
+{"id":"memory-store-meeting-statement","response":"{\"arguments\":{\"category\":\"reminders\",\"content\":\"calendar event: meeting on saturday 10am\"},\"tool\":\"memory_store\"}"}
+{"id":"memory-store-remember-appointment","response":"{\"arguments\":{\"category\":\"reminders\",\"content\":\"calendar event: my dentist appointment is next tuesday 3pm\"},\"tool\":\"memory_store\"}"}
+{"id":"memory-store-remember-fact","response":"{\"arguments\":{\"category\":\"fact\",\"content\":\"note: the wifi password is hunter2\"},\"tool\":\"memory_store\"}"}
+{"id":"memory-recall-allergy-question","response":"{\"arguments\":{\"query\":\"is anyone allergic to peanuts\"},\"tool\":\"memory_recall\"}"}

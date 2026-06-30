@@ -3,6 +3,7 @@ pub mod calc;
 pub(crate) mod calc_input;
 pub mod dispatch;
 mod home;
+pub mod home_action;
 mod number_words;
 pub mod parser;
 pub mod quick;
