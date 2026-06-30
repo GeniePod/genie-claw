@@ -215,6 +215,83 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Remove old conversation messages and trim long conversations.
+    ///
+    /// Two passes are run:
+    /// 1. Messages older than `retention_days` are deleted across all conversations
+    ///    (pass 0 to skip age-based pruning).
+    /// 2. Each conversation that exceeds `max_messages_per_conversation` has its
+    ///    oldest messages deleted until only the most recent N remain
+    ///    (pass 0 to skip per-conversation capping).
+    ///
+    /// After both passes, `PRAGMA wal_checkpoint(TRUNCATE)` is issued so the WAL
+    /// file is folded back into the main database and freed pages are returned
+    /// to the OS.
+    ///
+    /// Returns the total number of messages deleted.
+    pub fn prune_old_turns(
+        &self,
+        retention_days: u32,
+        max_messages_per_conversation: usize,
+    ) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut deleted = 0usize;
+
+        if retention_days > 0 {
+            let cutoff_ms = now_ms() - (retention_days as i64 * 86_400_000);
+            deleted += tx.execute("DELETE FROM messages WHERE ts_ms < ?1", [cutoff_ms])?;
+            // Remove conversations that have no remaining messages.
+            tx.execute(
+                "DELETE FROM conversations \
+                 WHERE id NOT IN (SELECT DISTINCT conv_id FROM messages)",
+                [],
+            )?;
+        }
+
+        if max_messages_per_conversation > 0 {
+            let over_limit: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM conversations \
+                     WHERE (SELECT COUNT(*) FROM messages WHERE conv_id = conversations.id) > ?1",
+                )?;
+                stmt.query_map([max_messages_per_conversation as i64], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
+            for conv_id in &over_limit {
+                deleted += tx.execute(
+                    "DELETE FROM messages \
+                     WHERE conv_id = ?1 \
+                       AND id NOT IN ( \
+                           SELECT id FROM messages \
+                           WHERE conv_id = ?1 \
+                           ORDER BY ts_ms DESC, id DESC \
+                           LIMIT ?2 \
+                       )",
+                    rusqlite::params![conv_id, max_messages_per_conversation as i64],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+        Ok(deleted)
+    }
+
+    /// Return the combined on-disk size of the conversation database and its
+    /// WAL file in bytes. The WAL can be sizeable between checkpoints, so
+    /// omitting it would under-report actual disk use in WAL mode.
+    pub fn db_size_bytes(&self) -> Option<u64> {
+        let path = self.conn.path()?;
+        let main_size = std::fs::metadata(path).ok()?.len();
+        let wal_size = std::fs::metadata(format!("{}-wal", path))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        Some(main_size + wal_size)
+    }
+
     /// Delete all conversations.
     pub fn clear_all(&self) -> Result<()> {
         self.conn.execute("DELETE FROM messages", [])?;
@@ -535,5 +612,107 @@ mod tests {
         store.append(&id, "user", &message, None).unwrap();
         let convos = store.list().unwrap();
         assert_eq!(convos[0].title, format!("{}...", "a".repeat(57)));
+    }
+
+    fn insert_at(store: &ConversationStore, conv_id: &str, content: &str, ts_ms: i64) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages (conv_id, role, content, tool_name, ts_ms) \
+                 VALUES (?1, 'user', ?2, NULL, ?3)",
+                rusqlite::params![conv_id, content, ts_ms],
+            )
+            .unwrap();
+    }
+
+    fn msg_count(store: &ConversationStore, conv_id: &str) -> usize {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conv_id = ?1",
+                [conv_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as usize
+    }
+
+    fn conv_exists(store: &ConversationStore, conv_id: &str) -> bool {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE id = ?1",
+                [conv_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0
+    }
+
+    fn msg_contents(store: &ConversationStore, conv_id: &str) -> Vec<String> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT content FROM messages WHERE conv_id = ?1 ORDER BY ts_ms ASC, id ASC")
+            .unwrap();
+        stmt.query_map([conv_id], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    fn make_conv(store: &ConversationStore, id: &str) {
+        let now = now_ms();
+        store
+            .conn
+            .execute(
+                "INSERT INTO conversations (id, title, created_ms, updated_ms) \
+                 VALUES (?1, ?1, ?2, ?2)",
+                rusqlite::params![id, now],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn prune_old_turns_deletes_stale_keeps_recent_removes_orphan_trims_cap() {
+        let store = temp_store();
+        let now = now_ms();
+        let day_ms = 86_400_000i64;
+
+        // conv_keep: 1 old message (will be deleted) + 1 recent (kept).
+        let keep = "conv-keep";
+        make_conv(&store, keep);
+        insert_at(&store, keep, "old", now - 3 * day_ms);
+        insert_at(&store, keep, "recent", now);
+
+        // conv_gone: only old messages → conversation itself must be removed.
+        let gone = "conv-gone";
+        make_conv(&store, gone);
+        insert_at(&store, gone, "old-a", now - 3 * day_ms);
+        insert_at(&store, gone, "old-b", now - 3 * day_ms);
+
+        // conv_cap: 5 messages, cap at 3 → oldest 2 dropped, newest 3 kept.
+        let cap = "conv-cap";
+        make_conv(&store, cap);
+        for i in 0..5i64 {
+            insert_at(&store, cap, &format!("msg-{i}"), now - (4 - i) * 1000);
+        }
+
+        let deleted = store.prune_old_turns(2, 3).unwrap();
+
+        // Age pass: 3 old rows deleted (1 from conv_keep + 2 from conv_gone).
+        // Cap pass: 2 rows deleted from conv_cap.
+        assert_eq!(deleted, 5);
+
+        // conv_keep: only the recent message remains.
+        assert!(conv_exists(&store, keep));
+        assert_eq!(msg_count(&store, keep), 1);
+        assert_eq!(msg_contents(&store, keep), vec!["recent"]);
+
+        // conv_gone: removed entirely (no surviving messages).
+        assert!(!conv_exists(&store, gone));
+
+        // conv_cap: exactly the 3 newest messages (msg-2, msg-3, msg-4).
+        assert!(conv_exists(&store, cap));
+        let remaining = msg_contents(&store, cap);
+        assert_eq!(remaining, vec!["msg-2", "msg-3", "msg-4"]);
     }
 }

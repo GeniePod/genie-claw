@@ -74,6 +74,16 @@ pub fn route(text: &str) -> Option<ToolCall> {
         ));
     }
 
+    if let Some((category, content)) = personal_fact_store_request(&normalized) {
+        return Some(tool(
+            "memory_store",
+            serde_json::json!({
+                "category": category,
+                "content": content
+            }),
+        ));
+    }
+
     if let Some((seconds, label)) = preferred_timer_request(&normalized) {
         return Some(tool(
             "set_timer",
@@ -1080,6 +1090,62 @@ fn reminder_or_alarm_store_request(text: &str) -> Option<(&'static str, String)>
             "reservation",
             "Bathroom reservation for Mia at 7:00 PM for hair wash".into(),
         ));
+    }
+
+    None
+}
+
+/// Route first-person *write* statements about personal facts and appointments
+/// to `memory_store` (#379). The deterministic router previously abstained on
+/// these, so the local model picked the wrong tool — `set_timer` for "I'm
+/// allergic to peanuts", `memory_recall` for "remember my dentist appointment
+/// is next Tuesday". Question forms ("is anyone allergic to peanuts?", "when is
+/// my dentist appointment?") are intentionally left for `memory_recall`: every
+/// matcher here keys off a first-person *assertion* prefix the question forms do
+/// not have. Returns `(category, content)` like the sibling `*_store_request`
+/// helpers and runs after them, so their curated mappings still win.
+fn personal_fact_store_request(text: &str) -> Option<(&'static str, String)> {
+    // "I'm allergic to peanuts" / "I am allergic to shellfish" — a dietary fact,
+    // not the recall question "is anyone allergic to peanuts?".
+    for prefix in ["i m allergic to ", "i am allergic to "] {
+        if let Some(allergen) = text.strip_prefix(prefix).map(str::trim)
+            && !allergen.is_empty()
+        {
+            return Some((
+                "health_tracker",
+                format!("dietary allergy: allergic to {allergen}"),
+            ));
+        }
+    }
+
+    // "I have a meeting on Saturday" / "I have a dentist appointment on Friday" —
+    // a calendar event the user is stating, not the recall question "when is my
+    // dentist appointment?".
+    if let Some(rest) = text
+        .strip_prefix("i have a ")
+        .or_else(|| text.strip_prefix("i have an "))
+        && (rest.contains("appointment") || rest.contains("meeting"))
+    {
+        return Some(("reminders", format!("calendar event: {}", rest.trim())));
+    }
+
+    // "remember my dentist appointment is next Tuesday 3pm" / "remember that the
+    // wifi password is hunter2" — an explicit assertion of a new fact. The
+    // required " is " keeps identity recalls ("remember my name", which has no
+    // " is ") on the `memory_recall` path. Content keeps the descriptive
+    // "label: detail" shape the sibling `*_store_request` helpers use.
+    if (text.starts_with("remember my ") || text.starts_with("remember that "))
+        && text.contains(" is ")
+    {
+        let fact = text
+            .strip_prefix("remember ")
+            .map(|rest| rest.strip_prefix("that ").unwrap_or(rest))
+            .unwrap_or(text)
+            .trim();
+        if text.contains("appointment") || text.contains("meeting") {
+            return Some(("reminders", format!("calendar event: {fact}")));
+        }
+        return Some(("fact", format!("note: {fact}")));
     }
 
     None
@@ -3913,6 +3979,64 @@ mod tests {
         let call = route("Jared: What's the current water pressure?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "water pressure");
+    }
+
+    #[test]
+    fn routes_personal_write_statements_to_memory_store() {
+        // #379: first-person fact/appointment statements the deterministic router
+        // used to abstain on, so the local model misrouted them.
+        let call = route("I'm allergic to peanuts").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "health_tracker");
+        assert_eq!(
+            call.arguments["content"],
+            "dietary allergy: allergic to peanuts"
+        );
+
+        let call = route("I am allergic to shellfish").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(
+            call.arguments["content"],
+            "dietary allergy: allergic to shellfish"
+        );
+
+        let call = route("I have a meeting on Saturday 10AM").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "reminders");
+        assert_eq!(
+            call.arguments["content"],
+            "calendar event: meeting on saturday 10am"
+        );
+
+        let call = route("Remember my dentist appointment is next Tuesday 3pm").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "reminders");
+        assert_eq!(
+            call.arguments["content"],
+            "calendar event: my dentist appointment is next tuesday 3pm"
+        );
+
+        let call = route("Remember that the wifi password is hunter2").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "fact");
+        assert_eq!(
+            call.arguments["content"],
+            "note: the wifi password is hunter2"
+        );
+    }
+
+    #[test]
+    fn personal_write_routing_does_not_steal_recall_questions() {
+        // Question forms and identity recalls must still reach memory_recall —
+        // the write matchers key off first-person assertion prefixes these lack.
+        let call = route("Is anyone allergic to peanuts?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("When is Mia's next dentist appointment?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("remember my name").unwrap();
+        assert_eq!(call.name, "memory_recall");
     }
 
     #[test]

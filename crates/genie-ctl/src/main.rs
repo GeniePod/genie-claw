@@ -2879,6 +2879,7 @@ mod tests {
             web_search: Default::default(),
             connectivity: Default::default(),
             http: Default::default(),
+            storage: Default::default(),
         };
 
         assert_eq!(config.core_http_addr(), "127.0.0.1:3001");
@@ -2908,6 +2909,7 @@ mod tests {
             web_search: Default::default(),
             connectivity: Default::default(),
             http: Default::default(),
+            storage: Default::default(),
         };
 
         assert_eq!(config.core_http_addr(), "127.0.0.1:3000");
