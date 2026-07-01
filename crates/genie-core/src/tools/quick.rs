@@ -2803,6 +2803,17 @@ fn parse_decimal_token(token: &str) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
+/// Seconds-per-unit for a duration unit token, or `None` when the token is not
+/// a recognized time unit.
+fn duration_unit_seconds(unit: Option<&str>) -> Option<u64> {
+    Some(match unit? {
+        "second" | "seconds" | "sec" | "secs" => 1,
+        "minute" | "minutes" | "min" | "mins" => 60,
+        "hour" | "hours" | "hr" | "hrs" => 3600,
+        _ => return None,
+    })
+}
+
 fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
     let mut start = 0;
     while start < tokens.len() {
@@ -2811,16 +2822,39 @@ fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
             start += 1;
             continue;
         };
-        let multiplier = match tokens.get(unit_index).copied() {
-            Some("second" | "seconds" | "sec" | "secs") => 1,
-            Some("minute" | "minutes" | "min" | "mins") => 60,
-            Some("hour" | "hours" | "hr" | "hrs") => 3600,
-            _ => {
-                start += 1;
-                continue;
-            }
+        let Some(multiplier) = duration_unit_seconds(tokens.get(unit_index).copied()) else {
+            start += 1;
+            continue;
         };
-        return Some((amount.saturating_mul(multiplier), unit_index));
+        // First "<number> <unit>" span matched. Sum any immediately-following
+        // spans so compound durations like "1 hour and 30 minutes" or "2 hours
+        // 15 minutes" accumulate instead of truncating to the first unit — the
+        // trailing "and 30 minutes" was previously dropped, emitting a
+        // confidently-wrong `set_timer{seconds:3600}`. Only spans sitting
+        // directly after the previous unit (optionally separated by a single
+        // connective "and") are summed, so a number later inside a timer label
+        // ("... to feed the 2 cats") is never mistaken for more duration.
+        // Returning the *last* consumed unit index also keeps the trailing span
+        // out of the label window used by `reminder_label` /
+        // `extract_named_timer_label`.
+        let mut total = amount.saturating_mul(multiplier);
+        let mut last_unit_index = unit_index;
+        loop {
+            let mut next = last_unit_index + 1;
+            if tokens.get(next).copied() == Some("and") {
+                next += 1;
+            }
+            let Some((amount, unit_index)) = super::number_words::parse_spoken_number(tokens, next)
+            else {
+                break;
+            };
+            let Some(multiplier) = duration_unit_seconds(tokens.get(unit_index).copied()) else {
+                break;
+            };
+            total = total.saturating_add(amount.saturating_mul(multiplier));
+            last_unit_index = unit_index;
+        }
+        return Some((total, last_unit_index));
     }
     None
 }
@@ -4588,6 +4622,43 @@ mod tests {
         let call = route("remind me in forty five minutes to check the oven").unwrap();
         assert_eq!(call.arguments["seconds"], 2700);
         assert_eq!(call.arguments["label"], "check the oven");
+    }
+
+    #[test]
+    fn routes_compound_multi_unit_timer() {
+        // Regression: "<hours> and <minutes>" used to truncate to the hours only
+        // (parse_duration returned on the first matched span), emitting a
+        // confidently-wrong set_timer instead of summing the spans.
+        let call = route("set a timer for 1 hour and 30 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 5400);
+
+        let call = route("set a timer for 2 hours and 15 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 8100);
+
+        // The connective "and" is optional.
+        let call = route("set a timer for 1 hour 30 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+
+        // Three spans sum too; worded amounts stitch the same way.
+        let call = route("set a timer for one hour twenty minutes and 30 seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 3600 + 20 * 60 + 30);
+
+        // The summed span is carried past the label boundary, so the trailing
+        // duration is not swallowed into the reminder label.
+        let call = route("remind me in 1 hour and 30 minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // Single-unit durations are unchanged; a lone number in a later label is
+        // not mistaken for another duration span.
+        let call = route("set a timer for 90 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+        let call = route("set a timer for 10 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 600);
+        let call = route("remind me in 5 minutes to feed the 2 cats").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "feed the 2 cats");
     }
 
     #[test]
