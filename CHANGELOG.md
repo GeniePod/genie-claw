@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Quick-router
+
+- **Calculator**: fold spoken-word decimals in the calculator path (`three point
+  five` → `3.5`, `ninety eight point six` → `98.6`) — extends digit-only spoken
+  decimals from #504 to cardinal-word forms.
+
 ## 1.0.0-rc.2 - 2026-07-01
 
 Second release candidate. The headline is a large, measured jump in
