@@ -70,11 +70,22 @@ pub fn dream_cycle(
     let candidates = score_candidates(memory, weights, min_recalls)?;
 
     // Phase 2: Promote top candidates above threshold.
-    let mut promoted = 0;
-    for candidate in candidates.iter().take(max_promotions) {
-        if candidate.score >= min_score {
-            memory.mark_promoted(candidate.entry.id)?;
-            promoted += 1;
+    //
+    // Collect the winners first and promote them in a single batch so the
+    // canonical MEMORY.md tree is rebuilt once for the whole cycle rather than
+    // once per promotion (each rebuild is a full `promoted = 1` scan plus a
+    // rewrite of MEMORY.md, INDEX.md, and every namespace file). Same rows
+    // promoted, same per-promotion log lines.
+    let winners: Vec<&PromotionCandidate> = candidates
+        .iter()
+        .take(max_promotions)
+        .filter(|candidate| candidate.score >= min_score)
+        .collect();
+
+    if !winners.is_empty() {
+        let ids: Vec<i64> = winners.iter().map(|candidate| candidate.entry.id).collect();
+        memory.mark_promoted_many(&ids)?;
+        for candidate in &winners {
             tracing::info!(
                 id = candidate.entry.id,
                 score = format!("{:.3}", candidate.score),
@@ -84,6 +95,7 @@ pub fn dream_cycle(
             );
         }
     }
+    let promoted = winners.len();
 
     // Phase 3: Prune decayed memories.
     let pruned = memory.prune_decayed(prune_threshold)?;
