@@ -1623,15 +1623,7 @@ async fn generate_bfcl_llm_predictions(
     let selected_cases = select_bfcl_cases(cases, limit);
     let system_prompt = build_bfcl_llm_system_prompt(&selected_cases);
     let config = Config::load()?;
-    let timeouts = genie_core::llm::LlmTimeouts::from_secs(
-        config.core.llm_connect_timeout_secs,
-        config.core.llm_read_timeout_secs,
-        config.core.llm_request_timeout_secs,
-    );
-    let llm = genie_core::llm::LlmClient::from_service_config_with_timeouts(
-        &config.services.llm,
-        timeouts,
-    );
+    let llm = genie_core::llm::LlmClient::from_config(&config)?;
     let backend = llm.backend_name().to_string();
 
     let mut predictions = Vec::with_capacity(selected_cases.len());
