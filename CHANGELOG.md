@@ -8,6 +8,18 @@
   five` → `3.5`, `ninety eight point six` → `98.6`) — extends digit-only spoken
   decimals from #504 to cardinal-word forms.
 
+### Fixed
+
+- **Quick-router live strict accuracy restored to 96% (25/26).** Three outputs
+  the committed BFCL suite expected were not actually produced by the live
+  `route_for_available_tools` path: the `memory_recall` note query now rebuilds
+  from the original text, preserving proper-noun and brand casing ("Find
+  Grandma's Wi-Fi note." → `Grandma Wi-Fi note`); the office standby entity
+  grounds to `office standby power`; and the green night-light preference keeps
+  the user's own phrasing (`Leo likes the green night-light better.`). The
+  remaining gap is the two-call homework-timer case (#533), which the
+  single-emit quick router cannot satisfy by design.
+
 ## 1.0.0-rc.2 - 2026-07-01
 
 Second release candidate. The headline is a large, measured jump in
