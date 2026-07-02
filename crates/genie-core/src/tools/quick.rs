@@ -2461,7 +2461,11 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     }
 
     let tokens = text.split_whitespace().collect::<Vec<_>>();
-    let (seconds, unit_end_index) = parse_duration(&tokens)?;
+    // Try a fractional duration ("half an hour", "quarter of an hour") before the
+    // whole-number parser: `parse_duration` skips the fraction word and reads the
+    // bare unit, so "half an hour" used to become "an hour" -> 3600s.
+    let (seconds, unit_end_index) =
+        fractional_duration(&tokens).or_else(|| parse_duration(&tokens))?;
     if seconds == 0 {
         return None;
     }
@@ -2801,6 +2805,42 @@ fn parse_decimal_token(token: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite())
+}
+
+/// Parse a fractional spoken duration such as "half an hour" or "quarter of an
+/// hour". `parse_duration` misses these: it skips the fraction word ("half" is
+/// not a spoken number) and reads the bare unit, so "half an hour" collapses to
+/// "an hour" -> 3600s instead of 1800s. Returns the whole-second duration and
+/// the index of the matched unit token (so the reminder-label path can look past
+/// it), or `None` when no `<fraction> [of] [a|an] <unit>` pattern is present.
+fn fractional_duration(tokens: &[&str]) -> Option<(u64, usize)> {
+    for i in 0..tokens.len() {
+        let (numerator, denominator) = match tokens[i] {
+            "half" => (1u64, 2),
+            "quarter" => (1u64, 4),
+            _ => continue,
+        };
+        // Optional connective / article between the fraction and the unit:
+        // "quarter of an hour", "half an hour", or the bare "half hour".
+        let mut unit_index = i + 1;
+        if tokens.get(unit_index).copied() == Some("of") {
+            unit_index += 1;
+        }
+        if matches!(tokens.get(unit_index).copied(), Some("a" | "an")) {
+            unit_index += 1;
+        }
+        let unit_seconds = match tokens.get(unit_index).copied() {
+            Some("second" | "seconds" | "sec" | "secs") => 1,
+            Some("minute" | "minutes" | "min" | "mins") => 60,
+            Some("hour" | "hours" | "hr" | "hrs") => 3600,
+            _ => continue,
+        };
+        // Integer math is exact for the recognized fractions of a minute/hour;
+        // sub-second results (e.g. "half a second") floor to 0 and the caller's
+        // `seconds == 0` guard abstains, letting the LLM handle it.
+        return Some((unit_seconds * numerator / denominator, unit_index));
+    }
+    None
 }
 
 fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
@@ -4566,6 +4606,34 @@ mod tests {
         let call = route("set a timer for 15 minutes").unwrap();
         assert_eq!(call.name, "set_timer");
         assert_eq!(call.arguments["seconds"], 900);
+    }
+
+    #[test]
+    fn routes_fractional_duration_timer() {
+        // Regression: "half an hour" used to skip "half" and read "an hour" as a
+        // whole unit, emitting a confidently-wrong set_timer{seconds:3600}.
+        let call = route("set a timer for half an hour").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 1800);
+
+        // The article is optional and other units divide too.
+        let call = route("set a timer for half a minute").unwrap();
+        assert_eq!(call.arguments["seconds"], 30);
+
+        // "quarter of an hour" -> 900s; the trailing label is still recovered.
+        let call = route("remind me in quarter of an hour to stretch").unwrap();
+        assert_eq!(call.arguments["seconds"], 900);
+        assert_eq!(call.arguments["label"], "stretch");
+
+        // The bare "half hour timer" phrasing (no article) works as well.
+        let call = route("set a half hour timer").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 1800);
+
+        // Whole-number durations are unaffected — the fraction path only fires on
+        // "half"/"quarter", otherwise it falls through to parse_duration.
+        let call = route("set a timer for 1 hour").unwrap();
+        assert_eq!(call.arguments["seconds"], 3600);
     }
 
     #[test]
