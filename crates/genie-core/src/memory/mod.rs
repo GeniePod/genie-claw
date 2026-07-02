@@ -1005,6 +1005,42 @@ impl Memory {
         Ok(self.query_hashes(id)?.len())
     }
 
+    /// Batch form of `query_diversity`: distinct query-shape counts for many
+    /// memory ids in a single query, avoiding the per-id `SELECT query_hashes`
+    /// N+1 in `recall::score_candidates` (up to ~1000 candidates per dream
+    /// cycle). Parsing matches `query_hashes` (`unwrap_or_default`). Ids with no
+    /// row are simply absent from the map; callers default to 0, matching the
+    /// old `query_diversity(id).unwrap_or(0)`.
+    pub fn query_diversity_for_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, usize>> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        // Stay under SQLite's 999 bound-variable limit.
+        const CHUNK: usize = 900;
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT id, query_hashes FROM memories WHERE id IN ({placeholders})");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                let id: i64 = row.get(0)?;
+                let hashes_json: String = row.get(1)?;
+                Ok((id, hashes_json))
+            })?;
+            for row in rows {
+                let (id, hashes_json) = row?;
+                let count = serde_json::from_str::<Vec<String>>(&hashes_json)
+                    .unwrap_or_default()
+                    .len();
+                out.insert(id, count);
+            }
+        }
+        Ok(out)
+    }
+
     /// Get recent memories for context injection.
     pub fn recent(&self, limit: usize) -> Result<Vec<MemoryEntry>> {
         let mut stmt = self.conn.prepare(
@@ -11296,6 +11332,91 @@ mod tests {
         // Promoted memories excluded from candidates.
         let candidates = mem.promotion_candidates(0, 0.0, 10).unwrap();
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn query_diversity_for_ids_matches_per_id() {
+        let mem = temp_memory();
+        let cases = [
+            ("[]", 0usize),
+            ("[\"a\"]", 1),
+            ("[\"a\",\"b\",\"c\"]", 3),
+            ("[\"x\",\"y\"]", 2),
+        ];
+        let mut ids = Vec::new();
+        for (json, _) in cases {
+            let id = mem.store("fact", "f").unwrap();
+            mem.conn
+                .execute(
+                    "UPDATE memories SET query_hashes = ?1 WHERE id = ?2",
+                    rusqlite::params![json, id],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        let batched = mem.query_diversity_for_ids(&ids).unwrap();
+        for (i, (_, expected)) in cases.iter().enumerate() {
+            let id = ids[i];
+            // Batched count matches the expected and the per-id query_diversity.
+            assert_eq!(
+                batched.get(&id).copied().unwrap_or(0),
+                *expected,
+                "batched id {id}"
+            );
+            assert_eq!(mem.query_diversity(id).unwrap(), *expected, "per-id {id}");
+        }
+        // Missing id -> absent (caller defaults to 0); empty input -> empty map.
+        assert!(mem.query_diversity_for_ids(&[999_999]).unwrap().is_empty());
+        assert!(mem.query_diversity_for_ids(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "microbench; run with --ignored --nocapture"]
+    fn bench_query_diversity_batched_vs_n_plus_1() {
+        use std::time::Instant;
+        let n = 500usize;
+        let reps = 20u32;
+
+        let mem = temp_memory();
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = mem.store("fact", &format!("f{i}")).unwrap();
+            mem.conn
+                .execute(
+                    "UPDATE memories SET query_hashes = ?1 WHERE id = ?2",
+                    rusqlite::params![format!("[\"q{i}a\",\"q{i}b\",\"q{i}c\"]"), id],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+
+        // NEW: one batched query.
+        let mut new_total = 0u128;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let m = mem.query_diversity_for_ids(&ids).unwrap();
+            new_total += t.elapsed().as_nanos();
+            assert_eq!(m.len(), n);
+        }
+
+        // OLD: one query_diversity per id (the N+1).
+        let mut old_total = 0u128;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let mut sum = 0usize;
+            for id in &ids {
+                sum += mem.query_diversity(*id).unwrap();
+            }
+            old_total += t.elapsed().as_nanos();
+            assert_eq!(sum, n * 3);
+        }
+
+        let new_ns = new_total / u128::from(reps);
+        let old_ns = old_total / u128::from(reps);
+        eprintln!(
+            "query_diversity over {n} ids: old(N+1) {old_ns} ns -> new(batched) {new_ns} ns ({:.2}x)",
+            old_ns as f64 / new_ns as f64
+        );
     }
 
     #[test]

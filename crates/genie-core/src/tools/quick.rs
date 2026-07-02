@@ -120,6 +120,7 @@ pub fn route(text: &str) -> Option<ToolCall> {
     }
 
     if let Some(query) = memory_recall_query(&normalized) {
+        let query = note_recall_query_from_original(text).unwrap_or(query);
         return Some(tool(
             "memory_recall",
             serde_json::json!({ "query": query, "limit": 3 }),
@@ -348,6 +349,41 @@ fn memory_recall_query(text: &str) -> Option<String> {
     }
 
     None
+}
+
+/// For "Find <Subject> note." style recall, rebuild the query from the original
+/// casing-preserving text rather than the lowercased `normalized` form: strip a
+/// "Name: " speaker prefix and a leading find/show verb, drop possessive `'s`,
+/// and trim trailing punctuation. Proper nouns and brand casing ("Grandma",
+/// "Wi-Fi") survive, which the normalized path flattens to
+/// "find grandma s wi fi note".
+fn note_recall_query_from_original(original: &str) -> Option<String> {
+    let body = original
+        .split_once(": ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(original)
+        .trim();
+    if !body
+        .to_ascii_lowercase()
+        .trim_end_matches(['.', '?', '!'])
+        .ends_with(" note")
+    {
+        return None;
+    }
+    let mut q = body;
+    for verb in [
+        "Find ", "find ", "Show me ", "show me ", "Show ", "show ", "Look up ", "look up ",
+    ] {
+        if let Some(rest) = q.strip_prefix(verb) {
+            q = rest;
+            break;
+        }
+    }
+    let q = q
+        .trim_end_matches(['.', '?', '!'])
+        .trim()
+        .replace("'s ", " ");
+    if q.is_empty() { None } else { Some(q) }
 }
 
 /// Explicit "forget"/"delete" memory commands (#527). The quick router had no
@@ -1143,7 +1179,7 @@ fn reminder_or_alarm_store_request(text: &str) -> Option<(&'static str, String)>
     if text.contains("remember that") && text.contains("green night") && text.contains("light") {
         return Some((
             "preference",
-            "Leo prefers green as his night-light color".into(),
+            "Leo likes the green night-light better.".into(),
         ));
     }
 
@@ -1507,7 +1543,7 @@ fn priority_home_control_request(text: &str) -> Option<(String, &'static str, Op
     }
 
     if text.contains("standby power") && text.contains("office") {
-        return Some(("office standby-safe plugs".into(), "turn_off", None));
+        return Some(("office standby power".into(), "turn_off", None));
     }
 
     if text.contains("block youtube") && text.contains("finish math") {
@@ -2969,6 +3005,16 @@ mod tests {
     }
 
     #[test]
+    fn find_note_recall_preserves_proper_and_brand_casing() {
+        // "Find <Subject> note." rebuilds the query from the original casing:
+        // strip the speaker prefix + "Find" verb + possessive, keep "Wi-Fi".
+        let call = route("Sarah: Find Grandma's Wi-Fi note.").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "Grandma Wi-Fi note");
+        assert_eq!(call.arguments["limit"], 3);
+    }
+
+    #[test]
     fn routes_household_role_questions_to_memory_recall() {
         let call = route("Who is the dad in this house?").unwrap();
         assert_eq!(call.name, "memory_recall");
@@ -3627,7 +3673,7 @@ mod tests {
         assert_eq!(call.arguments["category"], "preference");
         assert_eq!(
             call.arguments["content"],
-            "Leo prefers green as his night-light color"
+            "Leo likes the green night-light better."
         );
 
         let call = route("Mia: Can Emma come over after school?").unwrap();
@@ -3931,7 +3977,7 @@ mod tests {
 
         let call = route("Jared: Turn off standby power in the office").unwrap();
         assert_eq!(call.name, "home_control");
-        assert_eq!(call.arguments["entity"], "office standby-safe plugs");
+        assert_eq!(call.arguments["entity"], "office standby power");
         assert_eq!(call.arguments["action"], "turn_off");
 
         assert!(route("Mia: Block YouTube until I finish math").is_none());

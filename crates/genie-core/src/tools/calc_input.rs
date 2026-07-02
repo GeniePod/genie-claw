@@ -31,21 +31,66 @@ fn fold_spoken_decimals(text: &str) -> String {
     let mut index = 0;
 
     while index < tokens.len() {
-        let token = tokens[index];
-        let prev_is_digits = out.last().is_some_and(|p| is_digits(p));
-        let next_is_digits = tokens.get(index + 1).is_some_and(|n| is_digits(n));
-
-        if token == "point" && prev_is_digits && next_is_digits {
-            let prev = out.pop().expect("prev_is_digits implies a previous token");
-            out.push(format!("{prev}.{}", tokens[index + 1]));
-            index += 2;
-        } else {
-            out.push(token.to_string());
-            index += 1;
+        if let Some((consumed, decimal)) = match_decimal_fold_at(&tokens, index) {
+            out.push(decimal);
+            index += consumed;
+            continue;
         }
+
+        out.push(tokens[index].to_string());
+        index += 1;
     }
 
     out.join(" ")
+}
+
+/// Fold `<int> point <frac>` into a single decimal token.
+///
+/// Handles digit forms (`3 point 5` → `3.5`, landed in #504) and spoken forms
+/// (`three point five` → `3.5`, `ninety eight point six` → `98.6`). The
+/// fractional part is a single digit word (`zero`–`nine`) or digit token.
+fn match_decimal_fold_at(tokens: &[&str], start: usize) -> Option<(usize, String)> {
+    let point_rel = tokens[start..].iter().position(|token| *token == "point")?;
+    if point_rel == 0 {
+        return None;
+    }
+
+    let point_idx = start + point_rel;
+    let frac_token = tokens.get(point_idx + 1)?;
+    let frac_digit = parse_single_digit_word(frac_token).or_else(|| {
+        is_digits(frac_token)
+            .then(|| frac_token.parse::<u64>().ok())
+            .flatten()
+    })?;
+
+    let int_val = if point_idx == start + 1 && is_digits(tokens[start]) {
+        tokens[start].parse().ok()?
+    } else if let Some((value, end)) = super::number_words::parse_spoken_number(tokens, start)
+        && end == point_idx
+    {
+        value
+    } else {
+        return None;
+    };
+
+    let consumed = point_idx + 2 - start;
+    Some((consumed, format!("{int_val}.{frac_digit}")))
+}
+
+fn parse_single_digit_word(token: &str) -> Option<u64> {
+    match token {
+        "zero" => Some(0),
+        "one" => Some(1),
+        "two" => Some(2),
+        "three" => Some(3),
+        "four" => Some(4),
+        "five" => Some(5),
+        "six" => Some(6),
+        "seven" => Some(7),
+        "eight" => Some(8),
+        "nine" => Some(9),
+        _ => None,
+    }
 }
 
 fn is_digits(token: &str) -> bool {

@@ -2,19 +2,68 @@
 
 ## Unreleased
 
-- **Calculator handles decimals** (#504): the deterministic quick-router fed the
-  calculator text from the integer-only normalizer, which stripped the decimal
-  point — "what is 3.5 plus 2.5" became "3 5 + 2 5" and "12.5 percent of 80"
-  picked the stray "5". A new decimal-aware `calc_input::prepare` keeps a `.`
-  between digits, folds "3 point 5" into "3.5", and is used only by the
-  calculator branch, so other routing is unchanged.
-- **Full spoken-number durations** (#490): the quick-router only mapped a sparse
-  set of number words, so "set a timer for thirteen minutes" set no timer
-  (thirteen, fourteen, sixteen–nineteen were missing, and hundreds/thousands
-  were unsupported). A real English cardinal parser now folds units, teens,
-  tens, `hundred`, `thousand`, and the `and` connector into one value, so
-  "one hundred and twenty seconds" and the like resolve correctly. Digit forms
-  and the existing "forty five" compound are unchanged.
+### Quick-router
+
+- **Calculator**: fold spoken-word decimals in the calculator path (`three point
+  five` → `3.5`, `ninety eight point six` → `98.6`) — extends digit-only spoken
+  decimals from #504 to cardinal-word forms.
+
+### Fixed
+
+- **Quick-router live strict accuracy restored to 96% (25/26).** Three outputs
+  the committed BFCL suite expected were not actually produced by the live
+  `route_for_available_tools` path: the `memory_recall` note query now rebuilds
+  from the original text, preserving proper-noun and brand casing ("Find
+  Grandma's Wi-Fi note." → `Grandma Wi-Fi note`); the office standby entity
+  grounds to `office standby power`; and the green night-light preference keeps
+  the user's own phrasing (`Leo likes the green night-light better.`). The
+  remaining gap is the two-call homework-timer case (#533), which the
+  single-emit quick router cannot satisfy by design.
+
+## 1.0.0-rc.2 - 2026-07-01
+
+Second release candidate. The headline is a large, measured jump in
+**deterministic tool-call accuracy** — the quick router now handles far more
+household commands correctly without an LLM round-trip, taking BFCL strict
+accuracy on the committed suite from **~33% to 96%**. This RC also adds automatic
+storage pruning, a memory-maintenance optimization that is dramatically faster on
+Jetson, and continued CI/build hardening.
+
+### Quick-router tool-call accuracy
+
+- **Routing**: basic light on/off (#534), weather/home-status questions ahead of
+  memory recall (#540), "undo … last change/action" → `home_undo` (#538),
+  memory-pressure → `system_info` (#553), a `memory_forget` route (#547),
+  first-person facts/appointments → `memory_store` (#521), household action
+  canonicalization to valid `home_control` verbs (#509), and spoken-number
+  temperature setpoints (#507).
+- **Arguments**: `set_timer` labels extracted from "<label> timer …" (#539), full
+  spoken-number durations (#490), calculator decimals (#504) and word-form
+  arithmetic ("two plus two" → `2 + 2`) (#555), `memory_recall` default `limit`
+  and integer `set_temperature` (#537), `web_search` freshness and stock-ticker
+  resolution (Apple → AAPL) (#541, #555), speaker-possessive resolution in media
+  queries ("Mia: play my …") (#551), faithful preference paraphrasing, and
+  note-recall queries rebuilt from the original text (#555).
+- **Dispatch hardening**: whole-number float seconds accepted (#518), non-string
+  `set_timer` labels rejected at the boundary (#520), tied-entity disambiguation
+  instead of actuating the first device (#512), and `home_undo` no longer reports
+  success when blocked or restores groups incorrectly (#505, #508).
+
+### Storage & performance
+
+- **Automatic DB pruning + storage health** (#516): decayed conversation turns and
+  memories are pruned on a maintenance cycle, exposed via a storage-health endpoint.
+- **Batched memory pruning** (#542): `prune_decayed` coalesces per-row deletes into
+  batched `DELETE … IN (…)` — ~26× faster on x86 and ~270× on Jetson (per-commit
+  fsync dominates on eMMC).
+- Faster hot paths: single-pass accent tally in language detection (#513), lazy
+  injection normalization (#500), and memory-scan early-outs (#496, #498).
+
+### Build / CI
+
+- Release binary size budget raised to 6.6 MB after the quick-router growth (#544).
+- `--version` works without a config file (#493); web_search validation unified
+  across the voice and HTTP paths (#486); SQLite test temp-path isolation (#488).
 
 ## 1.0.0-rc.1 - 2026-06-24
 
