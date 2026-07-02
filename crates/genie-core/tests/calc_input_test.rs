@@ -22,6 +22,27 @@ fn spoken_point_becomes_decimal() {
 }
 
 #[test]
+fn spoken_word_decimals_fold_before_calculate() {
+    assert_eq!(
+        expression("what is three point five plus two point five"),
+        "3.5 + 2.5"
+    );
+    assert_eq!(
+        expression("what is twelve point five percent of 80"),
+        "80 * 12.5 / 100"
+    );
+    assert_eq!(
+        expression("convert ninety eight point six f to celsius"),
+        "(98.6 - 32) * 5 / 9"
+    );
+}
+
+#[test]
+fn mixed_digit_and_spoken_fraction_decimals() {
+    assert_eq!(expression("what is 3 point five plus 2.5"), "3.5 + 2.5");
+}
+
+#[test]
 fn decimal_percentage_and_temperature() {
     assert_eq!(expression("what is 12.5 percent of 80"), "80 * 12.5 / 100");
     assert_eq!(
