@@ -177,14 +177,15 @@ async fn main() -> Result<()> {
     // Open conversation store.
     let conv_path = config.data_dir.join("conversations.db");
     let conversations = conversation::ConversationStore::open(&conv_path)?;
-    let conv_list = conversations.list()?;
-    tracing::info!(conversations = conv_list.len(), "conversation store loaded");
+    let conv_list = conversations.list().await?;
+    let conv_count = conv_list.len();
+    tracing::info!(conversations = conv_count, "conversation store loaded");
 
     let boot_contract = memory::with_shared_memory(&memory, |mem| {
         genie_core::server::build_runtime_contract_snapshot(
             &tool_dispatcher,
             mem,
-            &conversations,
+            conv_count,
             &system_prompt,
             config.core.max_history_turns,
             model_family,
@@ -351,7 +352,8 @@ async fn main() -> Result<()> {
             model_family,
             config.core.expected_runtime_contract_hash.clone(),
             boot_harness,
-        )?
+        )
+        .await?
         .with_http_config(config.http.clone())
         .with_origin_auth(origin_resolver);
 
