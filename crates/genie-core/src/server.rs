@@ -1108,12 +1108,8 @@ async fn handle_chat_stream(
     let llm_response = llm_result?;
 
     let mut tool_name: Option<String> = None;
-    let final_response = if let Some(tool_result) = crate::tools::try_tool_call_with_context(
-        &llm_response,
-        tools,
-        tool_ctx,
-    )
-    .await
+    let final_response = if let Some(tool_result) =
+        crate::tools::try_tool_call_with_context(&llm_response, tools, tool_ctx).await
     {
         tool_name = Some(tool_result.tool.clone());
         let provider = LocalProvider::new(llm);
@@ -1390,12 +1386,8 @@ pub async fn process_chat_turn(
     };
 
     let mut tool_name: Option<String> = None;
-    let final_response = if let Some(tool_result) = crate::tools::try_tool_call_with_context(
-        &llm_response,
-        tools,
-        tool_ctx,
-    )
-    .await
+    let final_response = if let Some(tool_result) =
+        crate::tools::try_tool_call_with_context(&llm_response, tools, tool_ctx).await
     {
         tool_name = Some(tool_result.tool.clone());
         finalize_tool_turn(

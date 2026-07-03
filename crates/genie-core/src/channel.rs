@@ -56,11 +56,7 @@ impl Default for SpeakerInfo {
 impl SpeakerInfo {
     /// Memory policy inputs for this speaker on a chat/API turn (not shared-space voice).
     pub fn memory_read_context(&self, text: &str) -> MemoryReadContext {
-        crate::memory::policy::memory_read_context_from_text(
-            text,
-            self.confidence,
-            false,
-        )
+        crate::memory::policy::memory_read_context_from_text(text, self.confidence, false)
     }
 }
 

@@ -603,11 +603,7 @@ fn unix_time_ms() -> u128 {
 }
 
 pub fn build_memory_read_context(text: &str, speaker: &SpeakerIdentity) -> MemoryReadContext {
-    crate::memory::policy::memory_read_context_from_text(
-        text,
-        speaker.confidence,
-        true,
-    )
+    crate::memory::policy::memory_read_context_from_text(text, speaker.confidence, true)
 }
 
 fn identity_confidence_from_str(value: &str) -> IdentityConfidence {
