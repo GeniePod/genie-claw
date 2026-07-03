@@ -2464,8 +2464,9 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     // Try a fractional duration ("half an hour", "quarter of an hour") before the
     // whole-number parser: `parse_duration` skips the fraction word and reads the
     // bare unit, so "half an hour" used to become "an hour" -> 3600s.
-    let (seconds, unit_end_index) =
-        fractional_duration(&tokens).or_else(|| parse_duration(&tokens))?;
+    let (seconds, unit_end_index) = fractional_duration(&tokens)
+        .or_else(|| dozen_duration(&tokens))
+        .or_else(|| parse_duration(&tokens))?;
     if seconds == 0 {
         return None;
     }
@@ -2899,6 +2900,25 @@ fn fractional_duration(tokens: &[&str]) -> Option<(u64, usize)> {
         // sub-second results (e.g. "half a second") floor to 0 and the caller's
         // `seconds == 0` guard abstains, letting the LLM handle it.
         return Some((unit_seconds * numerator / denominator, unit_index));
+    }
+    None
+}
+
+/// Parse the spoken idiom "a dozen minutes" (always twelve of the unit).
+/// `parse_duration` does not treat "dozen" as a number, so these utterances
+/// used to abstain. Returns the duration and the unit token index for label
+/// extraction, matching `fractional_duration`.
+fn dozen_duration(tokens: &[&str]) -> Option<(u64, usize)> {
+    for i in 0..tokens.len() {
+        if tokens[i] != "dozen" {
+            continue;
+        }
+        let mut unit_index = i + 1;
+        if tokens.get(unit_index).copied() == Some("of") {
+            unit_index += 1;
+        }
+        let multiplier = duration_unit_seconds(tokens.get(unit_index).copied())?;
+        return Some((12_u64.saturating_mul(multiplier), unit_index));
     }
     None
 }
@@ -4717,6 +4737,29 @@ mod tests {
         // "half"/"quarter", otherwise it falls through to parse_duration.
         let call = route("set a timer for 1 hour").unwrap();
         assert_eq!(call.arguments["seconds"], 3600);
+    }
+
+    #[test]
+    fn routes_dozen_duration_timer() {
+        let call = route("set a timer for a dozen minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 720);
+
+        let call = route("remind me in a dozen minutes to stretch").unwrap();
+        assert_eq!(call.arguments["seconds"], 720);
+        assert_eq!(call.arguments["label"], "stretch");
+
+        // The connective "of" is optional; a leading article before "dozen" is fine.
+        let call = route("set a timer for dozen minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 720);
+
+        let call = route("set a timer for a dozen hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 43200);
+
+        // "dozen" inside a later label is not mistaken for duration.
+        let call = route("remind me in 5 minutes to buy a dozen eggs").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "buy a dozen eggs");
     }
 
     #[test]
