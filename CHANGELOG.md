@@ -70,6 +70,11 @@ the single-threaded executor no longer stalls one session behind another.
   into `structured.rs` / `parse_household.rs` (#604) — pure code moves, no behavior
   change.
 
+### Security
+
+- **`anyhow` 1.0.102 → 1.0.103** (RUSTSEC-2026-0190): patches an unsoundness in
+  `Error::downcast_mut()`. A semver-compatible patch bump; no code change.
+
 ### Build / CI
 
 - **The BFCL gate now scores the live quick-router**, not the hand-authored golden
