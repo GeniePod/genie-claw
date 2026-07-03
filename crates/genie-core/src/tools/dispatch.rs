@@ -180,6 +180,18 @@ fn parse_memory_store_content(args: &serde_json::Value) -> Result<Vec<(String, S
     Ok(memories)
 }
 
+/// Format a count with the grammatically correct noun form for user-facing
+/// answers, e.g. `count_noun(1, "item", "items")` -> "1 item" and
+/// `count_noun(2, "item", "items")` -> "2 items". Avoids the "1 item(s)"
+/// lazy-plural antipattern in tool responses.
+fn count_noun(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
 fn parse_calculate_expression(args: &serde_json::Value) -> Result<&str> {
     args.get("expression")
         .and_then(|v| v.as_str())
@@ -1542,7 +1554,11 @@ impl ToolDispatcher {
         if deleted == 0 {
             Ok(format!("No memories found matching '{}'.", query))
         } else {
-            Ok(format!("Forgot {} memory(ies) about '{}'.", deleted, query))
+            Ok(format!(
+                "Forgot {} about '{}'.",
+                count_noun(deleted, "memory", "memories"),
+                query
+            ))
         }
     }
 
@@ -1628,13 +1644,14 @@ impl ToolDispatcher {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            let total = count_noun(count, "item", "items");
             if removed {
                 return Ok(format!(
-                    "Removed {added} from the shopping list. You have {count} item(s) total."
+                    "Removed {added} from the shopping list. You have {total} total."
                 ));
             }
             return Ok(format!(
-                "Added {added} to the shopping list. You have {count} item(s) total."
+                "Added {added} to the shopping list. You have {total} total."
             ));
         }
 
@@ -1871,9 +1888,9 @@ impl ActuationRateLimiter {
         }
         if bucket.len() >= limit {
             anyhow::bail!(
-                "actuation from '{}' exceeded {} action(s) per minute",
+                "actuation from '{}' exceeded {} per minute",
                 origin.as_policy_key(),
-                limit
+                count_noun(limit, "action", "actions")
             );
         }
         bucket.push_back(now);
@@ -1907,7 +1924,11 @@ impl ToolRateLimiter {
             bucket.pop_front();
         }
         if bucket.len() >= limit {
-            anyhow::bail!("tool '{}' exceeded {} call(s) per minute", tool, limit);
+            anyhow::bail!(
+                "tool '{}' exceeded {} per minute",
+                tool,
+                count_noun(limit, "call", "calls")
+            );
         }
         bucket.push_back(now);
         Ok(())
@@ -2068,7 +2089,19 @@ fn format_household_role_answer(
         .map(|profile| profile.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{names} are the {role}s.")
+    format!("{names} are the {}.", pluralize_household_role(role))
+}
+
+/// Pluralize a canonical household role. Roles come from
+/// `normalize_household_role_query_token`, whose set is regular `+s` except for
+/// the two irregular plurals `child` -> `children` and `wife` -> `wives`.
+/// Without this, the multi-profile answer produced "childs"/"wifes".
+fn pluralize_household_role(role: &str) -> String {
+    match role {
+        "child" => "children".to_string(),
+        "wife" => "wives".to_string(),
+        other => format!("{other}s"),
+    }
 }
 
 fn normalize_memories_to_store(args: &serde_json::Value) -> Vec<(String, String)> {
@@ -3757,7 +3790,8 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("Added milk, eggs"));
-        assert!(result.contains("2 item"));
+        assert!(result.contains("You have 2 items total."));
+        assert!(!result.contains("item(s)"));
 
         {
             let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
@@ -3774,10 +3808,20 @@ mod tests {
             )
             .unwrap();
         assert!(result.contains("Removed milk"));
-        assert!(result.contains("1 item"));
+        assert!(result.contains("You have 1 item total."));
+        assert!(!result.contains("item(s)"));
 
         let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
         assert_eq!(mem.shopping_list_pending_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn count_noun_uses_singular_only_for_one() {
+        assert_eq!(count_noun(0, "item", "items"), "0 items");
+        assert_eq!(count_noun(1, "item", "items"), "1 item");
+        assert_eq!(count_noun(2, "item", "items"), "2 items");
+        assert_eq!(count_noun(1, "memory", "memories"), "1 memory");
+        assert_eq!(count_noun(3, "memory", "memories"), "3 memories");
     }
 
     #[test]
@@ -3979,6 +4023,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "Jared is the dad.");
+    }
+
+    #[test]
+    fn household_role_answer_pluralizes_irregular_roles() {
+        let profile = |name: &str, role: &str| crate::memory::HouseholdProfile {
+            source_memory_id: 0,
+            name: name.to_string(),
+            role: role.to_string(),
+        };
+
+        // "who are the kids" canonicalizes to role "child"; the plural must be
+        // "children", not the previous naive "childs".
+        assert_eq!(
+            format_household_role_answer(
+                "child",
+                &[profile("Leo", "child"), profile("Mia", "child")],
+            ),
+            "Leo, Mia are the children."
+        );
+
+        // The other irregular canonical role.
+        assert_eq!(
+            format_household_role_answer("wife", &[profile("Ada", "wife"), profile("Bea", "wife")],),
+            "Ada, Bea are the wives."
+        );
+
+        // Regular roles still pluralize with +s.
+        assert_eq!(
+            format_household_role_answer("son", &[profile("Leo", "son"), profile("Sam", "son")]),
+            "Leo, Sam are the sons."
+        );
+
+        // Single-profile phrasing is unchanged.
+        assert_eq!(
+            format_household_role_answer("child", &[profile("Leo", "child")]),
+            "Leo is the child."
+        );
+    }
+
+    #[test]
+    fn memory_recall_pluralizes_multiple_children() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-children-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("relationship", "Leo is my child").unwrap();
+        memory.store("relationship", "Mia is my child").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "who are the kids in this house"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        // End-to-end: "kids" canonicalizes to role "child" and the two stored
+        // profiles must read "children", not "childs".
+        assert!(
+            output.contains("are the children."),
+            "expected a 'children' plural, got: {output}"
+        );
+        assert!(
+            output.contains("Leo") && output.contains("Mia"),
+            "got: {output}"
+        );
     }
 
     #[test]
