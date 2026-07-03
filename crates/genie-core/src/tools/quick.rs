@@ -2595,15 +2595,51 @@ fn is_time_unit(token: &str) -> bool {
     )
 }
 
+/// True when the text after `rain in …` is a time expression ("the morning",
+/// "an hour", "20 minutes", "a bit") rather than a place, so it must not be
+/// treated as a weather location. Leading "the " is already trimmed by
+/// [`extract_location_after_marker`].
+fn is_time_expression(location: &str) -> bool {
+    // Vague time-of-day / duration words that are single tokens (so they are not
+    // caught by the "<n> <unit>" tail check below).
+    const TIME_PHRASES: &[&str] = &[
+        "morning",
+        "afternoon",
+        "evening",
+        "night",
+        "midday",
+        "noon",
+        "midnight",
+        "a while",
+        "a bit",
+        "a moment",
+    ];
+    if TIME_PHRASES.contains(&location) {
+        return true;
+    }
+    // Numeric / vague durations ending in a time unit: "20 minutes", "an hour",
+    // "a few hours", "a couple days", "the next hour".
+    matches!(
+        location.split_whitespace().next_back(),
+        Some(last) if is_time_unit(last) || matches!(last, "day" | "days" | "week" | "weeks")
+    )
+}
+
 fn weather_request(text: &str) -> Option<(String, bool)> {
     if text.starts_with("is it rain") || text.starts_with("will it rain") {
         if text.contains("school pickup") {
             return Some(("home".into(), false));
         }
-        if let Some(location) = extract_location_after_marker(text, " for ")
+        // Accept a named place after "in"/"for" ("will it rain in Seattle"), but
+        // not a time expression ("will it rain in the morning" / "in an hour"),
+        // which keeps the default local forecast. The " for " marker alone missed
+        // the common "rain in <city>" order entirely.
+        if let Some(location) = extract_location_after_marker(text, " in ")
+            .or_else(|| extract_location_after_marker(text, " for "))
             && !location.is_empty()
             && location != "today"
             && location != "tomorrow"
+            && !is_time_expression(&location)
         {
             if location.contains("school pickup") {
                 return Some(("home".into(), false));
@@ -4925,6 +4961,38 @@ mod tests {
             assert_eq!(call.name, "get_weather", "{utterance:?}");
             assert_eq!(call.arguments["location"], location, "{utterance:?}");
             assert_eq!(call.arguments["forecast"], forecast, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn rain_query_keeps_named_city() {
+        // "will it rain in <city>" used to drop the city and return home weather
+        // because the rain branch only checked the " for " marker, never " in ".
+        for (utterance, location) in [
+            ("will it rain in Seattle tomorrow?", "seattle"),
+            ("is it raining in Denver", "denver"),
+            ("will it rain in New York this weekend", "new york"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_weather", "{utterance:?}");
+            assert_eq!(call.arguments["location"], location, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn rain_query_time_expression_is_not_a_location() {
+        // A time expression after "in" ("the morning", "an hour", "20 minutes")
+        // is not a place — the query must keep the default local forecast, not
+        // route to get_weather with location "morning".
+        for utterance in [
+            "will it rain in the morning",
+            "will it rain in an hour",
+            "will it rain in 20 minutes",
+            "will it rain in a bit",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_weather", "{utterance:?}");
+            assert_eq!(call.arguments["location"], "home", "{utterance:?}");
         }
     }
 
