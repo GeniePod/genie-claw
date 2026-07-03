@@ -1,5 +1,6 @@
 mod genie_ai_runtime;
 mod llama_cpp;
+mod local_provider;
 mod mock;
 mod openai_compat;
 mod openai_compatible;
@@ -12,6 +13,7 @@ use genie_common::config::{LlmBackendKind, ServiceEndpoint};
 
 pub use genie_ai_runtime::GenieAiRuntimeBackend;
 pub use llama_cpp::LlamaCppBackend;
+pub use local_provider::{LocalProvider, Provider};
 pub use mock::MockLlmBackend;
 pub use openai_compat::{LlmTimeouts, Message, ResponseFormat};
 pub use openai_compatible::OpenAiCompatibleBackend;
