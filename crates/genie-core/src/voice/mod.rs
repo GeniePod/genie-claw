@@ -41,14 +41,7 @@ pub struct VoiceOrchestrator {
 
 impl VoiceOrchestrator {
     pub async fn new(config: Config) -> Result<Self> {
-        let llm = LlmClient::from_service_config_with_timeouts(
-            &config.services.llm,
-            llm::LlmTimeouts::from_secs(
-                config.core.llm_connect_timeout_secs,
-                config.core.llm_read_timeout_secs,
-                config.core.llm_request_timeout_secs,
-            ),
-        );
+        let llm = LlmClient::from_config(&config)?;
 
         let ha = crate::ha::provider_from_config(&config);
         let skill_loader = crate::skills::load_all_with_policy(

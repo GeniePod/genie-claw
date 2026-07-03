@@ -63,7 +63,7 @@ pub async fn run(
 
         // Persist user message.
         conversations
-            .append_or_log(&conv_id, "user", text, None)
+            .append_or_log(&conv_id, "user", text, None, None)
             .await;
 
         if let Some(call) = tools::quick::route_for_available_tools(
@@ -94,7 +94,13 @@ pub async fn run(
 
             eprintln!("\nGeniePod: {}", response);
             conversations
-                .append_or_log(&conv_id, "assistant", &tool_json, Some(&tool_result.tool))
+                .append_or_log(
+                    &conv_id,
+                    "assistant",
+                    &tool_json,
+                    Some(&tool_result.tool),
+                    None,
+                )
                 .await;
             conversations
                 .append_or_log(
@@ -102,10 +108,11 @@ pub async fn run(
                     "system",
                     &format!("Tool: {}", tool_result.output),
                     None,
+                    None,
                 )
                 .await;
             conversations
-                .append_or_log(&conv_id, "assistant", &response, None)
+                .append_or_log(&conv_id, "assistant", &response, None, None)
                 .await;
 
             let stored = with_shared_memory(memory, |memory| {
@@ -172,13 +179,20 @@ pub async fn run(
                 {
                     eprintln!("[TOOL: {}] {}", tool_result.tool, tool_result.output);
                     conversations
-                        .append_or_log(&conv_id, "assistant", &response, Some(&tool_result.tool))
+                        .append_or_log(
+                            &conv_id,
+                            "assistant",
+                            &response,
+                            Some(&tool_result.tool),
+                            None,
+                        )
                         .await;
                     conversations
                         .append_or_log(
                             &conv_id,
                             "system",
                             &format!("Tool: {}", tool_result.output),
+                            None,
                             None,
                         )
                         .await;
@@ -195,7 +209,7 @@ pub async fn run(
 
                     if preserve_raw {
                         conversations
-                            .append_or_log(&conv_id, "assistant", &tool_result.output, None)
+                            .append_or_log(&conv_id, "assistant", &tool_result.output, None, None)
                             .await;
                     } else {
                         // Get follow-up summary.
@@ -226,7 +240,7 @@ pub async fn run(
                             Ok(summary) => {
                                 eprintln!();
                                 conversations
-                                    .append_or_log(&conv_id, "assistant", &summary, None)
+                                    .append_or_log(&conv_id, "assistant", &summary, None, None)
                                     .await;
                             }
                             Err(_) => eprintln!(),
@@ -234,7 +248,7 @@ pub async fn run(
                     }
                 } else {
                     conversations
-                        .append_or_log(&conv_id, "assistant", &response, None)
+                        .append_or_log(&conv_id, "assistant", &response, None, None)
                         .await;
                 }
             }

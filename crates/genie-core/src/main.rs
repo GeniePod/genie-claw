@@ -65,21 +65,17 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Build shared components. Thread the operator-configured network timeouts
-    // into the client so every chat call site inherits a bounded read (issue
-    // #181): a hung backend now fails the turn instead of wedging the daemon.
-    let llm_timeouts = llm::LlmTimeouts::from_secs(
-        config.core.llm_connect_timeout_secs,
-        config.core.llm_read_timeout_secs,
-        config.core.llm_request_timeout_secs,
-    );
-    let llm = llm::LlmClient::from_service_config_with_timeouts(&config.services.llm, llm_timeouts);
+    let llm = llm::LlmClient::from_config(&config)?;
     tracing::info!(
         backend = %llm.backend_name(),
+        provider = ?config.active_llm_provider_kind(),
+        model = %config.core.llm_model_name,
+        model_path = %config.core.llm_model_path.display(),
+        context_window_tokens = config.agent.context_window_tokens,
         connect_timeout_secs = config.core.llm_connect_timeout_secs,
         read_timeout_secs = config.core.llm_read_timeout_secs,
         request_timeout_secs = config.core.llm_request_timeout_secs,
-        "LLM backend configured"
+        "LLM provider configured"
     );
 
     let ha = ha::provider_from_config(&config);

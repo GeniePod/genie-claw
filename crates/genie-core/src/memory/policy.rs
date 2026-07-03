@@ -36,6 +36,19 @@ pub enum IdentityConfidence {
     High,
 }
 
+impl IdentityConfidence {
+    /// Stable lowercase representation for logs/audit trails — independent of
+    /// the derived `Debug` repr, which is free to change with variant names.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IdentityConfidence::Unknown => "unknown",
+            IdentityConfidence::Low => "low",
+            IdentityConfidence::Medium => "medium",
+            IdentityConfidence::High => "high",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryDisclosure {
     Speak,

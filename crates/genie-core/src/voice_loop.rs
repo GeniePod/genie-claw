@@ -364,6 +364,10 @@ async fn run_with_wakeword(
                                 },
                             );
                             let read_context = identity::build_memory_read_context(&text, &speaker);
+                            crate::security::audit::log_speaker_resolved(
+                                speaker.name.as_deref().unwrap_or("unknown"),
+                                speaker.confidence.as_str(),
+                            );
                             let _ = tokio::fs::remove_file(&followup_path).await;
 
                             if let VoiceIntentDecision::Reject(reason) =
@@ -384,7 +388,13 @@ async fn run_with_wakeword(
                             // Build context and process — reuse voice_cycle but skip recording
                             // (we already have the text).
                             conversations
-                                .append_or_log(conv_id, "user", &text, None)
+                                .append_or_log(
+                                    conv_id,
+                                    "user",
+                                    &text,
+                                    None,
+                                    speaker.name.as_deref(),
+                                )
                                 .await;
 
                             if handle_quick_tool_for_voice(
@@ -442,7 +452,7 @@ async fn run_with_wakeword(
                             {
                                 Ok(response) => {
                                     conversations
-                                        .append_or_log(conv_id, "assistant", &response, None)
+                                        .append_or_log(conv_id, "assistant", &response, None, None)
                                         .await;
                                     eprintln!("[voice] GeniePod: {}", format::for_voice(&response));
                                 }
@@ -718,7 +728,7 @@ async fn handle_quick_tool_for_voice(
         if let Some(rejected) = tools.gate_tool_call(&call, exec_ctx) {
             let response = crate::security::sandbox::sanitize_output(&rejected.output);
             conversations
-                .append_or_log(conv_id, "assistant", &response, None)
+                .append_or_log(conv_id, "assistant", &response, None, None)
                 .await;
             let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
             let voice_text = format::for_voice(&response);
@@ -737,7 +747,7 @@ async fn handle_quick_tool_for_voice(
                     let started = std::time::Instant::now();
                     tools.audit_gated_tool(&call, exec_ctx, started, false, &response);
                     conversations
-                        .append_or_log(conv_id, "assistant", &response, None)
+                        .append_or_log(conv_id, "assistant", &response, None, None)
                         .await;
                     let tts_engine =
                         tts_engine_for_language(voice_cfg, audio_device, response_language);
@@ -770,13 +780,19 @@ async fn handle_quick_tool_for_voice(
         .to_string();
 
         conversations
-            .append_or_log(conv_id, "assistant", &tool_json, Some("web_search"))
+            .append_or_log(conv_id, "assistant", &tool_json, Some("web_search"), None)
             .await;
         conversations
-            .append_or_log(conv_id, "system", &format!("Tool: {}", response), None)
+            .append_or_log(
+                conv_id,
+                "system",
+                &format!("Tool: {}", response),
+                None,
+                None,
+            )
             .await;
         conversations
-            .append_or_log(conv_id, "assistant", &response, None)
+            .append_or_log(conv_id, "assistant", &response, None, None)
             .await;
 
         let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
@@ -811,7 +827,13 @@ async fn handle_quick_tool_for_voice(
     .to_string();
 
     conversations
-        .append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool))
+        .append_or_log(
+            conv_id,
+            "assistant",
+            &tool_json,
+            Some(&tool_result.tool),
+            None,
+        )
         .await;
     conversations
         .append_or_log(
@@ -819,10 +841,11 @@ async fn handle_quick_tool_for_voice(
             "system",
             &format!("Tool: {}", tool_result.output),
             None,
+            None,
         )
         .await;
     conversations
-        .append_or_log(conv_id, "assistant", &response, None)
+        .append_or_log(conv_id, "assistant", &response, None, None)
         .await;
 
     let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
@@ -1074,6 +1097,10 @@ pub async fn process_transcript(
             detected_language: response_language.as_deref(),
         });
     let read_context = identity::build_memory_read_context(&text, &speaker);
+    crate::security::audit::log_speaker_resolved(
+        speaker.name.as_deref().unwrap_or("unknown"),
+        speaker.confidence.as_str(),
+    );
     if let Some(path) = wav_path {
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -1086,7 +1113,7 @@ pub async fn process_transcript(
         text, transcript.duration_ms
     );
     conversations
-        .append_or_log(conv_id, "user", &text, None)
+        .append_or_log(conv_id, "user", &text, None, speaker.name.as_deref())
         .await;
 
     if let Some(final_response) = handle_quick_tool_for_voice(
@@ -1210,13 +1237,20 @@ pub async fn process_transcript(
             tool_result.tool, tool_result.output
         );
         conversations
-            .append_or_log(conv_id, "assistant", &response, Some(&tool_result.tool))
+            .append_or_log(
+                conv_id,
+                "assistant",
+                &response,
+                Some(&tool_result.tool),
+                None,
+            )
             .await;
         conversations
             .append_or_log(
                 conv_id,
                 "system",
                 &format!("Tool: {}", tool_result.output),
+                None,
                 None,
             )
             .await;
@@ -1277,12 +1311,12 @@ pub async fn process_transcript(
         };
 
         conversations
-            .append_or_log(conv_id, "assistant", &summary, None)
+            .append_or_log(conv_id, "assistant", &summary, None, None)
             .await;
         (summary, Some(tool_result.tool))
     } else {
         conversations
-            .append_or_log(conv_id, "assistant", &response, None)
+            .append_or_log(conv_id, "assistant", &response, None, None)
             .await;
         (response, None)
     };
