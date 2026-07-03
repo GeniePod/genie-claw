@@ -11420,6 +11420,88 @@ mod tests {
     }
 
     #[test]
+    fn wal_pruning_path_recovers_after_unclean_shutdown() {
+        // Durability check for the WAL/pruning path (#516/#542): committed writes
+        // and a decayed-prune must survive a process that dies without a clean
+        // close, and the reopened database must pass an integrity check.
+        let path = temp_memory_path("crash-recovery");
+
+        let mem = Memory::open(&path).unwrap();
+        for i in 0..50 {
+            mem.store("fact", &format!("durable fact {i}")).unwrap();
+        }
+        // Age half the rows so the decayed-prune (the chunked IN(...) DELETE from
+        // #542) actually removes them inside the WAL before the crash.
+        mem.conn
+            .execute("UPDATE memories SET accessed_ms = 0 WHERE id % 2 = 0", [])
+            .unwrap();
+        let pruned = mem.prune_decayed(0.5).unwrap();
+        assert!(pruned > 0, "aged rows should have been pruned");
+        let survivors = mem.count().unwrap();
+
+        // Simulate an unclean shutdown: leak the connection so its destructor never
+        // runs, meaning the WAL is never checkpointed or cleanly closed. This is the
+        // state left behind by a killed process or a power loss mid-run.
+        std::mem::forget(mem);
+
+        // Recovery: a fresh connection must replay the committed WAL frames.
+        let recovered = Memory::open(&path).unwrap();
+        let integrity: String = recovered
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "database corrupt after unclean shutdown");
+        assert_eq!(
+            recovered.count().unwrap(),
+            survivors,
+            "committed state not recovered from the WAL"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_serialize_without_corruption() {
+        // WAL mode plus busy_timeout must let several connections write the same
+        // database at once without losing writes or corrupting the file.
+        let path = temp_memory_path("concurrent-write");
+        // Create the schema up front so the writer threads open an existing
+        // database and do not race on first-time migration.
+        {
+            let seed = Memory::open(&path).unwrap();
+            seed.store("fact", "seed").unwrap();
+        }
+
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 25;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    // Each thread owns its own connection; nothing is shared.
+                    let mem = Memory::open(&p).unwrap();
+                    for i in 0..PER_THREAD {
+                        mem.store("fact", &format!("thread {t} write {i}")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mem = Memory::open(&path).unwrap();
+        let integrity: String = mem
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "concurrent writes corrupted the database");
+        assert_eq!(
+            mem.count().unwrap(),
+            1 + THREADS * PER_THREAD,
+            "a concurrent write was lost"
+        );
+    }
+
+    #[test]
     fn search_handles_question_words_and_apostrophes() {
         let mem = temp_memory();
         mem.store("identity", "User's name is Jared").unwrap();

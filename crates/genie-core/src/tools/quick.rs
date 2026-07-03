@@ -2461,7 +2461,11 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     }
 
     let tokens = text.split_whitespace().collect::<Vec<_>>();
-    let (seconds, unit_end_index) = parse_duration(&tokens)?;
+    // Try a fractional duration ("half an hour", "quarter of an hour") before the
+    // whole-number parser: `parse_duration` skips the fraction word and reads the
+    // bare unit, so "half an hour" used to become "an hour" -> 3600s.
+    let (seconds, unit_end_index) =
+        fractional_duration(&tokens).or_else(|| parse_duration(&tokens))?;
     if seconds == 0 {
         return None;
     }
@@ -2726,9 +2730,8 @@ fn temperature_conversion_expression(text: &str) -> Option<String> {
         return None;
     }
     let tokens = text.split_whitespace().collect::<Vec<_>>();
-    let fahrenheit = tokens
-        .iter()
-        .find_map(|token| parse_decimal_token(token.trim_end_matches("f")))?;
+    let to_idx = tokens.iter().position(|token| *token == "to")?;
+    let fahrenheit = calc_number_before_to(&tokens, to_idx)?;
     Some(format!("({fahrenheit} - 32) * 5 / 9"))
 }
 
@@ -2737,12 +2740,12 @@ fn percentage_expression(text: &str) -> Option<String> {
     let percent_idx = tokens
         .iter()
         .position(|token| matches!(*token, "percent" | "percentage" | "%"))?;
-    let percent = parse_decimal_token(tokens.get(percent_idx.wrapping_sub(1))?)?;
+    let percent = calc_number_ending_at(&tokens, percent_idx)?;
 
     let of_idx = tokens.iter().position(|token| *token == "of")?;
-    let base = parse_decimal_token(tokens.get(of_idx + 1)?)?;
+    let base = calc_number_starting_at(&tokens, of_idx + 1)?;
 
-    Some(format!("{} * {} / 100", base, percent))
+    Some(format!("{base} * {percent} / 100"))
 }
 
 fn arithmetic_expression(text: &str) -> Option<String> {
@@ -2796,11 +2799,108 @@ fn words_to_digits(expression: &str) -> String {
 }
 
 fn parse_decimal_token(token: &str) -> Option<f64> {
-    token
-        .trim_end_matches('%')
+    let trimmed = token.trim_end_matches('%').trim_end_matches('f');
+    trimmed
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite())
+        .or_else(|| super::number_words::parse_amount(trimmed))
+}
+
+/// Parse a cardinal (digit or spoken-word) immediately before `end`.
+fn calc_number_ending_at(tokens: &[&str], end: usize) -> Option<f64> {
+    if end == 0 {
+        return None;
+    }
+    let mut best: Option<f64> = None;
+    let mut best_span = 0usize;
+    for start in 0..end {
+        if let Some((value, consumed)) = super::number_words::parse_spoken_number(tokens, start)
+            && consumed == end
+        {
+            let span = end - start;
+            if span > best_span {
+                best = Some(value as f64);
+                best_span = span;
+            }
+        }
+    }
+    best.or_else(|| parse_decimal_token(tokens[end - 1]))
+}
+
+/// Parse a cardinal (digit or spoken-word) starting at `start`.
+fn calc_number_starting_at(tokens: &[&str], start: usize) -> Option<f64> {
+    if start >= tokens.len() {
+        return None;
+    }
+    if let Some((value, _)) = super::number_words::parse_spoken_number(tokens, start) {
+        return Some(value as f64);
+    }
+    parse_decimal_token(tokens[start])
+}
+
+/// Fahrenheit value before a `to celsius` tail, tolerating a trailing `f` token
+/// and optional unit words (`degrees`, `fahrenheit`).
+fn calc_number_before_to(tokens: &[&str], to_idx: usize) -> Option<f64> {
+    if to_idx == 0 {
+        return None;
+    }
+    let mut end = to_idx;
+    if end > 0 && tokens[end - 1] == "f" {
+        end -= 1;
+    }
+    const SKIP_BEFORE_TO: &[&str] = &["degrees", "degree", "fahrenheit", "f"];
+    while end > 0 && SKIP_BEFORE_TO.contains(&tokens[end - 1]) {
+        end -= 1;
+    }
+    calc_number_ending_at(tokens, end)
+}
+
+/// Seconds-per-unit for a duration unit token, or `None` when the token is not
+/// a recognized time unit.
+fn duration_unit_seconds(unit: Option<&str>) -> Option<u64> {
+    Some(match unit? {
+        "second" | "seconds" | "sec" | "secs" => 1,
+        "minute" | "minutes" | "min" | "mins" => 60,
+        "hour" | "hours" | "hr" | "hrs" => 3600,
+        _ => return None,
+    })
+}
+
+/// Parse a fractional spoken duration such as "half an hour" or "quarter of an
+/// hour". `parse_duration` misses these: it skips the fraction word ("half" is
+/// not a spoken number) and reads the bare unit, so "half an hour" collapses to
+/// "an hour" -> 3600s instead of 1800s. Returns the whole-second duration and
+/// the index of the matched unit token (so the reminder-label path can look past
+/// it), or `None` when no `<fraction> [of] [a|an] <unit>` pattern is present.
+fn fractional_duration(tokens: &[&str]) -> Option<(u64, usize)> {
+    for i in 0..tokens.len() {
+        let (numerator, denominator) = match tokens[i] {
+            "half" => (1u64, 2),
+            "quarter" => (1u64, 4),
+            _ => continue,
+        };
+        // Optional connective / article between the fraction and the unit:
+        // "quarter of an hour", "half an hour", or the bare "half hour".
+        let mut unit_index = i + 1;
+        if tokens.get(unit_index).copied() == Some("of") {
+            unit_index += 1;
+        }
+        if matches!(tokens.get(unit_index).copied(), Some("a" | "an")) {
+            unit_index += 1;
+        }
+        let unit_seconds = match tokens.get(unit_index).copied() {
+            Some("second" | "seconds" | "sec" | "secs") => 1,
+            Some("minute" | "minutes" | "min" | "mins") => 60,
+            Some("hour" | "hours" | "hr" | "hrs") => 3600,
+            _ => continue,
+        };
+        // Integer math is exact for the recognized fractions of a minute/hour;
+        // sub-second results (e.g. "half a second") floor to 0 and the caller's
+        // `seconds == 0` guard abstains, letting the LLM handle it.
+        return Some((unit_seconds * numerator / denominator, unit_index));
+    }
+    None
 }
 
 fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
@@ -2811,16 +2911,39 @@ fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
             start += 1;
             continue;
         };
-        let multiplier = match tokens.get(unit_index).copied() {
-            Some("second" | "seconds" | "sec" | "secs") => 1,
-            Some("minute" | "minutes" | "min" | "mins") => 60,
-            Some("hour" | "hours" | "hr" | "hrs") => 3600,
-            _ => {
-                start += 1;
-                continue;
-            }
+        let Some(multiplier) = duration_unit_seconds(tokens.get(unit_index).copied()) else {
+            start += 1;
+            continue;
         };
-        return Some((amount.saturating_mul(multiplier), unit_index));
+        // First "<number> <unit>" span matched. Sum any immediately-following
+        // spans so compound durations like "1 hour and 30 minutes" or "2 hours
+        // 15 minutes" accumulate instead of truncating to the first unit — the
+        // trailing "and 30 minutes" was previously dropped, emitting a
+        // confidently-wrong `set_timer{seconds:3600}`. Only spans sitting
+        // directly after the previous unit (optionally separated by a single
+        // connective "and") are summed, so a number later inside a timer label
+        // ("... to feed the 2 cats") is never mistaken for more duration.
+        // Returning the *last* consumed unit index also keeps the trailing span
+        // out of the label window used by `reminder_label` /
+        // `extract_named_timer_label`.
+        let mut total = amount.saturating_mul(multiplier);
+        let mut last_unit_index = unit_index;
+        loop {
+            let mut next = last_unit_index + 1;
+            if tokens.get(next).copied() == Some("and") {
+                next += 1;
+            }
+            let Some((amount, unit_index)) = super::number_words::parse_spoken_number(tokens, next)
+            else {
+                break;
+            };
+            let Some(multiplier) = duration_unit_seconds(tokens.get(unit_index).copied()) else {
+                break;
+            };
+            total = total.saturating_add(amount.saturating_mul(multiplier));
+            last_unit_index = unit_index;
+        }
+        return Some((total, last_unit_index));
     }
     None
 }
@@ -4569,6 +4692,34 @@ mod tests {
     }
 
     #[test]
+    fn routes_fractional_duration_timer() {
+        // Regression: "half an hour" used to skip "half" and read "an hour" as a
+        // whole unit, emitting a confidently-wrong set_timer{seconds:3600}.
+        let call = route("set a timer for half an hour").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 1800);
+
+        // The article is optional and other units divide too.
+        let call = route("set a timer for half a minute").unwrap();
+        assert_eq!(call.arguments["seconds"], 30);
+
+        // "quarter of an hour" -> 900s; the trailing label is still recovered.
+        let call = route("remind me in quarter of an hour to stretch").unwrap();
+        assert_eq!(call.arguments["seconds"], 900);
+        assert_eq!(call.arguments["label"], "stretch");
+
+        // The bare "half hour timer" phrasing (no article) works as well.
+        let call = route("set a half hour timer").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 1800);
+
+        // Whole-number durations are unaffected — the fraction path only fires on
+        // "half"/"quarter", otherwise it falls through to parse_duration.
+        let call = route("set a timer for 1 hour").unwrap();
+        assert_eq!(call.arguments["seconds"], 3600);
+    }
+
+    #[test]
     fn routes_compound_worded_timer() {
         // Regression: "forty five" used to parse as the trailing "five" (5 min)
         // because the compound cardinal was never stitched from its two tokens.
@@ -4588,6 +4739,43 @@ mod tests {
         let call = route("remind me in forty five minutes to check the oven").unwrap();
         assert_eq!(call.arguments["seconds"], 2700);
         assert_eq!(call.arguments["label"], "check the oven");
+    }
+
+    #[test]
+    fn routes_compound_multi_unit_timer() {
+        // Regression: "<hours> and <minutes>" used to truncate to the hours only
+        // (parse_duration returned on the first matched span), emitting a
+        // confidently-wrong set_timer instead of summing the spans.
+        let call = route("set a timer for 1 hour and 30 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 5400);
+
+        let call = route("set a timer for 2 hours and 15 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 8100);
+
+        // The connective "and" is optional.
+        let call = route("set a timer for 1 hour 30 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+
+        // Three spans sum too; worded amounts stitch the same way.
+        let call = route("set a timer for one hour twenty minutes and 30 seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 3600 + 20 * 60 + 30);
+
+        // The summed span is carried past the label boundary, so the trailing
+        // duration is not swallowed into the reminder label.
+        let call = route("remind me in 1 hour and 30 minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // Single-unit durations are unchanged; a lone number in a later label is
+        // not mistaken for another duration span.
+        let call = route("set a timer for 90 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+        let call = route("set a timer for 10 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 600);
+        let call = route("remind me in 5 minutes to feed the 2 cats").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "feed the 2 cats");
     }
 
     #[test]
