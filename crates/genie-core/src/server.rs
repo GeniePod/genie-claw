@@ -1209,10 +1209,10 @@ fn incoming_turn_from_chat_json(
 ) -> IncomingTurn {
     let text = parsed.get("message").and_then(|v| v.as_str()).unwrap_or("");
     let mut turn = IncomingTurn::new(text, fallback_session, ChannelKind::Http);
-    if let Some(speaker) = parsed.get("speaker").map(parse_speaker_field) {
-        if speaker.is_resolved() {
-            turn = turn.with_speaker(speaker);
-        }
+    if let Some(speaker) = parsed.get("speaker").map(parse_speaker_field)
+        && speaker.is_resolved()
+    {
+        turn = turn.with_speaker(speaker);
     }
     turn
 }
