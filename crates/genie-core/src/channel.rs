@@ -54,9 +54,18 @@ impl Default for SpeakerInfo {
 }
 
 impl SpeakerInfo {
-    /// Memory policy inputs for this speaker on a chat/API turn (not shared-space voice).
-    pub fn memory_read_context(&self, text: &str) -> MemoryReadContext {
-        crate::memory::policy::memory_read_context_from_text(text, self.confidence, false)
+    /// True when a transport supplied a resolved speaker (name or confidence).
+    pub fn is_resolved(&self) -> bool {
+        self.name.is_some() || self.confidence != IdentityConfidence::Unknown
+    }
+
+    /// Memory policy inputs for this speaker.
+    pub fn memory_read_context(&self, text: &str, shared_space_voice: bool) -> MemoryReadContext {
+        crate::memory::policy::memory_read_context_from_text(
+            text,
+            self.confidence,
+            shared_space_voice,
+        )
     }
 }
 
@@ -106,6 +115,42 @@ impl IncomingTurn {
     pub fn with_speaker(mut self, speaker: SpeakerInfo) -> Self {
         self.speaker = speaker;
         self
+    }
+
+    /// Resolved conversation id for per-(channel, speaker) continuity (#565).
+    pub fn conversation_id(&self, fallback_session_id: &str) -> String {
+        session_key(self.channel, &self.speaker, fallback_session_id)
+    }
+
+    /// Speaker name for conversation turn tagging (#560).
+    pub fn speaker_name(&self) -> Option<&str> {
+        self.speaker
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Memory policy inputs for this turn's text and resolved speaker.
+    pub fn memory_read_context(&self, shared_space_voice: bool) -> MemoryReadContext {
+        self.speaker
+            .memory_read_context(&self.text, shared_space_voice)
+    }
+
+    /// Tool execution context wired from session-layer speaker identity (#566).
+    pub fn tool_execution_context(
+        &self,
+        request_origin: crate::tools::RequestOrigin,
+        shared_space_voice: bool,
+    ) -> crate::tools::ToolExecutionContext {
+        crate::tools::ToolExecutionContext {
+            request_origin,
+            memory_read_context: self
+                .speaker
+                .is_resolved()
+                .then(|| self.memory_read_context(shared_space_voice)),
+            ..crate::tools::ToolExecutionContext::default()
+        }
     }
 }
 
@@ -255,10 +300,55 @@ mod tests {
             name: Some("dana".into()),
             confidence: IdentityConfidence::High,
         };
-        let ctx = speaker.memory_read_context("what does Maya like to drink");
+        let ctx = speaker.memory_read_context("what does Maya like to drink", false);
         assert!(ctx.explicit_named_person);
         assert!(!ctx.shared_space_voice);
         assert_eq!(ctx.identity_confidence, IdentityConfidence::High);
+    }
+
+    #[test]
+    fn incoming_turn_tool_context_is_channel_invariant() {
+        use crate::tools::RequestOrigin;
+
+        let speaker = SpeakerInfo {
+            name: Some("dana".into()),
+            confidence: IdentityConfidence::High,
+        };
+        let text = "what does Maya like to drink";
+        let contexts: Vec<_> = [ChannelKind::Http, ChannelKind::Voice, ChannelKind::Telegram]
+            .into_iter()
+            .map(|channel| {
+                IncomingTurn::new(text, "sess-fallback", channel)
+                    .with_speaker(speaker.clone())
+                    .tool_execution_context(RequestOrigin::Api, false)
+            })
+            .collect();
+        assert!(
+            contexts
+                .windows(2)
+                .all(|pair| pair[0].memory_read_context == pair[1].memory_read_context),
+            "resolved speaker must produce identical tool context across channels"
+        );
+    }
+
+    #[test]
+    fn incoming_turn_quick_route_is_channel_invariant() {
+        let text = "set a timer for 5 minutes";
+        let routes: Vec<_> = [ChannelKind::Http, ChannelKind::Voice, ChannelKind::Telegram]
+            .into_iter()
+            .map(|channel| {
+                crate::tools::quick::route_for_available_tools(
+                    &IncomingTurn::new(text, "sess-1", channel).text,
+                    false,
+                    false,
+                )
+                .map(|call| call.name)
+            })
+            .collect();
+        assert!(
+            routes.windows(2).all(|pair| pair[0] == pair[1]),
+            "quick router must not depend on transport channel"
+        );
     }
 
     #[test]
