@@ -9,278 +9,33 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::actuation::{
-    ActionLedger, AuditError, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager,
-    PendingConfirmation, RecordedAction, RequestOrigin, append_json_line, now_ms,
-    undo_restore_from_prior,
+    ActionLedger, AuditError, AuditLogger, ConfirmationManager, PendingConfirmation,
+    RecordedAction, RequestOrigin, append_json_line, now_ms,
 };
-use super::home;
 use super::timer;
 use crate::ha::HomeAutomationProvider;
 use crate::skills::SkillLoader;
 
 const ACTUATION_RATE_WINDOW_MS: u64 = 60_000;
 
-use super::home_action::{
-    HOME_CONTROL_ACTIONS, action_requires_value, canon_home_control_action, home_action_kind,
-};
-
 const TOO_MANY_PENDING_CONFIRMATIONS: &str = "Too many pending home confirmations; confirm or wait for existing ones to expire before requesting another.";
 
-fn format_undo_output(output: String) -> String {
-    if output.starts_with("Confirmation required") || output == TOO_MANY_PENDING_CONFIRMATIONS {
-        output
-    } else {
-        format!("Undid the last home action. {}", output)
-    }
-}
+// Per-tool dispatch modules: each owns one tool's schema, argument parsing, and
+// execution. The dispatcher below keeps the shared middleware and routing.
+mod calculate;
+mod get_time;
+mod home;
+mod memory;
+mod play_media;
+mod set_timer;
+mod skill;
+mod system_info;
+mod weather;
+mod web_search;
 
-fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Option<f64>)> {
-    let entity = args
-        .get("entity")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("home_control requires non-empty string argument 'entity'")
-        })?;
-    let raw_action = args
-        .get("action")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("home_control requires string argument 'action'"))?;
-    let action = canon_home_control_action(raw_action).ok_or_else(|| {
-        anyhow::anyhow!(
-            "home_control action '{}' is invalid; expected one of: {}",
-            raw_action,
-            HOME_CONTROL_ACTIONS.join(", ")
-        )
-    })?;
-    // `value` stays optional, but a *provided* value must be a number. The old
-    // `args.get("value").and_then(|v| v.as_f64())` silently dropped a non-numeric
-    // value (e.g. a model emitting `"value": "72"` or `"value": true`) to `None`,
-    // so `set_temperature` / `set_brightness` actuated with no value instead of
-    // the user's intent. Reject the malformed value at the boundary the same way
-    // set_timer rejects a non-integer `seconds`; an absent or null value is still
-    // a no-op None.
-    let value = match args.get("value") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(provided) => Some(provided.as_f64().ok_or_else(|| {
-            anyhow::anyhow!("home_control 'value' must be a number when provided")
-        })?),
-    };
-    // set_brightness / set_temperature actuate a numeric setpoint, so a call with
-    // no `value` is under-specified. The provider used to substitute a hardcoded
-    // default (brightness 50 / temperature 20) and report success, actuating a
-    // setpoint the user never asked for. Reject the missing value at the boundary
-    // so the agent asks for the number instead of guessing — the same boundary
-    // #414 uses to reject a *non-numeric* value. (issue #421)
-    if value.is_none() && action_requires_value(action) {
-        anyhow::bail!("home_control '{action}' requires a numeric argument 'value'");
-    }
-    Ok((entity, action, value))
-}
-
-fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
-    args.get("entity")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("home_status requires non-empty string argument 'entity'"))
-}
-
-fn parse_positive_integer_seconds(value: &serde_json::Value) -> Result<u64> {
-    if let Some(seconds) = value.as_u64() {
-        if seconds == 0 {
-            anyhow::bail!("set_timer seconds must be at least 1");
-        }
-        return Ok(seconds);
-    }
-    if let Some(float) = value.as_f64() {
-        if !float.is_finite() || float.fract() != 0.0 || float < 1.0 {
-            anyhow::bail!("set_timer requires integer argument 'seconds'");
-        }
-        let seconds = float as u64;
-        if (seconds as f64) != float {
-            anyhow::bail!("set_timer requires integer argument 'seconds'");
-        }
-        return Ok(seconds);
-    }
-    anyhow::bail!("set_timer requires integer argument 'seconds'")
-}
-
-/// `label` stays optional — absent or null defaults to `"timer"`. But a *provided*
-/// value must be a real string; the old `and_then(|v| v.as_str()).unwrap_or("timer")`
-/// silently dropped a number/boolean/array to the default, reporting success when
-/// the model emitted a schema-invalid label.
-fn parse_set_timer_label(args: &serde_json::Value) -> Result<&str> {
-    match args.get("label") {
-        None | Some(serde_json::Value::Null) => Ok("timer"),
-        Some(serde_json::Value::String(text)) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                Ok("timer")
-            } else {
-                Ok(trimmed)
-            }
-        }
-        Some(_) => Err(anyhow::anyhow!(
-            "set_timer 'label' must be a string when provided"
-        )),
-    }
-}
-
-fn parse_set_timer_args(args: &serde_json::Value) -> Result<(u64, &str)> {
-    let seconds = match args.get("seconds") {
-        Some(value) => parse_positive_integer_seconds(value)?,
-        None => anyhow::bail!("set_timer requires integer argument 'seconds'"),
-    };
-    let label = parse_set_timer_label(args)?;
-    Ok((seconds, label))
-}
-
-fn parse_memory_query_arg(args: &serde_json::Value) -> Result<&str> {
-    args.get("query")
-        .or_else(|| args.get("topic"))
-        .or_else(|| args.get("what"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("memory tool requires non-empty string argument (query/topic/what)")
-        })
-}
-
-fn parse_memory_recall_query(args: &serde_json::Value) -> Result<String> {
-    let raw = parse_memory_query_arg(args)?;
-    Ok(normalize_memory_recall_query(raw))
-}
-
-fn normalize_memory_recall_query(raw: &str) -> String {
-    let lower = raw.to_lowercase();
-    if lower.contains("my name") || lower == "name" || lower.contains("who am i") {
-        "name".into()
-    } else if lower.contains("about me") || lower == "me" || lower == "user" {
-        "user".into()
-    } else {
-        raw.to_string()
-    }
-}
-
-fn parse_memory_forget_query(args: &serde_json::Value) -> Result<&str> {
-    parse_memory_query_arg(args)
-}
-
-/// Reject a `memory_store` call with no usable `content` (#416). Delegates to
-/// `normalize_memories_to_store` so all valid shapes (aliases, catch-all, `name`)
-/// still pass; only missing/empty/wrong-type content is rejected.
-fn parse_memory_store_content(args: &serde_json::Value) -> Result<Vec<(String, String)>> {
-    let memories = normalize_memories_to_store(args);
-    if memories.is_empty() {
-        anyhow::bail!("memory_store requires non-empty string argument 'content'");
-    }
-    Ok(memories)
-}
-
-/// Format a count with the grammatically correct noun form for user-facing
-/// answers, e.g. `count_noun(1, "item", "items")` -> "1 item" and
-/// `count_noun(2, "item", "items")` -> "2 items". Avoids the "1 item(s)"
-/// lazy-plural antipattern in tool responses.
-fn count_noun(count: usize, singular: &str, plural: &str) -> String {
-    if count == 1 {
-        format!("1 {singular}")
-    } else {
-        format!("{count} {plural}")
-    }
-}
-
-fn parse_calculate_expression(args: &serde_json::Value) -> Result<&str> {
-    args.get("expression")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("calculate requires non-empty string argument 'expression'"))
-}
-
-fn parse_play_media_query(args: &serde_json::Value) -> Result<&str> {
-    args.get("query")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("play_media requires non-empty string argument 'query'"))
-}
-
-fn parse_web_search_query(args: &serde_json::Value) -> Result<&str> {
-    args.get("query")
-        .or_else(|| args.get("q"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("web_search requires non-empty string argument 'query'"))
-}
-
-/// `limit` stays optional — an absent or null value defaults to 3 results. But a
-/// *provided* value must be a non-negative integer. The old
-/// `args.get("limit").and_then(|v| v.as_u64()).unwrap_or(3)` silently coerced a
-/// malformed limit (a stringified `"5"`, a float `2.5`, or a negative) to the
-/// default 3, quietly returning a different result count than the caller asked
-/// for. Reject the malformed value at the boundary the same way home_control
-/// rejects a non-numeric `value` (PR #414); a valid integer outside 1..=5 still
-/// clamps into range rather than erroring.
-fn parse_web_search_limit(args: &serde_json::Value) -> Result<usize> {
-    match args.get("limit") {
-        None | Some(serde_json::Value::Null) => Ok(3),
-        Some(provided) => {
-            let limit = provided.as_u64().ok_or_else(|| {
-                anyhow::anyhow!("web_search 'limit' must be an integer when provided")
-            })?;
-            Ok(limit.clamp(1, 5) as usize)
-        }
-    }
-}
-
-/// `fresh` / `cache_bypass` stay optional — absent or null defaults to false. A
-/// provided value must be a real boolean (same boundary as `get_weather` forecast).
-fn parse_web_search_fresh(args: &serde_json::Value) -> Result<bool> {
-    match args.get("fresh").or_else(|| args.get("cache_bypass")) {
-        None | Some(serde_json::Value::Null) => Ok(false),
-        Some(serde_json::Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(anyhow::anyhow!(
-            "web_search 'fresh' must be a boolean when provided"
-        )),
-    }
-}
-
-pub(crate) fn parse_web_search_args(args: &serde_json::Value) -> Result<(String, usize, bool)> {
-    Ok((
-        parse_web_search_query(args)?.to_string(),
-        parse_web_search_limit(args)?,
-        parse_web_search_fresh(args)?,
-    ))
-}
-
-fn parse_get_weather_location(args: &serde_json::Value) -> Result<&str> {
-    args.get("location")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("get_weather requires non-empty string argument 'location'"))
-}
-
-/// `forecast` stays optional — an absent or null value means current weather
-/// (the no-op default). But a *provided* value must be a real boolean. The old
-/// `args.get("forecast").and_then(|v| v.as_bool()).unwrap_or(false)` silently
-/// coerced a stringified `"true"` (a form small models routinely emit) to
-/// `false`, returning current weather when the user asked for the 7-day
-/// forecast. Reject the malformed value at the boundary the same way
-/// home_control rejects a non-numeric `value` (PR #414).
-fn parse_get_weather_forecast(args: &serde_json::Value) -> Result<bool> {
-    match args.get("forecast") {
-        None | Some(serde_json::Value::Null) => Ok(false),
-        Some(serde_json::Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(anyhow::anyhow!(
-            "get_weather 'forecast' must be a boolean when provided"
-        )),
-    }
-}
+// Re-exported for the web-search entry points in `server` and `voice_loop`,
+// which parse the tool arguments before calling `web_search_response`.
+pub(crate) use web_search::parse_web_search_args;
 
 /// Tool definition for LLM function calling.
 ///
@@ -622,15 +377,6 @@ impl ToolDispatcher {
         })
     }
 
-    pub(crate) async fn web_search_response(
-        &self,
-        query: &str,
-        limit: usize,
-        fresh: bool,
-    ) -> Result<super::web_search::SearchResponse> {
-        super::web_search::search_response_with_options(query, limit, &self.web_search, fresh).await
-    }
-
     /// Set public web search provider configuration.
     pub fn with_web_search_config(mut self, config: WebSearchConfig) -> Self {
         self.web_search = config;
@@ -688,165 +434,25 @@ impl ToolDispatcher {
         let mut defs = Vec::new();
 
         if self.has_home_automation() {
-            defs.push(ToolDef {
-                name: "home_control".into(),
-                description: "Control Home Assistant devices, scenes, and voice-safe routines. Use for lights, switches, climate, safe covers, and scene activation. Risky actions like locks, garage doors, cameras, and alarms require local confirmation and may be blocked.".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "entity": {"type": "string", "description": "Household-facing target such as 'living room lights', 'thermostat', 'front door lock', or 'movie night'"},
-                        "action": {"type": "string", "enum": ["turn_on", "turn_off", "toggle", "set_brightness", "set_temperature", "open", "close", "lock", "unlock", "activate"]},
-                        "value": {"type": "number", "description": "Optional value. Brightness may be 0-100 percent or 0-255. Temperature is in degrees."}
-                    },
-                    "required": ["entity", "action"]
-                }),
-            });
-            defs.push(ToolDef {
-                name: "home_status".into(),
-                description: "Get the current status of a smart home device, room lights, thermostat, lock, cover, scene, or other Home Assistant target.".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "entity": {"type": "string", "description": "Household-facing target to query, such as 'living room lights' or 'front door lock'"}
-                    },
-                    "required": ["entity"]
-                }),
-            });
-            defs.push(ToolDef {
-                name: "home_undo".into(),
-                description: "Undo the most recent reversible home action. Use when the user says undo, put it back, revert that, or asks you to reverse the last device action. Still goes through runtime safety and may require confirmation.".into(),
-                parameters: serde_json::json!({"type": "object", "properties": {}}),
-            });
-            defs.push(ToolDef {
-                name: "action_history".into(),
-                description: "Report recent physical home actions and pending confirmations. Use when the user asks what you did, what changed, recent actions, or pending confirmations.".into(),
-                parameters: serde_json::json!({"type": "object", "properties": {}}),
-            });
+            defs.extend(home::tool_defs());
         }
 
-        defs.extend([
-            ToolDef {
-                name: "set_timer".into(),
-                description: "Set a countdown timer. Use for 'set a timer for 10 minutes', 'remind me in 5 minutes'.".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "seconds": {"type": "integer", "description": "Duration in seconds"},
-                        "label": {"type": "string", "description": "What the timer is for"}
-                    },
-                    "required": ["seconds"]
-                }),
-            },
-            ToolDef {
-                name: "get_time".into(),
-                description: "Get the current date and time.".into(),
-                parameters: serde_json::json!({"type": "object", "properties": {}}),
-            },
-        ]);
+        defs.push(set_timer::tool_def());
+        defs.push(get_time::tool_def());
 
-        defs.push(ToolDef {
-            name: "get_weather".into(),
-            description: "Get current weather or forecast for a location. Use for any weather question.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string", "description": "City name (e.g., 'Denver', 'Tokyo', 'London')"},
-                    "forecast": {"type": "boolean", "description": "true for 7-day forecast, false for current weather"}
-                },
-                "required": ["location"]
-            }),
-        });
+        defs.push(weather::tool_def());
 
         if self.has_web_search() {
-            defs.push(ToolDef {
-                name: "web_search".into(),
-                description: "Search the public web using a free no-key provider. Use for current or recent public facts, online lookup requests, and explicit web search requests. Do not use for private memory, local system status, or Home Assistant state.".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 5, "description": "Maximum number of results to return"},
-                        "fresh": {"type": "boolean", "description": "Bypass cached results and fetch fresh results"}
-                    },
-                    "required": ["query"]
-                }),
-            });
+            defs.push(web_search::tool_def());
         }
 
-        defs.push(ToolDef {
-            name: "system_info".into(),
-            description:
-                "Get GeniePod system status: Home Assistant connection state, memory, uptime, governor mode, and load average."
-                    .into(),
-            parameters: serde_json::json!({"type": "object", "properties": {}}),
-        });
+        defs.push(system_info::tool_def());
 
-        defs.push(ToolDef {
-            name: "calculate".into(),
-            description: "Evaluate a math expression. Supports +, -, *, /, parentheses, decimals.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "expression": {"type": "string", "description": "Math expression (e.g., '(100 - 32) * 5 / 9')"}
-                },
-                "required": ["expression"]
-            }),
-        });
+        defs.push(calculate::tool_def());
 
-        defs.push(ToolDef {
-            name: "play_media".into(),
-            description: "Play media on the TV/HDMI output. Triggers media mode (unloads LLM, launches mpv).".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "What to play (movie title, music, etc.)"}
-                },
-                "required": ["query"]
-            }),
-        });
+        defs.push(play_media::tool_def());
 
-        defs.push(ToolDef {
-            name: "memory_recall".into(),
-            description: "Recall what you know about a topic. Use when the user asks 'what do you know about me', 'do you remember my name', etc.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Topic to search memories for (e.g., 'name', 'age', 'preferences')"}
-                },
-                "required": ["query"]
-            }),
-        });
-
-        defs.push(ToolDef {
-            name: "memory_status".into(),
-            description: "Check memory database health, row counts, FTS consistency, and promoted memory count. Use for memory system diagnostics, not for recalling personal facts.".into(),
-            parameters: serde_json::json!({"type": "object", "properties": {}}),
-        });
-
-        defs.push(ToolDef {
-            name: "memory_forget".into(),
-            description: "Forget a specific piece of information. Use ONLY when the user explicitly asks to forget something, like 'forget my age' or 'delete what you know about X'.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "What to forget (e.g., 'age', 'name', 'favorite color')"}
-                },
-                "required": ["query"]
-            }),
-        });
-
-        defs.push(ToolDef {
-            name: "memory_store".into(),
-            description: "Explicitly store a safe household fact or preference. Use when the user says 'remember that...' or asks you to save something. Do not store passwords, one-time codes, payment details, keys, tokens, household access codes, lock combinations, sensitive document/key locations, or private secrets.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string", "description": "The fact to remember"},
-                    "category": {"type": "string", "enum": ["identity", "preference", "relationship", "fact", "context"], "description": "Category of the memory"}
-                },
-                "required": ["content"]
-            }),
-        });
+        defs.extend(memory::tool_defs());
 
         if let Some(skill_defs) = self.skill_tool_defs() {
             defs.extend(skill_defs);
@@ -882,11 +488,11 @@ impl ToolDispatcher {
             "home_undo" => self.exec_home_undo(exec_ctx).await,
             "action_history" => Ok(self.exec_action_history()),
             "set_timer" => self.exec_set_timer(&call.arguments),
-            "get_time" => Ok(get_current_time()),
-            "get_weather" => exec_weather(&call.arguments).await,
-            "web_search" => exec_web_search(&call.arguments, &self.web_search).await,
+            "get_time" => Ok(get_time::get_current_time()),
+            "get_weather" => weather::exec_weather(&call.arguments).await,
+            "web_search" => web_search::exec_web_search(&call.arguments, &self.web_search).await,
             "system_info" => super::system::system_info(self.ha.as_deref()).await,
-            "calculate" => exec_calculate(&call.arguments),
+            "calculate" => calculate::exec_calculate(&call.arguments),
             "play_media" => self.exec_play_media(&call.arguments).await,
             "memory_recall" => self.exec_memory_recall(&call.arguments, exec_ctx),
             "memory_status" => self.exec_memory_status(),
@@ -1081,767 +687,6 @@ impl ToolDispatcher {
             output_chars: result.output.chars().count(),
         });
     }
-
-    async fn exec_home_control(
-        &self,
-        args: &serde_json::Value,
-        exec_ctx: ToolExecutionContext,
-    ) -> Result<String> {
-        self.exec_home_control_inner(args, exec_ctx, None).await
-    }
-
-    async fn exec_home_control_inner(
-        &self,
-        args: &serde_json::Value,
-        exec_ctx: ToolExecutionContext,
-        undo_of: Option<u64>,
-    ) -> Result<String> {
-        let ha = self
-            .ha
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let (entity_name, action, value) = parse_home_control_args(args)?;
-        let resolved_entity = self.resolve_device_alias(entity_name);
-        if !actuation_origin_allowed(&self.actuation_safety, exec_ctx.request_origin) {
-            let reason = format!(
-                "actuation from '{}' is not allowed by channel policy",
-                exec_ctx.request_origin.as_policy_key()
-            );
-            self.audit_logger.append_or_log(AuditEvent {
-                ts_ms: now_ms(),
-                status: AuditStatus::BlockedPolicy,
-                origin: exec_ctx.request_origin,
-                entity: resolved_entity.clone(),
-                action: action.to_string(),
-                value,
-                reason: reason.clone(),
-                token: None,
-                confidence: None,
-                action_id: None,
-                undo_of: None,
-                undo_restore: None,
-            });
-            anyhow::bail!("Home action blocked by channel policy: {}", reason);
-        }
-        // Skip the rate-limit recharge for pre-confirmed actions. The
-        // origin's bucket already paid one slot on the original request that
-        // returned `ConfirmationRequired`; counting the confirmation re-entry
-        // as a second hit would double-charge the same logical action.
-        if !exec_ctx.confirmed
-            && let Err(err) = self
-                .actuation_rate_limiter
-                .check_and_record(&self.actuation_safety, exec_ctx.request_origin)
-        {
-            let reason = err.to_string();
-            self.audit_logger.append_or_log(AuditEvent {
-                ts_ms: now_ms(),
-                status: AuditStatus::BlockedRuntime,
-                origin: exec_ctx.request_origin,
-                entity: resolved_entity.clone(),
-                action: action.to_string(),
-                value,
-                reason: reason.clone(),
-                token: None,
-                confidence: None,
-                action_id: None,
-                undo_of: None,
-                undo_restore: None,
-            });
-            anyhow::bail!("Home action blocked by rate limit: {}", reason);
-        }
-        let undo_restore = if undo_of.is_some() {
-            None
-        } else if matches!(action, "set_brightness" | "set_temperature" | "toggle") {
-            match home_action_kind(action) {
-                Ok(kind) => match ha.resolve_target(&resolved_entity, Some(kind)).await {
-                    Ok(target) => ha
-                        .get_state(&target)
-                        .await
-                        .ok()
-                        .and_then(|prior| undo_restore_from_prior(action, &prior)),
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        match home::control(
-            ha.as_ref(),
-            &resolved_entity,
-            action,
-            value,
-            &self.actuation_safety,
-            exec_ctx.request_origin,
-            exec_ctx.confirmed,
-        )
-        .await
-        {
-            Ok(home::ControlOutcome::Executed(output, confidence)) => {
-                let recorded = if let Some(original_id) = undo_of {
-                    self.action_ledger.record_undo(
-                        original_id,
-                        &resolved_entity,
-                        action,
-                        value,
-                        exec_ctx.request_origin,
-                        &output,
-                        confidence,
-                        None,
-                    )
-                } else {
-                    self.action_ledger.record(
-                        &resolved_entity,
-                        action,
-                        value,
-                        exec_ctx.request_origin,
-                        &output,
-                        confidence,
-                        undo_restore,
-                    )
-                };
-                self.audit_logger.append_or_log(AuditEvent {
-                    ts_ms: now_ms(),
-                    status: AuditStatus::Executed,
-                    origin: exec_ctx.request_origin,
-                    entity: resolved_entity.clone(),
-                    action: action.to_string(),
-                    value,
-                    reason: "home action executed".into(),
-                    token: None,
-                    confidence,
-                    action_id: Some(recorded.id),
-                    undo_of: recorded.undo_of,
-                    undo_restore: recorded.undo_restore.clone(),
-                });
-                Ok(output)
-            }
-            Ok(home::ControlOutcome::ConfirmationRequired { reason, .. }) => {
-                let Some(pending) = self.confirmations.issue(
-                    &resolved_entity,
-                    action,
-                    value,
-                    &reason,
-                    exec_ctx.request_origin,
-                ) else {
-                    return Ok(TOO_MANY_PENDING_CONFIRMATIONS.into());
-                };
-                self.audit_logger.append_or_log(AuditEvent {
-                    ts_ms: now_ms(),
-                    status: AuditStatus::ConfirmationIssued,
-                    origin: exec_ctx.request_origin,
-                    entity: resolved_entity.clone(),
-                    action: action.to_string(),
-                    value,
-                    reason: reason.clone(),
-                    token: Some(pending.token.clone()),
-                    confidence: None,
-                    action_id: None,
-                    undo_of: None,
-                    undo_restore: None,
-                });
-                // The token is a bearer secret: a leaked one is a reusable
-                // door-unlock credential for its full validity window. Keep it
-                // out of LLM tool output (transcripts, voice, logs). The
-                // dashboard fetches it over /api/actuation/pending to drive the
-                // Confirm button; humans confirm there rather than reading the
-                // token back from this string.
-                Ok(format!(
-                    "Confirmation required before I can do that: {}. Confirm this pending action from the local dashboard (or POST /api/actuation/confirm with its token from /api/actuation/pending).",
-                    reason
-                ))
-            }
-            Err(err) => {
-                let error = err.to_string();
-                let status = if error.contains("local policy") {
-                    AuditStatus::BlockedPolicy
-                } else if error.contains("runtime safety") {
-                    AuditStatus::BlockedRuntime
-                } else {
-                    AuditStatus::Failed
-                };
-                self.audit_logger.append_or_log(AuditEvent {
-                    ts_ms: now_ms(),
-                    status,
-                    origin: exec_ctx.request_origin,
-                    entity: resolved_entity,
-                    action: action.to_string(),
-                    value,
-                    reason: error.clone(),
-                    token: None,
-                    confidence: None,
-                    action_id: None,
-                    undo_of: None,
-                    undo_restore: None,
-                });
-                Err(anyhow::anyhow!(error))
-            }
-        }
-    }
-
-    async fn exec_home_undo(&self, exec_ctx: ToolExecutionContext) -> Result<String> {
-        let action = self
-            .action_ledger
-            .last_undoable()
-            .ok_or_else(|| anyhow::anyhow!("No recent reversible home action to undo."))?;
-        let args = ActionLedger::undo_home_control_args(&action)
-            .ok_or_else(|| anyhow::anyhow!("No recent reversible home action to undo."))?;
-        let output = self
-            .exec_home_control_inner(&args, exec_ctx, Some(action.id))
-            .await?;
-        Ok(format_undo_output(output))
-    }
-
-    fn exec_action_history(&self) -> String {
-        let pending = self.pending_confirmations();
-        let actions = self.recent_home_actions();
-        if actions.is_empty() && pending.is_empty() {
-            return "No recent home actions or pending confirmations.".into();
-        }
-
-        let mut lines = Vec::new();
-        if !actions.is_empty() {
-            lines.push("Recent home actions:".to_string());
-            for action in actions.iter().take(5) {
-                let undo = action.action_history_undo_hint();
-                lines.push(format!(
-                    "- {} {} via {:?};{}",
-                    action.action, action.entity, action.origin, undo
-                ));
-            }
-        }
-        if !pending.is_empty() {
-            lines.push("Pending confirmations:".to_string());
-            for item in pending.iter().take(5) {
-                lines.push(format!(
-                    "- {} {} requested by {:?}: {}",
-                    item.action, item.entity, item.requested_by, item.reason
-                ));
-            }
-        }
-        lines.join("\n")
-    }
-
-    pub async fn confirm_pending_home_action(&self, token: &str) -> Result<String> {
-        let pending = self
-            .confirmations
-            .confirm(token)
-            .ok_or_else(|| anyhow::anyhow!("unknown or expired confirmation token"))?;
-        let call = ToolCall {
-            name: "home_control".into(),
-            arguments: serde_json::json!({
-                "entity": pending.entity,
-                "action": pending.action,
-                "value": pending.value,
-            }),
-        };
-        // Re-enter with the channel that ORIGINALLY requested the action, not a
-        // synthetic `Confirmation` origin. The `confirmed: true` flag is what
-        // tells the policy gate the action is pre-approved; overriding origin
-        // would (a) hide the originating channel in `AuditEvent.origin`,
-        // (b) bypass `max_actions_per_minute_by_origin` for the requesting
-        // channel by charging the `Confirmation` bucket instead, and
-        // (c) break ACL setups whose `allowed_origins` exclude
-        // `"confirmation"`. The original-bucket already paid one slot when
-        // the request returned `ConfirmationRequired`, so the limiter skips
-        // re-charging here (see `confirmed`-guard in `exec_home_control_inner`).
-        let result = self
-            .execute_with_context(
-                &call,
-                ToolExecutionContext {
-                    request_origin: pending.requested_by,
-                    confirmed: true,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
-        if result.success {
-            Ok(result.output)
-        } else {
-            Err(anyhow::anyhow!(result.output))
-        }
-    }
-
-    async fn exec_home_status(&self, args: &serde_json::Value) -> Result<String> {
-        let ha = self
-            .ha
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = parse_home_status_args(args)?;
-        let entity_name = self.resolve_device_alias(entity_name);
-
-        home::status(ha.as_ref(), &entity_name).await
-    }
-
-    fn resolve_device_alias(&self, query: &str) -> String {
-        let Some(memory) = &self.memory else {
-            return query.to_string();
-        };
-        let Ok(memory) = memory.lock() else {
-            return query.to_string();
-        };
-        memory
-            .device_alias(query)
-            .ok()
-            .flatten()
-            .map(|alias| alias.target_id)
-            .unwrap_or_else(|| query.to_string())
-    }
-
-    fn exec_set_timer(&self, args: &serde_json::Value) -> Result<String> {
-        let (seconds, label) = parse_set_timer_args(args)?;
-        self.timers
-            .set(seconds, label)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(format!("Timer set for {} seconds: {}", seconds, label))
-    }
-
-    fn exec_memory_recall(
-        &self,
-        args: &serde_json::Value,
-        exec_ctx: ToolExecutionContext,
-    ) -> Result<String> {
-        let query = parse_memory_recall_query(args)?;
-        // Identity context must come only from trusted runtime surfaces (voice
-        // pipeline via exec_ctx.memory_read_context). Do not read
-        // identity_confidence or related fields from LLM tool arguments — an
-        // attacker could otherwise bypass shared-room privacy controls (#430).
-        let read_context = exec_ctx
-            .memory_read_context
-            .unwrap_or_else(crate::memory::policy::MemoryReadContext::shared_room_voice);
-        let mem = self
-            .memory
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("memory system not available"))?;
-        let mem = mem
-            .lock()
-            .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-        let query_ref = query.as_str();
-
-        if let Some(answer) = mem.structured_household_answer(query_ref)? {
-            return Ok(answer);
-        }
-
-        if let Some(role) = household_role_query(query_ref) {
-            let profiles = mem.household_profiles_by_role(role)?;
-            if !profiles.is_empty() {
-                return Ok(format_household_role_answer(role, &profiles));
-            }
-        }
-
-        let results =
-            crate::memory::recall::recall_with_context(&mem, query_ref, 10, read_context)?;
-        if results.is_empty() {
-            return Ok(match query_ref {
-                "name" => "I don't remember your name yet.".to_string(),
-                "user" => "I don't remember anything about you yet.".to_string(),
-                other => format!("I don't remember anything about {} yet.", other),
-            });
-        }
-
-        if query_ref == "name"
-            && let Some(entry) = results
-                .iter()
-                .find(|entry| entry.entry.content.to_lowercase().contains("name is "))
-        {
-            return Ok(entry
-                .entry
-                .content
-                .replace("User's name is ", "Your name is "));
-        }
-
-        if query_ref == "user" || query_ref == "me" {
-            let items = results
-                .iter()
-                .take(3)
-                .map(|entry| entry.entry.content.clone())
-                .collect::<Vec<_>>();
-            return Ok(format!("I remember:\n- {}", items.join("\n- ")));
-        }
-
-        if results.len() == 1 {
-            return Ok(format!("I remember: {}", results[0].entry.content));
-        }
-
-        let items = results
-            .iter()
-            .map(|entry| format!("- [{}] {}", entry.entry.kind, entry.entry.content))
-            .collect::<Vec<_>>();
-        Ok(format!("I found these memories:\n{}", items.join("\n")))
-    }
-
-    fn exec_memory_status(&self) -> Result<String> {
-        let mem = self
-            .memory
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("memory system not available"))?;
-        let mem = mem
-            .lock()
-            .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-        let health = mem.health()?;
-        let promoted = mem.promoted_count()?;
-        let state = if health.quick_check_ok && health.fts_consistent && !health.migration_degraded
-        {
-            "ok"
-        } else {
-            "degraded"
-        };
-
-        Ok(format!(
-            "Memory status: {}. Rows: {}. FTS rows: {}. FTS consistent: {}. Migration degraded: {}. Promoted memories: {}. Canonical root: {}. Namespace notes: {}. Daily notes: {}. Event logs: {}. Person-scoped memories: {}. Private memories: {}. Restricted memories: {}.",
-            state,
-            health.memory_rows,
-            health.fts_rows,
-            if health.fts_consistent { "yes" } else { "no" },
-            if health.migration_degraded {
-                "yes"
-            } else {
-                "no"
-            },
-            promoted,
-            if health.canonical_root_exists {
-                "present"
-            } else {
-                "missing"
-            },
-            health.canonical_namespace_files,
-            health.canonical_daily_files,
-            health.canonical_event_logs,
-            health.person_rows,
-            health.private_rows,
-            health.restricted_rows,
-        ))
-    }
-
-    fn exec_memory_forget(
-        &self,
-        args: &serde_json::Value,
-        exec_ctx: ToolExecutionContext,
-    ) -> Result<String> {
-        // Validate the argument at the execution boundary, before touching the
-        // memory backend, the same way exec_memory_recall does (PR #362). The
-        // previous `unwrap_or("")` silently coerced a missing or non-string
-        // `query` into "", and a whitespace-only query slipped past the
-        // `is_empty()` check straight into `mem.search("   ", ...)` — running a
-        // destructive forget on garbage input instead of being rejected and
-        // audited like its read-side sibling.
-        let query = parse_memory_forget_query(args)?;
-        let mem = self
-            .memory
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("memory system not available"))?;
-        let mem = mem
-            .lock()
-            .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-
-        // Gate deletes through the same MemoryReadContext that exec_memory_recall
-        // uses. Without it, an LLM that cannot READ a person-scoped row could
-        // still DELETE it by calling memory_forget — destroying data it has no
-        // privilege to see. This mirrors the read-side fix landed in
-        // PR #201 (commit be4a2da).
-        let read_context = exec_ctx
-            .memory_read_context
-            .unwrap_or_else(crate::memory::policy::MemoryReadContext::shared_room_voice);
-        let candidates = mem.search(query, 10)?;
-        let allowed = crate::memory::recall::filter_recall_results(candidates, read_context);
-        let mut deleted = 0usize;
-        for recallable in &allowed {
-            if mem.delete_by_id(recallable.entry.id)? {
-                deleted += 1;
-            }
-        }
-
-        if deleted == 0 {
-            Ok(format!("No memories found matching '{}'.", query))
-        } else {
-            Ok(format!(
-                "Forgot {} about '{}'.",
-                count_noun(deleted, "memory", "memories"),
-                query
-            ))
-        }
-    }
-
-    fn exec_memory_store(
-        &self,
-        args: &serde_json::Value,
-        exec_ctx: ToolExecutionContext,
-    ) -> Result<String> {
-        // Validate content before the lock; previously a soft Ok() audited as success (#416).
-        let memories = parse_memory_store_content(args)?;
-        let mem = self
-            .memory
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("memory system not available"))?;
-        let mem = mem
-            .lock()
-            .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-
-        // Mirror the read-side context gate from exec_memory_recall/exec_memory_forget
-        // (issue #454): person-scoped writes require the same verified identity that
-        // person-scoped reads do. Without this, an API/REPL path with no trusted
-        // MemoryReadContext could plant person-attributed facts that the voice
-        // pipeline would later surface as authoritative.
-        let write_context = exec_ctx
-            .memory_read_context
-            .unwrap_or_else(crate::memory::policy::MemoryReadContext::shared_room_voice);
-
-        let mut stored = Vec::new();
-        let mut stored_categories = Vec::new();
-        let mut rejected = Vec::new();
-        let mut replaced = 0;
-        for (category, content) in memories {
-            let policy = crate::memory::policy::assess_memory_write(&category, &content);
-            if !policy.allowed {
-                rejected.push(policy.reason);
-                continue;
-            }
-            let metadata = crate::memory::policy::infer_metadata(&category, &content);
-            if metadata.scope == crate::memory::policy::MemoryScope::Person
-                && !write_context.explicit_named_person
-                && write_context.identity_confidence
-                    < crate::memory::policy::IdentityConfidence::Medium
-            {
-                anyhow::bail!(
-                    "memory_store: person-linked category '{category}' requires a \
-                     verified identity context; use the voice pipeline or supply \
-                     an authenticated person context."
-                );
-            }
-            let outcome = mem.store_resolved(&category, &content)?;
-            replaced += outcome.replaced;
-            stored_categories.push(category);
-            stored.push(content);
-        }
-
-        if stored.is_empty() {
-            return Ok(rejected
-                .first()
-                .copied()
-                .unwrap_or("I could not store that memory.")
-                .to_string());
-        }
-
-        if stored_categories
-            .iter()
-            .any(|category| category == "shopping")
-        {
-            let count = mem.shopping_list_pending_count().unwrap_or(0);
-            let removed = stored.iter().any(|content| {
-                content
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("shopping list removed:")
-            });
-            let added = stored
-                .iter()
-                .map(|content| {
-                    content
-                        .trim_start_matches("shopping list pending:")
-                        .trim_start_matches("shopping list removed:")
-                        .trim()
-                        .to_string()
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let total = count_noun(count, "item", "items");
-            if removed {
-                return Ok(format!(
-                    "Removed {added} from the shopping list. You have {total} total."
-                ));
-            }
-            return Ok(format!(
-                "Added {added} to the shopping list. You have {total} total."
-            ));
-        }
-
-        if stored.len() == 1 {
-            if replaced > 0 {
-                Ok(format!(
-                    "I've updated that memory: {}.",
-                    stored[0].to_lowercase()
-                ))
-            } else {
-                Ok(format!("I'll remember that {}.", stored[0].to_lowercase()))
-            }
-        } else {
-            let prefix = if replaced > 0 {
-                "I've updated these details"
-            } else {
-                "I'll remember these details"
-            };
-            let mut response = format!("{prefix}:\n- {}", stored.join("\n- "));
-            if let Some(reason) = rejected.first() {
-                response.push_str(&format!("\nSkipped one memory: {reason}"));
-            }
-            Ok(response)
-        }
-    }
-
-    fn skill_tool_defs(&self) -> Option<Vec<ToolDef>> {
-        let skills = self.skills.as_ref()?;
-        let loader = skills.lock().ok()?;
-        Some(
-            loader
-                .loaded()
-                .iter()
-                .map(|skill| ToolDef {
-                    name: skill.name.clone(),
-                    description: runtime_skill_description(skill),
-                    parameters: serde_json::from_str(&skill.parameters_json).unwrap_or_else(
-                        |_| serde_json::json!({"type": "object", "properties": {}}),
-                    ),
-                })
-                .collect(),
-        )
-    }
-
-    async fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
-        let skills = self
-            .skills
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
-
-        let args_json = serde_json::to_string(args)?;
-
-        // Build a Send invocation handle under a short lock, then drop the lock
-        // BEFORE awaiting the (possibly blocking) C call. The invocation owns an
-        // Arc to the skill's library, so the native code stays mapped for the
-        // whole call even though the loader lock is released. Holding a
-        // std::sync::Mutex guard across the await would both serialize every
-        // other skill access and trip clippy's `await_holding_lock`.
-        let invocation = {
-            let loader = skills
-                .lock()
-                .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
-            let skill = loader
-                .loaded()
-                .iter()
-                .find(|s| s.name == name)
-                .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
-            skill.prepare(&args_json)
-        };
-
-        let outcome = invocation.run().await;
-
-        // Re-acquire the lock to record the fault and reap a skill that has
-        // exceeded its fault budget. The skill may have been unloaded meanwhile;
-        // that is fine — the Arc kept its library alive for the call above.
-        {
-            let mut loader = skills
-                .lock()
-                .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
-            if outcome.faulted
-                && let Some(skill) = loader.get_mut(name)
-            {
-                skill.fault_count += 1;
-            }
-            let pruned = loader.prune_faulted();
-            if pruned.iter().any(|skill_name| skill_name == name) {
-                tracing::warn!(skill = name, "skill auto-unloaded after repeated faults");
-            }
-        }
-
-        if outcome.success {
-            Ok(outcome.output)
-        } else {
-            Err(anyhow::anyhow!("{}", outcome.output))
-        }
-    }
-
-    async fn exec_play_media(&self, args: &serde_json::Value) -> Result<String> {
-        let query = parse_play_media_query(args)?;
-        let resolved = self.resolve_media_query(query);
-        tracing::info!(
-            query,
-            resolved_query = resolved.query.as_str(),
-            provider = resolved.provider.as_deref().unwrap_or("unknown"),
-            "triggering media mode via governor control socket"
-        );
-        write_media_request(&resolved).await;
-
-        // Send media_start command to the governor via its Unix control socket.
-        let response = governor_command(r#"{"cmd":"media_start"}"#).await;
-
-        match response {
-            Some(resp) => {
-                let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                if ok {
-                    Ok(format!(
-                        "Playing: {}. Switched to media mode — LLM unloaded, HDMI ready.",
-                        resolved.display()
-                    ))
-                } else {
-                    let err = resp
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    Err(anyhow::anyhow!("governor rejected media mode: {}", err))
-                }
-            }
-            None => {
-                // Fallback: write file trigger if governor socket is unavailable.
-                let _ = tokio::fs::create_dir_all("/run/geniepod").await;
-                tokio::fs::write("/run/geniepod/media_mode", b"1").await?;
-                Ok(format!(
-                    "Playing: {}. Media mode triggered (file fallback).",
-                    resolved.display()
-                ))
-            }
-        }
-    }
-
-    fn resolve_media_query(&self, query: &str) -> ResolvedMediaQuery {
-        let Some(memory) = &self.memory else {
-            return ResolvedMediaQuery::unresolved(query);
-        };
-        let Ok(memory) = memory.lock() else {
-            return ResolvedMediaQuery::unresolved(query);
-        };
-        match memory.media_playlist_for_query(query).ok().flatten() {
-            Some(item) => ResolvedMediaQuery {
-                query: item.name,
-                provider: item.provider,
-                target: Some(item.target),
-                source: "memory".into(),
-            },
-            None => ResolvedMediaQuery::unresolved(query),
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct ResolvedMediaQuery {
-    query: String,
-    provider: Option<String>,
-    target: Option<String>,
-    source: String,
-}
-
-impl ResolvedMediaQuery {
-    fn unresolved(query: &str) -> Self {
-        Self {
-            query: query.trim().to_string(),
-            provider: None,
-            target: None,
-            source: "query".into(),
-        }
-    }
-
-    fn display(&self) -> String {
-        match (&self.provider, &self.target) {
-            (Some(provider), Some(target))
-                if target
-                    .to_ascii_lowercase()
-                    .starts_with(&format!("{provider}:")) =>
-            {
-                format!("{} ({target})", self.query)
-            }
-            (Some(provider), Some(target)) => format!("{} ({provider}: {target})", self.query),
-            (_, Some(target)) => format!("{} ({target})", self.query),
-            _ => self.query.clone(),
-        }
-    }
 }
 
 pub fn tool_action_class(name: &str) -> ToolActionClass {
@@ -1863,6 +708,18 @@ fn actuation_origin_allowed(config: &ActuationSafetyConfig, origin: RequestOrigi
         .allowed_origins
         .iter()
         .any(|allowed| allowed.trim().eq_ignore_ascii_case(origin.as_policy_key()))
+}
+
+/// Format a count with the grammatically correct noun form for user-facing
+/// answers, e.g. `count_noun(1, "item", "items")` -> "1 item" and
+/// `count_noun(2, "item", "items")` -> "2 items". Avoids the "1 item(s)"
+/// lazy-plural antipattern in tool responses.
+pub(super) fn count_noun(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
 }
 
 impl ActuationRateLimiter {
@@ -2023,142 +880,6 @@ fn tool_confirmation_token(key: &str) -> String {
     format!("conf-{:016x}", hasher.finish())
 }
 
-fn household_role_query(query: &str) -> Option<&'static str> {
-    let normalized = query
-        .trim()
-        .to_ascii_lowercase()
-        .replace(
-            |ch: char| !ch.is_ascii_alphanumeric() && !ch.is_whitespace(),
-            " ",
-        )
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
-    let role = tokens
-        .iter()
-        .find_map(|token| normalize_household_role_query_token(token))?;
-
-    let is_role_question = normalized.starts_with("who is ")
-        || normalized.starts_with("who are ")
-        || normalized.starts_with("whos ")
-        || normalized.starts_with("who s ")
-        || normalized.contains(" in this house")
-        || normalized.contains(" in our house")
-        || normalized.contains(" household");
-    let is_direct_role_topic = tokens.len() == 1
-        || (tokens.len() == 2
-            && normalize_household_role_query_token(tokens[0]).is_some()
-            && matches!(tokens[1], "name" | "names"));
-
-    if is_role_question || is_direct_role_topic {
-        Some(role)
-    } else {
-        None
-    }
-}
-
-fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
-    match token {
-        "dad" | "father" => Some("dad"),
-        "mom" | "mother" | "mum" => Some("mom"),
-        "son" | "sons" => Some("son"),
-        "daughter" | "daughters" => Some("daughter"),
-        "child" | "children" | "kid" | "kids" => Some("child"),
-        "wife" => Some("wife"),
-        "husband" => Some("husband"),
-        "partner" => Some("partner"),
-        "dog" | "dogs" => Some("dog"),
-        "cat" | "cats" => Some("cat"),
-        "pet" | "pets" => Some("pet"),
-        _ => None,
-    }
-}
-
-fn format_household_role_answer(
-    role: &str,
-    profiles: &[crate::memory::HouseholdProfile],
-) -> String {
-    if profiles.len() == 1 {
-        return format!("{} is the {}.", profiles[0].name, role);
-    }
-
-    let names = profiles
-        .iter()
-        .map(|profile| profile.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{names} are the {}.", pluralize_household_role(role))
-}
-
-/// Pluralize a canonical household role. Roles come from
-/// `normalize_household_role_query_token`, whose set is regular `+s` except for
-/// the two irregular plurals `child` -> `children` and `wife` -> `wives`.
-/// Without this, the multi-profile answer produced "childs"/"wifes".
-fn pluralize_household_role(role: &str) -> String {
-    match role {
-        "child" => "children".to_string(),
-        "wife" => "wives".to_string(),
-        other => format!("{other}s"),
-    }
-}
-
-fn normalize_memories_to_store(args: &serde_json::Value) -> Vec<(String, String)> {
-    let category_hint = args
-        .get("category")
-        .and_then(|v| v.as_str())
-        .unwrap_or("fact");
-
-    let primary = ["content", "fact", "text", "memory", "note"]
-        .iter()
-        .find_map(|key| args.get(*key).and_then(|v| v.as_str()))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            args.as_object().and_then(|obj| {
-                obj.iter()
-                    .filter(|(key, _)| key.as_str() != "category")
-                    .find_map(|(_, value)| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned)
-            })
-        });
-
-    let mut normalized = Vec::new();
-
-    if let Some(content) = primary {
-        let extracted = crate::memory::extract::extract_facts(&content);
-        if extracted.is_empty() {
-            normalized.push((category_hint.to_string(), content));
-        } else {
-            normalized.extend(
-                extracted
-                    .into_iter()
-                    .map(|fact| (fact.category, fact.content))
-                    .collect::<Vec<_>>(),
-            );
-        }
-    } else if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
-        let name = name.trim();
-        if !name.is_empty() {
-            normalized.push(("identity".into(), format!("User's name is {}", name)));
-        }
-    }
-
-    normalized
-}
-
-fn runtime_skill_description(skill: &crate::skills::LoadedSkill) -> String {
-    if skill.name == "hello_world" {
-        "Demo greeting skill. Only use when the user explicitly asks you to say hello to someone or test the hello_world demo skill.".into()
-    } else {
-        skill.description.clone()
-    }
-}
-
 fn tool_origin_allowed(
     policy: &ToolPolicyConfig,
     origin: RequestOrigin,
@@ -2216,109 +937,23 @@ fn tool_argument_keys(args: &serde_json::Value) -> Vec<String> {
     keys
 }
 
-fn exec_calculate(args: &serde_json::Value) -> Result<String> {
-    let expr = parse_calculate_expression(args)?;
-    match super::calc::evaluate(expr) {
-        Ok(result) => {
-            // Format nicely: drop trailing zeros for integers.
-            if result == result.floor() && result.abs() < 1e15 {
-                Ok(format!("{} = {}", expr, result as i64))
-            } else {
-                Ok(format!("{} = {:.6}", expr, result))
-            }
-        }
-        Err(e) => Err(anyhow::anyhow!("calculation error: {}", e)),
-    }
-}
-
-async fn exec_weather(args: &serde_json::Value) -> Result<String> {
-    let location = parse_get_weather_location(args)?;
-    let forecast = parse_get_weather_forecast(args)?;
-
-    if forecast {
-        super::weather::get_forecast(location).await
-    } else {
-        super::weather::get_weather(location).await
-    }
-}
-
-async fn exec_web_search(args: &serde_json::Value, config: &WebSearchConfig) -> Result<String> {
-    let (query, limit, fresh) = parse_web_search_args(args)?;
-    super::web_search::search_with_options(&query, limit, config, fresh).await
-}
-
-fn get_current_time() -> String {
-    // Use libc for proper timezone.
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    #[cfg(unix)]
-    {
-        let time_t = secs as libc::time_t;
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        let result = unsafe { libc::localtime_r(&time_t, &mut tm) };
-        if !result.is_null() {
-            return format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                tm.tm_year + 1900,
-                tm.tm_mon + 1,
-                tm.tm_mday,
-                tm.tm_hour,
-                tm.tm_min,
-                tm.tm_sec
-            );
-        }
-    }
-
-    format!("Unix timestamp: {}", secs)
-}
-
-/// Send a JSON command to the governor's Unix control socket.
-/// Returns parsed JSON response, or None if the governor is unreachable.
-async fn governor_command(json_cmd: &str) -> Option<serde_json::Value> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-
-    let stream = UnixStream::connect("/run/geniepod/governor.sock")
-        .await
-        .ok()?;
-    let (reader, mut writer) = stream.into_split();
-
-    writer.write_all(json_cmd.as_bytes()).await.ok()?;
-    writer.write_all(b"\n").await.ok()?;
-
-    let mut lines = BufReader::new(reader).lines();
-    let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
-        .await
-        .ok()?
-        .ok()?;
-
-    line.and_then(|l| serde_json::from_str(&l).ok())
-}
-
-async fn write_media_request(request: &ResolvedMediaQuery) {
-    let result: Result<()> = async {
-        tokio::fs::create_dir_all("/run/geniepod").await?;
-        let json = serde_json::to_vec(request)?;
-        tokio::fs::write("/run/geniepod/media_request.json", json).await?;
-        Ok(())
-    }
-    .await;
-    if let Err(error) = result {
-        tracing::debug!(error = %error, "media request sidecar write skipped");
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::get_time::get_current_time;
+    use super::home::{format_undo_output, parse_home_control_args};
+    use super::memory::{format_household_role_answer, household_role_query};
+    use super::set_timer::{parse_set_timer_args, parse_set_timer_label};
+    use super::weather::parse_get_weather_forecast;
+    use super::web_search::{
+        parse_web_search_args, parse_web_search_fresh, parse_web_search_limit,
+    };
     use super::*;
     use crate::ha::{
         ActionResult, DeviceRef, Entity, HomeAction, HomeActionKind, HomeAutomationProvider,
         HomeGraph, HomeState, HomeTarget, HomeTargetKind, IntegrationHealth, SceneRef,
     };
     use crate::skills::SkillLoader;
+    use crate::tools::home_action::{action_requires_value, canon_home_control_action};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::OnceLock;
@@ -3816,15 +2451,6 @@ mod tests {
     }
 
     #[test]
-    fn count_noun_uses_singular_only_for_one() {
-        assert_eq!(count_noun(0, "item", "items"), "0 items");
-        assert_eq!(count_noun(1, "item", "items"), "1 item");
-        assert_eq!(count_noun(2, "item", "items"), "2 items");
-        assert_eq!(count_noun(1, "memory", "memories"), "1 memory");
-        assert_eq!(count_noun(3, "memory", "memories"), "3 memories");
-    }
-
-    #[test]
     fn memory_store_rejects_high_risk_secret() {
         let db = std::env::temp_dir().join(format!(
             "memory-store-secret-test-{}.db",
@@ -4023,6 +2649,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "Jared is the dad.");
+    }
+
+    #[test]
+    fn count_noun_uses_singular_only_for_one() {
+        assert_eq!(count_noun(0, "item", "items"), "0 items");
+        assert_eq!(count_noun(1, "item", "items"), "1 item");
+        assert_eq!(count_noun(2, "item", "items"), "2 items");
+        assert_eq!(count_noun(1, "memory", "memories"), "1 memory");
+        assert_eq!(count_noun(3, "memory", "memories"), "3 memories");
     }
 
     #[test]

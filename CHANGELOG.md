@@ -6,7 +6,11 @@
 
 - **Calculator**: fold spoken-word decimals in the calculator path (`three point
   five` → `3.5`, `ninety eight point six` → `98.6`) — extends digit-only spoken
-  decimals from #504 to cardinal-word forms.
+  decimals from #504 to cardinal-word forms (#562).
+- **Calculator**: parse spoken cardinal numbers in percentage and
+  Fahrenheit-to-Celsius routes (`twenty percent of 80`, `convert ninety eight f
+  to celsius`) — extends the #504/#555 calculator path to multi-token spoken
+  cardinals, not only digit literals.
 
 ### Fixed
 
