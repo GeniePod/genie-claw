@@ -85,7 +85,8 @@ async fn main() -> Result<()> {
     memory::with_shared_memory(&memory, |mem| {
         tracing::info!(memories = mem.count()?, "memory loaded");
         Ok::<(), anyhow::Error>(())
-    })?;
+    })
+    .await?;
 
     let skill_loader =
         skills::load_all_with_policy(skills::SkillLoadPolicy::from(&config.core.skill_policy));
@@ -113,9 +114,12 @@ async fn main() -> Result<()> {
 
     // Load user profile from /opt/geniepod/data/profile/.
     let profile_dir = config.data_dir.join("profile");
-    match memory::with_shared_memory(&memory, |mem| {
-        genie_core::profile::load_profile(&profile_dir, mem)
-    }) {
+    let profile_dir_owned = profile_dir.clone();
+    match memory::with_shared_memory(&memory, move |mem| {
+        genie_core::profile::load_profile(&profile_dir_owned, mem)
+    })
+    .await
+    {
         Ok(report) if report.total() > 0 => {
             tracing::info!(
                 toml = report.toml_facts,
@@ -139,10 +143,11 @@ async fn main() -> Result<()> {
     // Build system prompt optimized for the LLM model.
     let model_name = &config.core.llm_model_name;
     let model_family = prompt::ModelFamily::from_model_name(model_name);
-    let prompt_builder = prompt::PromptBuilder::from_model_name(model_name);
-    let system_prompt = memory::with_shared_memory(&memory, |mem| {
-        prompt_builder.build(&tool_dispatcher.tool_defs(), mem)
-    });
+    let tool_defs = tool_dispatcher.tool_defs();
+    let system_prompt = memory::with_shared_memory(&memory, move |mem| {
+        prompt::PromptBuilder::new(model_family).build(&tool_defs, mem)
+    })
+    .await;
     // M1 exit (issue #110): fingerprint the fully-assembled system prompt with a
     // real SHA-256 so silent prompt drift between restarts is observable. The
     // digest is logged here at boot and surfaced via /api/health and
@@ -156,15 +161,20 @@ async fn main() -> Result<()> {
         "system prompt assembled"
     );
 
-    let boot_harness = memory::with_shared_memory(&memory, |mem| {
+    let system_prompt_owned = system_prompt.clone();
+    let tool_defs = tool_dispatcher.tool_defs();
+    let agent_config = config.agent.clone();
+    let optional_ai_provider = config.optional_ai_provider.clone();
+    let boot_harness = memory::with_shared_memory(&memory, move |mem| {
         agent_harness::validate_boot_harness(
-            &system_prompt,
-            &tool_dispatcher.tool_defs(),
+            &system_prompt_owned,
+            &tool_defs,
             mem,
-            &config.agent,
-            &config.optional_ai_provider,
+            &agent_config,
+            &optional_ai_provider,
         )
-    });
+    })
+    .await;
     agent_harness::log_harness_report(&boot_harness);
 
     // Check if stdin is a terminal (REPL mode) or pipe/systemd (server-only).
@@ -177,17 +187,20 @@ async fn main() -> Result<()> {
     let conv_count = conv_list.len();
     tracing::info!(conversations = conv_count, "conversation store loaded");
 
-    let boot_contract = memory::with_shared_memory(&memory, |mem| {
-        genie_core::server::build_runtime_contract_snapshot(
-            &tool_dispatcher,
-            mem,
-            conv_count,
-            &system_prompt,
-            config.core.max_history_turns,
-            model_family,
-            &connectivity_health,
-        )
-    });
+    let (mem_count, mem_promoted_count) = memory::with_shared_memory(&memory, |mem| {
+        (mem.count().unwrap_or(0), mem.promoted_count().unwrap_or(0))
+    })
+    .await;
+    let boot_contract = genie_core::server::build_runtime_contract_snapshot(
+        &tool_dispatcher,
+        mem_count,
+        mem_promoted_count,
+        conv_count,
+        &system_prompt,
+        config.core.max_history_turns,
+        model_family,
+        &connectivity_health,
+    );
     let contract_hash = boot_contract.contract_hash.clone();
     let contract_validation = genie_core::runtime_contract::validate_runtime_contract(
         &contract_hash,

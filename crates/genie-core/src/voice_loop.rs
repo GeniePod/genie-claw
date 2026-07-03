@@ -413,13 +413,15 @@ async fn run_with_wakeword(
                                 continue;
                             }
 
-                            let memory_context = with_shared_memory(memory, |memory| {
+                            let text_owned = text.clone();
+                            let memory_context = with_shared_memory(memory, move |memory| {
                                 inject::build_memory_context_with_read_context(
                                     memory,
-                                    &text,
+                                    &text_owned,
                                     read_context,
                                 )
-                            });
+                            })
+                            .await;
                             let full_prompt = format!(
                                 "{}\n\nRelevant household context:\n{}",
                                 system_prompt, memory_context
@@ -466,9 +468,11 @@ async fn run_with_wakeword(
                             }
 
                             // Auto-capture from follow-up.
-                            with_shared_memory(memory, |memory| {
-                                extract::extract_and_store(memory, &text);
-                            });
+                            let text_owned = text.clone();
+                            with_shared_memory(memory, move |memory| {
+                                extract::extract_and_store(memory, &text_owned);
+                            })
+                            .await;
                         } else {
                             let _ = tokio::fs::remove_file(&followup_path).await;
                             eprintln!("[voice] No follow-up speech — returning to wake word.");
@@ -1132,7 +1136,11 @@ pub async fn process_transcript(
             "[voice] GeniePod: {} (quick tool)",
             format::for_voice(&final_response)
         );
-        let stored = with_shared_memory(memory, |memory| extract::extract_and_store(memory, &text));
+        let text_owned = text.clone();
+        let stored = with_shared_memory(memory, move |memory| {
+            extract::extract_and_store(memory, &text_owned)
+        })
+        .await;
         if stored > 0 {
             eprintln!(
                 "[voice] (remembered {} fact{})",
@@ -1144,9 +1152,11 @@ pub async fn process_transcript(
     }
 
     // Step 3: Build LLM context with per-query memory injection.
-    let memory_context = with_shared_memory(memory, |memory| {
-        inject::build_memory_context_with_read_context(memory, &text, read_context)
-    });
+    let text_owned = text.clone();
+    let memory_context = with_shared_memory(memory, move |memory| {
+        inject::build_memory_context_with_read_context(memory, &text_owned, read_context)
+    })
+    .await;
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -1370,7 +1380,10 @@ pub async fn process_transcript(
     }
 
     // Auto-capture facts from user's speech (runs after TTS, non-blocking).
-    let stored = with_shared_memory(memory, |memory| extract::extract_and_store(memory, &text));
+    let stored = with_shared_memory(memory, move |memory| {
+        extract::extract_and_store(memory, &text)
+    })
+    .await;
     if stored > 0 {
         eprintln!(
             "[voice] (remembered {} fact{})",
