@@ -10,7 +10,8 @@ fn facts_key(facts: &[ExtractedFact]) -> String {
 }
 
 /// Fixed corpus captured from `main` @ 72b0b28 — guards byte-identical output after
-/// identity/preference early-outs and favorite/remember allocation trims (#495).
+/// identity/preference early-outs, favorite/remember allocation trims (#495), and
+/// deferred `to_lowercase` on no-match utterances.
 #[test]
 fn extract_facts_corpus_regression() {
     const CORPUS: &[(&str, &str)] = &[
@@ -80,6 +81,8 @@ fn extract_facts_corpus_regression() {
         ("my plan today is to relax and read a good book", ""),
         ("REMEMBER my pin is 1234", "fact:my pin is 1234"),
         ("Remember that", ""),
+        ("WHAT TIME IS IT?", ""),
+        ("The Weather Today Is Nice", ""),
     ];
 
     for (input, expected) in CORPUS {
