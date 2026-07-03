@@ -17,6 +17,7 @@
 //! | Module | What it does |
 //! |--------|-------------|
 //! | [`agent_harness`] | Limited-context prompt/tool/memory/provider contract checks |
+//! | [`channel`] | Transport-agnostic `IncomingTurn`/`OutgoingResponse` boundary + `Channel` trait |
 //! | [`llm`] | OpenAI-compatible LLM facade (`genie-ai-runtime`, llama.cpp, optional providers) |
 //! | [`ha`] | Home Assistant provider boundary, structure cache, and REST client |
 //! | [`tools`] | Compiled tool dispatch + parser for LLM JSON output |
@@ -44,6 +45,7 @@
 #![allow(clippy::too_many_arguments, clippy::empty_line_after_doc_comments)]
 
 pub mod agent_harness;
+pub mod channel;
 pub mod connectivity;
 pub mod context;
 pub mod conversation;
