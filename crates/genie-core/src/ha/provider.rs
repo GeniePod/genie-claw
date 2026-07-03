@@ -340,19 +340,23 @@ impl HomeAssistantProvider {
         }
 
         let area_match = best_area_match(&graph.areas, &query_lower);
+        // `infer_domain` re-tokenizes and re-lowercases `query_lower`; compute it
+        // once and borrow it across both resolution attempts below. Borrowing
+        // `area_match` here also lets the whole-home fallback reuse it without a
+        // clone.
         let domain_match = infer_domain(&query_lower);
 
-        if let (Some((area_name, area_score)), Some(domain)) = (area_match.clone(), domain_match)
+        if let (Some((area_name, area_score)), Some(domain)) =
+            (area_match.as_ref(), domain_match.as_ref())
             && let Some(target) =
-                Self::resolve_group_target(graph, query, &domain, &area_name, area_score)
+                Self::resolve_group_target(graph, query, domain, area_name, *area_score)
         {
             return Some(target);
         }
 
-        let domain_match = infer_domain(&query_lower);
         if area_match.is_none()
-            && let Some(domain) = domain_match
-            && let Some(target) = Self::resolve_domain_target(graph, query, &domain)
+            && let Some(domain) = domain_match.as_ref()
+            && let Some(target) = Self::resolve_domain_target(graph, query, domain)
         {
             return Some(target);
         }
@@ -883,13 +887,16 @@ fn is_voice_relevant_domain(domain: &str) -> bool {
 }
 
 fn build_aliases(name: &str, domain: &str, area: Option<&str>) -> Vec<String> {
+    // `domain_synonyms` allocates a fresh Vec (one heap String per synonym);
+    // build it once and reuse it for the bare and area-qualified aliases.
+    let synonyms = domain_synonyms(domain);
     let mut aliases = vec![normalize(name)];
-    aliases.extend(domain_synonyms(domain));
+    aliases.extend(synonyms.iter().cloned());
 
     if let Some(area) = area {
         let area_norm = normalize(area);
         aliases.push(format!("{} {}", area_norm, normalize(name)));
-        for synonym in domain_synonyms(domain) {
+        for synonym in &synonyms {
             aliases.push(format!("{} {}", area_norm, synonym));
         }
     }
