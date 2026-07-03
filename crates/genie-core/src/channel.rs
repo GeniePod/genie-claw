@@ -13,7 +13,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::memory::policy::IdentityConfidence;
+use crate::memory::policy::{IdentityConfidence, MemoryReadContext};
 
 /// Which transport a turn arrived on / a response should be delivered through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,36 @@ impl Default for SpeakerInfo {
             name: None,
             confidence: IdentityConfidence::Unknown,
         }
+    }
+}
+
+impl SpeakerInfo {
+    /// Memory policy inputs for this speaker on a chat/API turn (not shared-space voice).
+    pub fn memory_read_context(&self, text: &str) -> MemoryReadContext {
+        crate::memory::policy::memory_read_context_from_text(
+            text,
+            self.confidence,
+            false,
+        )
+    }
+}
+
+/// Stable session key for per-(channel, speaker) continuity (#565).
+///
+/// When no resolved speaker name is present, returns `fallback_session_id` unchanged.
+pub fn session_key(
+    channel: ChannelKind,
+    speaker: &SpeakerInfo,
+    fallback_session_id: &str,
+) -> String {
+    match speaker
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) => format!("{}:{}", channel.as_str(), name.to_ascii_lowercase()),
+        None => fallback_session_id.to_string(),
     }
 }
 
@@ -201,6 +231,38 @@ mod tests {
             self.sent.push(response);
             Ok(())
         }
+    }
+
+    #[test]
+    fn session_key_uses_channel_and_speaker_when_name_present() {
+        let speaker = SpeakerInfo {
+            name: Some("Maya".into()),
+            confidence: IdentityConfidence::High,
+        };
+        assert_eq!(
+            session_key(ChannelKind::Http, &speaker, "default"),
+            "http:maya"
+        );
+    }
+
+    #[test]
+    fn session_key_falls_back_without_resolved_name() {
+        assert_eq!(
+            session_key(ChannelKind::Voice, &SpeakerInfo::default(), "sess-1"),
+            "sess-1"
+        );
+    }
+
+    #[test]
+    fn speaker_memory_read_context_detects_named_person_request() {
+        let speaker = SpeakerInfo {
+            name: Some("dana".into()),
+            confidence: IdentityConfidence::High,
+        };
+        let ctx = speaker.memory_read_context("what does Maya like to drink");
+        assert!(ctx.explicit_named_person);
+        assert!(!ctx.shared_space_voice);
+        assert_eq!(ctx.identity_confidence, IdentityConfidence::High);
     }
 
     #[test]

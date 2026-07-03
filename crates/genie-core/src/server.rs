@@ -12,12 +12,14 @@ use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::channel::{self, ChannelKind, SpeakerInfo};
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
 use crate::llm::{
     LlmBackendClient, LlmClient, LlmRequestHints, LocalProvider, Message, PrivacyProxyBackend,
     Provider,
 };
+use crate::memory::policy::IdentityConfidence;
 use crate::memory::{Memory, SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
 use crate::prompt::ModelFamily;
@@ -953,21 +955,15 @@ async fn handle_chat_stream(
         crate::security::injection::source::API_CHAT_STREAM,
     );
 
-    let conv_id = parsed
-        .get("conversation_id")
-        .and_then(|v| v.as_str())
-        .filter(|id| !id.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_default();
-    let conv_id = if conv_id.is_empty() {
-        current_conv_id.lock().await.clone()
-    } else {
-        conv_id
-    };
+    let speaker = parsed.get("speaker").map(parse_speaker_field);
+    let current = current_conv_id.lock().await.clone();
+    let conv_id = resolve_chat_conv_id(&parsed, &current, speaker.as_ref());
+    let tool_ctx = tool_execution_context_for_chat(request_origin, user_text, speaker.as_ref());
+    let speaker_name = speaker.as_ref().and_then(|s| s.name.as_deref());
 
     conversations.ensure(&conv_id, "New conversation").await?;
     conversations
-        .append(&conv_id, "user", user_text, None, None)
+        .append(&conv_id, "user", user_text, None, speaker_name)
         .await?;
 
     if let Some(call) = crate::tools::quick::route_for_available_tools(
@@ -982,15 +978,7 @@ async fn handle_chat_stream(
         )
         .await?;
 
-        let tool_result = tools
-            .execute_with_context(
-                &call,
-                ToolExecutionContext {
-                    request_origin,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let tool_result = tools.execute_with_context(&call, tool_ctx).await;
         let final_response =
             finalize_direct_tool_turn(conversations, &conv_id, &call, &tool_result).await;
         write_stream_event(
@@ -1014,9 +1002,7 @@ async fn handle_chat_stream(
         return Ok(());
     }
 
-    let memory_context = with_shared_memory(memory, |memory| {
-        crate::memory::inject::build_memory_context(memory, user_text)
-    });
+    let memory_context = build_chat_memory_context(memory, user_text, speaker.as_ref());
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -1125,10 +1111,7 @@ async fn handle_chat_stream(
     let final_response = if let Some(tool_result) = crate::tools::try_tool_call_with_context(
         &llm_response,
         tools,
-        ToolExecutionContext {
-            request_origin,
-            ..ToolExecutionContext::default()
-        },
+        tool_ctx,
     )
     .await
     {
@@ -1191,6 +1174,85 @@ async fn handle_chat_stream(
     Ok(())
 }
 
+fn parse_speaker_field(value: &serde_json::Value) -> SpeakerInfo {
+    match value {
+        serde_json::Value::String(name) if !name.trim().is_empty() => SpeakerInfo {
+            name: Some(name.trim().to_string()),
+            confidence: IdentityConfidence::High,
+        },
+        serde_json::Value::Object(_) => {
+            let map = value.as_object().expect("object branch");
+            let name = map
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
+            let confidence = map
+                .get("confidence")
+                .and_then(|v| v.as_str())
+                .map(chat_identity_confidence_from_str)
+                .unwrap_or(IdentityConfidence::High);
+            SpeakerInfo { name, confidence }
+        }
+        _ => SpeakerInfo::default(),
+    }
+}
+
+fn chat_identity_confidence_from_str(value: &str) -> IdentityConfidence {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "high" => IdentityConfidence::High,
+        "medium" => IdentityConfidence::Medium,
+        "low" => IdentityConfidence::Low,
+        _ => IdentityConfidence::Unknown,
+    }
+}
+
+fn resolve_chat_conv_id(
+    parsed: &serde_json::Value,
+    current_conv_id: &str,
+    speaker: Option<&SpeakerInfo>,
+) -> String {
+    if let Some(id) = parsed
+        .get("conversation_id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.trim().is_empty())
+    {
+        return id.to_string();
+    }
+    if let Some(speaker) = speaker {
+        return channel::session_key(ChannelKind::Http, speaker, current_conv_id);
+    }
+    current_conv_id.to_string()
+}
+
+fn tool_execution_context_for_chat(
+    request_origin: RequestOrigin,
+    user_text: &str,
+    speaker: Option<&SpeakerInfo>,
+) -> ToolExecutionContext {
+    ToolExecutionContext {
+        request_origin,
+        memory_read_context: speaker.map(|speaker| speaker.memory_read_context(user_text)),
+        ..ToolExecutionContext::default()
+    }
+}
+
+fn build_chat_memory_context(
+    memory: &SharedMemory,
+    user_text: &str,
+    speaker: Option<&SpeakerInfo>,
+) -> String {
+    with_shared_memory(memory, |memory| match speaker {
+        Some(speaker) => crate::memory::inject::build_memory_context_with_read_context(
+            memory,
+            user_text,
+            speaker.memory_read_context(user_text),
+        ),
+        None => crate::memory::inject::build_memory_context(memory, user_text),
+    })
+}
+
 /// POST /api/chat
 pub async fn process_chat_turn(
     provider: &dyn Provider,
@@ -1204,26 +1266,22 @@ pub async fn process_chat_turn(
     model_family: ModelFamily,
     request_origin: RequestOrigin,
     privacy_proxy: Option<&PrivacyProxyConfig>,
+    speaker: Option<&SpeakerInfo>,
 ) -> Result<ChatTurnResult> {
     conversations.ensure(conv_id, "New conversation").await?;
+    let speaker_name = speaker.and_then(|s| s.name.as_deref());
     conversations
-        .append(conv_id, "user", user_text, None, None)
+        .append(conv_id, "user", user_text, None, speaker_name)
         .await?;
+
+    let tool_ctx = tool_execution_context_for_chat(request_origin, user_text, speaker);
 
     if let Some(call) = crate::tools::quick::route_for_available_tools(
         user_text,
         tools.has_home_automation(),
         tools.has_web_search(),
     ) {
-        let tool_result = tools
-            .execute_with_context(
-                &call,
-                ToolExecutionContext {
-                    request_origin,
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
+        let tool_result = tools.execute_with_context(&call, tool_ctx).await;
         let final_response =
             finalize_direct_tool_turn(conversations, conv_id, &call, &tool_result).await;
         with_shared_memory(memory, |memory| {
@@ -1236,9 +1294,7 @@ pub async fn process_chat_turn(
         });
     }
 
-    let memory_context = with_shared_memory(memory, |memory| {
-        crate::memory::inject::build_memory_context(memory, user_text)
-    });
+    let memory_context = build_chat_memory_context(memory, user_text, speaker);
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -1337,10 +1393,7 @@ pub async fn process_chat_turn(
     let final_response = if let Some(tool_result) = crate::tools::try_tool_call_with_context(
         &llm_response,
         tools,
-        ToolExecutionContext {
-            request_origin,
-            ..ToolExecutionContext::default()
-        },
+        tool_ctx,
     )
     .await
     {
@@ -1652,17 +1705,9 @@ async fn handle_chat(
         crate::security::injection::source::API_CHAT,
     );
 
-    let conv_id = parsed
-        .get("conversation_id")
-        .and_then(|v| v.as_str())
-        .filter(|id| !id.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_default();
-    let conv_id = if conv_id.is_empty() {
-        current_conv_id.lock().await.clone()
-    } else {
-        conv_id
-    };
+    let speaker = parsed.get("speaker").map(parse_speaker_field);
+    let current = current_conv_id.lock().await.clone();
+    let conv_id = resolve_chat_conv_id(&parsed, &current, speaker.as_ref());
 
     let provider = LocalProvider::new(llm);
     let turn = match process_chat_turn(
@@ -1677,6 +1722,7 @@ async fn handle_chat(
         model_family,
         request_origin,
         privacy_proxy,
+        speaker.as_ref(),
     )
     .await
     {
