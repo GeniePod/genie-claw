@@ -2949,9 +2949,46 @@ fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
 }
 
 fn reminder_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
+    // Preferred order — the task clause follows the duration:
+    // "remind me in 5 minutes to check the oven".
+    if let Some(label) = reminder_label_after_duration(tokens, unit_end_index) {
+        return Some(label);
+    }
+    // Reversed order — the task clause precedes the duration (#591):
+    // "remind me to check the oven in 5 minutes".
+    reminder_label_before_duration(tokens, unit_end_index)
+}
+
+fn reminder_label_after_duration(tokens: &[&str], unit_end_index: usize) -> Option<String> {
     let after_unit = tokens.get(unit_end_index + 1..)?;
     let to_index = after_unit.iter().position(|token| *token == "to")?;
     let label_tokens = after_unit.get(to_index + 1..)?;
+    if label_tokens.is_empty() {
+        return None;
+    }
+    Some(label_tokens.join(" "))
+}
+
+/// Extract the reminder task when it precedes the duration, e.g.
+/// "remind me **to check the oven** in 5 minutes". `reminder_label_after_duration`
+/// only scans tokens *after* the unit, so this reversed order used to drop the
+/// task and fall back to the generic "reminder" label (#591).
+///
+/// The label is the span between `to` and the delay connective ("in", "after",
+/// "within") that introduces the trailing duration. Scanning for the *rightmost*
+/// connective whose tail parses as a real duration keeps a task that itself
+/// contains "in"/"after" intact ("... bring the trash in in 10 minutes"). A bare
+/// "to <n> <unit>" with no task clause finds no connective and keeps the generic
+/// fallback.
+fn reminder_label_before_duration(tokens: &[&str], unit_end_index: usize) -> Option<String> {
+    let clause = tokens.get(..=unit_end_index)?;
+    let to_index = clause.iter().position(|token| *token == "to")?;
+    let after_to = &clause[to_index + 1..];
+    let connective_index = after_to.iter().enumerate().rposition(|(index, token)| {
+        matches!(*token, "in" | "after" | "within")
+            && parse_duration(&after_to[index + 1..]).is_some_and(|(seconds, _)| seconds > 0)
+    })?;
+    let label_tokens = &after_to[..connective_index];
     if label_tokens.is_empty() {
         return None;
     }
@@ -4823,6 +4860,40 @@ mod tests {
         assert_eq!(call.name, "set_timer");
         assert_eq!(call.arguments["seconds"], 300);
         assert_eq!(call.arguments["label"], "check the oven");
+    }
+
+    #[test]
+    fn routes_reminder_timer_label_before_duration() {
+        // #591: the task clause precedes the duration, so the after-unit scan
+        // never saw the `to <task>` clause and the label was silently dropped
+        // to the generic "reminder".
+        let call = route("remind me to check the oven in 5 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // "after <duration>" connective, seconds unit.
+        let call = route("remind me to stretch after 90 seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 90);
+        assert_eq!(call.arguments["label"], "stretch");
+
+        // "remind us", hours unit, multi-word task.
+        let call = route("remind us to water the plants in 2 hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 7200);
+        assert_eq!(call.arguments["label"], "water the plants");
+
+        // A task that itself ends in "in" keeps the rightmost delay marker.
+        let call = route("remind me to bring the trash in in 10 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 600);
+        assert_eq!(call.arguments["label"], "bring the trash in");
+
+        // Already-supported order (task after the duration) is unchanged.
+        let call = route("remind me in 5 minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // A bare reminder with no task clause keeps the generic fallback.
+        let call = route("remind me in 5 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "reminder");
     }
 
     #[test]
