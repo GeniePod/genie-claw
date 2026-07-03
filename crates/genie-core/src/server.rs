@@ -14,7 +14,10 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
-use crate::llm::{LlmBackendClient, LlmClient, LlmRequestHints, Message, PrivacyProxyBackend};
+use crate::llm::{
+    LlmBackendClient, LlmClient, LlmRequestHints, LocalProvider, Message, PrivacyProxyBackend,
+    Provider,
+};
 use crate::memory::{Memory, SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
 use crate::prompt::ModelFamily;
@@ -1125,8 +1128,9 @@ async fn handle_chat_stream(
     .await
     {
         tool_name = Some(tool_result.tool.clone());
+        let provider = LocalProvider::new(llm);
         let summary = finalize_tool_turn(
-            llm,
+            &provider,
             conversations,
             &conv_id,
             &llm_response,
@@ -1182,7 +1186,7 @@ async fn handle_chat_stream(
 
 /// POST /api/chat
 pub async fn process_chat_turn(
-    llm: &LlmClient,
+    provider: &dyn Provider,
     tools: &ToolDispatcher,
     memory: &SharedMemory,
     conversations: &ConversationStore,
@@ -1277,13 +1281,14 @@ pub async fn process_chat_turn(
                     error = %proxy_err,
                     "PrivacyProxy escalation failed; falling back to local model"
                 );
-                llm.chat_with_hints(&messages, Some(512), &request_hints)
+                provider
+                    .complete(&messages, Some(512), Some(&request_hints))
                     .await?
             }
         }
     } else {
-        match llm
-            .chat_with_hints(&messages, Some(512), &request_hints)
+        match provider
+            .complete(&messages, Some(512), Some(&request_hints))
             .await
         {
             Ok(r) => r,
@@ -1331,7 +1336,7 @@ pub async fn process_chat_turn(
     {
         tool_name = Some(tool_result.tool.clone());
         finalize_tool_turn(
-            llm,
+            provider,
             conversations,
             conv_id,
             &llm_response,
@@ -1426,7 +1431,7 @@ fn finalize_direct_tool_turn(
 }
 
 async fn finalize_tool_turn(
-    llm: &LlmClient,
+    provider: &dyn Provider,
     conversations: &ConversationStore,
     conv_id: &str,
     llm_response: &str,
@@ -1458,7 +1463,8 @@ async fn finalize_tool_turn(
         );
 
         let summary_hints = LlmRequestHints::tool_summary(conv_id, 128);
-        llm.chat_with_hints(&summary_msgs, Some(128), &summary_hints)
+        provider
+            .complete(&summary_msgs, Some(128), Some(&summary_hints))
             .await
             .unwrap_or_else(|_| tool_result.output.clone())
     } else {
@@ -1617,8 +1623,9 @@ async fn handle_chat(
         conv_id
     };
 
+    let provider = LocalProvider::new(llm);
     let turn = match process_chat_turn(
-        llm,
+        &provider,
         tools,
         memory,
         conversations,

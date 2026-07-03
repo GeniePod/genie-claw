@@ -58,6 +58,24 @@ fn integer_math_is_unchanged() {
 }
 
 #[test]
+fn spoken_cardinals_in_percentage_and_temperature() {
+    assert_eq!(expression("what is twenty percent of 80"), "80 * 20 / 100");
+    assert_eq!(expression("what is 20 percent of eighty"), "80 * 20 / 100");
+    assert_eq!(
+        expression("what is twenty five percent of eighty"),
+        "80 * 25 / 100"
+    );
+    assert_eq!(
+        expression("convert ninety eight f to celsius"),
+        "(98 - 32) * 5 / 9"
+    );
+    assert_eq!(
+        expression("convert 350 degrees to celsius"),
+        "(350 - 32) * 5 / 9"
+    );
+}
+
+#[test]
 fn non_math_does_not_route_to_calculate() {
     assert!(
         route("what time is it")

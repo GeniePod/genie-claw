@@ -2726,9 +2726,8 @@ fn temperature_conversion_expression(text: &str) -> Option<String> {
         return None;
     }
     let tokens = text.split_whitespace().collect::<Vec<_>>();
-    let fahrenheit = tokens
-        .iter()
-        .find_map(|token| parse_decimal_token(token.trim_end_matches("f")))?;
+    let to_idx = tokens.iter().position(|token| *token == "to")?;
+    let fahrenheit = calc_number_before_to(&tokens, to_idx)?;
     Some(format!("({fahrenheit} - 32) * 5 / 9"))
 }
 
@@ -2737,12 +2736,12 @@ fn percentage_expression(text: &str) -> Option<String> {
     let percent_idx = tokens
         .iter()
         .position(|token| matches!(*token, "percent" | "percentage" | "%"))?;
-    let percent = parse_decimal_token(tokens.get(percent_idx.wrapping_sub(1))?)?;
+    let percent = calc_number_ending_at(&tokens, percent_idx)?;
 
     let of_idx = tokens.iter().position(|token| *token == "of")?;
-    let base = parse_decimal_token(tokens.get(of_idx + 1)?)?;
+    let base = calc_number_starting_at(&tokens, of_idx + 1)?;
 
-    Some(format!("{} * {} / 100", base, percent))
+    Some(format!("{base} * {percent} / 100"))
 }
 
 fn arithmetic_expression(text: &str) -> Option<String> {
@@ -2796,11 +2795,61 @@ fn words_to_digits(expression: &str) -> String {
 }
 
 fn parse_decimal_token(token: &str) -> Option<f64> {
-    token
-        .trim_end_matches('%')
+    let trimmed = token.trim_end_matches('%').trim_end_matches('f');
+    trimmed
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite())
+        .or_else(|| super::number_words::parse_amount(trimmed))
+}
+
+/// Parse a cardinal (digit or spoken-word) immediately before `end`.
+fn calc_number_ending_at(tokens: &[&str], end: usize) -> Option<f64> {
+    if end == 0 {
+        return None;
+    }
+    let mut best: Option<f64> = None;
+    let mut best_span = 0usize;
+    for start in 0..end {
+        if let Some((value, consumed)) = super::number_words::parse_spoken_number(tokens, start)
+            && consumed == end
+        {
+            let span = end - start;
+            if span > best_span {
+                best = Some(value as f64);
+                best_span = span;
+            }
+        }
+    }
+    best.or_else(|| parse_decimal_token(tokens[end - 1]))
+}
+
+/// Parse a cardinal (digit or spoken-word) starting at `start`.
+fn calc_number_starting_at(tokens: &[&str], start: usize) -> Option<f64> {
+    if start >= tokens.len() {
+        return None;
+    }
+    if let Some((value, _)) = super::number_words::parse_spoken_number(tokens, start) {
+        return Some(value as f64);
+    }
+    parse_decimal_token(tokens[start])
+}
+
+/// Fahrenheit value before a `to celsius` tail, tolerating a trailing `f` token
+/// and optional unit words (`degrees`, `fahrenheit`).
+fn calc_number_before_to(tokens: &[&str], to_idx: usize) -> Option<f64> {
+    if to_idx == 0 {
+        return None;
+    }
+    let mut end = to_idx;
+    if end > 0 && tokens[end - 1] == "f" {
+        end -= 1;
+    }
+    const SKIP_BEFORE_TO: &[&str] = &["degrees", "degree", "fahrenheit", "f"];
+    while end > 0 && SKIP_BEFORE_TO.contains(&tokens[end - 1]) {
+        end -= 1;
+    }
+    calc_number_ending_at(tokens, end)
 }
 
 fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
