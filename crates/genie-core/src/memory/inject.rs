@@ -9,7 +9,14 @@ use super::{Memory, policy};
 const MEMORY_HYDRATION_BUDGET_TOKENS: usize = 700;
 
 fn estimate_hydration_tokens(text: &str) -> usize {
-    text.len().div_ceil(4)
+    estimate_hydration_tokens_from_len(text.len())
+}
+
+/// Token estimate from a byte length. Shared by [`estimate_hydration_tokens`]
+/// and the incremental fit in [`fit_entries_to_budget`] so both paths apply the
+/// identical `div_ceil(4)` rule and can never disagree.
+fn estimate_hydration_tokens_from_len(len: usize) -> usize {
+    len.div_ceil(4)
 }
 
 fn format_memory_lines(entries: &[String]) -> String {
@@ -54,25 +61,54 @@ fn truncate_entry_to_budget(entry: &str, budget_tokens: usize) -> String {
     }
 }
 
+/// Greedily keep the longest in-order prefix of `entries` whose formatted
+/// `- {entry}` lines (joined by newlines) fit the hydration token budget.
+///
+/// The straightforward way to compute this is to grow a `selected` vector and,
+/// on each step, re-render every kept entry to measure the budget — which clones
+/// the vector and re-`join`s all kept entries once per candidate (O(n^2) string
+/// work, n allocations). But `format_memory_lines` renders each entry as a fixed
+/// 2-byte `- ` prefix plus the entry bytes, joined by single newlines, so the joined
+/// byte length is exactly additive:
+///
+/// ```text
+/// len(join(k entries)) = sum(2 + entry.len())  +  (k - 1)   // k >= 1
+/// ```
+///
+/// Tracking that length incrementally and applying the same `div_ceil(4)` token
+/// estimate reproduces the identical accept/reject decision at every step — and
+/// therefore the identical kept prefix — in O(n) with no per-step clone or
+/// re-join. See the `hydration_fit_matches_reference_*` regression tests.
+fn fit_entries_to_budget(entries: Vec<String>) -> Vec<String> {
+    let mut selected: Vec<String> = Vec::with_capacity(entries.len());
+    // Running byte length of `format_memory_lines(&selected)`, kept in lockstep
+    // with `selected` so the budget check never re-scans the already-kept lines.
+    let mut joined_len = 0usize;
+
+    for entry in entries {
+        // This entry adds its `- {entry}` line (2-byte prefix + entry bytes) and,
+        // unless it is the first kept line, one newline separator.
+        let separator = usize::from(!selected.is_empty());
+        let trial_len = joined_len + separator + 2 + entry.len();
+        if estimate_hydration_tokens_from_len(trial_len) <= MEMORY_HYDRATION_BUDGET_TOKENS {
+            joined_len = trial_len;
+            selected.push(entry);
+        } else {
+            break;
+        }
+    }
+
+    selected
+}
+
 fn apply_hydration_budget(entries: Vec<String>) -> String {
     if entries.is_empty() {
         return "(no household context yet)".to_string();
     }
 
     let total_candidates = entries.len();
-    let mut selected = Vec::new();
     let first_entry = entries.first().cloned();
-
-    for entry in entries {
-        let mut trial = selected.clone();
-        trial.push(entry);
-        if estimate_hydration_tokens(&format_memory_lines(&trial)) <= MEMORY_HYDRATION_BUDGET_TOKENS
-        {
-            selected = trial;
-        } else {
-            break;
-        }
-    }
+    let mut selected = fit_entries_to_budget(entries);
 
     let mut truncated_content = false;
     if selected.is_empty()
@@ -191,6 +227,135 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// The original O(n^2) budget fit: clone the growing prefix and re-`join`
+    /// every kept entry to measure the budget on each step. Kept verbatim as the
+    /// oracle the linear `fit_entries_to_budget` must match byte-for-byte.
+    fn fit_entries_reference(entries: Vec<String>) -> Vec<String> {
+        let mut selected: Vec<String> = Vec::new();
+        for entry in entries {
+            let mut trial = selected.clone();
+            trial.push(entry);
+            if estimate_hydration_tokens(&format_memory_lines(&trial))
+                <= MEMORY_HYDRATION_BUDGET_TOKENS
+            {
+                selected = trial;
+            } else {
+                break;
+            }
+        }
+        selected
+    }
+
+    /// Entry sets that exercise the accept path, the exact-boundary case, and the
+    /// break path — including the first entry alone already overflowing.
+    fn fit_corpus() -> Vec<Vec<String>> {
+        let short = || "[identity] Household member name is Jared".to_string();
+        let long = || format!("[identity] {}", "household detail sentence. ".repeat(20));
+        vec![
+            vec![],
+            vec![short()],
+            vec![short(), short(), short()],
+            // Straddle the 700-token budget so the greedy fit stops mid-list.
+            (0..12).map(|i| format!("{} #{i}", long())).collect(),
+            // First entry alone overflows -> empty selection (truncate path).
+            vec![format!("{} {}", long(), long())],
+            // Mixed lengths so the accepted prefix is a non-trivial boundary.
+            vec![short(), long(), short(), long(), short()],
+            // Multi-byte content: byte-length accounting must use bytes, not chars.
+            vec!["[identity] café — naïve façade ✅".to_string(); 6],
+        ]
+    }
+
+    #[test]
+    fn hydration_fit_matches_reference_selection() {
+        for entries in fit_corpus() {
+            let expected = fit_entries_reference(entries.clone());
+            let actual = fit_entries_to_budget(entries.clone());
+            assert_eq!(
+                actual, expected,
+                "linear fit selected a different prefix than the O(n^2) oracle for {entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hydration_fit_matches_reference_rendered_output() {
+        // The user-visible contract is the rendered string; pin it to the oracle.
+        for entries in fit_corpus() {
+            let expected = format_memory_lines(&fit_entries_reference(entries.clone()));
+            let actual = format_memory_lines(&fit_entries_to_budget(entries.clone()));
+            assert_eq!(
+                actual, expected,
+                "rendered hydration differs for {entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hydration_fit_kept_prefix_is_within_budget_and_maximal() {
+        // Independent of the oracle: the kept prefix fits, and the next dropped
+        // entry (if any) would have overflowed — i.e. the greedy fit is maximal.
+        for entries in fit_corpus() {
+            let kept = fit_entries_to_budget(entries.clone());
+            assert!(
+                estimate_hydration_tokens(&format_memory_lines(&kept))
+                    <= MEMORY_HYDRATION_BUDGET_TOKENS,
+                "kept prefix exceeds budget for {entries:?}"
+            );
+            if kept.len() < entries.len() {
+                let mut with_next = kept.clone();
+                with_next.push(entries[kept.len()].clone());
+                assert!(
+                    estimate_hydration_tokens(&format_memory_lines(&with_next))
+                        > MEMORY_HYDRATION_BUDGET_TOKENS,
+                    "fit stopped early while the next entry still fit, for {entries:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_hydration_fit_linear_vs_quadratic() {
+        use std::time::Instant;
+        // A realistic-to-worst-case candidate set: the injector caps entries at 8
+        // per turn, but the quadratic cost is in the re-join, so we also show a
+        // larger set to make the asymptotic gap visible. Every entry is short
+        // enough that the whole prefix fits, so both fits keep all entries and do
+        // the maximum work.
+        for n in [8usize, 64, 256] {
+            let entries: Vec<String> = (0..n)
+                .map(|i| format!("[identity] household member {i}"))
+                .collect();
+            let iters = 5000u32;
+
+            // Warm up + prevent the optimizer from eliding the calls.
+            let mut sink = 0usize;
+            let t = Instant::now();
+            for _ in 0..iters {
+                sink += std::hint::black_box(fit_entries_reference(std::hint::black_box(
+                    entries.clone(),
+                )))
+                .len();
+            }
+            let old_ns = t.elapsed().as_nanos() as f64 / iters as f64;
+
+            let t = Instant::now();
+            for _ in 0..iters {
+                sink += std::hint::black_box(fit_entries_to_budget(std::hint::black_box(
+                    entries.clone(),
+                )))
+                .len();
+            }
+            let new_ns = t.elapsed().as_nanos() as f64 / iters as f64;
+
+            eprintln!(
+                "BENCH hydration fit [n={n}]: old(O(n^2)) {old_ns:.0} ns -> new(O(n)) {new_ns:.0} ns ({:.1}x) (sink={sink})",
+                old_ns / new_ns
+            );
+        }
+    }
 
     fn temp_memory() -> Memory {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
