@@ -63,6 +63,9 @@ impl ConversationStore {
             ",
         )?;
 
+        // Upgrade existing DBs: tag user turns with resolved speaker (#560).
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN speaker TEXT", []);
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -123,16 +126,18 @@ impl ConversationStore {
         role: &str,
         content: &str,
         tool_name: Option<&str>,
+        speaker: Option<&str>,
     ) -> Result<()> {
         let conv_id = conv_id.to_string();
         let role = role.to_string();
         let content = content.to_string();
         let tool_name = tool_name.map(|s| s.to_string());
+        let speaker = speaker.map(|s| s.to_string());
         self.with_conn(move |conn| {
             let now = now_ms();
             conn.execute(
-                "INSERT INTO messages (conv_id, role, content, tool_name, ts_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![conv_id, role, content, tool_name, now],
+                "INSERT INTO messages (conv_id, role, content, tool_name, speaker, ts_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![conv_id, role, content, tool_name, speaker, now],
             )?;
 
             // Update conversation title from first user message.
@@ -178,8 +183,12 @@ impl ConversationStore {
         role: &str,
         content: &str,
         tool_name: Option<&str>,
+        speaker: Option<&str>,
     ) {
-        if let Err(error) = self.append(conv_id, role, content, tool_name).await {
+        if let Err(error) = self
+            .append(conv_id, role, content, tool_name, speaker)
+            .await
+        {
             tracing::error!(
                 conv_id,
                 role,
@@ -501,7 +510,7 @@ mod tests {
             )),
         };
         let error = store
-            .append(&conv_id, "assistant", "hello", None)
+            .append(&conv_id, "assistant", "hello", None, None)
             .await
             .unwrap_err();
         assert!(
@@ -510,7 +519,7 @@ mod tests {
         );
 
         store
-            .append_or_log(&conv_id, "assistant", "hello", None)
+            .append_or_log(&conv_id, "assistant", "hello", None, None)
             .await;
 
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
@@ -524,9 +533,12 @@ mod tests {
         let store = temp_store();
         let id = store.create().await.unwrap();
 
-        store.append(&id, "user", "hello", None).await.unwrap();
         store
-            .append(&id, "assistant", "hi there!", None)
+            .append(&id, "user", "hello", None, None)
+            .await
+            .unwrap();
+        store
+            .append(&id, "assistant", "hi there!", None, None)
             .await
             .unwrap();
 
@@ -543,7 +555,7 @@ mod tests {
         let id = store.create().await.unwrap();
 
         store
-            .append(&id, "user", "what's the weather in Tokyo?", None)
+            .append(&id, "user", "what's the weather in Tokyo?", None, None)
             .await
             .unwrap();
 
@@ -558,7 +570,7 @@ mod tests {
 
         for i in 0..10 {
             store
-                .append(&id, "user", &format!("msg {}", i), None)
+                .append(&id, "user", &format!("msg {}", i), None, None)
                 .await
                 .unwrap();
         }
@@ -573,7 +585,7 @@ mod tests {
     async fn delete_conversation() {
         let store = temp_store();
         let id = store.create().await.unwrap();
-        store.append(&id, "user", "test", None).await.unwrap();
+        store.append(&id, "user", "test", None, None).await.unwrap();
 
         store.delete(&id).await.unwrap();
         assert_eq!(store.list().await.unwrap().len(), 0);
@@ -583,8 +595,14 @@ mod tests {
     async fn export_json() {
         let store = temp_store();
         let id = store.create().await.unwrap();
-        store.append(&id, "user", "hello", None).await.unwrap();
-        store.append(&id, "assistant", "world", None).await.unwrap();
+        store
+            .append(&id, "user", "hello", None, None)
+            .await
+            .unwrap();
+        store
+            .append(&id, "assistant", "world", None, None)
+            .await
+            .unwrap();
 
         let json = store.export_json(&id).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -644,7 +662,10 @@ mod tests {
 
         let message = format!("I love coding! {}", "🎉".repeat(13));
         assert!(message.len() > 60, "test fixture must trigger the >60 path");
-        store.append(&id, "user", &message, None).await.unwrap();
+        store
+            .append(&id, "user", &message, None, None)
+            .await
+            .unwrap();
 
         let convos = store.list().await.unwrap();
         let title = &convos[0].title;
@@ -673,7 +694,10 @@ mod tests {
         // 31 × "й" = 62 bytes. Byte 57 is inside char 29 (0-indexed 28).
         let message = "й".repeat(31);
         assert!(message.len() > 60);
-        store.append(&id, "user", &message, None).await.unwrap();
+        store
+            .append(&id, "user", &message, None, None)
+            .await
+            .unwrap();
 
         let convos = store.list().await.unwrap();
         let title = &convos[0].title;
@@ -690,7 +714,7 @@ mod tests {
         let store = temp_store();
         let id = store.create().await.unwrap();
         store
-            .append(&id, "user", "set a timer", None)
+            .append(&id, "user", "set a timer", None, None)
             .await
             .unwrap();
         let convos = store.list().await.unwrap();
@@ -704,9 +728,58 @@ mod tests {
         let store = temp_store();
         let id = store.create().await.unwrap();
         let message = "a".repeat(70);
-        store.append(&id, "user", &message, None).await.unwrap();
+        store
+            .append(&id, "user", &message, None, None)
+            .await
+            .unwrap();
         let convos = store.list().await.unwrap();
         assert_eq!(convos[0].title, format!("{}...", "a".repeat(57)));
+    }
+
+    #[tokio::test]
+    async fn speaker_column_persists_resolved_user_turn() {
+        let id_counter = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-conv-test-{}-{}.db",
+            std::process::id(),
+            id_counter
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = ConversationStore::open(&path).unwrap();
+        let conv_id = store.create().await.unwrap();
+        store
+            .append(
+                &conv_id,
+                "user",
+                "turn on the kitchen light",
+                None,
+                Some("dana"),
+            )
+            .await
+            .unwrap();
+        store
+            .append(&conv_id, "assistant", "done", None, None)
+            .await
+            .unwrap();
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let speaker: Option<String> = conn
+            .query_row(
+                "SELECT speaker FROM messages WHERE conv_id = ?1 AND role = 'user'",
+                [&conv_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(speaker.as_deref(), Some("dana"));
+
+        let assistant_speaker: Option<String> = conn
+            .query_row(
+                "SELECT speaker FROM messages WHERE conv_id = ?1 AND role = 'assistant'",
+                [&conv_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(assistant_speaker.is_none());
     }
 
     /// Regression for #571: conversation writes must not monopolize the
@@ -728,7 +801,7 @@ mod tests {
             tokio::spawn(async move {
                 for i in 0..200 {
                     store
-                        .append(&id, "user", &format!("message number {i}"), None)
+                        .append(&id, "user", &format!("message number {i}"), None, None)
                         .await
                         .unwrap();
                 }

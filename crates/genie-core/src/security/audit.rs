@@ -267,6 +267,11 @@ fn check_localhost_binding(findings: &mut Vec<AuditFinding>) {
     });
 }
 
+/// Structured trace for operators monitoring voice turns in journalctl (#560).
+pub fn log_speaker_resolved(name: &str, confidence: &str) {
+    tracing::info!(speaker = name, confidence, "speaker identity resolved");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

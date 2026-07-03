@@ -602,6 +602,19 @@ fn unix_time_ms() -> u128 {
         .unwrap_or_default()
 }
 
+pub fn speaker_audit_name(speaker: &SpeakerIdentity) -> &str {
+    speaker.name.as_deref().unwrap_or("unknown")
+}
+
+pub fn speaker_confidence_label(confidence: IdentityConfidence) -> &'static str {
+    match confidence {
+        IdentityConfidence::High => "High",
+        IdentityConfidence::Medium => "Medium",
+        IdentityConfidence::Low => "Low",
+        IdentityConfidence::Unknown => "Unknown",
+    }
+}
+
 pub fn build_memory_read_context(text: &str, speaker: &SpeakerIdentity) -> MemoryReadContext {
     let lower = text.trim().to_ascii_lowercase();
     MemoryReadContext {
