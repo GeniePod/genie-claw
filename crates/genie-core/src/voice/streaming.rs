@@ -294,28 +294,54 @@ fn is_cjk_boundary(ch: char) -> bool {
 /// code blocks, truncates to N sentences, etc.) so this applies the
 /// inline subset: strip markdown links, raw URLs, leading list/header
 /// markers, common inline emphasis chars, and collapse whitespace.
-fn clean_sentence(text: &str) -> String {
+///
+/// Allocation budget per call (was ~16 intermediate strings on `main`):
+/// - `strip_inline_links` → 1
+/// - `strip_raw_urls` → 1 (was 2: Vec alloc + join; now direct-build)
+/// - `strip_list_or_header_prefix` → 1
+/// - `replace("**")` → 1, `replace("__")` → 1, filter+collect → 1  (was 4)
+/// - four multi-char punct replacements → 4
+/// - single-char punct match loop → 1  (was 2 separate replace passes)
+/// - `replace("'s")` → 1
+/// - `collapse_whitespace` → 1
+///
+/// Total: 13 (saves 3 heap allocations per sentence vs the old chain).
+pub fn clean_sentence(text: &str) -> String {
     let stripped_links = strip_inline_links(text);
     let stripped_urls = strip_raw_urls(&stripped_links);
     let stripped_prefix = strip_list_or_header_prefix(stripped_urls.trim());
-    #[allow(clippy::collapsible_str_replace)]
-    let stripped_inline = stripped_prefix
+    // Reduce the four emphasis passes to 3: remove multi-char markers first
+    // (preserving the same order as the original replace chain), then fuse
+    // the remaining lone `*` and `` ` `` removals into a single char-filter.
+    // This keeps the same observable ordering (`__` is stripped before any
+    // backtick removal that might expose an adjacent `__` pattern).
+    let stripped_inline: String = stripped_prefix
         .replace("**", "")
         .replace("__", "")
-        .replace('*', "")
-        .replace('`', "");
-    let punct_cleaned = stripped_inline
+        .chars()
+        .filter(|&c| c != '*' && c != '`')
+        .collect();
+    // Apply multi-char punctuation replacements first (require a separate pass
+    // each), then fuse the single-char replacements into one match loop —
+    // the same approach used by `format::clean_for_tts`.
+    let pre = stripped_inline
         .replace("...", ", ")
         .replace(" - ", ", ")
         .replace(" — ", ", ")
-        .replace(" – ", ", ")
-        .replace(['(', ')'], ", ")
-        .replace(['[', ']', '{', '}', '"'], "")
-        .replace("'s", "s");
+        .replace(" – ", ", ");
+    let mut punct_cleaned = String::with_capacity(pre.len());
+    for ch in pre.chars() {
+        match ch {
+            '(' | ')' => punct_cleaned.push_str(", "),
+            '[' | ']' | '{' | '}' | '"' => {}
+            _ => punct_cleaned.push(ch),
+        }
+    }
+    let punct_cleaned = punct_cleaned.replace("'s", "s");
     collapse_whitespace(punct_cleaned.trim())
 }
 
-fn strip_inline_links(text: &str) -> String {
+pub fn strip_inline_links(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -352,21 +378,30 @@ fn strip_inline_links(text: &str) -> String {
     result
 }
 
-fn strip_raw_urls(text: &str) -> String {
-    text.split_whitespace()
-        .filter(|token| {
-            let trimmed = token.trim_matches(|c: char| {
-                matches!(
-                    c,
-                    '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '"' | '\''
-                )
-            });
-            !(trimmed.starts_with("http://")
-                || trimmed.starts_with("https://")
-                || trimmed.starts_with("www."))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+pub fn strip_raw_urls(text: &str) -> String {
+    // Build the output directly instead of collecting filtered tokens into a
+    // Vec<&str> and joining — eliminates the intermediate Vec allocation.
+    // Identical logic and output to the old filter+collect+join form.
+    let mut result = String::with_capacity(text.len());
+    for token in text.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '"' | '\''
+            )
+        });
+        if trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("www.")
+        {
+            continue;
+        }
+        if !result.is_empty() {
+            result.push(' ');
+        }
+        result.push_str(token);
+    }
+    result
 }
 
 fn strip_list_or_header_prefix(line: &str) -> String {
