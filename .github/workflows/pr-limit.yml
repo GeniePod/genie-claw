@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     env:
-      MAX_OPEN_PRS: "3"
+      MAX_OPEN_PRS: "2"
     steps:
       - name: Close PR when author has too many open PRs
         env:

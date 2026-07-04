@@ -31,6 +31,20 @@ impl ToolDispatcher {
         )
     }
 
+    /// Whether a loaded skill exposes a tool called `name`, without building the
+    /// skill's `ToolDef` (no description build, no `parameters_json` parse).
+    /// Mirrors the availability of [`skill_tool_defs`](Self::skill_tool_defs): a
+    /// missing skill loader or a poisoned lock means no skill tools are known.
+    pub(super) fn skill_tool_name_loaded(&self, name: &str) -> bool {
+        let Some(skills) = self.skills.as_ref() else {
+            return false;
+        };
+        let Ok(loader) = skills.lock() else {
+            return false;
+        };
+        loader.loaded().iter().any(|skill| skill.name == name)
+    }
+
     pub(super) async fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
         let skills = self
             .skills

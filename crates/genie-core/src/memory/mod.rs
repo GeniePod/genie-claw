@@ -930,11 +930,12 @@ impl Memory {
         values.push((limit * 3).to_string());
 
         let mut stmt = self.conn.prepare(&sql)?;
+        let query_lex = QueryLexicon::new(query);
         let mut scored: Vec<(MemoryEntry, f64)> = stmt
             .query_map(params_from_iter(values.iter()), read_entry)?
             .filter_map(|r| r.ok())
             .map(|entry| {
-                let score = lexical_overlap_score(query, &entry.content);
+                let score = query_lex.lexical_overlap_score(&entry.content);
                 (entry, score)
             })
             .collect();
@@ -1616,6 +1617,7 @@ impl Memory {
              WHERE secret_type = ?1
              ORDER BY updated_ms DESC, source_memory_id DESC",
         )?;
+        let query_lex = QueryLexicon::new(query);
         let mut entries = stmt
             .query_map([secret_type], |row| {
                 Ok(AppOnlySecretReference {
@@ -1627,7 +1629,7 @@ impl Memory {
             })?
             .filter_map(|row| row.ok())
             .map(|entry| {
-                let score = lexical_overlap_score(query, &entry.label);
+                let score = query_lex.lexical_overlap_score(&entry.label);
                 (entry, score)
             })
             .filter(|(_, score)| *score > 0.0)
@@ -2033,6 +2035,7 @@ impl Memory {
         let query_text = embedding_text_for_query(query);
         let query_type = semantic_query_type(query);
         let query_embedding = provider.embed(&query_text);
+        let query_lex = QueryLexicon::new(&query_text);
         let now = now_ms();
         let query_hash = hash_query(query);
         let mut stmt = self.conn.prepare(
@@ -2060,7 +2063,7 @@ impl Memory {
                     if query_type.as_deref().is_some_and(|expected| {
                         expected == semantic_memory_type(&entry.kind, &entry.content)
                     }) {
-                        score = score.max(0.95 + word_overlap(&query_text, &entry.content) * 0.04);
+                        score = score.max(0.95 + query_lex.word_overlap(&entry.content) * 0.04);
                     }
                     SemanticMemoryHit {
                         entry,
@@ -9064,25 +9067,60 @@ fn count_markdown_files(root: &Path) -> usize {
     count
 }
 
-/// Word overlap ratio between two strings (Jaccard-like).
-fn word_overlap(a: &str, b: &str) -> f64 {
-    let a_lower = a.to_lowercase();
-    let b_lower = b.to_lowercase();
-    let a_words: std::collections::HashSet<&str> = a_lower.split_whitespace().collect();
-    let b_words: std::collections::HashSet<&str> = b_lower.split_whitespace().collect();
-
-    if a_words.is_empty() || b_words.is_empty() {
-        return 0.0;
-    }
-
-    let intersection = a_words.intersection(&b_words).count();
-    let union = a_words.union(&b_words).count();
-
-    intersection as f64 / union as f64
+/// A query string's distinct lowercased words, tokenized once so scoring many
+/// candidates against the same query does not re-lowercase and re-tokenize the
+/// query on every candidate.
+///
+/// The memory recall paths (`search_like_fallback`, `app_only_secret_reference_fallback`,
+/// `semantic_search`) each score every candidate DB row against a single fixed
+/// query. The previous free `word_overlap(query, candidate)` rebuilt
+/// `query.to_lowercase()` and the query's word set on every call -- O(rows)
+/// redundant lowercasings and allocations per turn. Building the query side once
+/// and reusing it makes that work O(1) per query while producing bit-identical
+/// scores. See the `query_lexicon_matches_reference_*` regression tests, which
+/// diff this against the original per-call logic (kept verbatim in the test
+/// module as `word_overlap_reference`).
+struct QueryLexicon {
+    /// Distinct lowercased whitespace-separated words of the query.
+    words: std::collections::HashSet<String>,
 }
 
-fn lexical_overlap_score(a: &str, b: &str) -> f64 {
-    word_overlap(a, b).max(0.05)
+impl QueryLexicon {
+    fn new(query: &str) -> Self {
+        let lower = query.to_lowercase();
+        let words = lower.split_whitespace().map(str::to_string).collect();
+        Self { words }
+    }
+
+    /// Word-overlap ratio (Jaccard) of this query against `other`. Identical to
+    /// the original `word_overlap(query, other)`: `|A n B| / |A u B|` over the two
+    /// distinct lowercased word sets, and `0.0` when either side has no words.
+    fn word_overlap(&self, other: &str) -> f64 {
+        if self.words.is_empty() {
+            return 0.0;
+        }
+        let other_lower = other.to_lowercase();
+        let other_words: std::collections::HashSet<&str> = other_lower.split_whitespace().collect();
+        if other_words.is_empty() {
+            return 0.0;
+        }
+
+        let intersection = other_words
+            .iter()
+            .filter(|word| self.words.contains(**word))
+            .count();
+        // Inclusion-exclusion: |A u B| = |A| + |B| - |A n B|. intersection is at
+        // most other_words.len(), so this never underflows.
+        let union = self.words.len() + other_words.len() - intersection;
+
+        intersection as f64 / union as f64
+    }
+
+    /// Lexical-overlap score with the same `0.05` floor as the original
+    /// `lexical_overlap_score(query, other)`.
+    fn lexical_overlap_score(&self, other: &str) -> f64 {
+        self.word_overlap(other).max(0.05)
+    }
 }
 
 fn normalize_memory_content(content: &str) -> String {
@@ -9209,6 +9247,97 @@ fn hash_query(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The original per-call `word_overlap`, kept verbatim as the oracle the
+    /// reused `QueryLexicon` must match bit-for-bit.
+    fn word_overlap_reference(a: &str, b: &str) -> f64 {
+        let a_lower = a.to_lowercase();
+        let b_lower = b.to_lowercase();
+        let a_words: std::collections::HashSet<&str> = a_lower.split_whitespace().collect();
+        let b_words: std::collections::HashSet<&str> = b_lower.split_whitespace().collect();
+
+        if a_words.is_empty() || b_words.is_empty() {
+            return 0.0;
+        }
+
+        let intersection = a_words.intersection(&b_words).count();
+        let union = a_words.union(&b_words).count();
+
+        intersection as f64 / union as f64
+    }
+
+    fn lexical_overlap_score_reference(a: &str, b: &str) -> f64 {
+        word_overlap_reference(a, b).max(0.05)
+    }
+
+    /// (query, candidate) pairs exercising: empty sides, no/partial/full overlap,
+    /// repeated words (distinct-set cardinality), case folding on both sides,
+    /// collapsed interior whitespace, and punctuation kept attached to a token
+    /// (exactly as `split_whitespace` does).
+    fn lexical_pairs() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("", ""),
+            ("hello world", ""),
+            ("", "hello world"),
+            ("the quick brown fox", "the quick brown fox"),
+            ("the quick brown fox", "a slow green turtle"),
+            ("User's Favorite Color is Blue", "user favorite color blue"),
+            ("Remember my DOG name", "remember my dog Name is Rex"),
+            ("run run run run", "run walk run"),
+            ("HELLO Hello hello", "hello HELLO"),
+            ("cafe naive facade resume", "CAFE resume FACADE"),
+            ("  spaced   out  words ", "words spaced"),
+            ("what's the wifi password?", "the wifi password is hunter2"),
+        ]
+    }
+
+    #[test]
+    fn query_lexicon_matches_reference_word_overlap() {
+        for (q, c) in lexical_pairs() {
+            let expected = word_overlap_reference(q, c);
+            let actual = QueryLexicon::new(q).word_overlap(c);
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "word_overlap mismatch for query {q:?} candidate {c:?}: {actual} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_lexicon_matches_reference_lexical_score() {
+        for (q, c) in lexical_pairs() {
+            let expected = lexical_overlap_score_reference(q, c);
+            let actual = QueryLexicon::new(q).lexical_overlap_score(c);
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "lexical_overlap_score mismatch for query {q:?} candidate {c:?}: {actual} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_lexicon_reuse_scores_each_candidate_like_the_oracle() {
+        // The point of the type: build the query side once, score many
+        // candidates. Assert the reused lexicon matches per-call scoring.
+        let query = "user's favorite programming language is Rust";
+        let candidates = [
+            "user likes Rust a lot",
+            "the weather is sunny today",
+            "favorite language rust",
+            "",
+            "RUST rust Rust programming",
+        ];
+        let lex = QueryLexicon::new(query);
+        for c in candidates {
+            assert_eq!(
+                lex.lexical_overlap_score(c).to_bits(),
+                lexical_overlap_score_reference(query, c).to_bits(),
+                "reused lexicon diverged from per-call oracle for candidate {c:?}"
+            );
+        }
+    }
 
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
