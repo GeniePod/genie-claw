@@ -2,27 +2,85 @@
 
 ## Unreleased
 
-### Quick-router
+## 1.0.0-rc.3 - 2026-07-03
 
-- **Calculator**: fold spoken-word decimals in the calculator path (`three point
-  five` → `3.5`, `ninety eight point six` → `98.6`) — extends digit-only spoken
-  decimals from #504 to cardinal-word forms (#562).
-- **Calculator**: parse spoken cardinal numbers in percentage and
-  Fahrenheit-to-Celsius routes (`twenty percent of 80`, `convert ninety eight f
-  to celsius`) — extends the #504/#555 calculator path to multi-token spoken
-  cardinals, not only digit literals.
+Third release candidate. This RC lays the **M2 foundations** — a portable
+provider and channel architecture — while taking deterministic tool-call
+accuracy to a **genuine, CI-enforced 96%** and hardening runtime reliability:
+the single-threaded executor no longer stalls one session behind another.
 
-### Fixed
+### Portable providers & channels (M2)
 
-- **Quick-router live strict accuracy restored to 96% (25/26).** Three outputs
-  the committed BFCL suite expected were not actually produced by the live
-  `route_for_available_tools` path: the `memory_recall` note query now rebuilds
-  from the original text, preserving proper-noun and brand casing ("Find
-  Grandma's Wi-Fi note." → `Grandma Wi-Fi note`); the office standby entity
-  grounds to `office standby power`; and the green night-light preference keeps
-  the user's own phrasing (`Leo likes the green night-light better.`). The
-  remaining gap is the two-call homework-timer case (#533), which the
-  single-emit quick router cannot satisfy by design.
+- **`Provider` trait** (#578): the agent turn depends on a swappable `Provider`
+  (`prompt → completion`) with the on-device model as the default
+  `LocalProvider` — the seam the optional API-provider work plugs into, with no
+  behavior change to the local default.
+- **Config-driven provider selection** (#595): select and parameterize the LLM
+  from `geniepod.toml` with fail-loud startup validation; local stays the
+  default, and the optional OpenAI-compatible surface is opt-in behind an
+  explicit gate.
+- **`Channel` boundary** (#573): transport-agnostic
+  `IncomingTurn`/`OutgoingResponse` plus a `Channel` trait and registry, so the
+  agent loop can run identically across voice, HTTP, and Telegram (porting the
+  transports onto it is tracked separately).
+- **Speaker identity in the conversation store** (#560): voice turns persist the
+  resolved speaker on each message (live `ALTER TABLE` migration) and emit an
+  audit event.
+
+### Reliability
+
+- **Channel concurrency — no session stalls another** (#583, #606):
+  `ConversationStore` and `Memory` ran synchronous SQLite on genie-core's single
+  shared thread, freezing every other in-flight HTTP/Telegram turn for its
+  duration. Both now run their I/O on `spawn_blocking` behind their existing
+  choke points — behavior-preserving, verified with concurrent-starvation tests.
+- **Memory durability** (#576, #581): crash-recovery (WAL replay after an unclean
+  shutdown) and concurrent-writer tests, plus dispatch-boundary schema
+  enforcement for `memory_forget`/`memory_store` (#416).
+
+### Quick-router tool-call accuracy
+
+- **Live strict accuracy is genuinely 96% (25/26)** (#580): three outputs the
+  committed BFCL suite assumed had shipped were not actually produced by the live
+  router — the `memory_recall` note query now preserves proper-noun/brand casing
+  ("Find Grandma's Wi-Fi note." → `Grandma Wi-Fi note`), the office standby entity
+  grounds to `office standby power`, and the night-light preference keeps the
+  user's phrasing. The remaining gap is the two-call homework-timer case (#533).
+- **Calculator**: spoken-word decimals (#562) and spoken cardinals in percentage
+  / Fahrenheit→Celsius routes (#575).
+- **Timers**: compound `<hours> and <minutes>` durations sum correctly (#587) and
+  fractional `half an hour` / `quarter of an hour` (#588).
+- **Weather**: trailing time words (`tonight`, `right now`, …) no longer glue onto
+  the `location` argument (#597).
+- **Dispatch answers**: correct plurals — `children`/`wives` and `1 item` vs
+  `2 items` (#556, #557).
+
+### Storage & performance
+
+- **Batched query-diversity lookup** (#548): the dream-cycle scoring pass replaces
+  a per-candidate N+1 with a single batched `IN (…)` (~4.5× on Jetson).
+- **Linear hydration budget** (#585): the per-turn memory-injection fit is O(n)
+  instead of O(n²) (~20–100× on Jetson), behavior-preserving via equivalence tests.
+- **Batched dream-cycle promotions** (#586): one `MEMORY.md` rebuild per batch
+  instead of one per promotion.
+
+### Internals
+
+- Split `tools/dispatch.rs` into per-tool modules (#404 / #584) and `memory/mod.rs`
+  into `structured.rs` / `parse_household.rs` (#604) — pure code moves, no behavior
+  change.
+
+### Security
+
+- **`anyhow` 1.0.102 → 1.0.103** (RUSTSEC-2026-0190): patches an unsoundness in
+  `Error::downcast_mut()`. A semver-compatible patch bump; no code change.
+
+### Build / CI
+
+- **The BFCL gate now scores the live quick-router**, not the hand-authored golden
+  file (#579 / #594): a `bfcl-score --min-strict` flag plus a CI step that
+  regenerates predictions from `route_for_available_tools` and fails below 96%. The
+  golden file is retained as a scorer-parsing check.
 
 ## 1.0.0-rc.2 - 2026-07-01
 

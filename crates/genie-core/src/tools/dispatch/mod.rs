@@ -275,6 +275,48 @@ impl ToolDispatcher {
         self.web_search.enabled
     }
 
+    /// Whether `name` is a currently-available tool, without building the full
+    /// [`tool_defs`](Self::tool_defs) table.
+    ///
+    /// The tool-call parser only needs the *name* set to validate a compact
+    /// single-key call like `{"get_weather":"Denver"}`, but it used to call
+    /// `tool_defs()` — which allocates a `ToolDef` per built-in tool (each with a
+    /// `serde_json::json!` parameter schema) and `serde_json::from_str`-parses
+    /// every loaded skill's `parameters_json` — and then read only `.name`. This
+    /// returns membership over exactly that same name set, with the same
+    /// `has_home_automation()` / `has_web_search()` gating and the same loaded
+    /// skills, but allocates nothing. Kept in lockstep with `tool_defs()` by
+    /// `is_known_tool_matches_tool_defs_names` in the tests.
+    pub fn is_known_tool(&self, name: &str) -> bool {
+        // Non-skill tools `tool_defs()` always emits (set_timer/get_time/weather/
+        // system_info/calculate/play_media + memory::tool_defs()).
+        const BASE_TOOLS: &[&str] = &[
+            "set_timer",
+            "get_time",
+            "get_weather",
+            "system_info",
+            "calculate",
+            "play_media",
+            "memory_recall",
+            "memory_status",
+            "memory_forget",
+            "memory_store",
+        ];
+        // Emitted only when Home Assistant automation is wired up (home::tool_defs()).
+        const HOME_TOOLS: &[&str] = &["home_control", "home_status", "home_undo", "action_history"];
+
+        if BASE_TOOLS.contains(&name) {
+            return true;
+        }
+        if self.has_home_automation() && HOME_TOOLS.contains(&name) {
+            return true;
+        }
+        if self.has_web_search() && name == "web_search" {
+            return true;
+        }
+        self.skill_tool_name_loaded(name)
+    }
+
     pub fn web_search_status(&self) -> serde_json::Value {
         serde_json::json!({
             "enabled": self.web_search.enabled,
@@ -1241,6 +1283,48 @@ mod tests {
 
         assert!(!defs.iter().any(|d| d.name == "web_search"));
         assert!(!dispatcher.has_web_search());
+    }
+
+    #[test]
+    fn is_known_tool_matches_tool_defs_names() {
+        // is_known_tool is the allocation-free membership check the parser uses in
+        // place of tool_defs(); it must agree exactly with the name set tool_defs()
+        // emits for every configuration, and reject anything outside it.
+        let configs = [
+            ToolDispatcher::new(None),
+            ToolDispatcher::new(Some(Arc::new(StubHomeProvider))),
+            ToolDispatcher::new(None).with_web_search_config(WebSearchConfig {
+                enabled: true,
+                ..WebSearchConfig::default()
+            }),
+        ];
+
+        for dispatcher in &configs {
+            for def in dispatcher.tool_defs() {
+                assert!(
+                    dispatcher.is_known_tool(&def.name),
+                    "is_known_tool must accept every tool_defs() name: {}",
+                    def.name
+                );
+            }
+            assert!(!dispatcher.is_known_tool("definitely_not_a_tool"));
+            assert!(!dispatcher.is_known_tool(""));
+        }
+
+        // Feature gating parity with tool_defs(): home tools require an HA
+        // provider; web search is default-on and must drop out when disabled.
+        let base = ToolDispatcher::new(None);
+        assert!(base.is_known_tool("calculate"));
+        assert!(!base.is_known_tool("home_control"));
+        assert!(
+            ToolDispatcher::new(Some(Arc::new(StubHomeProvider))).is_known_tool("home_control")
+        );
+
+        let no_web = ToolDispatcher::new(None).with_web_search_config(WebSearchConfig {
+            enabled: false,
+            ..WebSearchConfig::default()
+        });
+        assert!(!no_web.is_known_tool("web_search"));
     }
 
     #[test]

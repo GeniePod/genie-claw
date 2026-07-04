@@ -31,6 +31,16 @@ pub struct ConversationMeta {
     pub message_count: usize,
 }
 
+/// A persisted message, including the resolved speaker (if any) that was
+/// tagged when the message was appended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredMessage {
+    pub role: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+}
+
 impl ConversationStore {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -62,6 +72,9 @@ impl ConversationStore {
             CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_id, ts_ms);
             ",
         )?;
+
+        // Migrate existing databases: add speaker column if not present (#559).
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN speaker TEXT", []);
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -123,16 +136,18 @@ impl ConversationStore {
         role: &str,
         content: &str,
         tool_name: Option<&str>,
+        speaker: Option<&str>,
     ) -> Result<()> {
         let conv_id = conv_id.to_string();
         let role = role.to_string();
         let content = content.to_string();
         let tool_name = tool_name.map(|s| s.to_string());
+        let speaker = speaker.map(|s| s.to_string());
         self.with_conn(move |conn| {
             let now = now_ms();
             conn.execute(
-                "INSERT INTO messages (conv_id, role, content, tool_name, ts_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![conv_id, role, content, tool_name, now],
+                "INSERT INTO messages (conv_id, role, content, tool_name, ts_ms, speaker) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![conv_id, role, content, tool_name, now, speaker],
             )?;
 
             // Update conversation title from first user message.
@@ -178,8 +193,12 @@ impl ConversationStore {
         role: &str,
         content: &str,
         tool_name: Option<&str>,
+        speaker: Option<&str>,
     ) {
-        if let Err(error) = self.append(conv_id, role, content, tool_name).await {
+        if let Err(error) = self
+            .append(conv_id, role, content, tool_name, speaker)
+            .await
+        {
             tracing::error!(
                 conv_id,
                 role,
@@ -190,19 +209,20 @@ impl ConversationStore {
         }
     }
 
-    /// Get all messages in a conversation.
-    pub async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>> {
+    /// Get all messages in a conversation, including the tagged speaker (if any).
+    pub async fn get_messages(&self, conv_id: &str) -> Result<Vec<StoredMessage>> {
         let conv_id = conv_id.to_string();
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT role, content FROM messages WHERE conv_id = ?1 ORDER BY ts_ms ASC",
+                "SELECT role, content, speaker FROM messages WHERE conv_id = ?1 ORDER BY ts_ms ASC",
             )?;
 
             let messages = stmt
                 .query_map([conv_id], |row| {
-                    Ok(Message {
+                    Ok(StoredMessage {
                         role: row.get(0)?,
                         content: row.get(1)?,
+                        speaker: row.get(2)?,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -501,7 +521,7 @@ mod tests {
             )),
         };
         let error = store
-            .append(&conv_id, "assistant", "hello", None)
+            .append(&conv_id, "assistant", "hello", None, None)
             .await
             .unwrap_err();
         assert!(
@@ -510,7 +530,7 @@ mod tests {
         );
 
         store
-            .append_or_log(&conv_id, "assistant", "hello", None)
+            .append_or_log(&conv_id, "assistant", "hello", None, None)
             .await;
 
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
@@ -524,9 +544,12 @@ mod tests {
         let store = temp_store();
         let id = store.create().await.unwrap();
 
-        store.append(&id, "user", "hello", None).await.unwrap();
         store
-            .append(&id, "assistant", "hi there!", None)
+            .append(&id, "user", "hello", None, None)
+            .await
+            .unwrap();
+        store
+            .append(&id, "assistant", "hi there!", None, None)
             .await
             .unwrap();
 
@@ -538,12 +561,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_persists_speaker_round_trip() {
+        let store = temp_store();
+        let id = store.create().await.unwrap();
+
+        store
+            .append(&id, "user", "hello", None, Some("dana"))
+            .await
+            .unwrap();
+        store
+            .append(&id, "assistant", "hi there!", None, None)
+            .await
+            .unwrap();
+
+        let messages = store.get_messages(&id).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].speaker.as_deref(),
+            Some("dana"),
+            "speaker tagged on the user turn should round-trip through storage"
+        );
+        assert_eq!(
+            messages[1].speaker, None,
+            "turns appended without a speaker should read back as None"
+        );
+    }
+
+    #[tokio::test]
     async fn auto_title_from_first_message() {
         let store = temp_store();
         let id = store.create().await.unwrap();
 
         store
-            .append(&id, "user", "what's the weather in Tokyo?", None)
+            .append(&id, "user", "what's the weather in Tokyo?", None, None)
             .await
             .unwrap();
 
@@ -558,7 +608,7 @@ mod tests {
 
         for i in 0..10 {
             store
-                .append(&id, "user", &format!("msg {}", i), None)
+                .append(&id, "user", &format!("msg {}", i), None, None)
                 .await
                 .unwrap();
         }
@@ -573,7 +623,7 @@ mod tests {
     async fn delete_conversation() {
         let store = temp_store();
         let id = store.create().await.unwrap();
-        store.append(&id, "user", "test", None).await.unwrap();
+        store.append(&id, "user", "test", None, None).await.unwrap();
 
         store.delete(&id).await.unwrap();
         assert_eq!(store.list().await.unwrap().len(), 0);
@@ -583,8 +633,14 @@ mod tests {
     async fn export_json() {
         let store = temp_store();
         let id = store.create().await.unwrap();
-        store.append(&id, "user", "hello", None).await.unwrap();
-        store.append(&id, "assistant", "world", None).await.unwrap();
+        store
+            .append(&id, "user", "hello", None, None)
+            .await
+            .unwrap();
+        store
+            .append(&id, "assistant", "world", None, None)
+            .await
+            .unwrap();
 
         let json = store.export_json(&id).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -644,7 +700,10 @@ mod tests {
 
         let message = format!("I love coding! {}", "🎉".repeat(13));
         assert!(message.len() > 60, "test fixture must trigger the >60 path");
-        store.append(&id, "user", &message, None).await.unwrap();
+        store
+            .append(&id, "user", &message, None, None)
+            .await
+            .unwrap();
 
         let convos = store.list().await.unwrap();
         let title = &convos[0].title;
@@ -673,7 +732,10 @@ mod tests {
         // 31 × "й" = 62 bytes. Byte 57 is inside char 29 (0-indexed 28).
         let message = "й".repeat(31);
         assert!(message.len() > 60);
-        store.append(&id, "user", &message, None).await.unwrap();
+        store
+            .append(&id, "user", &message, None, None)
+            .await
+            .unwrap();
 
         let convos = store.list().await.unwrap();
         let title = &convos[0].title;
@@ -690,7 +752,7 @@ mod tests {
         let store = temp_store();
         let id = store.create().await.unwrap();
         store
-            .append(&id, "user", "set a timer", None)
+            .append(&id, "user", "set a timer", None, None)
             .await
             .unwrap();
         let convos = store.list().await.unwrap();
@@ -704,7 +766,10 @@ mod tests {
         let store = temp_store();
         let id = store.create().await.unwrap();
         let message = "a".repeat(70);
-        store.append(&id, "user", &message, None).await.unwrap();
+        store
+            .append(&id, "user", &message, None, None)
+            .await
+            .unwrap();
         let convos = store.list().await.unwrap();
         assert_eq!(convos[0].title, format!("{}...", "a".repeat(57)));
     }
@@ -728,7 +793,7 @@ mod tests {
             tokio::spawn(async move {
                 for i in 0..200 {
                     store
-                        .append(&id, "user", &format!("message number {i}"), None)
+                        .append(&id, "user", &format!("message number {i}"), None, None)
                         .await
                         .unwrap();
                 }

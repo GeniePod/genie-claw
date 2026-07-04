@@ -389,6 +389,72 @@ impl OptionalAiProviderConfig {
             OptionalAiProviderAuthMode::OAuthBearer => &self.oauth_token_env,
         }
     }
+
+    /// Fail-loud validation when `enabled = true` (#568).
+    pub fn ensure_enabled_ready(&self, agent: &AgentConfig) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let mut reasons = Vec::new();
+        if self.context_window_tokens > agent.context_window_tokens {
+            reasons.push(
+                "[optional_ai_provider].context_window_tokens exceeds [agent].context_window_tokens",
+            );
+        }
+        if self.credential_env().trim().is_empty() {
+            reasons.push(match self.auth_mode {
+                OptionalAiProviderAuthMode::ApiKey => {
+                    "[optional_ai_provider].api_key_env must be set when auth_mode = api_key"
+                }
+                OptionalAiProviderAuthMode::OAuthBearer => {
+                    "[optional_ai_provider].oauth_token_env must be set when auth_mode = oauth_bearer"
+                }
+            });
+        }
+        if self.base_url.trim().is_empty() {
+            reasons.push("[optional_ai_provider].base_url must be set when enabled");
+        }
+        if is_remote_url(&self.base_url) && !self.allow_remote_base_url {
+            reasons.push(
+                "[optional_ai_provider].base_url is remote; set allow_remote_base_url = true to opt in",
+            );
+        }
+
+        if !reasons.is_empty() {
+            anyhow::bail!("optional_ai_provider misconfigured: {}", reasons.join("; "));
+        }
+
+        match self.provider {
+            OptionalAiProviderKind::OpenAiCompatible | OptionalAiProviderKind::OpenAi => {}
+            OptionalAiProviderKind::Anthropic => {
+                anyhow::bail!(
+                    "[optional_ai_provider].provider = \"anthropic\" is not wired yet; use open_ai_compatible"
+                );
+            }
+            OptionalAiProviderKind::Gemini => {
+                anyhow::bail!(
+                    "[optional_ai_provider].provider = \"gemini\" is not wired yet; use open_ai_compatible"
+                );
+            }
+            OptionalAiProviderKind::Custom => {
+                anyhow::bail!(
+                    "[optional_ai_provider].provider = \"custom\" is not wired yet; use open_ai_compatible"
+                );
+            }
+        }
+
+        let credential_env = self.credential_env();
+        match std::env::var(credential_env) {
+            Ok(value) if !value.trim().is_empty() => Ok(()),
+            Ok(_) => anyhow::bail!(
+                "optional_ai_provider enabled but environment variable {credential_env} is empty"
+            ),
+            Err(_) => anyhow::bail!(
+                "optional_ai_provider enabled but environment variable {credential_env} is not set"
+            ),
+        }
+    }
 }
 
 impl Default for OptionalAiProviderConfig {
@@ -1369,6 +1435,12 @@ fn ensure_port(authority: &str, default_port: u16) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveLlmProviderKind {
+    Local,
+    OptionalApi,
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmBackendKind {
@@ -1394,7 +1466,58 @@ impl Config {
         let mut config: Config = toml::from_str(&contents)?;
         config.resolve_env_overrides();
         config.validate_service_url_drift();
+        config.validate_llm_provider()?;
         Ok(config)
+    }
+
+    /// Resolve which LLM surface is active from existing config keys.
+    ///
+    /// `[optional_ai_provider].enabled = true` selects the gated API path;
+    /// otherwise the local `[services.llm]` backend is used.
+    pub fn active_llm_provider_kind(&self) -> ActiveLlmProviderKind {
+        if self.optional_ai_provider.enabled {
+            ActiveLlmProviderKind::OptionalApi
+        } else {
+            ActiveLlmProviderKind::Local
+        }
+    }
+
+    /// Fail-loud validation for the configured LLM provider path (#568).
+    pub fn validate_llm_provider(&self) -> anyhow::Result<()> {
+        if self.agent.context_window_tokens == 0 {
+            anyhow::bail!("[agent].context_window_tokens must be greater than 0");
+        }
+
+        if self.core.llm_model_name.trim().is_empty() {
+            anyhow::bail!("[core].llm_model_name must not be empty");
+        }
+
+        if self.core.llm_model_path.as_os_str().is_empty() {
+            anyhow::bail!("[core].llm_model_path must be set");
+        }
+
+        match self.active_llm_provider_kind() {
+            ActiveLlmProviderKind::Local => self.validate_local_llm_provider(),
+            ActiveLlmProviderKind::OptionalApi => self.validate_optional_llm_provider(),
+        }
+    }
+
+    fn validate_local_llm_provider(&self) -> anyhow::Result<()> {
+        let url = self.services.llm.url.trim();
+        if url.is_empty() {
+            anyhow::bail!("[services.llm].url must be set for the local provider");
+        }
+
+        match parse_service_probe_target(url) {
+            ServiceProbeTarget::Http { .. } | ServiceProbeTarget::Https { .. } => Ok(()),
+            ServiceProbeTarget::UnsupportedScheme { scheme } => anyhow::bail!(
+                "[services.llm].url has unsupported scheme \"{scheme}\" (use http:// or https://)"
+            ),
+        }
+    }
+
+    fn validate_optional_llm_provider(&self) -> anyhow::Result<()> {
+        self.optional_ai_provider.ensure_enabled_ready(&self.agent)
     }
 
     /// Fold environment-provided secrets into the parsed config so every
@@ -1935,6 +2058,52 @@ home_runtime_boundary = "external_runtime"
                 .optional_ai_provider
                 .transitional_test_candidate(&config.agent)
         );
+    }
+
+    #[test]
+    fn validate_llm_provider_accepts_default_local_config() {
+        let config = test_config();
+        config.validate_llm_provider().unwrap();
+        assert_eq!(
+            config.active_llm_provider_kind(),
+            ActiveLlmProviderKind::Local
+        );
+    }
+
+    #[test]
+    fn validate_llm_provider_rejects_empty_local_llm_url() {
+        let mut config = test_config();
+        config.services.llm.url.clear();
+        let err = config.validate_llm_provider().unwrap_err().to_string();
+        assert!(err.contains("[services.llm].url must be set"));
+    }
+
+    #[test]
+    fn validate_llm_provider_rejects_enabled_optional_provider_without_base_url() {
+        let mut config = test_config();
+        config.optional_ai_provider.enabled = true;
+        config.optional_ai_provider.base_url.clear();
+        let err = config
+            .optional_ai_provider
+            .ensure_enabled_ready(&config.agent)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("base_url must be set"));
+    }
+
+    #[test]
+    fn validate_llm_provider_rejects_unwired_optional_provider_kind() {
+        let mut config = test_config();
+        config.optional_ai_provider.enabled = true;
+        config.optional_ai_provider.provider = OptionalAiProviderKind::Anthropic;
+        config.optional_ai_provider.base_url = "http://127.0.0.1:11434/v1".into();
+        let err = config
+            .optional_ai_provider
+            .ensure_enabled_ready(&config.agent)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("anthropic"));
+        assert!(err.contains("not wired"));
     }
 
     #[test]

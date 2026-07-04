@@ -15,10 +15,10 @@ voice_runtime_boundary = "transitional_adapter" # In-repo voice path is temporar
 home_runtime_boundary = "transitional_adapter"  # HA provider today; target is the external home boundary.
 
 # Optional API/OAuth provider path. Disabled by default so the local Jetson
-# image and binary stay focused on genie-ai-runtime. This exists for better
-# testing, development portability, and transitional validation only; it is not
-# the product runtime. Enable only after the provider passes the same
-# 4096-token home-agent harness.
+# image and binary stay focused on genie-ai-runtime. Set enabled = true to
+# select this path instead of [services.llm]; misconfiguration fails startup.
+# Provider kind, model path, and context budget are parameterized through the
+# existing keys below and [core].llm_model_path / [agent].context_window_tokens.
 [optional_ai_provider]
 enabled = false
 provider = "open_ai_compatible"   # "open_ai_compatible", "open_ai", "anthropic", "gemini", or "custom".

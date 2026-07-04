@@ -8,8 +8,9 @@
 //!                              Search the web through genie-core
 //!   genie-ctl history         Show conversation history
 //!   genie-ctl tools           List available tools
-//!   genie-ctl bfcl-score --cases CASES.jsonl --predictions PREDS.jsonl [--json]
+//!   genie-ctl bfcl-score --cases CASES.jsonl --predictions PREDS.jsonl [--json] [--min-strict PCT]
 //!                              Score tool-call accuracy from JSONL fixtures
+//!                              (--min-strict fails when strict accuracy < PCT)
 //!   genie-ctl bfcl-predict-quick --cases CASES.jsonl --out PREDS.jsonl
 //!                              Generate deterministic quick-router predictions
 //!   genie-ctl bfcl-predict-llm --cases CASES.jsonl --out PREDS.jsonl
@@ -257,8 +258,9 @@ COMMANDS:
                         Search the web through genie-core
     history             Show conversation history
     tools               List available tools
-    bfcl-score --cases C --predictions P [--json]
+    bfcl-score --cases C --predictions P [--json] [--min-strict PCT]
                         Score tool-call accuracy from JSONL fixtures
+                        (--min-strict PCT fails when strict accuracy < PCT)
     bfcl-score-llm --cases C [--out P] [--json] [--max-tokens N] [--limit N]
                         Generate and score local LLM predictions without executing tools
     bfcl-predict-quick --cases C --out P
@@ -986,11 +988,13 @@ struct SearchArgs {
     query: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct BfclScoreArgs {
     cases: PathBuf,
     predictions: PathBuf,
     json: bool,
+    /// Fail (non-zero exit) when strict accuracy falls below this percentage.
+    min_strict: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1081,6 +1085,7 @@ fn parse_bfcl_score_args(args: &[String]) -> Result<BfclScoreArgs> {
     let mut cases = None;
     let mut predictions = None;
     let mut json = false;
+    let mut min_strict = None;
     let mut idx = 0;
 
     while idx < args.len() {
@@ -1104,6 +1109,13 @@ fn parse_bfcl_score_args(args: &[String]) -> Result<BfclScoreArgs> {
                 json = true;
                 idx += 1;
             }
+            "--min-strict" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--min-strict requires a percentage value (0-100)");
+                };
+                min_strict = Some(parse_min_strict(value)?);
+                idx += 2;
+            }
             _ if arg.starts_with("--cases=") => {
                 cases = Some(PathBuf::from(arg.trim_start_matches("--cases=")));
                 idx += 1;
@@ -1116,18 +1128,22 @@ fn parse_bfcl_score_args(args: &[String]) -> Result<BfclScoreArgs> {
                 predictions = Some(PathBuf::from(arg.trim_start_matches("--preds=")));
                 idx += 1;
             }
+            _ if arg.starts_with("--min-strict=") => {
+                min_strict = Some(parse_min_strict(arg.trim_start_matches("--min-strict="))?);
+                idx += 1;
+            }
             other => anyhow::bail!("unknown bfcl-score option: {}", other),
         }
     }
 
     let Some(cases) = cases else {
         anyhow::bail!(
-            "Usage: genie-ctl bfcl-score --cases CASES.jsonl --predictions PREDICTIONS.jsonl [--json]"
+            "Usage: genie-ctl bfcl-score --cases CASES.jsonl --predictions PREDICTIONS.jsonl [--json] [--min-strict PCT]"
         );
     };
     let Some(predictions) = predictions else {
         anyhow::bail!(
-            "Usage: genie-ctl bfcl-score --cases CASES.jsonl --predictions PREDICTIONS.jsonl [--json]"
+            "Usage: genie-ctl bfcl-score --cases CASES.jsonl --predictions PREDICTIONS.jsonl [--json] [--min-strict PCT]"
         );
     };
 
@@ -1135,7 +1151,19 @@ fn parse_bfcl_score_args(args: &[String]) -> Result<BfclScoreArgs> {
         cases,
         predictions,
         json,
+        min_strict,
     })
+}
+
+/// Parse a `--min-strict` percentage threshold (0-100 inclusive).
+fn parse_min_strict(value: &str) -> Result<f64> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("invalid --min-strict value: {value}"))?;
+    if !parsed.is_finite() || !(0.0..=100.0).contains(&parsed) {
+        anyhow::bail!("--min-strict must be a percentage between 0 and 100");
+    }
+    Ok(parsed)
 }
 
 fn parse_bfcl_score_llm_args(args: &[String]) -> Result<BfclScoreLlmArgs> {
@@ -1462,11 +1490,37 @@ fn cmd_bfcl_score(args: &BfclScoreArgs) -> Result<()> {
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
+    } else {
+        print_bfcl_report("BFCL tool-call score", &report);
     }
 
-    print_bfcl_report("BFCL tool-call score", &report);
+    enforce_min_strict(args.min_strict, &report)?;
 
+    Ok(())
+}
+
+/// Fail the process when a `--min-strict` gate is set and strict accuracy is below it.
+///
+/// The score is printed before this runs, so CI logs always show the measured
+/// accuracy alongside the gate outcome. A tiny epsilon keeps an exact match
+/// (e.g. 96.00% against `--min-strict 96`) passing despite float rounding.
+fn enforce_min_strict(
+    min_strict: Option<f64>,
+    report: &genie_core::eval::bfcl::BfclReport,
+) -> Result<()> {
+    let Some(threshold) = min_strict else {
+        return Ok(());
+    };
+    let actual = report.strict_accuracy * 100.0;
+    if actual + 1e-9 < threshold {
+        anyhow::bail!(
+            "BFCL strict accuracy {:.2}% ({}/{}) is below the required --min-strict {:.2}%",
+            actual,
+            report.strict_matches,
+            report.total_cases,
+            threshold
+        );
+    }
     Ok(())
 }
 
@@ -1623,15 +1677,7 @@ async fn generate_bfcl_llm_predictions(
     let selected_cases = select_bfcl_cases(cases, limit);
     let system_prompt = build_bfcl_llm_system_prompt(&selected_cases);
     let config = Config::load()?;
-    let timeouts = genie_core::llm::LlmTimeouts::from_secs(
-        config.core.llm_connect_timeout_secs,
-        config.core.llm_read_timeout_secs,
-        config.core.llm_request_timeout_secs,
-    );
-    let llm = genie_core::llm::LlmClient::from_service_config_with_timeouts(
-        &config.services.llm,
-        timeouts,
-    );
+    let llm = genie_core::llm::LlmClient::from_config(&config)?;
     let backend = llm.backend_name().to_string();
 
     let mut predictions = Vec::with_capacity(selected_cases.len());
@@ -1822,11 +1868,13 @@ async fn cmd_history() -> Result<()> {
     for msg in &messages {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let prefix = match role {
-            "user" => "You",
-            "assistant" => "GeniePod",
-            "system" => "System",
-            _ => role,
+        let speaker = msg.get("speaker").and_then(|v| v.as_str());
+        let prefix = match (role, speaker) {
+            ("user", Some(name)) => format!("You ({})", name),
+            ("user", None) => "You".to_string(),
+            ("assistant", _) => "GeniePod".to_string(),
+            ("system", _) => "System".to_string(),
+            _ => role.to_string(),
         };
         println!("{}: {}", prefix, content);
     }
@@ -3017,6 +3065,65 @@ mod tests {
         ];
 
         assert!(parse_bfcl_score_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_bfcl_score_args_parses_min_strict_threshold() {
+        let space = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--preds=preds.jsonl".to_string(),
+            "--min-strict".to_string(),
+            "96".to_string(),
+        ];
+        let equals = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--preds=preds.jsonl".to_string(),
+            "--min-strict=96.5".to_string(),
+        ];
+
+        assert_eq!(
+            parse_bfcl_score_args(&space).unwrap().min_strict,
+            Some(96.0)
+        );
+        assert_eq!(
+            parse_bfcl_score_args(&equals).unwrap().min_strict,
+            Some(96.5)
+        );
+        // Absent by default so the gate stays opt-in.
+        let bare = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--preds=preds.jsonl".to_string(),
+        ];
+        assert_eq!(parse_bfcl_score_args(&bare).unwrap().min_strict, None);
+    }
+
+    #[test]
+    fn parse_min_strict_rejects_out_of_range_and_nonnumeric() {
+        assert!(parse_min_strict("-1").is_err());
+        assert!(parse_min_strict("100.1").is_err());
+        assert!(parse_min_strict("nan").is_err());
+        assert!(parse_min_strict("ninety").is_err());
+        assert_eq!(parse_min_strict("0").unwrap(), 0.0);
+        assert_eq!(parse_min_strict("100").unwrap(), 100.0);
+    }
+
+    #[test]
+    fn enforce_min_strict_gates_on_threshold() {
+        let report_at = |matches: usize| genie_core::eval::bfcl::BfclReport {
+            total_cases: 26,
+            strict_matches: matches,
+            strict_accuracy: matches as f64 / 26.0,
+            ..Default::default()
+        };
+
+        // 25/26 = 96.15% clears a 96% gate...
+        assert!(enforce_min_strict(Some(96.0), &report_at(25)).is_ok());
+        // ...but not a 97% gate.
+        assert!(enforce_min_strict(Some(97.0), &report_at(25)).is_err());
+        // No gate configured never fails.
+        assert!(enforce_min_strict(None, &report_at(25)).is_ok());
+        // An exact match passes despite float rounding.
+        assert!(enforce_min_strict(Some(100.0), &report_at(26)).is_ok());
     }
 
     #[test]
