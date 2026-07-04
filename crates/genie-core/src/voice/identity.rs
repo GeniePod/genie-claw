@@ -603,63 +603,7 @@ fn unix_time_ms() -> u128 {
 }
 
 pub fn build_memory_read_context(text: &str, speaker: &SpeakerIdentity) -> MemoryReadContext {
-    let lower = text.trim().to_ascii_lowercase();
-    MemoryReadContext {
-        identity_confidence: speaker.confidence,
-        explicit_named_person: mentions_named_person(&lower),
-        explicit_private_intent: contains_any(
-            &lower,
-            &[
-                "private",
-                "privately",
-                "for me only",
-                "don't say this aloud",
-                "do not say this aloud",
-            ],
-        ),
-        shared_space_voice: true,
-    }
-}
-
-fn mentions_named_person(lower: &str) -> bool {
-    starts_with_any(
-        lower,
-        &[
-            "what does ",
-            "what did ",
-            "tell me about ",
-            "who is ",
-            "does ",
-            "is ",
-            "ask ",
-            "call ",
-            "text ",
-            "message ",
-            "remind ",
-        ],
-    ) || contains_any(
-        lower,
-        &[
-            " my wife",
-            " my husband",
-            " my son",
-            " my daughter",
-            " my mom",
-            " my mother",
-            " my dad",
-            " my father",
-            " my friend",
-            " my partner",
-        ],
-    )
-}
-
-fn starts_with_any(text: &str, prefixes: &[&str]) -> bool {
-    prefixes.iter().any(|prefix| text.starts_with(prefix))
-}
-
-fn contains_any(text: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| text.contains(needle))
+    crate::memory::policy::memory_read_context_from_text(text, speaker.confidence, true)
 }
 
 fn identity_confidence_from_str(value: &str) -> IdentityConfidence {
