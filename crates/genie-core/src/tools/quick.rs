@@ -2704,6 +2704,17 @@ fn company_ticker(subject: &str) -> Option<&'static str> {
 }
 
 fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
+    // A trailing "in the <time-of-day>" phrase carries its own " in ", which
+    // otherwise wins the `rsplit_once(" in ")` below and discards the city
+    // ("weather in Denver in the morning" -> location "the morning" -> "morning").
+    // Strip that phrase before the marker split so the city survives; forecast
+    // detection reads the whole utterance, so it is unaffected.
+    let text = text
+        .trim_end()
+        .trim_end_matches(" in the morning")
+        .trim_end_matches(" in the afternoon")
+        .trim_end_matches(" in the evening")
+        .trim_end_matches(" in the night");
     let (_, location) = text.rsplit_once(marker)?;
     let location = location
         .trim()
@@ -4866,6 +4877,16 @@ mod tests {
             ("weather in Tokyo right now", "tokyo", false),
             ("forecast for Boston this weekend", "boston", true),
             ("what's the weather in Paris now", "paris", false),
+            // A trailing "in the <time-of-day>" phrase carries its own " in ",
+            // which collided with the " in <location>" marker split and dropped
+            // the city entirely (location came back as "morning"/"evening").
+            (
+                "what's the weather in Denver in the morning?",
+                "denver",
+                false,
+            ),
+            ("weather in Austin in the evening", "austin", false),
+            ("weather in Tokyo in the afternoon", "tokyo", false),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "get_weather", "{utterance:?}");
