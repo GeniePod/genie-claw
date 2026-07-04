@@ -36,6 +36,19 @@ pub enum IdentityConfidence {
     High,
 }
 
+impl IdentityConfidence {
+    /// Stable lowercase representation for logs/audit trails — independent of
+    /// the derived `Debug` repr, which is free to change with variant names.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IdentityConfidence::Unknown => "unknown",
+            IdentityConfidence::Low => "low",
+            IdentityConfidence::Medium => "medium",
+            IdentityConfidence::High => "high",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryDisclosure {
     Speak,
@@ -157,6 +170,72 @@ impl MemoryReadContext {
             shared_space_voice: true,
         }
     }
+}
+
+/// Build a [`MemoryReadContext`] from turn text and resolved identity, without
+/// depending on the `voice` feature (used by `channel::SpeakerInfo` and voice).
+pub fn memory_read_context_from_text(
+    text: &str,
+    identity_confidence: IdentityConfidence,
+    shared_space_voice: bool,
+) -> MemoryReadContext {
+    let lower = text.trim().to_ascii_lowercase();
+    MemoryReadContext {
+        identity_confidence,
+        explicit_named_person: text_mentions_named_person(&lower),
+        explicit_private_intent: text_has_private_intent(&lower),
+        shared_space_voice,
+    }
+}
+
+fn text_mentions_named_person(lower: &str) -> bool {
+    starts_with_any(
+        lower,
+        &[
+            "what does ",
+            "what did ",
+            "tell me about ",
+            "who is ",
+            "does ",
+            "is ",
+            "ask ",
+            "call ",
+            "text ",
+            "message ",
+            "remind ",
+        ],
+    ) || contains_any(
+        lower,
+        &[
+            " my wife",
+            " my husband",
+            " my son",
+            " my daughter",
+            " my mom",
+            " my mother",
+            " my dad",
+            " my father",
+            " my friend",
+            " my partner",
+        ],
+    )
+}
+
+fn text_has_private_intent(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "private",
+            "privately",
+            "for me only",
+            "don't say this aloud",
+            "do not say this aloud",
+        ],
+    )
+}
+
+fn starts_with_any(text: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| text.starts_with(prefix))
 }
 
 pub fn classify_memory(metadata: MemoryPolicyMetadata) -> MemoryDisclosureClass {
@@ -777,6 +856,17 @@ mod tests {
         assert_eq!(decision.disclosure, MemoryDisclosure::Speak);
         assert_eq!(decision.class, MemoryDisclosureClass::Household);
         assert_eq!(decision.class.as_str(), "household");
+    }
+
+    #[test]
+    fn memory_read_context_from_text_detects_private_intent() {
+        let ctx = memory_read_context_from_text(
+            "remember this privately and do not say this aloud",
+            IdentityConfidence::Unknown,
+            false,
+        );
+        assert!(ctx.explicit_private_intent);
+        assert!(!ctx.shared_space_voice);
     }
 
     #[test]

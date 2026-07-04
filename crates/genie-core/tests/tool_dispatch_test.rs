@@ -39,9 +39,12 @@ fn core_binary_builds() {
 /// Raised to 6.6 MB after the quick-router BFCL accuracy work: the deterministic
 /// tool-call matchers and helpers merged across #509/#512/#521/#534/#537 grew
 /// genie-core to 6.43 MB.
+/// Raised to 6.8 MB after the M2 foundations (Provider trait, Channel boundary,
+/// session/speaker work) and consolidating outbound HTTP onto one TLS-capable
+/// client (weather now over TLS) grew genie-core to 6.62 MB.
 /// Keep it tight enough that another large dependency or module forces a
 /// deliberate decision.
-const RELEASE_BINARY_SIZE_BUDGET_MB: f64 = 6.6;
+const RELEASE_BINARY_SIZE_BUDGET_MB: f64 = 6.8;
 
 /// Verify release binary stays within the release size budget.
 #[test]

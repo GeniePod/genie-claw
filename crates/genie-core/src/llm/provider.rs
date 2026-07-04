@@ -77,6 +77,46 @@ impl OptionalProviderPlan {
             OptionalAiProviderAuthMode::OAuthBearer => &self.oauth_token_env,
         }
     }
+
+    /// Fail-loud check used at config load when `[optional_ai_provider].enabled`.
+    pub fn ensure_ready(&self, agent: &AgentConfig) -> anyhow::Result<()> {
+        match self.readiness(agent) {
+            ProviderReadiness::Ready => Ok(()),
+            ProviderReadiness::Disabled => {
+                anyhow::bail!("optional AI provider plan is disabled")
+            }
+            ProviderReadiness::Blocked(reasons) => {
+                let details = reasons
+                    .iter()
+                    .map(|reason| blocked_reason_message(reason))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                anyhow::bail!("optional_ai_provider misconfigured: {details}")
+            }
+        }
+    }
+}
+
+fn blocked_reason_message(reason: &str) -> String {
+    match reason {
+        "context_window_exceeds_agent_budget" => {
+            "[optional_ai_provider].context_window_tokens exceeds [agent].context_window_tokens"
+                .into()
+        }
+        "missing_api_key_env" => {
+            "[optional_ai_provider].api_key_env must be set when auth_mode = api_key".into()
+        }
+        "missing_oauth_token_env" => {
+            "[optional_ai_provider].oauth_token_env must be set when auth_mode = oauth_bearer"
+                .into()
+        }
+        "missing_base_url" => "[optional_ai_provider].base_url must be set when enabled".into(),
+        "remote_base_url_not_allowed" => {
+            "[optional_ai_provider].base_url is remote; set allow_remote_base_url = true to opt in"
+                .into()
+        }
+        _ => reason.to_string(),
+    }
 }
 
 fn remote_url(url: &str) -> bool {
