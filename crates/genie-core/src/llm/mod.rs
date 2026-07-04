@@ -1,3 +1,4 @@
+pub mod escalation_audit;
 mod genie_ai_runtime;
 mod llama_cpp;
 mod local_provider;

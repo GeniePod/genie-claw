@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Privacy (M2)
+
+- **Cloud-escalation privacy audit** (#570): when a chat turn escalates off-device
+  through the PrivacyProxy gateway, genie-core now emits a content-free
+  `EscalationAudit` record of exactly what left the box — a credential-redacted
+  `host:port` endpoint, message/character counts, the masking posture, and the
+  number of seeded terms. The record deliberately carries no prompt content, and
+  `redact_endpoint` strips any scheme/path/`user:pass@` credentials, so the audit
+  trail itself can't become a leak. New clean `llm/escalation_audit` module with
+  integration tests.
+
 ## 1.0.0-rc.3 - 2026-07-03
 
 Third release candidate. This RC lays the **M2 foundations** — a portable

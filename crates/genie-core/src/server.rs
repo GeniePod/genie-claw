@@ -1423,6 +1423,15 @@ async fn escalate_via_privacy_proxy(
         tracing::warn!(error = %e, terms = terms.len(), "vocab seed failed; continuing");
     }
 
+    crate::llm::escalation_audit::EscalationAudit::record(
+        "privacy_proxy",
+        &proxy.base_url,
+        true,
+        messages,
+        terms.len(),
+    )
+    .emit();
+
     backend.chat_with_format(messages, Some(512), None).await
 }
 
