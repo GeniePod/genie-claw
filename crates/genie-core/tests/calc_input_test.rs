@@ -83,3 +83,17 @@ fn non_math_does_not_route_to_calculate() {
             .unwrap_or(true)
     );
 }
+
+#[test]
+fn percent_symbol_routes_like_the_spelled_out_word() {
+    // The "%" symbol is the common way to type a percentage. It must reach the
+    // same calculator expression as the spelled-out "percent" word, which
+    // already works (`spoken_cardinals_in_percentage_and_temperature`).
+    assert_eq!(expression("what is 15% of 200"), "200 * 15 / 100");
+    assert_eq!(expression("what is 20% of 80"), "80 * 20 / 100");
+    // A spaced "%" and a decimal base both fold to the same expression.
+    assert_eq!(expression("what is 20 % of 80"), "80 * 20 / 100");
+    assert_eq!(expression("what is 12.5% of 80"), "80 * 12.5 / 100");
+    // Apostrophe prefix ("what's") must not block the percent-symbol path.
+    assert_eq!(expression("what's 50% of 80"), "80 * 50 / 100");
+}
