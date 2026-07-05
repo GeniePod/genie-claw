@@ -68,6 +68,27 @@ jobs:
         run: cargo test --workspace --locked --all-targets
       - name: cargo test --doc
         run: cargo test --workspace --locked --doc
+      # BFCL live-router accuracy gate (issue #579). The committed
+      # golden-file smoke test (`loads_jsonl_fixture_and_scores_report`)
+      # is fixed at 100% and only exercises the scorer's parsing, so the
+      # *live* quick-router could silently regress with CI green. Regenerate
+      # predictions from the live `route_for_available_tools` path and gate
+      # on the real score.
+      #
+      # Floor is 96% (live is 25/26). The single holdout is the two-call
+      # `multi-homework-timer` case (#533), which the deterministic router
+      # emits as one call. Raise this floor toward 100% as #533 lands.
+      - name: BFCL live quick-router accuracy gate
+        run: |
+          cargo run --locked -p genie-ctl -- \
+            bfcl-predict-quick \
+            --cases tests/bfcl/home_tool_cases.jsonl \
+            --out target/bfcl-live-predictions.jsonl
+          cargo run --locked -p genie-ctl -- \
+            bfcl-score \
+            --cases tests/bfcl/home_tool_cases.jsonl \
+            --predictions target/bfcl-live-predictions.jsonl \
+            --min-strict 96
 
   # Chat-only build axis (issue #59 / closes acceptance criterion #8 from
   # #41 + #57). Guards `cargo {clippy,test} --no-default-features` on

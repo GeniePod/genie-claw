@@ -1,6 +1,6 @@
 use genie_common::config::Config;
 use genie_common::jsonl::{self, DEFAULT_MAX_JSONL_LINE_BYTES};
-use genie_common::probe::{ProbeTimeouts, probe_configured_url};
+use genie_common::probe::{ProbeTimeouts, http_request, probe_configured_url};
 use genie_common::tegrastats;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -626,6 +626,7 @@ pub fn serve_dashboard_js() -> Response {
     }
 }
 
+#[derive(Debug)]
 struct CoreProxyResponse {
     status: u16,
     body: String,
@@ -846,31 +847,13 @@ pub async fn post_memory_reorder(config: &Config, body: Option<&str>) -> Respons
 }
 
 const MAX_CORE_PROXY_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Connect deadline for the genie-api → genie-core loopback proxy. Every
+/// inbound dashboard connection holds a semaphore permit for the request's
+/// full lifetime (see `http.rs`'s connection cap); a connect with no
+/// deadline that never resolves (genie-core wedged / not accepting) would
+/// leak that permit indefinitely instead of failing fast.
+const CORE_PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CORE_PROXY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-async fn read_core_proxy_response(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>, String> {
-    use tokio::io::AsyncReadExt;
-
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let n = tokio::time::timeout(CORE_PROXY_READ_TIMEOUT, stream.read(&mut chunk))
-            .await
-            .map_err(|_| "core response read timeout".to_string())?
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() + n > MAX_CORE_PROXY_RESPONSE_BYTES {
-            return Err(format!(
-                "core response exceeds {} bytes",
-                MAX_CORE_PROXY_RESPONSE_BYTES
-            ));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    Ok(buf)
-}
 
 async fn proxy_core_json(
     config: &Config,
@@ -878,47 +861,33 @@ async fn proxy_core_json(
     path: &str,
     body: Option<&str>,
 ) -> Result<CoreProxyResponse, String> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpStream;
-
     let addr = config.core_http_addr();
-    let mut stream = TcpStream::connect(&addr)
-        .await
-        .map_err(|e| format!("{addr}: {e}"))?;
-    let body_str = body.unwrap_or("");
     // Send the full host:port as Host so it matches genie-core's allowlist, and
     // forward the shared local token so genie-core's mutating-endpoint gate
     // accepts the proxied request (issue #228).
     let token = config.http.local_api_token.trim();
-    let token_header = if token.is_empty() {
-        String::new()
-    } else {
-        format!("X-Genie-Token: {token}\r\n")
-    };
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{token_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body_str.len(),
-        body_str
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    let raw = read_core_proxy_response(&mut stream).await?;
-    let raw = String::from_utf8_lossy(&raw);
-    let (head, body) = raw
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "invalid core response".to_string())?;
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| "invalid core status".to_string())?;
-    Ok(CoreProxyResponse {
-        status,
-        body: body.to_string(),
-    })
+    let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
+    if !token.is_empty() {
+        headers.push(("X-Genie-Token", token));
+    }
+
+    let (status, body) = http_request(
+        &addr,
+        path,
+        false,
+        method,
+        &headers,
+        body,
+        ProbeTimeouts {
+            connect: CORE_PROXY_CONNECT_TIMEOUT,
+            read: CORE_PROXY_READ_TIMEOUT,
+        },
+        MAX_CORE_PROXY_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|e| format!("{addr}: {e}"))?;
+
+    Ok(CoreProxyResponse { status, body })
 }
 
 #[cfg(test)]
@@ -1174,14 +1143,17 @@ mod tests {
         assert_eq!(wakeword.sub_state, "disabled");
     }
 
+    /// End-to-end regression through `proxy_core_json` (not just the shared
+    /// reader in isolation): a genie-core response declaring a
+    /// `Content-Length` past `MAX_CORE_PROXY_RESPONSE_BYTES` must be
+    /// rejected before the dashboard proxy accumulates it in memory.
     #[tokio::test]
-    async fn read_core_proxy_response_rejects_oversized_body() {
+    async fn proxy_core_json_rejects_oversized_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let max = MAX_CORE_PROXY_RESPONSE_BYTES;
 
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -1192,21 +1164,49 @@ mod tests {
                 .await;
             let chunk = vec![b'x'; 8192];
             loop {
-                let _ = stream.write_all(&chunk).await;
+                if stream.write_all(&chunk).await.is_err() {
+                    break;
+                }
             }
         });
 
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let _ = stream
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await;
-        let error = read_core_proxy_response(&mut stream).await.unwrap_err();
+        let mut config = test_config();
+        config.core.bind_host = "127.0.0.1".into();
+        config.core.port = addr.port();
+
+        let error = proxy_core_json(&config, "GET", "/api/health", None)
+            .await
+            .unwrap_err();
         server.abort();
 
         assert!(
-            error.contains(&format!("core response exceeds {max} bytes")),
+            error.contains("too large"),
             "expected size cap error, got: {error}"
         );
+    }
+
+    /// A closed core port fails fast (`ECONNREFUSED`) rather than hanging.
+    /// This doesn't exercise `CORE_PROXY_CONNECT_TIMEOUT` itself (a refused
+    /// loopback connection returns well before the deadline), but it does
+    /// confirm the migration to `http_request` still surfaces a clean
+    /// error instead of ever blocking the caller indefinitely.
+    #[tokio::test]
+    async fn proxy_core_json_fails_when_core_is_unreachable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // Free the port so nothing is listening on it.
+
+        let mut config = test_config();
+        config.core.bind_host = "127.0.0.1".into();
+        config.core.port = addr.port();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            proxy_core_json(&config, "GET", "/api/health", None),
+        )
+        .await
+        .expect("proxy_core_json must not hang past its own connect timeout");
+        assert!(result.is_err(), "connecting to a closed port must fail");
     }
 
     #[tokio::test]
