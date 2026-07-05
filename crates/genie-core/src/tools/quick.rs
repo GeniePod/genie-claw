@@ -1923,6 +1923,16 @@ fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
         .trim_start_matches("the ")
         .trim_start_matches("a ")
         .trim_start_matches("an ");
+    // A trailing directional adverb describes the setpoint change, not the
+    // device: "set the thermostat down to 68" / "set the thermostat up to 72"
+    // name the thermostat, not "thermostat down". Strip it so the entity stays
+    // the named device.
+    let entity = entity
+        .strip_suffix(" down")
+        .or_else(|| entity.strip_suffix(" up"))
+        .or_else(|| entity.strip_suffix(" back"))
+        .map(str::trim)
+        .unwrap_or(entity);
     if entity.is_empty() {
         return None;
     }
