@@ -121,8 +121,7 @@ pub fn extract_facts(text: &str) -> Vec<ExtractedFact> {
     }
 
     // Explicit "remember" requests.
-    if trimmed.len() >= 8
-        && trimmed[..8].eq_ignore_ascii_case("remember")
+    if starts_with_ascii_ci(trimmed, "remember")
         && let Some(content) = extract_remember(trimmed)
         && facts.is_empty()
     {
@@ -489,9 +488,23 @@ fn extract_relationships(text: &str) -> Vec<(String, String)> {
     results
 }
 
+/// Whether `text` begins with `prefix`, compared ASCII-case-insensitively,
+/// without panicking on multi-byte UTF-8 input.
+///
+/// A byte-length guard (`text.len() >= prefix.len()`) followed by
+/// `text[..prefix.len()]` is unsound: the length check counts bytes, so byte
+/// `prefix.len()` can land inside a multi-byte char and the slice panics with
+/// "byte index N is not a char boundary". `get(..prefix.len())` returns `None`
+/// on a non-boundary (and for too-short input) instead of panicking, so a
+/// non-ASCII utterance simply does not match the prefix.
+fn starts_with_ascii_ci(text: &str, prefix: &str) -> bool {
+    text.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 fn extract_remember(text: &str) -> Option<String> {
     const PREFIX: &str = "remember";
-    if text.len() < PREFIX.len() || !text[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+    if !starts_with_ascii_ci(text, PREFIX) {
         return None;
     }
     let rest = text[PREFIX.len()..].trim();

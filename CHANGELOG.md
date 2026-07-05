@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Memory**: `extract_facts` no longer panics on non-ASCII input. The
+  explicit-"remember" fast-path guarded a byte-index slice (`trimmed[..8]`)
+  with only a byte-length check, so any utterance whose 8th byte fell inside a
+  multi-byte UTF-8 char sliced on a non-char-boundary and panicked — taking
+  down fact extraction for non-Latin-script households (#634).
+
 ## 1.0.0-rc.3 - 2026-07-03
 
 Third release candidate. This RC lays the **M2 foundations** — a portable
