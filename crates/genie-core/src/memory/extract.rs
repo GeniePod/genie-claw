@@ -26,8 +26,11 @@ pub fn extract_facts(text: &str) -> Vec<ExtractedFact> {
     let trimmed = text.trim();
 
     if !needs_extract_facts_lower(text) {
-        if trimmed.len() >= 8
-            && trimmed[..8].eq_ignore_ascii_case("remember")
+        // Explicit "remember" requests. Char-boundary-safe: `get` yields `None`
+        // when byte 8 is not a char boundary, so non-ASCII never panics (#634).
+        if trimmed
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("remember"))
             && let Some(content) = extract_remember(trimmed)
         {
             facts.push(ExtractedFact {
@@ -134,9 +137,11 @@ pub fn extract_facts(text: &str) -> Vec<ExtractedFact> {
         });
     }
 
-    // Explicit "remember" requests.
-    if trimmed.len() >= 8
-        && trimmed[..8].eq_ignore_ascii_case("remember")
+    // Explicit "remember" requests. `str::get` returns `None` when byte 8 is not a
+    // char boundary, so non-ASCII input never slices mid-char and panics (#634).
+    if trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("remember"))
         && let Some(content) = extract_remember(trimmed)
         && facts.is_empty()
     {
@@ -537,7 +542,12 @@ fn extract_relationships(text: &str) -> Vec<(String, String)> {
 
 fn extract_remember(text: &str) -> Option<String> {
     const PREFIX: &str = "remember";
-    if text.len() < PREFIX.len() || !text[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+    // Char-boundary-safe prefix check: `get` yields `None` when `PREFIX.len()` is
+    // out of range or lands inside a multi-byte char, so this never panics (#634).
+    if !text
+        .get(..PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+    {
         return None;
     }
     let rest = text[PREFIX.len()..].trim();

@@ -300,3 +300,33 @@ fn auto_store_rejects_password_memory() {
     assert_eq!(stored, 0);
     assert!(memory.search("password", 5).unwrap().is_empty());
 }
+
+#[test]
+fn non_ascii_input_does_not_panic() {
+    // Regression for #634: the explicit-"remember" fast-path sliced `trimmed[..8]`
+    // behind only a byte-length check, so an utterance whose 8th byte fell inside a
+    // multi-byte UTF-8 char panicked ("byte index 8 is not a char boundary"). Each
+    // input below has an interior byte 8, so a byte slice there would panic; the
+    // char-boundary-safe guard must instead simply not match the fast-path.
+    for input in [
+        "日本語です", // CJK: byte 8 is inside the 3rd char (6..9)
+        "hello 日本", // byte 8 is inside "日" (6..9)
+        "x👍👍y",     // 4-byte emoji: byte 8 is inside the 2nd emoji (5..9)
+    ] {
+        let facts = extract_facts(input);
+        assert!(
+            facts.iter().all(|f| f.category != "fact"),
+            "non-ASCII input {input:?} must not match the remember fast-path"
+        );
+    }
+}
+
+#[test]
+fn remember_still_matches_with_non_ascii_payload() {
+    // The char-boundary-safe guard must still capture a genuine "remember" request
+    // whose payload contains non-ASCII text (payload preserved verbatim).
+    let facts = extract_facts("Remember 日本語 is my hobby");
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].category, "fact");
+    assert!(facts[0].content.contains("日本語"));
+}
