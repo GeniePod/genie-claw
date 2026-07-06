@@ -2858,6 +2858,18 @@ fn calc_number_starting_at(tokens: &[&str], start: usize) -> Option<f64> {
     if start >= tokens.len() {
         return None;
     }
+    // A leading article ("a"/"an") is not the amount: "20 percent of a 50 dollar
+    // bill" means 50, not 1 (the article word parses as the cardinal 1). Skip it
+    // and read the number that follows — but only when a real number actually
+    // follows, so "a dollar" (no number after) still falls through to 1.
+    if matches!(tokens[start], "a" | "an") && start + 1 < tokens.len() {
+        if let Some((value, _)) = super::number_words::parse_spoken_number(tokens, start + 1) {
+            return Some(value as f64);
+        }
+        if let Some(value) = parse_decimal_token(tokens[start + 1]) {
+            return Some(value);
+        }
+    }
     if let Some((value, _)) = super::number_words::parse_spoken_number(tokens, start) {
         return Some(value as f64);
     }
