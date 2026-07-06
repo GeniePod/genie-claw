@@ -1,7 +1,7 @@
 use genie_common::config::ActuationSafetyConfig;
 use serde::{Deserialize, Serialize};
 
-use super::{HomeAction, HomeActionKind, HomeState, HomeTargetKind, IntegrationHealth};
+use super::{HomeAction, HomeActionKind, HomeState, HomeTarget, HomeTargetKind, IntegrationHealth};
 use crate::tools::actuation::RequestOrigin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,13 +79,6 @@ impl ActionPolicyDecision {
 pub fn assess_home_action(action: &HomeAction) -> ActionPolicyDecision {
     let target = &action.target;
     let domain = target.domain.as_deref().unwrap_or("");
-    let descriptor = format!(
-        "{} {} {}",
-        target.display_name,
-        target.query,
-        target.entity_ids.join(" ")
-    )
-    .to_lowercase();
 
     if !target.voice_safe {
         return ActionPolicyDecision::require_confirmation(
@@ -111,11 +104,12 @@ pub fn assess_home_action(action: &HomeAction) -> ActionPolicyDecision {
         );
     }
 
+    // Only `Open` actions consult the descriptor, so build it lazily here
+    // instead of allocating a lowercased string for every turn_on/off/toggle/
+    // brightness action. The `cover` domain short-circuits before the string
+    // is built at all.
     if matches!(action.kind, HomeActionKind::Open)
-        && (domain == "cover"
-            || descriptor.contains("garage")
-            || descriptor.contains("door")
-            || descriptor.contains("gate"))
+        && (domain == "cover" || opens_physical_barrier(target))
     {
         return ActionPolicyDecision::require_confirmation(
             ActionRisk::High,
@@ -140,6 +134,20 @@ pub fn assess_home_action(action: &HomeAction) -> ActionPolicyDecision {
         _ => ActionRisk::Low,
     };
     ActionPolicyDecision::allow(risk, "allowed by local household policy")
+}
+
+/// Whether the target's name/query/entities suggest a physical barrier
+/// (garage, door, gate) whose opening warrants confirmation. Builds the
+/// lowercased descriptor on demand so non-`Open` actions never pay for it.
+fn opens_physical_barrier(target: &HomeTarget) -> bool {
+    let descriptor = format!(
+        "{} {} {}",
+        target.display_name,
+        target.query,
+        target.entity_ids.join(" ")
+    )
+    .to_lowercase();
+    descriptor.contains("garage") || descriptor.contains("door") || descriptor.contains("gate")
 }
 
 pub fn assess_runtime_home_action(

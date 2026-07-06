@@ -65,6 +65,7 @@ pub mod runtime_contract;
 pub mod runtime_mode;
 pub mod security;
 pub mod server;
+pub mod session;
 pub mod skills;
 #[cfg(feature = "telegram")]
 pub mod telegram;
