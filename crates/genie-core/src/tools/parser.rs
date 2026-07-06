@@ -114,8 +114,9 @@ fn normalize_single_key_tool_call(
     }
 
     let (tool_name, nested) = object.iter().next()?;
-    let known_tool = tools.tool_defs().iter().any(|tool| tool.name == *tool_name);
-    if !known_tool {
+    // Membership only — avoid building the full `tool_defs()` schema table (a
+    // JSON parameter schema per tool + a parse per skill) just to read names.
+    if !tools.is_known_tool(tool_name) {
         return None;
     }
 

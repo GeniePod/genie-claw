@@ -356,13 +356,14 @@ async fn run_with_wakeword(
                             let response_language = transcript.language.clone().or_else(|| {
                                 crate::voice::language::detect_language_from_text(&text)
                             });
-                            let speaker = voice_cfg.speaker_identity.identify(
-                                &identity::SpeakerIdentityRequest {
+                            let speaker = voice_cfg
+                                .speaker_identity
+                                .identify(&identity::SpeakerIdentityRequest {
                                     wav_path: Some(&followup_path),
                                     transcript: &text,
                                     detected_language: response_language.as_deref(),
-                                },
-                            );
+                                })
+                                .await;
                             let read_context = identity::build_memory_read_context(&text, &speaker);
                             crate::security::audit::log_speaker_resolved(
                                 speaker.name.as_deref().unwrap_or("unknown"),
@@ -1099,7 +1100,8 @@ pub async fn process_transcript(
             wav_path,
             transcript: &text,
             detected_language: response_language.as_deref(),
-        });
+        })
+        .await;
     let read_context = identity::build_memory_read_context(&text, &speaker);
     crate::security::audit::log_speaker_resolved(
         speaker.name.as_deref().unwrap_or("unknown"),
