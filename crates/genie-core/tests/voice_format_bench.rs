@@ -46,6 +46,11 @@ fn run(label: &str, input: &str, iters: u32) {
 fn bench_for_voice() {
     let short = short_reply();
     let long = long_reply();
-    run("short", &short, 300_000);
-    run("long", &long, 300_000);
+    run("short-no-url", &short, 300_000);
+    run("long-with-url", &long, 300_000);
+    run(
+        "clean-no-url",
+        "The living room lights are on and set to warm white.",
+        300_000,
+    );
 }

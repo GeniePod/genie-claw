@@ -1,6 +1,51 @@
 #![cfg(feature = "voice")]
 use genie_core::voice::format::for_voice;
 
+/// Fixed corpus — guards byte-identical `for_voice` output after the lazy raw-URL
+/// gate and redundant normalize elision on the URL-stripped path.
+#[test]
+fn for_voice_corpus_regression() {
+    const CORPUS: &[(&str, &str)] = &[
+        ("This is **bold** and *italic*", "This is bold and italic"),
+        ("## Weather\nIt's sunny.", "Weather Its sunny."),
+        ("The lights are on.", "The lights are on."),
+        ("", ""),
+        (
+            "First sentence. Second sentence. Third sentence. Fourth sentence. Fifth sentence.",
+            "First sentence. Second sentence. Third sentence.",
+        ),
+        (
+            "It is 72.5 degrees outside and feels warm.",
+            "It is 72.5 degrees outside and feels warm.",
+        ),
+        (
+            "Version v1.0.0 is installed and ready.",
+            "Version v1.0.0 is installed and ready.",
+        ),
+        (
+            "Dinner is at 6 p.m. today in the kitchen.",
+            "Dinner is at 6 p.m. today in the kitchen.",
+        ),
+        (
+            "The CPU is at 3.50 GHz now. Memory usage is fine. All systems normal.",
+            "The CPU is at 3.50 GHz now. Memory usage is fine. All systems normal.",
+        ),
+        ("第一句。第二句！第三句？第四句。", "第一句。 第二句！ 第三句？"),
+        (
+            "Top result: ESP32-C6 supports Thread. https://example.com/thread",
+            "Top result: ESP32-C6 supports Thread.",
+        ),
+        (
+            "Check [this guide](https://example.com) for details.",
+            "Check this guide for details.",
+        ),
+    ];
+
+    for (input, expected) in CORPUS {
+        assert_eq!(for_voice(input), *expected, "corpus mismatch for {input:?}");
+    }
+}
+
 #[test]
 fn strip_bold_and_italic() {
     assert_eq!(

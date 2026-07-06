@@ -11,6 +11,13 @@
   `infer_metadata` until restricted, private-intent, or cautious content markers
   are present — benign household writes skip the content allocation.
 
+### Voice
+
+- **TTS cleanup**: skip the allocating `strip_raw_urls` scan in `for_voice` when
+  no raw URL marker is present, and elide the redundant `normalize_whitespace`
+  pass on the URL-stripped path — most spoken replies avoid one to two buffer
+  allocations per call.
+
 ## 1.0.0-rc.3 - 2026-07-03
 
 Third release candidate. This RC lays the **M2 foundations** — a portable

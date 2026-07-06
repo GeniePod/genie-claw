@@ -6,21 +6,19 @@
 
 /// Clean LLM text for TTS output.
 pub fn for_voice(text: &str) -> String {
-    let mut result = text.to_string();
+    let mut result = strip_markdown(text);
 
-    // Strip markdown formatting.
-    result = strip_markdown(&result);
+    // Raw URLs are uncommon in spoken replies; skip the allocating token scan
+    // when no marker is present. `strip_raw_urls` already collapses whitespace
+    // via `split_whitespace`, so the separate normalize pass is only needed on
+    // the no-URL path.
+    if needs_raw_url_strip(&result) {
+        result = strip_raw_urls(&result);
+    } else {
+        result = normalize_whitespace(&result);
+    }
 
-    // Raw URLs sound terrible in TTS and add no value in spoken replies.
-    result = strip_raw_urls(&result);
-
-    // Normalize whitespace.
-    result = normalize_whitespace(&result);
-
-    // Shorten if too long for voice (>3 sentences).
     result = truncate_for_voice(&result, 3);
-
-    // Clean up special characters that TTS handles badly.
     result = clean_for_tts(&result);
 
     result.trim().to_string()
@@ -129,6 +127,26 @@ fn strip_links(text: &str) -> String {
     }
 
     result
+}
+
+/// Conservative gate: skip the allocating `strip_raw_urls` scan when no raw URL
+/// marker is present. Markers must be a superset of the stripped prefixes.
+fn needs_raw_url_strip(text: &str) -> bool {
+    const MARKERS: &[&str] = &["http://", "https://", "www."];
+    MARKERS.iter().any(|marker| contains_ascii_ci(text, marker))
+}
+
+/// ASCII case-insensitive substring check for raw-URL early-out.
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.as_bytes().windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle.bytes())
+            .all(|(left, right)| left.eq_ignore_ascii_case(&right))
+    })
 }
 
 fn strip_raw_urls(text: &str) -> String {
