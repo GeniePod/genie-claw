@@ -153,6 +153,13 @@ fn parse_power(line: &str) -> Option<u32> {
 }
 
 /// Read `/proc/meminfo` and return MemAvailable in MB.
+///
+/// Synchronous filesystem I/O — callers on a shared async executor (every
+/// caller in this workspace: `genie-core`, `genie-api`, `genie-governor` are
+/// all `tokio::main(flavor = "current_thread")`) must go through
+/// [`mem_available_mb_async`] instead of calling this directly, so a slow
+/// `/proc` read (e.g. under cgroup throttling or heavy memory pressure)
+/// can't stall every other concurrent session on the same thread.
 pub fn mem_available_mb() -> Result<u64> {
     let contents = std::fs::read_to_string("/proc/meminfo")?;
     for line in contents.lines() {
@@ -165,11 +172,35 @@ pub fn mem_available_mb() -> Result<u64> {
     anyhow::bail!("MemAvailable not found in /proc/meminfo")
 }
 
+/// Async wrapper around [`mem_available_mb`] for callers running on a shared
+/// `current_thread` executor. Moves the synchronous `/proc/meminfo` read to
+/// Tokio's blocking thread pool instead of running it directly on the
+/// caller's task — the same pattern `memory::with_shared_memory` already
+/// established for the same class of bug.
+pub async fn mem_available_mb_async() -> Result<u64> {
+    tokio::task::spawn_blocking(mem_available_mb)
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SAMPLE: &str = "RAM 2345/7620MB (lfb 234x4MB) SWAP 0/3810MB (cached 0MB) CPU [20%@1510,15%@1510,10%@1510,8%@1510,off,off] EMC_FREQ 0% GR3D_FREQ 50% VIC_FREQ 0% APE 174 gpu@42C cpu@38.5C iwlwifi@37C CV0@-256C CV1@-256C CV2@-256C SOC2@38.5C SOC0@40C SOC1@37.5C tj@42C VDD_IN 4500mW/4500mW VDD_CPU_GPU_CV 799mW/799mW VDD_SOC 1598mW/1598mW";
+
+    /// `mem_available_mb_async` must return the same result as the
+    /// synchronous version — the only difference is running on Tokio's
+    /// blocking pool instead of the calling task.
+    #[tokio::test]
+    async fn mem_available_mb_async_matches_sync_version() {
+        let sync_result = mem_available_mb();
+        let async_result = mem_available_mb_async().await;
+        assert_eq!(sync_result.is_ok(), async_result.is_ok());
+        if let (Ok(sync_val), Ok(async_val)) = (sync_result, async_result) {
+            assert_eq!(sync_val, async_val);
+        }
+    }
 
     #[test]
     fn parse_ram_values() {
