@@ -7,6 +7,9 @@
 - **Auto-capture**: defer the allocating `to_lowercase` in `extract_facts` until
   an identity, preference, or relationship trigger is present — common no-match
   utterances (weather, questions, chit-chat) skip the allocation entirely.
+- **Policy**: defer the allocating `to_lowercase` in `assess_memory_write` and
+  `infer_metadata` until restricted, private-intent, or cautious content markers
+  are present — benign household writes skip the content allocation.
 
 ## 1.0.0-rc.3 - 2026-07-03
 

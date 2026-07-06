@@ -291,8 +291,46 @@ fn restricted_decision(reason: &'static str) -> MemoryPolicyDecision {
 /// backfilled into the persisted scope/sensitivity/spoken-policy columns.
 pub fn infer_metadata(kind: &str, content: &str) -> MemoryPolicyMetadata {
     let kind_lower = kind.trim().to_lowercase();
+    if !needs_policy_content_lower(content) {
+        return infer_metadata_kind_only(kind, &kind_lower);
+    }
     let content_lower = content.to_lowercase();
     infer_metadata_lower(kind, &kind_lower, &content_lower)
+}
+
+fn infer_metadata_kind_only(_kind: &str, kind_lower: &str) -> MemoryPolicyMetadata {
+    let private_intent = kind_lower == "private" || kind_lower.starts_with("private_");
+    let person_linked = kind_lower == "person"
+        || kind_lower.starts_with("person_")
+        || kind_lower == "person-linked"
+        || kind_lower == "person_linked";
+
+    let scope = if private_intent {
+        MemoryScope::Private
+    } else if person_linked {
+        MemoryScope::Person
+    } else {
+        MemoryScope::Household
+    };
+
+    let sensitivity = if private_intent {
+        MemorySensitivity::Cautious
+    } else {
+        MemorySensitivity::Normal
+    };
+
+    let spoken_policy = match (scope, sensitivity) {
+        (_, MemorySensitivity::Restricted) => SpokenMemoryPolicy::Deny,
+        (MemoryScope::Private, _) => SpokenMemoryPolicy::AppOnly,
+        (_, MemorySensitivity::Cautious) => SpokenMemoryPolicy::Confirm,
+        _ => SpokenMemoryPolicy::Allow,
+    };
+
+    MemoryPolicyMetadata {
+        scope,
+        sensitivity,
+        spoken_policy,
+    }
 }
 
 fn infer_metadata_lower(kind: &str, kind_lower: &str, content_lower: &str) -> MemoryPolicyMetadata {
@@ -339,15 +377,35 @@ fn infer_metadata_lower(kind: &str, kind_lower: &str, content_lower: &str) -> Me
 
 /// Decide whether a proposed memory may be written by voice/tool flow.
 pub fn assess_memory_write(kind: &str, content: &str) -> MemoryPolicyDecision {
-    let content_lower = content.to_lowercase();
-    if needs_restricted_secret_scan(&content_lower)
-        && let Some(reason) = restricted_secret_reason(&content_lower)
-    {
-        return restricted_decision(reason);
+    let kind_lower = kind.trim().to_lowercase();
+
+    if needs_policy_content_lower(content) {
+        let content_lower = content.to_lowercase();
+        if needs_restricted_secret_scan(&content_lower)
+            && let Some(reason) = restricted_secret_reason(&content_lower)
+        {
+            return restricted_decision(reason);
+        }
+
+        let metadata = infer_metadata_lower(kind, &kind_lower, &content_lower);
+        if metadata.scope == MemoryScope::Private {
+            return decision_for_metadata(
+                metadata,
+                false,
+                MemoryDisclosure::AppOnly,
+                "Private personal memory requires an explicit app-backed flow in V1.",
+            );
+        }
+
+        return decision_for_metadata(
+            metadata,
+            true,
+            MemoryDisclosure::Speak,
+            "Memory is safe for household-shared storage.",
+        );
     }
 
-    let kind_lower = kind.trim().to_lowercase();
-    let metadata = infer_metadata_lower(kind, &kind_lower, &content_lower);
+    let metadata = infer_metadata_kind_only(kind, &kind_lower);
     if metadata.scope == MemoryScope::Private {
         return decision_for_metadata(
             metadata,
@@ -613,89 +671,121 @@ fn is_cautious_memory(kind: &str, lower: &str) -> bool {
 }
 
 fn needs_restricted_secret_scan(lower: &str) -> bool {
-    lower.contains("password")
-        || lower.contains("passcode")
-        || lower.contains("pass:")
-        || lower.contains(" pass:")
-        || lower.contains("one-time")
-        || lower.contains("one time")
-        || lower.contains("otp")
-        || lower.contains("2fa")
-        || lower.contains("recovery")
-        || lower.contains("seed phrase")
-        || lower.contains("private key")
-        || lower.contains("secret key")
-        || lower.contains("api key")
-        || lower.contains("access token")
-        || lower.contains("gate code")
-        || lower.contains("door code")
-        || lower.contains("garage code")
-        || lower.contains("alarm code")
-        || lower.contains("security code")
-        || lower.contains("safe code")
-        || lower.contains("combination")
-        || lower.contains(" lock combo")
-        || lower.contains("credit card")
-        || lower.contains("card number")
-        || lower.contains("cvv")
-        || lower.contains("account number")
-        || lower.contains("confirmation number")
-        || lower.contains("bank account")
-        || lower.contains("routing number")
-        || lower.contains("social security")
-        || lower.contains("ssn")
-        || lower.contains("passport")
-        || lower.contains("driver license")
-        || lower.contains("government id")
-        || lower.contains(" is in ")
-        || lower.contains(" are in ")
-        || lower.contains(" is inside ")
-        || lower.contains(" are inside ")
-        || lower.contains(" is kept ")
-        || lower.contains(" are kept ")
-        || lower.contains(" is stored ")
-        || lower.contains(" are stored ")
-        || lower.contains(" is hidden ")
-        || lower.contains(" are hidden ")
-        || lower.contains(" under ")
-        || lower.contains(" behind ")
-        || lower.contains("birth certificate")
-        || lower.contains("house key")
-        || lower.contains("spare key")
-        || lower.contains("safe key")
-        || lower.contains("car title")
-        || lower.contains("property deed")
-        || lower.contains("documents are")
-        || lower.contains("valuables are")
-        || lower.contains("important documents")
+    needs_restricted_secret_scan_ci(lower)
+}
+
+fn needs_restricted_secret_scan_ci(text: &str) -> bool {
+    contains_ascii_ci(text, "password")
+        || contains_ascii_ci(text, "passcode")
+        || contains_ascii_ci(text, "pass:")
+        || contains_ascii_ci(text, " pass:")
+        || contains_ascii_ci(text, "one-time")
+        || contains_ascii_ci(text, "one time")
+        || contains_ascii_ci(text, "otp")
+        || contains_ascii_ci(text, "2fa")
+        || contains_ascii_ci(text, "recovery")
+        || contains_ascii_ci(text, "seed phrase")
+        || contains_ascii_ci(text, "private key")
+        || contains_ascii_ci(text, "secret key")
+        || contains_ascii_ci(text, "api key")
+        || contains_ascii_ci(text, "access token")
+        || contains_ascii_ci(text, "gate code")
+        || contains_ascii_ci(text, "door code")
+        || contains_ascii_ci(text, "garage code")
+        || contains_ascii_ci(text, "alarm code")
+        || contains_ascii_ci(text, "security code")
+        || contains_ascii_ci(text, "safe code")
+        || contains_ascii_ci(text, "combination")
+        || contains_ascii_ci(text, " lock combo")
+        || contains_ascii_ci(text, "credit card")
+        || contains_ascii_ci(text, "card number")
+        || contains_ascii_ci(text, "cvv")
+        || contains_ascii_ci(text, "account number")
+        || contains_ascii_ci(text, "confirmation number")
+        || contains_ascii_ci(text, "bank account")
+        || contains_ascii_ci(text, "routing number")
+        || contains_ascii_ci(text, "social security")
+        || contains_ascii_ci(text, "ssn")
+        || contains_ascii_ci(text, "passport")
+        || contains_ascii_ci(text, "driver license")
+        || contains_ascii_ci(text, "government id")
+        || contains_ascii_ci(text, " is in ")
+        || contains_ascii_ci(text, " are in ")
+        || contains_ascii_ci(text, " is inside ")
+        || contains_ascii_ci(text, " are inside ")
+        || contains_ascii_ci(text, " is kept ")
+        || contains_ascii_ci(text, " are kept ")
+        || contains_ascii_ci(text, " is stored ")
+        || contains_ascii_ci(text, " are stored ")
+        || contains_ascii_ci(text, " is hidden ")
+        || contains_ascii_ci(text, " are hidden ")
+        || contains_ascii_ci(text, " under ")
+        || contains_ascii_ci(text, " behind ")
+        || contains_ascii_ci(text, "birth certificate")
+        || contains_ascii_ci(text, "house key")
+        || contains_ascii_ci(text, "spare key")
+        || contains_ascii_ci(text, "safe key")
+        || contains_ascii_ci(text, "car title")
+        || contains_ascii_ci(text, "property deed")
+        || contains_ascii_ci(text, "documents are")
+        || contains_ascii_ci(text, "valuables are")
+        || contains_ascii_ci(text, "important documents")
 }
 
 fn needs_private_intent_scan(lower: &str) -> bool {
-    lower.contains("private")
-        || lower.contains("for me only")
-        || lower.contains("aloud")
-        || lower.contains("remember this")
+    needs_private_intent_scan_ci(lower)
+}
+
+fn needs_private_intent_scan_ci(text: &str) -> bool {
+    contains_ascii_ci(text, "private")
+        || contains_ascii_ci(text, "for me only")
+        || contains_ascii_ci(text, "aloud")
+        || contains_ascii_ci(text, "remember this")
 }
 
 fn needs_cautious_scan(lower: &str) -> bool {
-    lower.contains("medical")
-        || lower.contains("mental health")
-        || lower.contains("therapy")
-        || lower.contains("legal")
-        || lower.contains("secret")
-        || lower.contains("medication")
-        || lower.contains("prescription")
-        || lower.contains("diagnosed")
-        || lower.contains("diabetes")
-        || lower.contains("cancer")
-        || lower.contains("depression")
-        || lower.contains("anxiety")
-        || lower.contains("hypertension")
-        || lower.contains("epilepsy")
-        || lower.contains("asthma")
-        || lower.contains("insulin")
-        || lower.contains("chemotherapy")
-        || lower.contains("dialysis")
+    needs_cautious_scan_ci(lower)
+}
+
+fn needs_cautious_scan_ci(text: &str) -> bool {
+    contains_ascii_ci(text, "medical")
+        || contains_ascii_ci(text, "mental health")
+        || contains_ascii_ci(text, "therapy")
+        || contains_ascii_ci(text, "legal")
+        || contains_ascii_ci(text, "secret")
+        || contains_ascii_ci(text, "medication")
+        || contains_ascii_ci(text, "prescription")
+        || contains_ascii_ci(text, "diagnosed")
+        || contains_ascii_ci(text, "diabetes")
+        || contains_ascii_ci(text, "cancer")
+        || contains_ascii_ci(text, "depression")
+        || contains_ascii_ci(text, "anxiety")
+        || contains_ascii_ci(text, "hypertension")
+        || contains_ascii_ci(text, "epilepsy")
+        || contains_ascii_ci(text, "asthma")
+        || contains_ascii_ci(text, "insulin")
+        || contains_ascii_ci(text, "chemotherapy")
+        || contains_ascii_ci(text, "dialysis")
+}
+
+/// True when policy classification needs the allocating lowercase content view.
+fn needs_policy_content_lower(content: &str) -> bool {
+    needs_restricted_secret_scan_ci(content)
+        || needs_private_intent_scan_ci(content)
+        || needs_cautious_scan_ci(content)
+}
+
+/// ASCII case-insensitive substring check for pre-lowercase trigger gates.
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.as_bytes().windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle.bytes())
+            .all(|(left, right)| left.eq_ignore_ascii_case(&right))
+    })
 }
 
 fn restricted_secret_reason(lower: &str) -> Option<&'static str> {

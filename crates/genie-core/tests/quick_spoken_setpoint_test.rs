@@ -34,3 +34,23 @@ fn spoken_temperature_with_connector_routes() {
     let (_, value) = routed_temperature("Set the thermostat to one hundred and five degrees");
     assert_eq!(value, 105.0);
 }
+
+#[test]
+fn directional_adverb_is_not_part_of_the_entity() {
+    // "set the thermostat down/up/back to N" — the adverb describes the setpoint
+    // change, not the device. The entity must stay the named device, not
+    // "thermostat down". Value is already correct; only the entity was garbled.
+    for (utterance, entity, value) in [
+        ("Set the thermostat down to 68", "thermostat", 68.0),
+        ("Set the thermostat up to 72", "thermostat", 72.0),
+        (
+            "Set the bedroom thermostat back to 70",
+            "bedroom thermostat",
+            70.0,
+        ),
+    ] {
+        let (got_entity, got_value) = routed_temperature(utterance);
+        assert_eq!(got_entity, entity, "{utterance}");
+        assert_eq!(got_value, value, "{utterance}");
+    }
+}
