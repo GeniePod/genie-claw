@@ -1,8 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use genie_common::probe::{ProbeTimeouts, http_request};
 
 /// Weather via Open-Meteo API (free, no API key required).
 ///
@@ -10,23 +9,30 @@ use tokio::net::TcpStream;
 /// We use their geocoding API to resolve city names → coordinates,
 /// then fetch weather for those coordinates.
 ///
-/// All requests go through raw TCP+TLS-free HTTP to api.open-meteo.com.
-/// Note: Open-Meteo supports HTTP (no TLS required for the free tier).
+/// Requests go over TLS via the shared outbound HTTP client in
+/// `genie_common::probe` — previously this module hand-rolled a
+/// TLS-free raw-socket client, sending household location queries over
+/// plain HTTP despite `reqwest`+`rustls-tls` (and now this TLS-capable
+/// probe client) already being available in the workspace.
 
 /// Connect-timeout cap for Open-Meteo HTTP requests.
 const WEATHER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Total request-lifecycle timeout (covers write + read). Without this, a
-/// slow or hung Open-Meteo response leaves the calling chat task wedged
-/// forever. Same fix shape as PR #174 / closes #173 for `ha::client`.
+/// Read-timeout cap, applied per write/read step (see
+/// `genie_common::probe`). Without this, a slow or hung Open-Meteo
+/// response leaves the calling chat task wedged forever. Same fix shape
+/// as PR #174 / closes #173 for `ha::client`.
 const WEATHER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Body-size cap on the accumulated response. The Open-Meteo free tier
 /// returns < 4 KiB for geocoding and < 20 KiB for forecasts in practice;
 /// 1 MiB leaves a healthy margin while still preventing RSS growth from a
-/// misbehaving or man-in-the-middle response (the connection is plain
-/// HTTP). Without this the body-read loop would accumulate unboundedly.
+/// misbehaving response. Without this the body-read loop would
+/// accumulate unboundedly.
 const WEATHER_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Open-Meteo's HTTPS port.
+const WEATHER_TLS_PORT: u16 = 443;
 
 // ── Public API ──────────────────────────────────────────────
 
@@ -201,15 +207,16 @@ async fn fetch_forecast(lat: f64, lon: f64) -> Result<Vec<ForecastDay>> {
     Ok(forecast)
 }
 
-/// Raw HTTP GET (no TLS — Open-Meteo supports plain HTTP).
-///
-/// Production callers reach this via the host-only convenience signature;
-/// it defaults to port 80 and the workspace-wide timeout/size constants.
+/// HTTPS GET against an Open-Meteo host via the shared outbound HTTP
+/// client. Production callers reach this via the host-only convenience
+/// signature; it defaults to port 443 and the workspace-wide
+/// timeout/size constants.
 async fn http_get(host: &str, path: &str) -> Result<String> {
     http_get_with_limits(
         host,
-        80,
+        WEATHER_TLS_PORT,
         path,
+        true,
         WEATHER_CONNECT_TIMEOUT,
         WEATHER_REQUEST_TIMEOUT,
         WEATHER_MAX_RESPONSE_BYTES,
@@ -218,100 +225,40 @@ async fn http_get(host: &str, path: &str) -> Result<String> {
 }
 
 /// Inner implementation that takes explicit limits — exposed `pub(crate)`
-/// only so the test module can point at an ephemeral mock listener with
-/// millisecond-scale timeouts. NOT part of any stable API.
+/// only so the test module can point at an ephemeral plain-HTTP mock
+/// listener (`tls: false`) with millisecond-scale timeouts. NOT part of
+/// any stable API.
 pub(crate) async fn http_get_with_limits(
     host: &str,
     port: u16,
     path: &str,
+    tls: bool,
     connect_timeout: Duration,
     request_timeout: Duration,
     max_bytes: usize,
 ) -> Result<String> {
     let addr = format!("{}:{}", host, port);
-    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(&addr))
-        .await
-        .map_err(|_| anyhow::anyhow!("Open-Meteo connect to {} timed out", addr))??;
-
-    let (reader, mut writer) = stream.into_split();
-
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: GeniePod/0.2\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-        path, host
-    );
-
-    // Run the entire write + read cycle under a single deadline. Without
-    // this a hung Open-Meteo wedges the chat task forever even after the
-    // TCP connect succeeds. Same shape as PR #174 / closes #173.
-    let body = tokio::time::timeout(request_timeout, async move {
-        writer.write_all(request.as_bytes()).await?;
-        read_http_get_body(reader, max_bytes).await
-    })
+    let (status, body) = http_request(
+        &addr,
+        path,
+        tls,
+        "GET",
+        &[
+            ("User-Agent", "GeniePod/0.2"),
+            ("Accept", "application/json"),
+        ],
+        None,
+        ProbeTimeouts {
+            connect: connect_timeout,
+            read: request_timeout,
+        },
+        max_bytes,
+    )
     .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "Open-Meteo GET {} timed out after {}s",
-            path,
-            request_timeout.as_secs()
-        )
-    })??;
+    .map_err(|e| anyhow::anyhow!("Open-Meteo GET {} failed: {}", path, e))?;
 
-    Ok(body.trim().to_string())
-}
-
-/// Drain headers and body from a one-shot `Connection: close` GET response,
-/// rejecting chunked encoding (Open-Meteo's free tier doesn't use it) and
-/// bounding accumulated body bytes at `max_bytes`.
-async fn read_http_get_body(
-    reader: tokio::net::tcp::OwnedReadHalf,
-    max_bytes: usize,
-) -> Result<String> {
-    let mut buf_reader = BufReader::new(reader);
-    let mut in_body = false;
-    let mut body = String::new();
-
-    loop {
-        let mut line = String::new();
-        let n = buf_reader.read_line(&mut line).await?;
-        if n == 0 {
-            break;
-        }
-
-        if !in_body {
-            // The previous implementation tried to be clever about
-            // `Transfer-Encoding: chunked` after the fact (lines 216-225
-            // of the pre-fix code) and joined non-hex-only lines with
-            // `push_str` — no separator between adjacent chunks, so JSON
-            // spanning multiple chunks was silently corrupted, and the
-            // heuristic fired on legitimate responses whose first body
-            // character was a hex digit. Refuse chunked explicitly
-            // instead: Open-Meteo's free tier returns Content-Length, so
-            // this path should be unreachable in practice; if a proxy or
-            // future Open-Meteo upgrade turns it on, the user gets a
-            // clear error and the call site can retry/fallback.
-            let lower = line.to_ascii_lowercase();
-            if let Some(value) = lower.strip_prefix("transfer-encoding:")
-                && value.split(',').any(|tok| tok.trim() == "chunked")
-            {
-                anyhow::bail!("Open-Meteo response uses unsupported chunked encoding");
-            }
-
-            if line.trim().is_empty() {
-                in_body = true;
-            }
-            continue;
-        }
-
-        // Body branch.
-        let projected = body.len().saturating_add(line.len());
-        if projected > max_bytes {
-            anyhow::bail!(
-                "Open-Meteo response exceeded {} bytes (got at least {})",
-                max_bytes,
-                projected
-            );
-        }
-        body.push_str(&line);
+    if !(200..300).contains(&status) {
+        anyhow::bail!("Open-Meteo HTTP {} for GET {}", status, path);
     }
 
     Ok(body)
@@ -436,6 +383,7 @@ mod tests {
             &addr.ip().to_string(),
             addr.port(),
             "/v1/search?name=Denver",
+            false,
             Duration::from_millis(500),
             Duration::from_millis(500),
             WEATHER_MAX_RESPONSE_BYTES,
@@ -445,14 +393,15 @@ mod tests {
         let err = result.expect_err("hung server must produce a timeout error");
         let msg = err.to_string();
         assert!(
-            msg.contains("timed out"),
+            msg.contains("timeout") || msg.contains("timed out"),
             "expected a timeout error, got: {}",
             msg
         );
     }
 
-    /// Regression for the size-cap fix: an oversized response body fails
-    /// cleanly with a "exceeded N bytes" error instead of growing RSS.
+    /// Regression for the size-cap fix: an oversized response body (no
+    /// `Content-Length`, streamed past the cap) fails cleanly with a
+    /// "too large" error instead of growing RSS or truncating silently.
     #[tokio::test(flavor = "current_thread")]
     async fn oversized_response_is_size_capped() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -477,6 +426,7 @@ mod tests {
             &addr.ip().to_string(),
             addr.port(),
             "/v1/search?name=Denver",
+            false,
             Duration::from_millis(500),
             Duration::from_secs(5),
             64 * 1024, // cap at 64 KiB so the test bails fast
@@ -485,42 +435,49 @@ mod tests {
         server.abort();
         let err = result.expect_err("oversized response must produce a size error");
         assert!(
-            err.to_string().contains("exceeded"),
+            err.to_string().contains("too large"),
             "expected a size-exceeded error, got: {}",
             err
         );
     }
 
-    /// Regression for the chunked-encoding fix: a `Transfer-Encoding:
-    /// chunked` response is rejected explicitly instead of going through
-    /// the old broken decoder that silently corrupted multi-chunk JSON.
+    /// Regression for the shared-client migration: `Transfer-Encoding:
+    /// chunked` responses are now correctly decoded (via
+    /// `genie_common::probe`'s real chunked reader) instead of the old
+    /// hand-rolled behavior of explicitly refusing them. Multi-chunk JSON
+    /// must reassemble intact — the old bug this module used to guard
+    /// against (silently corrupting multi-chunk bodies with no separator)
+    /// lived in a from-scratch decoder that no longer exists here.
     #[tokio::test(flavor = "current_thread")]
-    async fn chunked_encoding_is_explicitly_rejected() {
+    async fn chunked_encoding_is_decoded_correctly() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.expect("accept");
             let mut buf = [0u8; 4096];
             let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
-            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\n{\"a\":1}\r\n0\r\n\r\n";
+            // Two chunks — `{"a":1` (6 bytes) then `,"b":2}` (7 bytes) —
+            // that must reassemble into one JSON body with no spurious
+            // separator or truncation between them.
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\n{\"a\":1\r\n7\r\n,\"b\":2}\r\n0\r\n\r\n";
             let _ = sock.write_all(response.as_bytes()).await;
         });
-        let result = http_get_with_limits(
+        let body = http_get_with_limits(
             &addr.ip().to_string(),
             addr.port(),
             "/v1/search?name=Denver",
+            false,
             Duration::from_millis(500),
             Duration::from_secs(5),
             WEATHER_MAX_RESPONSE_BYTES,
         )
-        .await;
+        .await
+        .expect("chunked response must decode successfully");
         server.abort();
-        let err = result.expect_err("chunked encoding must produce an explicit error");
-        assert!(
-            err.to_string().contains("chunked"),
-            "expected a chunked-encoding error, got: {}",
-            err
-        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("decoded chunked body must be valid JSON");
+        assert_eq!(parsed["a"], 1);
+        assert_eq!(parsed["b"], 2);
     }
 
     /// Regression for the URL-encoding fix: the geocode request line on
@@ -578,6 +535,7 @@ mod tests {
             &addr.ip().to_string(),
             addr.port(),
             &path,
+            false,
             Duration::from_millis(500),
             Duration::from_secs(5),
             WEATHER_MAX_RESPONSE_BYTES,

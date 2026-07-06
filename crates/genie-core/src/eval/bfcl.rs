@@ -90,7 +90,7 @@ pub struct BfclCaseScore {
     pub diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct BfclReport {
     pub total_cases: usize,
     pub parsed_cases: usize,

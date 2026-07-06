@@ -97,7 +97,7 @@ impl Governor {
             }
             Command::MediaStop => {
                 let ts = store::now_ms();
-                let mem_avail = tegrastats::mem_available_mb().unwrap_or(4096);
+                let mem_avail = tegrastats::mem_available_mb_async().await.unwrap_or(4096);
                 let target = self.determine_mode(mem_avail);
                 let result: Result<Mode, anyhow::Error> = async {
                     if let Err(error) = tokio::fs::remove_file("/run/geniepod/media_mode").await
@@ -115,7 +115,7 @@ impl Governor {
                 }
             }
             Command::Status => {
-                let mem_avail = tegrastats::mem_available_mb().unwrap_or(0);
+                let mem_avail = tegrastats::mem_available_mb_async().await.unwrap_or(0);
                 let resp = StatusResponse {
                     mode: self.current_mode,
                     mem_available_mb: mem_avail,
@@ -130,7 +130,7 @@ impl Governor {
         let ts = store::now_ms();
 
         // 1. Read memory from /proc/meminfo (always available).
-        let mem_avail = tegrastats::mem_available_mb().unwrap_or(0);
+        let mem_avail = tegrastats::mem_available_mb_async().await.unwrap_or(0);
 
         // 2. If tegrastats is running, log the latest snapshot.
         if let Some(ref rx) = self.tegra_rx {

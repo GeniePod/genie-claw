@@ -25,7 +25,7 @@ pub async fn run(
     let mut lines = stdin.lines();
 
     // Get or create a REPL conversation.
-    let conv_id = conversations.create()?;
+    let conv_id = conversations.create().await?;
     tracing::info!(conv_id = %conv_id, "REPL conversation started");
 
     let tool_names = tools_dispatch
@@ -62,7 +62,9 @@ pub async fn run(
         crate::security::injection::scan_and_warn(text, crate::security::injection::source::REPL);
 
         // Persist user message.
-        conversations.append_or_log(&conv_id, "user", text, None);
+        conversations
+            .append_or_log(&conv_id, "user", text, None, None)
+            .await;
 
         if let Some(call) = tools::quick::route_for_available_tools(
             text,
@@ -91,18 +93,33 @@ pub async fn run(
             .to_string();
 
             eprintln!("\nGeniePod: {}", response);
-            conversations.append_or_log(&conv_id, "assistant", &tool_json, Some(&tool_result.tool));
-            conversations.append_or_log(
-                &conv_id,
-                "system",
-                &format!("Tool: {}", tool_result.output),
-                None,
-            );
-            conversations.append_or_log(&conv_id, "assistant", &response, None);
+            conversations
+                .append_or_log(
+                    &conv_id,
+                    "assistant",
+                    &tool_json,
+                    Some(&tool_result.tool),
+                    None,
+                )
+                .await;
+            conversations
+                .append_or_log(
+                    &conv_id,
+                    "system",
+                    &format!("Tool: {}", tool_result.output),
+                    None,
+                    None,
+                )
+                .await;
+            conversations
+                .append_or_log(&conv_id, "assistant", &response, None, None)
+                .await;
 
-            let stored = with_shared_memory(memory, |memory| {
-                memory::extract::extract_and_store(memory, text)
-            });
+            let text_owned = text.to_string();
+            let stored = with_shared_memory(memory, move |memory| {
+                memory::extract::extract_and_store(memory, &text_owned)
+            })
+            .await;
             if stored > 0 {
                 eprintln!(
                     "(remembered {} fact{})",
@@ -114,9 +131,11 @@ pub async fn run(
         }
 
         // Build context with per-query memory injection.
-        let memory_context = with_shared_memory(memory, |memory| {
-            memory::inject::build_memory_context(memory, text)
-        });
+        let text_owned = text.to_string();
+        let memory_context = with_shared_memory(memory, move |memory| {
+            memory::inject::build_memory_context(memory, &text_owned)
+        })
+        .await;
         let full_prompt = format!(
             "{}\n\nRelevant household context:\n{}",
             system_prompt, memory_context
@@ -124,6 +143,7 @@ pub async fn run(
 
         let history = conversations
             .get_recent(&conv_id, max_history)
+            .await
             .unwrap_or_default();
         let mut messages = vec![Message {
             role: "system".into(),
@@ -162,18 +182,24 @@ pub async fn run(
                 .await
                 {
                     eprintln!("[TOOL: {}] {}", tool_result.tool, tool_result.output);
-                    conversations.append_or_log(
-                        &conv_id,
-                        "assistant",
-                        &response,
-                        Some(&tool_result.tool),
-                    );
-                    conversations.append_or_log(
-                        &conv_id,
-                        "system",
-                        &format!("Tool: {}", tool_result.output),
-                        None,
-                    );
+                    conversations
+                        .append_or_log(
+                            &conv_id,
+                            "assistant",
+                            &response,
+                            Some(&tool_result.tool),
+                            None,
+                        )
+                        .await;
+                    conversations
+                        .append_or_log(
+                            &conv_id,
+                            "system",
+                            &format!("Tool: {}", tool_result.output),
+                            None,
+                            None,
+                        )
+                        .await;
 
                     let preserve_raw = matches!(
                         tool_result.tool.as_str(),
@@ -186,15 +212,15 @@ pub async fn run(
                     );
 
                     if preserve_raw {
-                        conversations.append_or_log(
-                            &conv_id,
-                            "assistant",
-                            &tool_result.output,
-                            None,
-                        );
+                        conversations
+                            .append_or_log(&conv_id, "assistant", &tool_result.output, None, None)
+                            .await;
                     } else {
                         // Get follow-up summary.
-                        let recent = conversations.get_recent(&conv_id, 6).unwrap_or_default();
+                        let recent = conversations
+                            .get_recent(&conv_id, 6)
+                            .await
+                            .unwrap_or_default();
                         let mut summary_msgs = vec![Message {
                             role: "system".into(),
                             content: "Summarize the tool result in one sentence.".into(),
@@ -217,13 +243,17 @@ pub async fn run(
                         {
                             Ok(summary) => {
                                 eprintln!();
-                                conversations.append_or_log(&conv_id, "assistant", &summary, None);
+                                conversations
+                                    .append_or_log(&conv_id, "assistant", &summary, None, None)
+                                    .await;
                             }
                             Err(_) => eprintln!(),
                         }
                     }
                 } else {
-                    conversations.append_or_log(&conv_id, "assistant", &response, None);
+                    conversations
+                        .append_or_log(&conv_id, "assistant", &response, None, None)
+                        .await;
                 }
             }
             Err(e) => {
@@ -232,9 +262,11 @@ pub async fn run(
         }
 
         // Auto-capture facts.
-        let stored = with_shared_memory(memory, |memory| {
-            memory::extract::extract_and_store(memory, text)
-        });
+        let text_owned = text.to_string();
+        let stored = with_shared_memory(memory, move |memory| {
+            memory::extract::extract_and_store(memory, &text_owned)
+        })
+        .await;
         if stored > 0 {
             eprintln!(
                 "(remembered {} fact{})",
