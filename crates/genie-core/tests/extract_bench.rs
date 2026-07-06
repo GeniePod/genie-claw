@@ -21,8 +21,8 @@ fn run(label: &str, input: &str, iters: u32) {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn bench_extract_facts() {
-    // Common case: no relationship, identity, or preference phrase — skips all
-    // prefix scans after the single to_lowercase (see #495 early-outs).
+    // Common case: no relationship, identity, or preference phrase — skips the
+    // allocating to_lowercase entirely (see #495 early-outs + deferred lower).
     run(
         "no-match",
         "the weather today is nice and i went for a walk",

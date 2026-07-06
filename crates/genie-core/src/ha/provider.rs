@@ -1184,7 +1184,15 @@ fn summarize_state(target_name: &str, domain: Option<&str>, entities: &[Entity])
                     .attributes
                     .get("brightness")
                     .and_then(|value| value.as_u64())
-                    .map(|value| format!(", brightness {}%", value * 100 / 255))
+                    .map(|value| {
+                        // Round to the nearest percent, matching Home
+                        // Assistant's own brightness_pct and the rounding
+                        // `normalize_brightness` applies on the write path.
+                        // Integer `value * 100 / 255` truncates, so a light
+                        // set to 75% (stored 191/255) under-reported as 74%.
+                        let percent = ((value as f64) * 100.0 / 255.0).round() as u64;
+                        format!(", brightness {percent}%")
+                    })
                     .unwrap_or_default();
                 format!("{} is {}{}", target_name, entity.state, brightness)
             }
@@ -1625,5 +1633,37 @@ mod tests {
     fn brightness_percent_maps_to_255_scale() {
         assert_eq!(normalize_brightness(50.0), 128);
         assert_eq!(normalize_brightness(255.0), 255);
+    }
+
+    /// Regression: the `home_status` brightness readback must round to the
+    /// nearest percent, matching Home Assistant's own `brightness_pct` and the
+    /// rounding `normalize_brightness` applies on the write path. Integer
+    /// `value * 100 / 255` truncates, so a light set to 75% (stored 191/255)
+    /// used to read back as "74%" and 99% (stored 252) as "98%".
+    #[test]
+    fn brightness_readback_rounds_to_nearest_percent() {
+        let light = |b: u64| Entity {
+            entity_id: "light.living".into(),
+            state: "on".into(),
+            attributes: serde_json::json!({ "brightness": b }),
+        };
+        // 191/255 = 74.9% -> 75%, not the truncated 74%.
+        let summary = summarize_state("Living room lamp", Some("light"), &[light(191)]);
+        assert!(
+            summary.contains("brightness 75%"),
+            "expected rounded 75%, got: {summary}"
+        );
+        // 252/255 = 98.8% -> 99%.
+        let summary = summarize_state("Living room lamp", Some("light"), &[light(252)]);
+        assert!(
+            summary.contains("brightness 99%"),
+            "expected rounded 99%, got: {summary}"
+        );
+        // Full scale still reports exactly 100%.
+        let summary = summarize_state("Living room lamp", Some("light"), &[light(255)]);
+        assert!(
+            summary.contains("brightness 100%"),
+            "expected 100%, got: {summary}"
+        );
     }
 }
