@@ -30,7 +30,10 @@ fn for_voice_corpus_regression() {
             "The CPU is at 3.50 GHz now. Memory usage is fine. All systems normal.",
             "The CPU is at 3.50 GHz now. Memory usage is fine. All systems normal.",
         ),
-        ("第一句。第二句！第三句？第四句。", "第一句。 第二句！ 第三句？"),
+        (
+            "第一句。第二句！第三句？第四句。",
+            "第一句。 第二句！ 第三句？",
+        ),
         (
             "Top result: ESP32-C6 supports Thread. https://example.com/thread",
             "Top result: ESP32-C6 supports Thread.",
