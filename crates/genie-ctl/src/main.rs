@@ -1868,11 +1868,13 @@ async fn cmd_history() -> Result<()> {
     for msg in &messages {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let prefix = match role {
-            "user" => "You",
-            "assistant" => "GeniePod",
-            "system" => "System",
-            _ => role,
+        let speaker = msg.get("speaker").and_then(|v| v.as_str());
+        let prefix = match (role, speaker) {
+            ("user", Some(name)) => format!("You ({})", name),
+            ("user", None) => "You".to_string(),
+            ("assistant", _) => "GeniePod".to_string(),
+            ("system", _) => "System".to_string(),
+            _ => role.to_string(),
         };
         println!("{}: {}", prefix, content);
     }

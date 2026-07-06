@@ -2708,8 +2708,22 @@ fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
     let location = location
         .trim()
         .trim_start_matches("the ")
+        // Drop a trailing time qualifier so "weather in Denver tonight" yields
+        // "denver", not "denver tonight". Longest phrases first so a shorter
+        // suffix (" now") does not pre-empt a longer one (" right now"). Forecast
+        // detection reads the whole utterance, so trimming here never changes it.
+        .trim_end_matches(" right now")
+        .trim_end_matches(" this weekend")
+        .trim_end_matches(" this week")
+        .trim_end_matches(" this morning")
+        .trim_end_matches(" this afternoon")
+        .trim_end_matches(" this evening")
+        .trim_end_matches(" tonight")
         .trim_end_matches(" today")
         .trim_end_matches(" tomorrow")
+        .trim_end_matches(" now")
+        .trim_end_matches(" later")
+        .trim_end_matches(" currently")
         .trim()
         .to_string();
     if location.is_empty() {
@@ -4839,6 +4853,25 @@ mod tests {
         assert_eq!(call.name, "get_weather");
         assert_eq!(call.arguments["location"], "new york");
         assert_eq!(call.arguments["forecast"], true);
+    }
+
+    #[test]
+    fn weather_location_drops_trailing_time_qualifier() {
+        // A trailing time word ("tonight", "right now", "this weekend", "now")
+        // is not part of the city — the location argument must be just the city,
+        // not "denver tonight". Forecast detection reads the whole utterance, so
+        // it is unaffected by trimming the location.
+        for (utterance, location, forecast) in [
+            ("what's the weather in Denver tonight?", "denver", false),
+            ("weather in Tokyo right now", "tokyo", false),
+            ("forecast for Boston this weekend", "boston", true),
+            ("what's the weather in Paris now", "paris", false),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_weather", "{utterance:?}");
+            assert_eq!(call.arguments["location"], location, "{utterance:?}");
+            assert_eq!(call.arguments["forecast"], forecast, "{utterance:?}");
+        }
     }
 
     #[test]

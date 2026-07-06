@@ -7,6 +7,10 @@
 #   * bug          — title starts with `fix` or contains `[bug]`.
 # Author label — `maintainer` only, by GitHub role (author_association):
 #   * maintainer — OWNER / MEMBER / COLLABORATOR. Everyone else gets no author label.
+# Reward labels (drive the Gittensor scoring multipliers):
+#   * verify-jetson    — PR only; the "verified ... on Jetson hardware" box is ticked.
+#   * maintainer-issue — a maintainer-opened issue, and any PR that closes such an
+#     issue (via a `closes/fixes/resolves #N` reference).
 #
 # Ownership / reconciliation:
 #   * {optimization, performance} is fully owned here: the workflow keeps exactly
@@ -16,6 +20,10 @@
 #     retired `community-contribution` label is always removed.
 #   * `bug` is ADD-only — the issue forms ([bug]/[audio]/[voice]) and manual
 #     curation also apply it, so the workflow never removes it.
+#   * `verify-jetson` is owned on PRs: added when the Jetson box is ticked, removed
+#     when it is not (so re-review edits flip it).
+#   * `maintainer-issue` is ADD-only — set on maintainer-opened issues and inherited
+#     by PRs that close them; manual curation also applies it, so it is never removed.
 #   * Every other label (enhancement, audio, voice, jetson, M1, ...) is untouched.
 #
 # Like contribution.yml / pr-limit.yml this uses `pull_request_target` and never
@@ -50,6 +58,7 @@ jobs:
           TITLE: ${{ github.event.issue.title || github.event.pull_request.title }}
           BODY: ${{ github.event.issue.body || github.event.pull_request.body }}
           ASSOC: ${{ github.event.issue.author_association || github.event.pull_request.author_association }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -uo pipefail
 
@@ -87,6 +96,10 @@ jobs:
             --description "Performance work (not verified on Jetson hardware)" 2>/dev/null || true
           gh label create maintainer --repo "$REPO" --color 6F42C1 \
             --description "Authored by a project maintainer" 2>/dev/null || true
+          gh label create verify-jetson --repo "$REPO" --color 1D76DB \
+            --description "Verified end-to-end on Jetson hardware" 2>/dev/null || true
+          gh label create maintainer-issue --repo "$REPO" --color 5319E7 \
+            --description "Resolves a maintainer-filed issue" 2>/dev/null || true
 
           add()    { gh api -X POST "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=$1" >/dev/null 2>&1 || true; }
           remove() { gh api -X DELETE "repos/$REPO/issues/$NUMBER/labels/$1" >/dev/null 2>&1 || true; }
@@ -109,3 +122,25 @@ jobs:
 
           # bug — add-only (issue forms and manual curation also set it).
           [ "$type_label" = "bug" ] && add bug || true
+
+          # verify-jetson — owned here for PRs: ticking the "verified ... on Jetson
+          # hardware" box adds it, unticking removes it. (Issues have no such box.)
+          if [ "$EVENT" = "pull_request_target" ]; then
+            if [ "$jetson" = 1 ]; then add verify-jetson; else remove verify-jetson; fi
+          fi
+
+          # maintainer-issue — add-only. A maintainer-opened issue is marked as
+          # maintainer-filed; a PR that closes an issue carrying the label inherits
+          # it (so the PR earns the reward multiplier). Manual curation also applies
+          # it, so it is never removed here.
+          if [ "$EVENT" = "issues" ]; then
+            [ "$author_label" = "maintainer" ] && add maintainer-issue || true
+          elif [ "$EVENT" = "pull_request_target" ]; then
+            refs="$(printf '%s' "$BODY" | grep -oiE '(clos|fix|resolv)[a-z]*[[:space:]]+#[0-9]+' | grep -oE '[0-9]+' | sort -u)"
+            for iss in $refs; do
+              if gh api "repos/$REPO/issues/$iss/labels" --jq '.[].name' 2>/dev/null | grep -qx "maintainer-issue"; then
+                add maintainer-issue
+                break
+              fi
+            done
+          fi

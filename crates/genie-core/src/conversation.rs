@@ -31,6 +31,16 @@ pub struct ConversationMeta {
     pub message_count: usize,
 }
 
+/// A persisted message, including the resolved speaker (if any) that was
+/// tagged when the message was appended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredMessage {
+    pub role: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+}
+
 impl ConversationStore {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -63,7 +73,7 @@ impl ConversationStore {
             ",
         )?;
 
-        // Upgrade existing DBs: tag user turns with resolved speaker (#560).
+        // Migrate existing databases: add speaker column if not present (#559).
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN speaker TEXT", []);
 
         Ok(Self {
@@ -136,8 +146,8 @@ impl ConversationStore {
         self.with_conn(move |conn| {
             let now = now_ms();
             conn.execute(
-                "INSERT INTO messages (conv_id, role, content, tool_name, speaker, ts_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![conv_id, role, content, tool_name, speaker, now],
+                "INSERT INTO messages (conv_id, role, content, tool_name, ts_ms, speaker) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![conv_id, role, content, tool_name, now, speaker],
             )?;
 
             // Update conversation title from first user message.
@@ -199,19 +209,20 @@ impl ConversationStore {
         }
     }
 
-    /// Get all messages in a conversation.
-    pub async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>> {
+    /// Get all messages in a conversation, including the tagged speaker (if any).
+    pub async fn get_messages(&self, conv_id: &str) -> Result<Vec<StoredMessage>> {
         let conv_id = conv_id.to_string();
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT role, content FROM messages WHERE conv_id = ?1 ORDER BY ts_ms ASC",
+                "SELECT role, content, speaker FROM messages WHERE conv_id = ?1 ORDER BY ts_ms ASC",
             )?;
 
             let messages = stmt
                 .query_map([conv_id], |row| {
-                    Ok(Message {
+                    Ok(StoredMessage {
                         role: row.get(0)?,
                         content: row.get(1)?,
+                        speaker: row.get(2)?,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -547,6 +558,33 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].role, "assistant");
+    }
+
+    #[tokio::test]
+    async fn append_persists_speaker_round_trip() {
+        let store = temp_store();
+        let id = store.create().await.unwrap();
+
+        store
+            .append(&id, "user", "hello", None, Some("dana"))
+            .await
+            .unwrap();
+        store
+            .append(&id, "assistant", "hi there!", None, None)
+            .await
+            .unwrap();
+
+        let messages = store.get_messages(&id).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].speaker.as_deref(),
+            Some("dana"),
+            "speaker tagged on the user turn should round-trip through storage"
+        );
+        assert_eq!(
+            messages[1].speaker, None,
+            "turns appended without a speaker should read back as None"
+        );
     }
 
     #[tokio::test]
