@@ -2683,6 +2683,16 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
             })
             .unwrap_or("")
             .trim();
+        // Drop a trailing time qualifier ("apple today" -> "apple") so it does
+        // not leak into the subject and defeat the company_ticker lookup (which
+        // matches the bare company name). Longest phrase first.
+        let subject = subject
+            .trim_end_matches(" right now")
+            .trim_end_matches(" today")
+            .trim_end_matches(" now")
+            .trim_end_matches(" currently")
+            .trim_end_matches(" this week")
+            .trim();
         let query = if subject.is_empty() {
             "stock price".to_string()
         } else {
@@ -4660,6 +4670,25 @@ mod tests {
         // Unknown company falls through unchanged.
         let call = route("What is the stock price of Wendys?").unwrap();
         assert_eq!(call.arguments["query"], "wendys stock price");
+    }
+
+    #[test]
+    fn stock_price_query_strips_trailing_time_word() {
+        // A trailing time word ("today"/"right now"/"now") must not leak into the
+        // subject — otherwise company_ticker misses and the query becomes
+        // "apple today stock price" instead of "AAPL stock price".
+        for (utterance, query) in [
+            ("What's the stock price of Apple today?", "AAPL stock price"),
+            ("stock price of Tesla right now", "TSLA stock price"),
+            (
+                "what is the stock price of Microsoft now",
+                "MSFT stock price",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
     }
 
     #[test]
