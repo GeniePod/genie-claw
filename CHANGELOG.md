@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Memory
+
+- **Auto-capture**: defer the allocating `to_lowercase` in `extract_facts` until
+  an identity, preference, or relationship trigger is present — common no-match
+  utterances (weather, questions, chit-chat) skip the allocation entirely.
+
 ## 1.0.0-rc.3 - 2026-07-03
 
 Third release candidate. This RC lays the **M2 foundations** — a portable
