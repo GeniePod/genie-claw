@@ -17,13 +17,23 @@
 //! Safety invariant: `base_url` must always be a localhost address.
 //! The config layer enforces this via `PrivacyProxyConfig::endpoint_is_valid`.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use genie_common::probe::{ProbeTimeouts, http_request};
 
 use super::openai_compat::OpenAiCompatClient;
 use super::{LlmBackendClient, LlmRequestHints, Message, ResponseFormat};
+
+/// Connect-timeout cap for the vocabulary-seeding request.
+const VOCAB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read-timeout cap. Without this, a proxy that accepts the connection but
+/// never responds would previously go undetected entirely — `seed_vocab`
+/// wrote the request and returned `Ok(())` without ever reading a reply.
+const VOCAB_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Body-size cap on the vocab-seed acknowledgement.
+const VOCAB_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// LLM backend that routes through the on-device PrivacyProxy.
 ///
@@ -84,19 +94,33 @@ impl PrivacyProxyBackend {
         let body = serde_json::to_string(&serde_json::json!({ "terms": terms }))?;
         let addr = format!("{}:{}", self.host, self.port);
 
-        let stream =
-            tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))
-                .await??;
+        let (status, response_body) = http_request(
+            &addr,
+            &self.vocab_path,
+            false,
+            "POST",
+            &[("Content-Type", "application/json")],
+            Some(&body),
+            ProbeTimeouts {
+                connect: VOCAB_CONNECT_TIMEOUT,
+                read: VOCAB_REQUEST_TIMEOUT,
+            },
+            VOCAB_MAX_RESPONSE_BYTES,
+        )
+        .await?;
 
-        let (_, mut writer) = stream.into_split();
-        let request = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            self.vocab_path,
-            addr,
-            body.len(),
-            body
-        );
-        writer.write_all(request.as_bytes()).await?;
+        if !(200..300).contains(&status) {
+            anyhow::bail!(
+                "PrivacyProxy vocab seed {} failed: HTTP {}{}",
+                self.vocab_path,
+                status,
+                if response_body.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", response_body.trim())
+                }
+            );
+        }
 
         tracing::debug!(
             terms = terms.len(),
@@ -184,5 +208,84 @@ mod tests {
         let backend = PrivacyProxyBackend::from_url("http://localhost:9090/v1", "/vocab/seed");
         assert_eq!(backend.host, "localhost");
         assert_eq!(backend.port, 9090);
+    }
+
+    #[tokio::test]
+    async fn seed_vocab_with_empty_terms_returns_ok_without_connecting() {
+        // No listener bound at all — if this connected, it would fail.
+        let backend = PrivacyProxyBackend::from_url("http://127.0.0.1:1/v1", "/vocab/seed");
+        assert!(backend.seed_vocab(&[]).await.is_ok());
+    }
+
+    /// Regression for the "fire and forget" bug: `seed_vocab` previously
+    /// wrote the request and returned `Ok(())` without ever reading a
+    /// response, so a proxy rejecting the vocab (e.g. malformed terms, 500)
+    /// went completely undetected. It must now surface a non-2xx status.
+    #[tokio::test]
+    async fn seed_vocab_surfaces_non_2xx_as_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = r#"{"error":"unknown term format"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let backend = PrivacyProxyBackend::from_url(&format!("http://{addr}/v1"), "/vocab/seed");
+        let err = backend
+            .seed_vocab(&["Alex".to_string()])
+            .await
+            .expect_err("a 400 response must surface as an error, not a silent Ok");
+        server.abort();
+
+        assert!(
+            err.to_string().contains("400"),
+            "expected the status to appear in the error, got: {err}"
+        );
+    }
+
+    /// A 2xx acknowledgement (with the request actually reaching the
+    /// server) still succeeds — the fix must not turn a healthy proxy into
+    /// a false failure.
+    #[tokio::test]
+    async fn seed_vocab_succeeds_and_sends_terms_on_2xx() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            request
+        });
+
+        let backend = PrivacyProxyBackend::from_url(&format!("http://{addr}/v1"), "/vocab/seed");
+        backend
+            .seed_vocab(&["Alex".to_string(), "kitchen light".to_string()])
+            .await
+            .expect("a 200 response must succeed");
+
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /vocab/seed HTTP/1.1"));
+        assert!(request.contains("Alex"));
+        assert!(request.contains("kitchen light"));
     }
 }

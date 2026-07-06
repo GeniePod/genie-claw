@@ -24,6 +24,15 @@ pub enum Severity {
     Info,
 }
 
+/// Emit a structured trace event when the voice pipeline resolves (or fails to
+/// resolve) a speaker identity. Called once per voice turn regardless of
+/// provider — including `None` and `Fixed`, where `name`/`confidence` are the
+/// provider's fixed or "unknown" values — so operators get a consistent
+/// per-turn trace no matter which provider is configured.
+pub fn log_speaker_resolved(name: &str, confidence: &str) {
+    tracing::info!(speaker = name, confidence, "speaker identity resolved");
+}
+
 /// Run all startup security checks. Returns findings.
 pub fn run_audit(config_path: &Path, data_dir: &Path) -> Vec<AuditFinding> {
     let mut findings = Vec::new();

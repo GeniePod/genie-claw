@@ -199,7 +199,7 @@ async fn full_mock_voice_turn_persists_user_and_assistant_to_conversation_store(
     let transcript = stt.transcribe_file("ignored.wav").await.unwrap();
     assert_eq!(transcript.text, "turn the kitchen light on");
     store
-        .append(conv_id, "user", transcript.text.trim(), None)
+        .append(conv_id, "user", transcript.text.trim(), None, None)
         .await
         .unwrap();
 
@@ -213,7 +213,7 @@ async fn full_mock_voice_turn_persists_user_and_assistant_to_conversation_store(
     let reply = llm.chat(&messages, Some(128)).await.unwrap();
     assert_eq!(reply, "Done — kitchen light is on.");
     store
-        .append(conv_id, "assistant", &reply, None)
+        .append(conv_id, "assistant", &reply, None, None)
         .await
         .unwrap();
 
@@ -254,7 +254,7 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
     assert_eq!(transcript.text, "what time is it"); // (a) transcript flow
 
     store
-        .append(conv_id, "user", transcript.text.trim(), None)
+        .append(conv_id, "user", transcript.text.trim(), None, None)
         .await
         .unwrap();
 
@@ -276,7 +276,13 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
     assert!(tool_result.success);
 
     store
-        .append(conv_id, "assistant", &llm_output, Some(&tool_result.tool))
+        .append(
+            conv_id,
+            "assistant",
+            &llm_output,
+            Some(&tool_result.tool),
+            None,
+        )
         .await
         .unwrap();
     store
@@ -284,6 +290,7 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
             conv_id,
             "system",
             &format!("Tool: {}", tool_result.output),
+            None,
             None,
         )
         .await
@@ -326,7 +333,10 @@ async fn mock_voice_turn_handles_back_to_back_cycles_without_state_bleed() {
     for expected_user in ["first prompt", "second prompt"] {
         let t = stt.transcribe_file("ignored.wav").await.unwrap();
         assert_eq!(t.text, expected_user);
-        store.append(conv_id, "user", &t.text, None).await.unwrap();
+        store
+            .append(conv_id, "user", &t.text, None, None)
+            .await
+            .unwrap();
         let reply = llm
             .chat(
                 &[Message {
@@ -338,7 +348,7 @@ async fn mock_voice_turn_handles_back_to_back_cycles_without_state_bleed() {
             .await
             .unwrap();
         store
-            .append(conv_id, "assistant", &reply, None)
+            .append(conv_id, "assistant", &reply, None, None)
             .await
             .unwrap();
     }

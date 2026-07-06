@@ -107,23 +107,41 @@ impl SpeakerIdentityProvider {
         }
     }
 
-    pub fn identify(&self, request: &SpeakerIdentityRequest<'_>) -> SpeakerIdentity {
+    /// Resolve a speaker identity for `request`.
+    ///
+    /// `LocalBiometric` scans every enrolled profile file on disk to find a
+    /// match — synchronous filesystem I/O that must never run directly on
+    /// genie-core's shared `current_thread` executor (the caller, the voice
+    /// loop's per-utterance turn handler, is not the only thing running on
+    /// that thread). `LocalBiometricRecognizer::identify` moves that work to
+    /// `spawn_blocking`, mirroring the pattern `memory::with_shared_memory`
+    /// already established for the same class of bug.
+    pub async fn identify(&self, request: &SpeakerIdentityRequest<'_>) -> SpeakerIdentity {
         match self {
             Self::None => SpeakerIdentity::default(),
             Self::Fixed(identity) => identity.clone(),
-            Self::LocalBiometric(recognizer) => recognizer.identify(request),
+            Self::LocalBiometric(recognizer) => recognizer.identify(request).await,
         }
     }
 }
 
 impl LocalBiometricRecognizer {
-    pub fn identify(&self, request: &SpeakerIdentityRequest<'_>) -> SpeakerIdentity {
+    pub async fn identify(&self, request: &SpeakerIdentityRequest<'_>) -> SpeakerIdentity {
         let _ = (request.transcript, request.detected_language);
         let Some(wav_path) = request.wav_path else {
             return SpeakerIdentity::default();
         };
 
-        match identify_speaker_file(&self.profile_dir, wav_path, self.min_score) {
+        let profile_dir = self.profile_dir.clone();
+        let wav_path = wav_path.to_string();
+        let min_score = self.min_score;
+        let result = tokio::task::spawn_blocking(move || {
+            identify_speaker_file(&profile_dir, &wav_path, min_score)
+        })
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+
+        match result {
             Ok(Some(result)) => {
                 let confidence = if result.score >= 0.92 {
                     IdentityConfidence::High
@@ -603,63 +621,7 @@ fn unix_time_ms() -> u128 {
 }
 
 pub fn build_memory_read_context(text: &str, speaker: &SpeakerIdentity) -> MemoryReadContext {
-    let lower = text.trim().to_ascii_lowercase();
-    MemoryReadContext {
-        identity_confidence: speaker.confidence,
-        explicit_named_person: mentions_named_person(&lower),
-        explicit_private_intent: contains_any(
-            &lower,
-            &[
-                "private",
-                "privately",
-                "for me only",
-                "don't say this aloud",
-                "do not say this aloud",
-            ],
-        ),
-        shared_space_voice: true,
-    }
-}
-
-fn mentions_named_person(lower: &str) -> bool {
-    starts_with_any(
-        lower,
-        &[
-            "what does ",
-            "what did ",
-            "tell me about ",
-            "who is ",
-            "does ",
-            "is ",
-            "ask ",
-            "call ",
-            "text ",
-            "message ",
-            "remind ",
-        ],
-    ) || contains_any(
-        lower,
-        &[
-            " my wife",
-            " my husband",
-            " my son",
-            " my daughter",
-            " my mom",
-            " my mother",
-            " my dad",
-            " my father",
-            " my friend",
-            " my partner",
-        ],
-    )
-}
-
-fn starts_with_any(text: &str, prefixes: &[&str]) -> bool {
-    prefixes.iter().any(|prefix| text.starts_with(prefix))
-}
-
-fn contains_any(text: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| text.contains(needle))
+    crate::memory::policy::memory_read_context_from_text(text, speaker.confidence, true)
 }
 
 fn identity_confidence_from_str(value: &str) -> IdentityConfidence {
@@ -705,8 +667,8 @@ mod tests {
         assert!(ctx.explicit_private_intent);
     }
 
-    #[test]
-    fn fixed_provider_returns_configured_identity() {
+    #[tokio::test]
+    async fn fixed_provider_returns_configured_identity() {
         let provider = SpeakerIdentityProvider::from_config(&SpeakerIdentityConfig {
             enabled: true,
             provider: SpeakerIdentityProviderKind::Fixed,
@@ -715,11 +677,13 @@ mod tests {
             local_profile_dir: PathBuf::from("/opt/geniepod/data/speakers"),
             local_min_score: 0.82,
         });
-        let identity = provider.identify(&SpeakerIdentityRequest {
-            wav_path: None,
-            transcript: "what do you remember about me",
-            detected_language: Some("en"),
-        });
+        let identity = provider
+            .identify(&SpeakerIdentityRequest {
+                wav_path: None,
+                transcript: "what do you remember about me",
+                detected_language: Some("en"),
+            })
+            .await;
         assert_eq!(identity.name.as_deref(), Some("Jared"));
         assert_eq!(identity.confidence, IdentityConfidence::High);
     }
@@ -787,8 +751,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn local_biometric_provider_returns_identity_when_profile_matches() {
+    #[tokio::test]
+    async fn local_biometric_provider_returns_identity_when_profile_matches() {
         let dir = std::env::temp_dir().join(format!(
             "geniepod-speaker-provider-test-{}",
             std::process::id()
@@ -806,11 +770,13 @@ mod tests {
             profile_dir: dir.clone(),
             min_score: 0.82,
         });
-        let identity = provider.identify(&SpeakerIdentityRequest {
-            wav_path: Some(test.to_str().unwrap()),
-            transcript: "what do you remember about me",
-            detected_language: Some("en"),
-        });
+        let identity = provider
+            .identify(&SpeakerIdentityRequest {
+                wav_path: Some(test.to_str().unwrap()),
+                transcript: "what do you remember about me",
+                detected_language: Some("en"),
+            })
+            .await;
 
         assert_eq!(identity.name.as_deref(), Some("Jared"));
         assert!(identity.confidence >= IdentityConfidence::Medium);
