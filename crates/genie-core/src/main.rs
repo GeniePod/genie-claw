@@ -51,11 +51,19 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Security audit on startup.
+    // Security audit on startup. `run_audit` does synchronous filesystem
+    // I/O (permission checks, config-secret scanning); move it to
+    // spawn_blocking so it doesn't run directly on the shared executor
+    // thread, matching the pattern established for `memory::with_shared_memory`.
     let config_path = std::env::var("GENIEPOD_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("/etc/geniepod/geniepod.toml"));
-    genie_core::security::audit::run_audit(&config_path, &config.data_dir);
+    let data_dir = config.data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        genie_core::security::audit::run_audit(&config_path, &data_dir)
+    })
+    .await
+    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
 
     let blocked_env = genie_core::security::env_sanitize::count_blocked();
     if blocked_env > 0 {
@@ -88,8 +96,14 @@ async fn main() -> Result<()> {
     })
     .await?;
 
+    // `load_all_with_policy` scans the skills directory and reads/verifies
+    // every `.so` + manifest on disk synchronously — move it to
+    // spawn_blocking rather than running it directly on the shared executor.
+    let skill_policy = skills::SkillLoadPolicy::from(&config.core.skill_policy);
     let skill_loader =
-        skills::load_all_with_policy(skills::SkillLoadPolicy::from(&config.core.skill_policy));
+        tokio::task::spawn_blocking(move || skills::load_all_with_policy(skill_policy))
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
     let connectivity = Arc::new(connectivity::NullConnectivityController::from_config(
         &config.connectivity,
     ));
