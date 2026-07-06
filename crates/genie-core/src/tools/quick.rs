@@ -1923,6 +1923,16 @@ fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
         .trim_start_matches("the ")
         .trim_start_matches("a ")
         .trim_start_matches("an ");
+    // A trailing directional adverb describes the setpoint change, not the
+    // device: "set the thermostat down to 68" / "set the thermostat up to 72"
+    // name the thermostat, not "thermostat down". Strip it so the entity stays
+    // the named device.
+    let entity = entity
+        .strip_suffix(" down")
+        .or_else(|| entity.strip_suffix(" up"))
+        .or_else(|| entity.strip_suffix(" back"))
+        .map(str::trim)
+        .unwrap_or(entity);
     if entity.is_empty() {
         return None;
     }
@@ -2464,8 +2474,9 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     // Try a fractional duration ("half an hour", "quarter of an hour") before the
     // whole-number parser: `parse_duration` skips the fraction word and reads the
     // bare unit, so "half an hour" used to become "an hour" -> 3600s.
-    let (seconds, unit_end_index) =
-        fractional_duration(&tokens).or_else(|| parse_duration(&tokens))?;
+    let (seconds, unit_end_index) = fractional_duration(&tokens)
+        .or_else(|| couple_duration(&tokens))
+        .or_else(|| parse_duration(&tokens))?;
     if seconds == 0 {
         return None;
     }
@@ -2913,6 +2924,25 @@ fn fractional_duration(tokens: &[&str]) -> Option<(u64, usize)> {
         // sub-second results (e.g. "half a second") floor to 0 and the caller's
         // `seconds == 0` guard abstains, letting the LLM handle it.
         return Some((unit_seconds * numerator / denominator, unit_index));
+    }
+    None
+}
+
+/// Parse the spoken idiom "a couple of minutes" (always two of the unit).
+/// `parse_duration` does not treat "couple" as a number, so these utterances
+/// used to abstain or mis-route. Returns the duration and the unit token index
+/// for label extraction, matching `fractional_duration`.
+fn couple_duration(tokens: &[&str]) -> Option<(u64, usize)> {
+    for i in 0..tokens.len() {
+        if tokens[i] != "couple" {
+            continue;
+        }
+        let mut unit_index = i + 1;
+        if tokens.get(unit_index).copied() == Some("of") {
+            unit_index += 1;
+        }
+        let multiplier = duration_unit_seconds(tokens.get(unit_index).copied())?;
+        return Some((2_u64.saturating_mul(multiplier), unit_index));
     }
     None
 }
@@ -4731,6 +4761,30 @@ mod tests {
         // "half"/"quarter", otherwise it falls through to parse_duration.
         let call = route("set a timer for 1 hour").unwrap();
         assert_eq!(call.arguments["seconds"], 3600);
+    }
+
+    #[test]
+    fn routes_couple_duration_timer() {
+        let call = route("set a timer for a couple of minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 120);
+
+        let call = route("remind me in a couple of minutes to stretch").unwrap();
+        assert_eq!(call.arguments["seconds"], 120);
+        assert_eq!(call.arguments["label"], "stretch");
+
+        // The connective "of" is optional; a leading article before "couple" is fine.
+        let call = route("set a timer for couple minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 120);
+
+        let call = route("set a timer for a couple of hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 7200);
+
+        // "couple" inside a later label is not mistaken for duration.
+        assert!(route("remind me in 5 minutes to feed the couple cats").is_some());
+        let call = route("remind me in 5 minutes to feed the couple cats").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "feed the couple cats");
     }
 
     #[test]
