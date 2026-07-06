@@ -16,7 +16,7 @@ pub async fn get_status(_config: &Config) -> Response {
     let governor_status = query_governor(r#"{"cmd":"status"}"#).await;
 
     // Augment with live memory reading.
-    let mem_avail = tegrastats::mem_available_mb().unwrap_or(0);
+    let mem_avail = tegrastats::mem_available_mb_async().await.unwrap_or(0);
 
     let body = if let Some(mut status) = governor_status {
         // Merge live mem_available into the governor's response.

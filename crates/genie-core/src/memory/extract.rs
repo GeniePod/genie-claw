@@ -24,6 +24,20 @@ pub struct ExtractedFact {
 pub fn extract_facts(text: &str) -> Vec<ExtractedFact> {
     let mut facts = Vec::new();
     let trimmed = text.trim();
+
+    if !needs_extract_facts_lower(text) {
+        if trimmed.len() >= 8
+            && trimmed[..8].eq_ignore_ascii_case("remember")
+            && let Some(content) = extract_remember(trimmed)
+        {
+            facts.push(ExtractedFact {
+                category: "fact".into(),
+                content,
+            });
+        }
+        return facts;
+    }
+
     let lower = text.to_lowercase();
 
     if needs_identity_scan(&lower) {
@@ -193,6 +207,26 @@ pub fn extract_and_store(memory: &Memory, user_text: &str) -> usize {
 
 // --- Pattern helpers ---
 
+/// ASCII case-insensitive substring check for pre-lowercase trigger gates.
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.as_bytes().windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle.bytes())
+            .all(|(left, right)| left.eq_ignore_ascii_case(&right))
+    })
+}
+
+/// True when any Tier-1 extractor needs the allocating lowercase view.
+fn needs_extract_facts_lower(text: &str) -> bool {
+    needs_identity_scan_ci(text)
+        || needs_preference_scan_ci(text)
+        || needs_relationship_scan_ci(text)
+}
+
 /// Phrases that mark where a captured value ends. A fact like "my name is X"
 /// must capture only X, not the conjunction or subordinate clause that follows
 /// it ("...and I love coding", "...but I hate meetings", "...who lives nearby").
@@ -282,32 +316,44 @@ fn extract_age(text: &str) -> Option<u32> {
 }
 
 fn needs_identity_scan(lower: &str) -> bool {
-    lower.contains("my name")
-        || lower.contains("call me")
-        || lower.contains("called")
-        || lower.contains("i work")
-        || lower.contains("working at")
-        || lower.contains("work as")
-        || lower.contains("i live")
-        || lower.contains("i'm from")
-        || lower.contains("i am from")
-        || lower.contains("based in")
-        || lower.contains("i'm a")
-        || lower.contains("i am a")
-        || lower.contains("i'm ")
-        || lower.contains("i am ")
+    needs_identity_scan_ci(lower)
+}
+
+fn needs_identity_scan_ci(text: &str) -> bool {
+    contains_ascii_ci(text, "my name")
+        || contains_ascii_ci(text, "call me")
+        || contains_ascii_ci(text, "called")
+        || contains_ascii_ci(text, "i work")
+        || contains_ascii_ci(text, "working at")
+        || contains_ascii_ci(text, "work as")
+        || contains_ascii_ci(text, "i live")
+        || contains_ascii_ci(text, "i'm from")
+        || contains_ascii_ci(text, "i am from")
+        || contains_ascii_ci(text, "based in")
+        || contains_ascii_ci(text, "i'm a")
+        || contains_ascii_ci(text, "i am a")
+        || contains_ascii_ci(text, "i'm ")
+        || contains_ascii_ci(text, "i am ")
 }
 
 fn needs_preference_scan(lower: &str) -> bool {
-    lower.contains("i like")
-        || lower.contains("i love")
-        || lower.contains("i enjoy")
-        || lower.contains("i prefer")
-        || lower.contains("i hate")
-        || lower.contains("i dislike")
-        || lower.contains("i don't like")
-        || lower.contains("i can't stand")
-        || lower.contains("favo")
+    needs_preference_scan_ci(lower)
+}
+
+fn needs_preference_scan_ci(text: &str) -> bool {
+    contains_ascii_ci(text, "i like")
+        || contains_ascii_ci(text, "i love")
+        || contains_ascii_ci(text, "i enjoy")
+        || contains_ascii_ci(text, "i prefer")
+        || contains_ascii_ci(text, "i hate")
+        || contains_ascii_ci(text, "i dislike")
+        || contains_ascii_ci(text, "i don't like")
+        || contains_ascii_ci(text, "i can't stand")
+        || contains_ascii_ci(text, "favo")
+}
+
+fn needs_relationship_scan_ci(text: &str) -> bool {
+    contains_ascii_ci(text, "my ")
 }
 
 fn extract_favorite(text: &str) -> Option<String> {

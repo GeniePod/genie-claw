@@ -11,11 +11,12 @@ pub async fn system_info(ha: Option<&dyn HomeAutomationProvider>) -> Result<Stri
     info.push(home_assistant_status(ha).await);
 
     // Prefer the governor's latest reading when available.
-    if let Some(avail) = governor_status
-        .as_ref()
-        .and_then(governor_mem_available_mb)
-        .or_else(|| tegrastats::mem_available_mb().ok())
-    {
+    let governor_avail = governor_status.as_ref().and_then(governor_mem_available_mb);
+    let avail = match governor_avail {
+        Some(avail) => Some(avail),
+        None => tegrastats::mem_available_mb_async().await.ok(),
+    };
+    if let Some(avail) = avail {
         info.push(format!("Memory available: {} MB", avail));
     }
 

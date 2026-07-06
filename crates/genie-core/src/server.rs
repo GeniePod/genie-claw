@@ -1811,6 +1811,9 @@ async fn handle_health(
 ) -> (u16, &'static str, String) {
     let llm_ok = llm.health().await;
     let connectivity_health = connectivity.health().await;
+    let mem_avail = genie_common::tegrastats::mem_available_mb_async()
+        .await
+        .unwrap_or(0);
     let (mem_count, mem_promoted_count, memory_health, memory_db_bytes) =
         with_shared_memory(memory, |memory| {
             (
@@ -1823,7 +1826,6 @@ async fn handle_health(
         .await;
     let conv_count = conversations.list().await.map(|l| l.len()).unwrap_or(0);
     let conversation_db_bytes = conversations.db_size_bytes().await.unwrap_or(0);
-    let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
     let chat = chat_gate.snapshot();
     let runtime_contract = build_runtime_contract_snapshot(
         tools,
