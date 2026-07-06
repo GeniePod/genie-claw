@@ -19,7 +19,8 @@ fn write_key(kind: &str, content: &str) -> String {
 }
 
 /// Fixed corpus captured from `main` @ ecd7592 — guards byte-identical policy
-/// decisions after assess_memory_write early-outs (#497).
+/// decisions after assess_memory_write early-outs (#497) and deferred content
+/// `to_lowercase` on benign auto-capture writes.
 #[test]
 fn memory_policy_corpus_regression() {
     const CORPUS: &[(&str, &str, &str)] = &[
@@ -61,6 +62,16 @@ fn memory_policy_corpus_regression() {
         (
             "fact",
             "kitchen light is the ceiling lamp",
+            "allowed=true;disclosure=Speak;class=Household;scope=Household;sensitivity=Normal;spoken=Allow;reason=Memory is safe for household-shared storage.",
+        ),
+        (
+            "preference",
+            "User LIKES hiking in the mountains",
+            "allowed=true;disclosure=Speak;class=Household;scope=Household;sensitivity=Normal;spoken=Allow;reason=Memory is safe for household-shared storage.",
+        ),
+        (
+            "identity",
+            "User's name is Jared",
             "allowed=true;disclosure=Speak;class=Household;scope=Household;sensitivity=Normal;spoken=Allow;reason=Memory is safe for household-shared storage.",
         ),
     ];
