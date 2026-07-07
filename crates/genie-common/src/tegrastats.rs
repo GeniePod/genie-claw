@@ -243,4 +243,43 @@ mod tests {
         let snap = parse_line(SAMPLE, 0).unwrap();
         assert_eq!(snap.power_mw, Some(4500));
     }
+
+    #[test]
+    fn parse_line_errors_on_missing_ram() {
+        // The RAM field is the required anchor; a line without it (a truncated
+        // read or a non-tegrastats line) is a hard parse error, not a zeroed snapshot.
+        assert!(parse_line("SWAP 0/3810MB GR3D_FREQ 10%", 0).is_err());
+        assert!(parse_line("", 0).is_err());
+    }
+
+    #[test]
+    fn parse_line_defaults_when_optional_fields_absent() {
+        // Only RAM is required; every other field degrades to a documented default
+        // rather than failing, so a stripped-down line still yields a usable snapshot.
+        let snap = parse_line("RAM 100/200MB", 7).unwrap();
+        assert_eq!(snap.timestamp_ms, 7);
+        assert_eq!(snap.ram_used_mb, 100);
+        assert_eq!(snap.ram_total_mb, 200);
+        assert_eq!(snap.swap_used_mb, 0);
+        assert_eq!(snap.swap_total_mb, 0);
+        assert_eq!(snap.gpu_freq_pct, 0);
+        assert!(snap.cpu_loads.is_empty());
+        assert_eq!(snap.gpu_temp_c, None);
+        assert_eq!(snap.cpu_temp_c, None);
+        assert_eq!(snap.power_mw, None);
+    }
+
+    #[test]
+    fn parse_cpus_skips_off_cores_and_keeps_core_index() {
+        // "off" cores are dropped, but surviving cores keep their physical core
+        // index (their position in the bracket list): id 1 and id 3 here.
+        let snap = parse_line("RAM 1/2MB CPU [off,30%@1000,off,45%@2000]", 0).unwrap();
+        assert_eq!(snap.cpu_loads.len(), 2);
+        assert_eq!(snap.cpu_loads[0].id, 1);
+        assert_eq!(snap.cpu_loads[0].load_pct, 30);
+        assert_eq!(snap.cpu_loads[0].freq_mhz, 1000);
+        assert_eq!(snap.cpu_loads[1].id, 3);
+        assert_eq!(snap.cpu_loads[1].load_pct, 45);
+        assert_eq!(snap.cpu_loads[1].freq_mhz, 2000);
+    }
 }
