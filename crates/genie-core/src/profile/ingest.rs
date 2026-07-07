@@ -6,9 +6,65 @@
 //! PDF support requires `pdftotext` (from poppler-utils) installed on the system.
 
 use std::path::Path;
+use std::time::Duration;
+
+use genie_common::subprocess::{SubprocessError, output_with_timeout};
+use tokio::process::Command;
 
 use crate::memory::Memory;
 use crate::memory::extract;
+
+/// Deadline for `pdftotext` during profile boot — long enough for real PDFs,
+/// short enough that a pathological file cannot wedge genie-core startup (#617).
+const PDF_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Extract text from a PDF via `pdftotext` under a hard deadline.
+///
+/// Runs asynchronously and must be called **without** holding the process-wide
+/// `Memory` mutex so a hung poppler child cannot block daemon boot.
+pub async fn extract_pdf_text(path: &Path) -> Option<String> {
+    let output = match output_with_timeout(
+        Command::new("pdftotext").args([
+            "-layout",
+            &path.to_string_lossy(),
+            "-", // output to stdout
+        ]),
+        PDF_EXTRACT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(SubprocessError::Timeout) => {
+            tracing::warn!(
+                path = %path.display(),
+                timeout_secs = PDF_EXTRACT_TIMEOUT.as_secs(),
+                "pdftotext timed out during profile ingest"
+            );
+            return None;
+        }
+        Err(SubprocessError::Io(e)) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "pdftotext not found or failed to start — install poppler-utils: sudo apt install poppler-utils"
+            );
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(path = %path.display(), error = %stderr, "pdftotext failed");
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Ingest already-extracted PDF text into memory.
+pub fn ingest_pdf_text(text: &str, filename: &str, memory: &Memory) -> usize {
+    ingest_text(text, filename, memory)
+}
 
 /// Ingest a text/markdown file into memory.
 ///
@@ -25,42 +81,6 @@ pub fn ingest_text_file(path: &Path, memory: &Memory) -> usize {
 
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
     ingest_text(&content, &filename, memory)
-}
-
-/// Ingest a PDF file into memory via `pdftotext`.
-///
-/// Shells out to `pdftotext` (poppler-utils) to extract text,
-/// then runs pattern extraction on the result.
-/// Returns the number of new facts stored.
-pub fn ingest_pdf_file(path: &Path, memory: &Memory) -> usize {
-    let output = match std::process::Command::new("pdftotext")
-        .args([
-            "-layout",
-            &path.to_string_lossy(),
-            "-", // output to stdout
-        ])
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "pdftotext not found — install poppler-utils: sudo apt install poppler-utils"
-            );
-            return 0;
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(path = %path.display(), error = %stderr, "pdftotext failed");
-        return 0;
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
-    let filename = path.file_name().unwrap_or_default().to_string_lossy();
-    ingest_text(&text, &filename, memory)
 }
 
 /// Core text ingestion: split into chunks, extract facts, deduplicate, store.
@@ -351,5 +371,11 @@ mod tests {
     fn split_sentences_basic() {
         let sentences = split_sentences("Hello world. How are you? I'm fine!");
         assert_eq!(sentences.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn extract_pdf_text_missing_file_returns_none() {
+        let path = Path::new("/nonexistent/geniepod-profile-ingest-test.pdf");
+        assert!(extract_pdf_text(path).await.is_none());
     }
 }

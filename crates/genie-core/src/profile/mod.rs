@@ -15,11 +15,11 @@
 pub mod ingest;
 pub mod toml_profile;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::memory::Memory;
+use crate::memory::{SharedMemory, with_shared_memory};
 
 /// Store an evergreen profile memory only when household write policy allows it.
 pub(crate) fn store_evergreen_if_allowed(memory: &Memory, kind: &str, content: &str) -> bool {
@@ -37,9 +37,9 @@ pub(crate) fn store_evergreen_if_allowed(memory: &Memory, kind: &str, content: &
 
 /// Ingest all profile data from the profile directory into memory.
 ///
-/// Called once at startup. Skips files that have already been ingested
-/// (tracked via a metadata entry in memory).
-pub fn load_profile(profile_dir: &Path, memory: &Memory) -> Result<ProfileReport> {
+/// Called once at startup. PDF text extraction runs asynchronously **before**
+/// taking the `Memory` lock so a hung `pdftotext` cannot wedge boot (#617).
+pub async fn load_profile(profile_dir: &Path, memory: &SharedMemory) -> Result<ProfileReport> {
     let mut report = ProfileReport::default();
 
     if !profile_dir.exists() {
@@ -50,7 +50,11 @@ pub fn load_profile(profile_dir: &Path, memory: &Memory) -> Result<ProfileReport
     // 1. Load profile.toml (structured data — always re-read).
     let toml_path = profile_dir.join("profile.toml");
     if toml_path.exists() {
-        match toml_profile::load_toml_profile(&toml_path, memory) {
+        match with_shared_memory(memory, move |mem| {
+            toml_profile::load_toml_profile(&toml_path, mem)
+        })
+        .await
+        {
             Ok(count) => {
                 tracing::info!(facts = count, "profile.toml loaded");
                 report.toml_facts = count;
@@ -62,9 +66,12 @@ pub fn load_profile(profile_dir: &Path, memory: &Memory) -> Result<ProfileReport
     }
 
     // 2. Scan for document files (.md, .txt, .pdf).
-    let entries = std::fs::read_dir(profile_dir)?;
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let paths: Vec<PathBuf> = std::fs::read_dir(profile_dir)?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+
+    for path in paths {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -78,7 +85,11 @@ pub fn load_profile(profile_dir: &Path, memory: &Memory) -> Result<ProfileReport
 
         match ext.as_str() {
             "md" | "txt" => {
-                let count = ingest::ingest_text_file(&path, memory);
+                let count = with_shared_memory(memory, {
+                    let path = path.clone();
+                    move |mem| ingest::ingest_text_file(&path, mem)
+                })
+                .await;
                 if count > 0 {
                     tracing::info!(
                         file = %path.display(),
@@ -90,7 +101,20 @@ pub fn load_profile(profile_dir: &Path, memory: &Memory) -> Result<ProfileReport
                 report.files_processed += 1;
             }
             "pdf" => {
-                let count = ingest::ingest_pdf_file(&path, memory);
+                let text = ingest::extract_pdf_text(&path).await;
+                let count = if let Some(text) = text {
+                    let filename = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    with_shared_memory(memory, move |mem| {
+                        ingest::ingest_pdf_text(&text, &filename, mem)
+                    })
+                    .await
+                } else {
+                    0
+                };
                 if count > 0 {
                     tracing::info!(
                         file = %path.display(),
