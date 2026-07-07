@@ -308,11 +308,12 @@ pub struct HttpResponseLimits {
 impl HttpResponseLimits {
     /// Build limits with shared header ceilings and a caller-supplied body cap.
     pub fn with_body_cap(max_body_bytes: usize) -> Self {
+        // Mirror the `[http]` defaults from `HttpServerConfig` / issue #195 ceilings.
         Self {
-            max_status_line_bytes: crate::config::defaults::http_max_request_line_bytes(),
-            max_header_line_bytes: crate::config::defaults::http_max_header_line_bytes(),
-            max_header_count: crate::config::defaults::http_max_header_count(),
-            max_header_bytes: crate::config::defaults::http_max_header_bytes(),
+            max_status_line_bytes: 8 * 1024,
+            max_header_line_bytes: 8 * 1024,
+            max_header_count: 100,
+            max_header_bytes: 64 * 1024,
             max_body_bytes,
         }
     }
@@ -447,12 +448,8 @@ where
             HttpReadError::HeaderLineTooLong
         })
         .await?;
-        let size_hex = String::from_utf8_lossy(&size_line)
-            .trim()
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let size_line_text = String::from_utf8_lossy(&size_line);
+        let size_hex = size_line_text.trim().split(';').next().unwrap_or("").trim();
         let size = usize::from_str_radix(size_hex, 16).map_err(|_| HttpReadError::Malformed)?;
 
         if size == 0 {

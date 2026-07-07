@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use genie_common::http::{read_response, HttpReadError, HttpResponse, HttpResponseLimits};
+use anyhow::Result;
+use genie_common::http::{HttpReadError, HttpResponse, HttpResponseLimits, read_response};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use super::LlmRequestHints;
