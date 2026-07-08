@@ -2482,6 +2482,7 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     }
 
     let label = reminder_label(&tokens, unit_end_index)
+        .or_else(|| reminder_label_before_duration(&tokens, unit_end_index))
         .filter(|label| !label.is_empty())
         .or_else(|| extract_named_timer_label(&tokens, unit_end_index))
         .unwrap_or_else(|| {
@@ -2996,6 +2997,35 @@ fn reminder_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
     let after_unit = tokens.get(unit_end_index + 1..)?;
     let to_index = after_unit.iter().position(|token| *token == "to")?;
     let label_tokens = after_unit.get(to_index + 1..)?;
+    if label_tokens.is_empty() {
+        return None;
+    }
+    Some(label_tokens.join(" "))
+}
+
+/// Extract a reminder label that appears *before* the duration, as in
+/// "remind me to <label> in <duration>" / "remind me to <label> after
+/// <duration>". [`reminder_label`] only recognizes the reversed
+/// label-after-duration order ("remind me in <duration> to <label>"), so this
+/// equally common leading-label phrasing otherwise dropped its task and fell
+/// back to the generic "reminder" label — e.g. "remind me to check the oven in
+/// 5 minutes" produced `label:"reminder"` instead of `label:"check the oven"`.
+///
+/// The label spans from the task-introducing "to" up to the "in"/"after"
+/// lead-in that precedes the duration. The lead-in is matched *closest to the
+/// duration* (the last one before the parsed unit), so a task that itself
+/// contains a preposition keeps all of its words: "remind me to turn off the
+/// lights in the kitchen in 5 minutes" yields "turn off the lights in the
+/// kitchen", not a truncated "turn off the lights". Requiring the lead-in at all
+/// keeps a bare "<n> <unit>" duration with no task clause ("set a timer to 5
+/// minutes") from being mistaken for a label.
+fn reminder_label_before_duration(tokens: &[&str], unit_end_index: usize) -> Option<String> {
+    let head = tokens.get(..unit_end_index)?;
+    let to_index = head.iter().position(|token| *token == "to")?;
+    let lead_index = (to_index + 1..unit_end_index)
+        .rev()
+        .find(|&i| matches!(tokens[i], "in" | "after"))?;
+    let label_tokens = tokens.get(to_index + 1..lead_index)?;
     if label_tokens.is_empty() {
         return None;
     }
@@ -4844,6 +4874,64 @@ mod tests {
         let call = route("remind me in 5 minutes to feed the 2 cats").unwrap();
         assert_eq!(call.arguments["seconds"], 300);
         assert_eq!(call.arguments["label"], "feed the 2 cats");
+    }
+
+    /// The task clause may also come *before* the duration:
+    /// "remind me to <label> in|after <duration>". This order previously dropped
+    /// the label and produced the generic "reminder" fallback (issue #591).
+    #[test]
+    fn routes_reminder_timer_with_label_before_duration() {
+        let call = route("remind me to check the oven in 5 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // "after" is an equally valid duration lead-in, worded durations included.
+        let call = route("remind me to stretch after ninety nine seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 99);
+        assert_eq!(call.arguments["label"], "stretch");
+
+        // "remind us" phrasing and a multi-word task are handled the same way.
+        let call = route("remind us to water the plants in 2 hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 7200);
+        assert_eq!(call.arguments["label"], "water the plants");
+
+        // Compound durations still land past the label boundary.
+        let call = route("remind me to check the oven in 1 hour and 30 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // The reversed order still resolves to the same label, unchanged.
+        let call = route("remind me in 5 minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["label"], "check the oven");
+    }
+
+    /// A task that itself contains an "in"/"after" preposition must keep all of
+    /// its words — the duration lead-in is the one *closest to* the duration, not
+    /// the first preposition after "to".
+    #[test]
+    fn reminder_label_before_duration_keeps_prepositional_task() {
+        let call = route("remind me to turn off the lights in the kitchen in 5 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(
+            call.arguments["label"],
+            "turn off the lights in the kitchen"
+        );
+
+        let call = route("remind me to clean up after dinner in 2 hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 7200);
+        assert_eq!(call.arguments["label"], "clean up after dinner");
+    }
+
+    /// A bare "to <n> <unit>" duration with no task clause must not mistake the
+    /// duration for a label — it keeps the generic fallback.
+    #[test]
+    fn timer_without_task_clause_keeps_generic_label() {
+        let call = route("set a timer to 5 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "timer");
     }
 
     #[test]
