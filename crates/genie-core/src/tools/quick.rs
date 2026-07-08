@@ -2715,6 +2715,18 @@ fn company_ticker(subject: &str) -> Option<&'static str> {
 }
 
 fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
+    // A trailing "in the <time-of-day>" phrase is a time qualifier, not part of
+    // the location. Because the split below takes the *last* marker occurrence,
+    // this phrase's own " in " wins the rsplit, so "weather in Denver in the
+    // morning" would capture "morning" as the location instead of "Denver".
+    // Trim it before the split. This extends the post-split trailing-qualifier
+    // trim below (which already drops "tonight", "this morning", ...) to the
+    // phrase form the split would otherwise mangle.
+    let text = text
+        .trim_end_matches(" in the morning")
+        .trim_end_matches(" in the afternoon")
+        .trim_end_matches(" in the evening")
+        .trim_end_matches(" in the night");
     let (_, location) = text.rsplit_once(marker)?;
     let location = location
         .trim()
@@ -4926,6 +4938,26 @@ mod tests {
             assert_eq!(call.arguments["location"], location, "{utterance:?}");
             assert_eq!(call.arguments["forecast"], forecast, "{utterance:?}");
         }
+    }
+
+    #[test]
+    fn weather_location_survives_in_the_time_of_day_phrase() {
+        // A trailing "in the <time-of-day>" phrase carries its own " in ", which
+        // wins the last-occurrence split — so the location used to resolve to the
+        // time word ("morning") instead of the city. The city must survive.
+        for (utterance, location) in [
+            ("what's the weather in Denver in the morning?", "denver"),
+            ("weather in San Francisco in the afternoon", "san francisco"),
+            ("what's the weather in Boston in the evening", "boston"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_weather", "{utterance:?}");
+            assert_eq!(call.arguments["location"], location, "{utterance:?}");
+        }
+
+        // With no city at all, the phrase is the only " in " content; the router
+        // abstains rather than emitting the time word as a bogus location.
+        assert!(route("what's the weather in the morning").is_none());
     }
 
     #[test]
