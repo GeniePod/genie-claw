@@ -2477,6 +2477,13 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     let (seconds, unit_end_index) = fractional_duration(&tokens)
         .or_else(|| couple_duration(&tokens))
         .or_else(|| parse_duration(&tokens))?;
+    // `fractional_duration` and `couple_duration` return as soon as they match
+    // their idiom, unlike `parse_duration`'s own trailing-span sum, so "half an
+    // hour and 15 minutes" silently dropped the second span, emitting a
+    // confidently-wrong 1800s instead of 2700s. Extending every path here makes
+    // compound summing uniform regardless of which detector matched first.
+    let (seconds, unit_end_index) =
+        extend_duration_with_trailing_spans(&tokens, seconds, unit_end_index);
     if seconds == 0 {
         return None;
     }
@@ -2990,6 +2997,35 @@ fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
         return Some((total, last_unit_index));
     }
     None
+}
+
+/// Sum any further `<number> <unit>` spans immediately following an
+/// already-matched duration (optionally joined by a single "and"), the same
+/// accumulation `parse_duration` applies to its own first span. Applying this
+/// after `fractional_duration` / `couple_duration` as well makes compound
+/// summing uniform across all three duration detectors — see the caller in
+/// `timer_request`.
+fn extend_duration_with_trailing_spans(
+    tokens: &[&str],
+    mut total: u64,
+    mut last_unit_index: usize,
+) -> (u64, usize) {
+    loop {
+        let mut next = last_unit_index + 1;
+        if tokens.get(next).copied() == Some("and") {
+            next += 1;
+        }
+        let Some((amount, unit_index)) = super::number_words::parse_spoken_number(tokens, next)
+        else {
+            break;
+        };
+        let Some(multiplier) = duration_unit_seconds(tokens.get(unit_index).copied()) else {
+            break;
+        };
+        total = total.saturating_add(amount.saturating_mul(multiplier));
+        last_unit_index = unit_index;
+    }
+    (total, last_unit_index)
 }
 
 fn reminder_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
@@ -4785,6 +4821,33 @@ mod tests {
         let call = route("remind me in 5 minutes to feed the couple cats").unwrap();
         assert_eq!(call.arguments["seconds"], 300);
         assert_eq!(call.arguments["label"], "feed the couple cats");
+    }
+
+    #[test]
+    fn routes_fractional_and_couple_compound_timer() {
+        // Regression: fractional_duration/couple_duration return as soon as they
+        // match their idiom, unlike parse_duration's own trailing-span sum, so a
+        // second span after "half an hour"/"a couple of minutes" was silently
+        // dropped, emitting a confidently-wrong 1800s instead of 2700s.
+        let call = route("set a timer for half an hour and 15 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 1800 + 15 * 60);
+
+        // The connective "and" is optional here too, matching parse_duration.
+        let call = route("set a timer for quarter of an hour 5 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 900 + 5 * 60);
+
+        let call = route("set a timer for a couple of minutes and 30 seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 120 + 30);
+
+        // The summed span is carried past the label boundary too.
+        let call = route("remind me in half an hour and 15 minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 1800 + 15 * 60);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // A single fractional/idiom span with nothing trailing is unchanged.
+        let call = route("set a timer for half an hour").unwrap();
+        assert_eq!(call.arguments["seconds"], 1800);
     }
 
     #[test]
