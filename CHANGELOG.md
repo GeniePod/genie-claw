@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Channels
+
+- **serve_channel**: add the `recv → handle → send` driver loop over the
+  `Channel` trait (#564), so a transport only implements the trait and supplies a
+  per-turn handler. Handler errors are per-turn and skipped; `send` errors are
+  treated as a dead transport and end the loop. Exercised end to end with the
+  in-process `ScriptedChannel` reference.
+
 ## 1.0.0-rc.4 - 2026-07-13
 
 Fourth release candidate. This RC drives **M2** forward: the portable
