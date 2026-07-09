@@ -1,5 +1,6 @@
 use crate::llm::Message;
 use crate::prompt::ModelFamily;
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionKind {
@@ -40,8 +41,20 @@ pub fn apply_reasoning_mode(
         );
     }
 
-    let explicit_mode = explicit_reasoning_mode(user_text);
-    let mode = explicit_mode.unwrap_or_else(|| auto_reasoning_mode(user_text, interaction));
+    // One shared lowercase view for every marker scan below.
+    // `explicit_reasoning_mode`, `is_simple_request`, and
+    // `looks_like_deep_reasoning_request` previously each built their own
+    // `to_lowercase()` copy of the same user text (up to three full-string
+    // allocations per utterance). ASCII text with no uppercase letters — the
+    // common voice-transcript case — borrows `user_text` without allocating.
+    let lower: Cow<'_, str> = if is_already_ascii_lowercase(user_text) {
+        Cow::Borrowed(user_text)
+    } else {
+        Cow::Owned(user_text.to_lowercase())
+    };
+
+    let explicit_mode = explicit_reasoning_mode(&lower);
+    let mode = explicit_mode.unwrap_or_else(|| auto_reasoning_mode(&lower, interaction));
     let explicit = explicit_mode.is_some();
     let cleaned_user_text = strip_reasoning_directives(user_text);
 
@@ -94,31 +107,46 @@ fn supports_reasoning_toggle(model_family: ModelFamily) -> bool {
     matches!(model_family, ModelFamily::Qwen)
 }
 
-fn explicit_reasoning_mode(user_text: &str) -> Option<ReasoningMode> {
-    let lower = user_text.to_lowercase();
-    if lower.contains("/no_think") {
-        Some(ReasoningMode::Normal)
-    } else if lower.contains("/think")
-        || lower.contains("think deeply")
+/// True when Unicode lowercasing is the identity for `text`, so the marker
+/// scans can borrow it instead of allocating. Conservative: any non-ASCII
+/// byte falls back to the allocating `to_lowercase` path.
+fn is_already_ascii_lowercase(text: &str) -> bool {
+    text.bytes()
+        .all(|b| b.is_ascii() && !b.is_ascii_uppercase())
+}
+
+/// `lower` must be the lowercased user text.
+fn explicit_reasoning_mode(lower: &str) -> Option<ReasoningMode> {
+    // Both slash directives contain '/': one byte scan gates both substring
+    // searches for the common directive-free utterance.
+    if lower.contains('/') {
+        if lower.contains("/no_think") {
+            return Some(ReasoningMode::Normal);
+        }
+        if lower.contains("/think") {
+            return Some(ReasoningMode::Deep);
+        }
+    }
+    if lower.contains("think deeply")
         || lower.contains("reason carefully")
         || lower.contains("step by step")
     {
-        Some(ReasoningMode::Deep)
-    } else {
-        None
+        return Some(ReasoningMode::Deep);
     }
+    None
 }
 
-fn auto_reasoning_mode(user_text: &str, interaction: InteractionKind) -> ReasoningMode {
+/// `lower` must be the lowercased user text.
+fn auto_reasoning_mode(lower: &str, interaction: InteractionKind) -> ReasoningMode {
     if matches!(interaction, InteractionKind::ToolSummary) {
         return ReasoningMode::Normal;
     }
 
-    if is_simple_request(user_text) {
+    if is_simple_request(lower) {
         return ReasoningMode::Normal;
     }
 
-    if looks_like_deep_reasoning_request(user_text) {
+    if looks_like_deep_reasoning_request(lower) {
         return ReasoningMode::Deep;
     }
 
@@ -126,9 +154,11 @@ fn auto_reasoning_mode(user_text: &str, interaction: InteractionKind) -> Reasoni
     ReasoningMode::Normal
 }
 
-fn is_simple_request(user_text: &str) -> bool {
-    let lower = user_text.to_lowercase();
-    let words = lower.split_whitespace().count();
+/// `lower` must be the lowercased user text.
+fn is_simple_request(lower: &str) -> bool {
+    // The decision only needs "10 words or fewer"; stop counting at 11 so
+    // long prompts don't pay for a full-string whitespace walk.
+    let words = lower.split_whitespace().take(11).count();
 
     words <= 10
         && (lower.contains("what time")
@@ -145,8 +175,8 @@ fn is_simple_request(user_text: &str) -> bool {
             || lower.contains("whats up"))
 }
 
-fn looks_like_deep_reasoning_request(user_text: &str) -> bool {
-    let lower = user_text.to_lowercase();
+/// `lower` must be the lowercased user text.
+fn looks_like_deep_reasoning_request(lower: &str) -> bool {
     let complex_markers = [
         "analy",
         "compare",
@@ -182,8 +212,13 @@ fn looks_like_deep_reasoning_request(user_text: &str) -> bool {
         || complex_markers.iter().any(|marker| lower.contains(marker))
 }
 
-fn strip_reasoning_directives(user_text: &str) -> String {
-    user_text.replace("/no_think", "").replace("/think", "")
+fn strip_reasoning_directives(user_text: &str) -> Cow<'_, str> {
+    // Both directives contain '/'; without one neither `replace` can match,
+    // so the directive-free common case borrows instead of copying twice.
+    if !user_text.contains('/') {
+        return Cow::Borrowed(user_text);
+    }
+    Cow::Owned(user_text.replace("/no_think", "").replace("/think", ""))
 }
 
 #[cfg(test)]

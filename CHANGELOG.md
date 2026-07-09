@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Reasoning
+
+- **Qwen reasoning mode**: share one lowercase view across the explicit-directive,
+  simple-request, and deep-reasoning scans in `apply_reasoning_mode` (previously
+  up to three full-string `to_lowercase` allocations per utterance), borrow
+  already-lowercase ASCII text without allocating, and skip the directive
+  `replace` passes when the text contains no `/`. Decisions and adjusted
+  message content stay byte-identical, guarded by a differential corpus test.
+
 ### Memory
 
 - **Auto-capture**: defer the allocating `to_lowercase` in `extract_facts` until
