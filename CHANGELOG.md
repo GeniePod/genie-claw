@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Voice
+
+- **Intent gate**: `assess_transcript` normalizes each transcript in one pass
+  (whitespace collapse + ASCII lowercase + word count in a single buffer,
+  replacing a `Vec`-collect/`join` plus a second full-string lowercase
+  allocation), dispatches the 39 direct-request prefixes by first byte, and
+  gates the 22 containment markers behind a byte scan of letters that actually
+  follow a space. Decisions (including reject reasons) stay identical, guarded
+  by a differential corpus test.
+
 ### Memory
 
 - **Auto-capture**: defer the allocating `to_lowercase` in `extract_facts` until
