@@ -2685,14 +2685,8 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
             .trim();
         // Drop a trailing time qualifier ("apple today" -> "apple") so it does
         // not leak into the subject and defeat the company_ticker lookup (which
-        // matches the bare company name). Longest phrase first.
-        let subject = subject
-            .trim_end_matches(" right now")
-            .trim_end_matches(" today")
-            .trim_end_matches(" now")
-            .trim_end_matches(" currently")
-            .trim_end_matches(" this week")
-            .trim();
+        // matches the bare company name).
+        let subject = strip_trailing_time_qualifier(subject);
         let query = if subject.is_empty() {
             "stock price".to_string()
         } else {
@@ -2760,15 +2754,12 @@ fn company_ticker(subject: &str) -> Option<&'static str> {
     }
 }
 
-fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
-    let (_, location) = text.rsplit_once(marker)?;
-    let location = location
-        .trim()
-        .trim_start_matches("the ")
-        // Drop a trailing time qualifier so "weather in Denver tonight" yields
-        // "denver", not "denver tonight". Longest phrases first so a shorter
-        // suffix (" now") does not pre-empt a longer one (" right now"). Forecast
-        // detection reads the whole utterance, so trimming here never changes it.
+/// Strip a trailing time qualifier ("denver tonight" -> "denver", "apple this
+/// morning" -> "apple") so it does not leak into an extracted location or stock
+/// subject and defeat downstream matching. Longest phrases first so a shorter
+/// suffix (" now") does not pre-empt a longer one (" right now").
+fn strip_trailing_time_qualifier(subject: &str) -> &str {
+    subject
         .trim_end_matches(" right now")
         .trim_end_matches(" this weekend")
         .trim_end_matches(" this week")
@@ -2782,7 +2773,14 @@ fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
         .trim_end_matches(" later")
         .trim_end_matches(" currently")
         .trim()
-        .to_string();
+}
+
+fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
+    let (_, location) = text.rsplit_once(marker)?;
+    // Forecast detection reads the whole utterance, so trimming a trailing time
+    // qualifier here never changes it.
+    let location =
+        strip_trailing_time_qualifier(location.trim().trim_start_matches("the ")).to_string();
     if location.is_empty() {
         None
     } else {
@@ -4694,6 +4692,28 @@ mod tests {
             ("stock price of Tesla right now", "TSLA stock price"),
             (
                 "what is the stock price of Microsoft now",
+                "MSFT stock price",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn stock_price_query_strips_part_of_day_time_word() {
+        // The weather-location path strips part-of-day qualifiers, but the
+        // stock path did not, so "apple stock price this morning" produced
+        // "apple this morning stock price" and company_ticker missed.
+        for (utterance, query) in [
+            (
+                "what's the stock price of apple this morning",
+                "AAPL stock price",
+            ),
+            ("stock price of tesla this afternoon", "TSLA stock price"),
+            (
+                "what is the stock price of microsoft this evening",
                 "MSFT stock price",
             ),
         ] {
