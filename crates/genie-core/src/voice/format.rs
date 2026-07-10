@@ -11,11 +11,18 @@ pub fn for_voice(text: &str) -> String {
     // Strip markdown formatting.
     result = strip_markdown(&result);
 
-    // Raw URLs sound terrible in TTS and add no value in spoken replies.
-    result = strip_raw_urls(&result);
-
-    // Normalize whitespace.
-    result = normalize_whitespace(&result);
+    // Raw URLs sound terrible in TTS and add no value in spoken replies. The
+    // URL scan is the only step here that can change a URL-free string's
+    // *content*, and its `split_whitespace` rejoin collapses whitespace exactly
+    // like `normalize_whitespace` — `strip_markdown` has already trimmed every
+    // line, so there is no leading/trailing whitespace for the two to disagree
+    // on. So run exactly one of the two: the URL scan when a marker is present
+    // (it also normalizes whitespace), the cheaper normalizer when it is not.
+    result = if has_raw_url_marker(&result) {
+        strip_raw_urls(&result)
+    } else {
+        normalize_whitespace(&result)
+    };
 
     // Shorten if too long for voice (>3 sentences).
     result = truncate_for_voice(&result, 3);
@@ -129,6 +136,17 @@ fn strip_links(text: &str) -> String {
     }
 
     result
+}
+
+/// Cheap, conservative gate for `strip_raw_urls`. That scan only drops a token
+/// whose punctuation-trimmed form starts with `http://`, `https://`, or `www.`,
+/// so if none of those markers appears anywhere in the text the scan cannot
+/// change it and `normalize_whitespace` alone does the whitespace collapse.
+/// `"http"` covers both `http://` and `https://` (a superstring). A false
+/// positive — a marker substring with no real URL — is harmless: it just runs
+/// the full scan, which then strips nothing.
+fn has_raw_url_marker(text: &str) -> bool {
+    text.contains("http") || text.contains("www.")
 }
 
 fn strip_raw_urls(text: &str) -> String {

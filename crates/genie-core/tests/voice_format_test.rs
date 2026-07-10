@@ -139,3 +139,41 @@ fn chinese_punctuation_still_segments_immediately() {
     assert!(output.contains("第三句"));
     assert!(!output.contains("第四句"));
 }
+
+// The url-marker gate (#645) skips strip_raw_urls when no marker is present.
+// These lock the two paths so a wrong gate can't slip through: url-free text
+// must still have its whitespace collapsed, and every marker form must still
+// strip.
+
+#[test]
+fn no_url_text_still_collapses_whitespace() {
+    // no http/www. marker: strip_raw_urls is skipped, so normalize_whitespace
+    // must still collapse the run of spaces.
+    assert_eq!(
+        for_voice("Turn on the   lights please"),
+        "Turn on the lights please"
+    );
+}
+
+#[test]
+fn www_marker_url_is_still_stripped() {
+    let output = for_voice("Visit www.example.org for the docs.");
+    assert!(output.contains("Visit for the docs"), "got {output:?}");
+    assert!(!output.contains("www."), "got {output:?}");
+}
+
+#[test]
+fn http_url_with_surrounding_spaces_is_stripped_and_collapsed() {
+    let output = for_voice("See   https://x.example.com   now");
+    assert_eq!(output, "See now");
+}
+
+#[test]
+fn plain_http_marker_word_without_a_url_is_unchanged() {
+    // "http" appears (gate fires) but no token is an actual url, so the full
+    // scan runs and strips nothing — output is just whitespace-normalized.
+    assert_eq!(
+        for_voice("the httpd service restarted"),
+        "the httpd service restarted"
+    );
+}

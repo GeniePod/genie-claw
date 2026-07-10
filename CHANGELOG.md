@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Voice
+
+- **Formatter**: gate `for_voice`'s raw-URL scan behind a cheap `http`/`www.`
+  marker check and run only one of `strip_raw_urls` / `normalize_whitespace`
+  per call — url-free replies (the common case) skip an allocation, and the
+  url path drops the now-redundant second normalize pass. output is
+  byte-identical; ~20% lower per-call latency in `voice_format_bench` on both
+  the url-free and url inputs.
+
 ### Memory
 
 - **Auto-capture**: defer the allocating `to_lowercase` in `extract_facts` until
