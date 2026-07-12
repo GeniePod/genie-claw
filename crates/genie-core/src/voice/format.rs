@@ -11,11 +11,19 @@ pub fn for_voice(text: &str) -> String {
     // Strip markdown formatting.
     result = strip_markdown(&result);
 
-    // Raw URLs sound terrible in TTS and add no value in spoken replies.
-    result = strip_raw_urls(&result);
-
-    // Normalize whitespace.
-    result = normalize_whitespace(&result);
+    // Raw URLs sound terrible in TTS and add no value in spoken replies, but
+    // scanning for them allocates a fresh token-joined string on every reply.
+    // `strip_raw_urls` rebuilds the text via `split_whitespace`, which already
+    // collapses whitespace runs and trims, so `normalize_whitespace` is a no-op
+    // afterwards. When there is no raw-URL marker (the common case) skip the
+    // URL scan entirely and just normalize whitespace; otherwise strip URLs and
+    // let that pass do the whitespace collapse. Output is byte-identical either
+    // way (the downstream sentence/`.trim()` passes absorb any edge difference).
+    if has_raw_url_marker(&result) {
+        result = strip_raw_urls(&result);
+    } else {
+        result = normalize_whitespace(&result);
+    }
 
     // Shorten if too long for voice (>3 sentences).
     result = truncate_for_voice(&result, 3);
@@ -129,6 +137,17 @@ fn strip_links(text: &str) -> String {
     }
 
     result
+}
+
+/// Cheap, conservative gate for [`strip_raw_urls`]: true when the text contains
+/// any raw-URL marker it could act on. `strip_raw_urls` only drops tokens whose
+/// (punctuation-trimmed) form *starts with* one of these prefixes, so the prefix
+/// substring is always present in the text when a token would be stripped —
+/// `contains` is therefore a safe superset of that decision and never skips a
+/// token the scan would have removed. A false positive (e.g. `shttp://`) only
+/// costs a redundant scan that still yields the correct output.
+fn has_raw_url_marker(text: &str) -> bool {
+    text.contains("http://") || text.contains("https://") || text.contains("www.")
 }
 
 fn strip_raw_urls(text: &str) -> String {
