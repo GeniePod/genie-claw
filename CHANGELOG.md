@@ -9,6 +9,22 @@
   with only a byte-length check, so any utterance whose 8th byte fell inside a
   multi-byte UTF-8 char sliced on a non-char-boundary and panicked — taking
   down fact extraction for non-Latin-script households (#634).
+### Memory
+
+- **Auto-capture**: defer the allocating `to_lowercase` in `extract_facts` until
+  an identity, preference, or relationship trigger is present — common no-match
+  utterances (weather, questions, chit-chat) skip the allocation entirely.
+- **Policy**: defer the allocating `to_lowercase` in `assess_memory_write` and
+  `infer_metadata` until restricted, private-intent, or cautious content markers
+  are present — benign household writes skip the content allocation.
+
+### Tool dispatch
+
+- **home_control**: skip the `to_lowercase` + `replace` allocations in
+  `canon_home_control_action` when the action verb is already in canonical shape
+  (`turn_off`, `set_brightness`, `switch_off`). The LLM tool call and the
+  quick-router usually emit exactly that, so the common dispatch drops two
+  `String` allocations; only natural-language forms ("turn off") still normalize.
 
 ## 1.0.0-rc.3 - 2026-07-03
 

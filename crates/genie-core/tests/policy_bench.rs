@@ -24,6 +24,7 @@ fn run(label: &str, kind: &str, content: &str, iters: u32) {
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn bench_assess_memory_write() {
     // Common allow path after auto-capture (no secret/private/cautious markers).
+    // Skips the allocating content to_lowercase when triggers are absent.
     run(
         "allow-preference",
         "preference",

@@ -871,6 +871,7 @@ fn is_voice_relevant_domain(domain: &str) -> bool {
         domain,
         "light"
             | "switch"
+            | "fan"
             | "scene"
             | "script"
             | "climate"
@@ -920,7 +921,7 @@ fn capabilities_for(domain: &str, attributes: &serde_json::Value) -> Vec<String>
                 caps.push("set_brightness".into());
             }
         }
-        "switch" => {
+        "switch" | "fan" => {
             caps.push("turn_on".into());
             caps.push("turn_off".into());
         }
@@ -969,6 +970,7 @@ fn domain_synonyms(domain: &str) -> Vec<String> {
             "plug".into(),
             "outlet".into(),
         ],
+        "fan" => vec!["fan".into(), "fans".into()],
         "climate" => vec!["thermostat".into(), "temperature".into(), "heater".into()],
         "cover" => vec![
             "cover".into(),
@@ -1184,7 +1186,15 @@ fn summarize_state(target_name: &str, domain: Option<&str>, entities: &[Entity])
                     .attributes
                     .get("brightness")
                     .and_then(|value| value.as_u64())
-                    .map(|value| format!(", brightness {}%", value * 100 / 255))
+                    .map(|value| {
+                        // Round to the nearest percent, matching Home
+                        // Assistant's own brightness_pct and the rounding
+                        // `normalize_brightness` applies on the write path.
+                        // Integer `value * 100 / 255` truncates, so a light
+                        // set to 75% (stored 191/255) under-reported as 74%.
+                        let percent = ((value as f64) * 100.0 / 255.0).round() as u64;
+                        format!(", brightness {percent}%")
+                    })
                     .unwrap_or_default();
                 format!("{} is {}{}", target_name, entity.state, brightness)
             }
@@ -1254,6 +1264,8 @@ fn domain_label(domain: &str, count: usize) -> &'static str {
         "light" => "lights",
         "switch" if count == 1 => "switch",
         "switch" => "switches",
+        "fan" if count == 1 => "fan",
+        "fan" => "fans",
         "cover" if count == 1 => "cover",
         "cover" => "covers",
         "lock" if count == 1 => "lock",
@@ -1267,6 +1279,7 @@ fn domain_plural_label(domain: &str) -> &'static str {
     match domain {
         "light" => "lights",
         "switch" => "switches",
+        "fan" => "fans",
         "cover" => "covers",
         "lock" => "locks",
         "climate" => "thermostats",
@@ -1466,6 +1479,49 @@ mod tests {
     }
 
     #[test]
+    fn build_graph_admits_fan_entities_and_resolves_them() {
+        // Regression: `fan` is a controllable domain in the quick router and
+        // `infer_domain`, but `is_voice_relevant_domain` omitted it, so
+        // `build_graph` dropped every fan entity and "turn on the bedroom fan"
+        // resolved to nothing even though the fan existed.
+        let states = vec![Entity {
+            entity_id: "fan.bedroom_ceiling".into(),
+            state: "off".into(),
+            attributes: serde_json::json!({ "friendly_name": "Bedroom Ceiling Fan" }),
+        }];
+        let areas = vec![AreaTemplateEntry {
+            id: "bedroom".into(),
+            name: "Bedroom".into(),
+            entities: vec!["fan.bedroom_ceiling".into()],
+        }];
+
+        let graph = HomeAssistantProvider::build_graph(&states, &areas);
+
+        // The fan survives the voice-relevant-domain gate.
+        assert!(
+            graph
+                .entities
+                .iter()
+                .any(|entity| entity.entity_id == "fan.bedroom_ceiling"),
+            "fan entity should be admitted to the graph"
+        );
+
+        // ...and resolves for a natural "turn on the bedroom fan" request.
+        let target = HomeAssistantProvider::resolve_target_in_graph(
+            &graph,
+            "bedroom fan",
+            Some(HomeActionKind::TurnOn),
+        )
+        .expect("bedroom fan should resolve to the fan entity");
+        assert_eq!(target.domain.as_deref(), Some("fan"));
+        assert!(
+            target
+                .entity_ids
+                .contains(&"fan.bedroom_ceiling".to_string())
+        );
+    }
+
+    #[test]
     fn ambiguous_named_entity_tie_declines_instead_of_guessing() {
         // Regression for #511: both lamps score 1.0 on the shared "lamp" alias.
         // The resolver must not silently actuate whichever the graph listed first.
@@ -1625,5 +1681,37 @@ mod tests {
     fn brightness_percent_maps_to_255_scale() {
         assert_eq!(normalize_brightness(50.0), 128);
         assert_eq!(normalize_brightness(255.0), 255);
+    }
+
+    /// Regression: the `home_status` brightness readback must round to the
+    /// nearest percent, matching Home Assistant's own `brightness_pct` and the
+    /// rounding `normalize_brightness` applies on the write path. Integer
+    /// `value * 100 / 255` truncates, so a light set to 75% (stored 191/255)
+    /// used to read back as "74%" and 99% (stored 252) as "98%".
+    #[test]
+    fn brightness_readback_rounds_to_nearest_percent() {
+        let light = |b: u64| Entity {
+            entity_id: "light.living".into(),
+            state: "on".into(),
+            attributes: serde_json::json!({ "brightness": b }),
+        };
+        // 191/255 = 74.9% -> 75%, not the truncated 74%.
+        let summary = summarize_state("Living room lamp", Some("light"), &[light(191)]);
+        assert!(
+            summary.contains("brightness 75%"),
+            "expected rounded 75%, got: {summary}"
+        );
+        // 252/255 = 98.8% -> 99%.
+        let summary = summarize_state("Living room lamp", Some("light"), &[light(252)]);
+        assert!(
+            summary.contains("brightness 99%"),
+            "expected rounded 99%, got: {summary}"
+        );
+        // Full scale still reports exactly 100%.
+        let summary = summarize_state("Living room lamp", Some("light"), &[light(255)]);
+        assert!(
+            summary.contains("brightness 100%"),
+            "expected 100%, got: {summary}"
+        );
     }
 }
