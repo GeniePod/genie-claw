@@ -288,24 +288,19 @@ impl Governor {
         target: Mode,
         stopped: &mut Vec<StoppedService>,
     ) -> Result<()> {
-        match (from, target) {
-            (_, Mode::Media) => {
-                let unit = self.llm_service_unit();
-                if ServiceCtl::is_active(&unit).await {
-                    ServiceCtl::stop(&unit).await?;
-                    stopped.push(StoppedService { alias: "llm", unit });
-                }
+        if target == Mode::Media {
+            // Entering Media unloads the LLM entirely.
+            let unit = self.llm_service_unit();
+            if ServiceCtl::is_active(&unit).await {
+                ServiceCtl::stop(&unit).await?;
+                stopped.push(StoppedService { alias: "llm", unit });
             }
-            (Mode::Media, _)
-            | (Mode::Day | Mode::NightA, Mode::NightB)
-            | (Mode::NightB, Mode::Day) => {
-                if let Some(model) = llm_model_for_transition(from, target) {
-                    let path = format!("/opt/geniepod/models/{}", model);
-                    let unit = self.llm_service_unit();
-                    ServiceCtl::swap_llm_model(&unit, &path).await?;
-                }
-            }
-            _ => {}
+        } else if let Some(model) = llm_model_for_transition(from, target) {
+            // Any other transition that changes the resident weights swaps the
+            // model in place (e.g. Day<->NightB, and NightB<->Pressure).
+            let path = format!("/opt/geniepod/models/{}", model);
+            let unit = self.llm_service_unit();
+            ServiceCtl::swap_llm_model(&unit, &path).await?;
         }
         Ok(())
     }
@@ -378,11 +373,19 @@ impl Governor {
 }
 
 fn llm_model_for_transition(from: Mode, target: Mode) -> Option<&'static str> {
-    match (from, target) {
-        (Mode::Media, _) => target.llm_model(),
-        (Mode::Day | Mode::NightA, Mode::NightB) => Mode::NightB.llm_model(),
-        (Mode::NightB, Mode::Day) => Mode::Day.llm_model(),
-        _ => None,
+    // `Media` has no resident model; entering it is handled by the stop path,
+    // and leaving it reloads the target's model below.
+    if target == Mode::Media {
+        return None;
+    }
+    // Swap whenever the resident weights actually change — the same predicate
+    // `llm_rollback_action` uses. A hard-coded transition list missed cases
+    // like `NightB` (9B) -> `Pressure` (4B), leaving the heavy model resident
+    // in the very mode meant to relieve memory pressure.
+    if transition_changes_llm_weights(from, target) {
+        target.llm_model()
+    } else {
+        None
     }
 }
 
@@ -666,6 +669,27 @@ mod tests {
             Mode::Day.llm_model()
         );
         assert!(llm_model_for_transition(Mode::Day, Mode::NightA).is_none());
+    }
+
+    #[test]
+    fn night_b_and_pressure_swap_the_resident_model() {
+        // NightB keeps the 9B model resident with very little headroom; entering
+        // emergency Pressure mode must swap DOWN to the 4B model, and recovery
+        // must reload the 9B. The forward swap path previously used a hard-coded
+        // transition list that skipped this pair, leaving the heaviest model
+        // loaded in the very mode meant to relieve memory pressure.
+        assert!(transition_changes_llm_weights(Mode::NightB, Mode::Pressure));
+        assert_eq!(
+            llm_model_for_transition(Mode::NightB, Mode::Pressure),
+            Mode::Pressure.llm_model()
+        );
+        assert_eq!(
+            llm_model_for_transition(Mode::Pressure, Mode::NightB),
+            Mode::NightB.llm_model()
+        );
+        // A same-weight transition (both 4B) still performs no swap.
+        assert!(!transition_changes_llm_weights(Mode::Day, Mode::Pressure));
+        assert!(llm_model_for_transition(Mode::Day, Mode::Pressure).is_none());
     }
 
     #[test]
