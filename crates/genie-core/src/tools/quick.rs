@@ -216,12 +216,29 @@ fn tool(name: &str, arguments: serde_json::Value) -> ToolCall {
 }
 
 fn normalize(text: &str) -> String {
-    text.trim()
-        .to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && !c.is_whitespace(), " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    // Lowercase (Unicode-correct), map every non-alphanumeric char to a single
+    // space, and collapse runs of them — in one pass into one buffer. Previously
+    // this chained `.replace(...)` + `.split_whitespace().collect::<Vec<_>>()` +
+    // `.join(" ")`, allocating an intermediate String, a `Vec<&str>`, and the
+    // joined String on top of the lowercased one; `normalize` runs on every
+    // routing turn. Output is byte-identical: non-alphanumeric == the old
+    // "whitespace or punctuation" set, so each maximal run collapses to one
+    // space with leading/trailing spaces trimmed.
+    let lowered = text.to_lowercase();
+    let mut out = String::with_capacity(lowered.len());
+    let mut pending_space = false;
+    for ch in lowered.chars() {
+        if ch.is_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push(ch);
+        } else {
+            pending_space = true;
+        }
+    }
+    out
 }
 
 fn strip_household_speaker_prefix(text: &str) -> String {
