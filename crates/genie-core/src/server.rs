@@ -3,9 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use genie_common::config::{
-    EscalationTrigger, HttpServerConfig, PrivacyProxyConfig, StorageConfig,
-};
+use genie_common::config::{HttpServerConfig, PrivacyProxyConfig, StorageConfig};
 use genie_common::http::{GuardRejection, HttpLimits, OriginDecision, RequestGuard, read_request};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -16,8 +14,8 @@ use crate::channel::{IncomingTurn, incoming_turn_from_chat_json};
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
 use crate::llm::{
-    LlmBackendClient, LlmClient, LlmRequestHints, LocalProvider, Message, PrivacyProxyBackend,
-    Provider,
+    EscalationReason, LlmBackendClient, LlmClient, LlmRequestHints, LocalProvider, Message,
+    PrivacyProxyBackend, Provider, may_escalate, summarize_messages,
 };
 use crate::memory::{SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
@@ -377,9 +375,9 @@ enum RequestRoute<'a> {
 }
 
 impl RequestRoute<'_> {
-    /// True for state-changing / actuating endpoints, which require the shared
-    /// local API token when one is configured (issue #228). Read-only routes
-    /// are guarded by the Origin/Host gate alone.
+    /// True for state-changing or sensitive actuation endpoints, which require
+    /// the shared local API token when one is configured (issue #228, #658).
+    /// Other read-only routes are guarded by the Origin/Host gate alone.
     fn is_mutating(&self) -> bool {
         matches!(
             self,
@@ -387,6 +385,8 @@ impl RequestRoute<'_> {
                 | RequestRoute::Chat
                 | RequestRoute::Clear
                 | RequestRoute::WebSearchPost
+                | RequestRoute::ActuationPending
+                | RequestRoute::ActuationActions
                 | RequestRoute::ActuationConfirm
                 | RequestRoute::MemoriesUpdate
                 | RequestRoute::MemoriesDelete
@@ -1184,15 +1184,21 @@ async fn resolve_chat_conv_id(
     parsed: &serde_json::Value,
     turn: &IncomingTurn,
 ) -> String {
+    let now_ms = session_now_ms();
     if let Some(id) = parsed
         .get("conversation_id")
         .and_then(|v| v.as_str())
         .filter(|id| !id.trim().is_empty())
     {
+        // A client-supplied conversation id still participates in the bounded,
+        // idle-expiring registry so clients that always send their own id (the
+        // web UI, Telegram) stay within the Jetson session budget instead of
+        // silently bypassing the cap. See #565.
+        let mut registry = registry.lock().await;
+        registry.track(id, now_ms);
         return id.to_string();
     }
     let session_key = turn.conversation_id(&turn.session_id);
-    let now_ms = session_now_ms();
     let mut registry = registry.lock().await;
     registry.resolve(&session_key, now_ms)
 }
@@ -1298,20 +1304,24 @@ pub async fn process_chat_turn(
 
     // Escalate on overflow before attempting the local model — sending a
     // context-length request to the local model would just error anyway.
-    let triggers_overflow = privacy_proxy.is_some()
-        && context_overflowed
-        && matches!(
-            privacy_proxy.map(|p| &p.trigger),
-            Some(EscalationTrigger::ContextOverflow)
-                | Some(EscalationTrigger::LocalDeclineOrContextOverflow)
-        );
+    let triggers_overflow = context_overflowed
+        && may_escalate(privacy_proxy, EscalationReason::ContextOverflow).is_some();
 
     let llm_response = if triggers_overflow {
+        let proxy =
+            may_escalate(privacy_proxy, EscalationReason::ContextOverflow).expect("checked above");
         tracing::info!(
             estimated_tokens,
             "context overflow; escalating via PrivacyProxy"
         );
-        match escalate_via_privacy_proxy(privacy_proxy.unwrap(), &messages, memory).await {
+        match escalate_via_privacy_proxy(
+            proxy,
+            &messages,
+            memory,
+            EscalationReason::ContextOverflow,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(proxy_err) => {
                 tracing::warn!(
@@ -1330,19 +1340,18 @@ pub async fn process_chat_turn(
         {
             Ok(r) => r,
             Err(local_err) => {
-                let triggers_decline = privacy_proxy.is_some()
-                    && matches!(
-                        privacy_proxy.map(|p| &p.trigger),
-                        Some(EscalationTrigger::LocalDecline)
-                            | Some(EscalationTrigger::LocalDeclineOrContextOverflow)
-                    );
-                if triggers_decline {
+                if let Some(proxy) = may_escalate(privacy_proxy, EscalationReason::LocalDecline) {
                     tracing::info!(
                         error = %local_err,
                         "local LLM declined; escalating via PrivacyProxy"
                     );
-                    match escalate_via_privacy_proxy(privacy_proxy.unwrap(), &messages, memory)
-                        .await
+                    match escalate_via_privacy_proxy(
+                        proxy,
+                        &messages,
+                        memory,
+                        EscalationReason::LocalDecline,
+                    )
+                    .await
                     {
                         Ok(r) => r,
                         Err(proxy_err) => {
@@ -1410,8 +1419,10 @@ async fn escalate_via_privacy_proxy(
     proxy: &PrivacyProxyConfig,
     messages: &[Message],
     memory: &SharedMemory,
+    reason: EscalationReason,
 ) -> Result<String> {
     let backend = PrivacyProxyBackend::from_url(&proxy.base_url, &proxy.vocab_path);
+    let summary = summarize_messages(messages);
 
     let terms: Vec<String> = with_shared_memory(memory, |mem| {
         let entries = mem.recent(500)?;
@@ -1428,6 +1439,14 @@ async fn escalate_via_privacy_proxy(
     })
     .await
     .unwrap_or_default();
+
+    crate::security::audit::log_provider_escalation(
+        reason.as_str(),
+        "privacy_proxy",
+        summary.message_count,
+        summary.payload_chars,
+        terms.len(),
+    );
 
     if let Err(e) = backend.seed_vocab(&terms).await {
         tracing::warn!(error = %e, terms = terms.len(), "vocab seed failed; continuing");
@@ -2736,8 +2755,10 @@ mod tests {
     use super::{
         ConnectivityState, StreamMode, detect_stream_mode, handle_actuation_actions, handle_chat,
         handle_health, handle_runtime_contract, handle_web_search, handle_web_search_status,
-        is_client_disconnect_error, overall_health_status, should_summarize_tool_result,
+        is_client_disconnect_error, overall_health_status, resolve_chat_conv_id,
+        should_summarize_tool_result,
     };
+    use crate::channel::{ChannelKind, IncomingTurn};
     use crate::connectivity::NullConnectivityController;
     use crate::conversation::ConversationStore;
     use crate::memory::{Memory, SharedMemory};
@@ -2817,6 +2838,24 @@ mod tests {
                 self.sources.lock().unwrap().push(src);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_conversation_ids_are_bounded_by_the_session_registry() {
+        // Before #565's lifecycle wiring, a client-supplied `conversation_id`
+        // short-circuited session resolution and never entered the registry, so
+        // clients that always send their own id (web UI, Telegram) escaped the
+        // Jetson session cap entirely. Resolving many distinct explicit ids must
+        // now keep the registry bounded to its cap.
+        let registry = Mutex::new(SessionRegistry::new(2, 60_000));
+        let turn = IncomingTurn::new("hello", "default", ChannelKind::Telegram);
+        for i in 0..5 {
+            let parsed = serde_json::json!({ "conversation_id": format!("telegram-{i}") });
+            let conv_id = resolve_chat_conv_id(&registry, &parsed, &turn).await;
+            // The caller's own id is still honored verbatim for continuity.
+            assert_eq!(conv_id, format!("telegram-{i}"));
+        }
+        assert_eq!(registry.lock().await.len(), 2, "registry must stay bounded");
     }
 
     fn temp_db_paths(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -3943,6 +3982,14 @@ mod tests {
                 )
                 .await;
                 assert!(with_tok.starts_with("HTTP/1.1 200"), "{with_tok:?}");
+
+                // Sensitive actuation reads are token-gated as well.
+                let actuation_no_tok = http_roundtrip(
+                    port,
+                    "GET /api/actuation/pending HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await;
+                assert!(actuation_no_tok.starts_with("HTTP/1.1 403"), "{actuation_no_tok:?}");
 
                 // A read route stays open without a token.
                 let read = http_roundtrip(

@@ -376,6 +376,14 @@ async fn read_chunked_body(
             return Ok(decoded);
         }
 
+        // A single chunk larger than the entire allowed response is invalid.
+        // Reject it up front (mirroring the Content-Length guard in
+        // `read_http_body`) so a hostile or malformed chunk-size header cannot
+        // overflow `chunk_size + 2` or drive an out-of-bounds `scratch` slice.
+        if chunk_size > max_response_bytes {
+            anyhow::bail!("response too large");
+        }
+
         while scratch.len() < chunk_size + 2 {
             if decoded.len() + scratch.len() > max_response_bytes {
                 anyhow::bail!("response too large");
@@ -696,5 +704,35 @@ mod tests {
 
         assert!(err.to_string().contains("too large"));
         server.abort();
+    }
+
+    // A `&[u8]` is a `tokio` `AsyncRead`, so it stands in for a socket here:
+    // reads consume the slice and yield EOF (`Ok(0)`) once drained.
+    #[tokio::test]
+    async fn read_chunked_body_decodes_valid_chunks() {
+        let mut stream: &[u8] = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let mut scratch = Vec::new();
+        let decoded =
+            read_chunked_body(&mut stream, &mut scratch, Duration::from_secs(1), 64 * 1024)
+                .await
+                .unwrap();
+        assert_eq!(decoded, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_chunked_body_rejects_oversize_chunk_header() {
+        // A chunk-size line of `usize::MAX` (16 hex Fs on a 64-bit target) used to
+        // reach `chunk_size + 2`, overflowing under overflow checks (or driving an
+        // out-of-bounds `scratch[..chunk_size]` slice in release). It must now be
+        // rejected without panicking.
+        let mut stream: &[u8] = b"ffffffffffffffff\r\npayload";
+        let mut scratch = Vec::new();
+        let err = read_chunked_body(&mut stream, &mut scratch, Duration::from_secs(1), 64 * 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too large") || err.to_string().contains("invalid HTTP"),
+            "got: {err}"
+        );
     }
 }
