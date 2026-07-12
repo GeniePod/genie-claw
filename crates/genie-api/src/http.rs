@@ -179,18 +179,20 @@ async fn handle_connection(
     write_response(&mut writer, &response, echo_origin.as_deref()).await
 }
 
-/// State-changing / actuating routes that require the shared local API token
-/// when one is configured (issue #228).
+/// State-changing or sensitive actuation routes that require the shared local
+/// API token when one is configured (issue #228, #658).
 fn is_mutating(method: &str, path: &str) -> bool {
-    method == "POST"
-        && matches!(
-            path,
-            "/api/actuation/confirm"
-                | "/api/memories/update"
-                | "/api/memories/delete"
-                | "/api/memories/reorder"
-                | "/api/mode"
-        )
+    matches!(
+        (method, path),
+        ("POST", "/api/actuation/confirm")
+            | ("GET", "/api/actuation/pending")
+            | ("GET", "/api/actuation/actions")
+            | ("GET", "/api/actuation/audit")
+            | ("POST", "/api/memories/update")
+            | ("POST", "/api/memories/delete")
+            | ("POST", "/api/memories/reorder")
+            | ("POST", "/api/mode")
+    )
 }
 
 /// `403` response for a gated-out request, reusing the shared rejection reason.
@@ -429,6 +431,17 @@ mod tests {
         .await;
         assert!(no_tok.starts_with("HTTP/1.1 403"), "{no_tok:?}");
         assert!(no_tok.contains("local API token"), "{no_tok:?}");
+
+        // Sensitive actuation read without the token is also rejected.
+        let actuation_no_tok = roundtrip(
+            port,
+            "GET /api/actuation/audit HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            actuation_no_tok.starts_with("HTTP/1.1 403"),
+            "{actuation_no_tok:?}"
+        );
 
         // The served dashboard carries the injected token.
         let root = roundtrip(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;

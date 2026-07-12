@@ -1545,7 +1545,16 @@ impl Config {
         } else {
             host
         };
-        format!("{host}:{}", self.core.port)
+        // Bracket a bare IPv6 literal (e.g. `::1`) so the result is a valid
+        // `host:port` authority. `ensure_port` and `derive_hosts_and_origins`
+        // already bracket IPv6 for the other address paths; a naive
+        // `{host}:{port}` here would emit `::1:3000`, an unparseable address
+        // that yields a false "core DOWN" from `core_health_url`.
+        if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{}", self.core.port)
+        } else {
+            format!("{host}:{}", self.core.port)
+        }
     }
 
     /// Health-probe URL for genie-core, derived from `[core].bind_host` and
@@ -2323,6 +2332,25 @@ systemd_unit = "genie-ai-runtime.service"
     }
 
     #[test]
+    fn core_http_addr_brackets_ipv6_bind_host() {
+        // `::1` is a valid local bind (see `is_remote_url` and the
+        // `core_api_local_only` security summary). A bare `{host}:{port}`
+        // would emit the unparseable `::1:3000`; it must be bracketed.
+        let mut config = test_config();
+        config.core.port = 3000;
+        config.core.bind_host = "::1".into();
+        assert_eq!(config.core_http_addr(), "[::1]:3000");
+    }
+
+    #[test]
+    fn core_http_addr_keeps_already_bracketed_ipv6() {
+        let mut config = test_config();
+        config.core.port = 3000;
+        config.core.bind_host = "[::1]".into();
+        assert_eq!(config.core_http_addr(), "[::1]:3000");
+    }
+
+    #[test]
     fn core_health_url_uses_default_port() {
         let config = test_config();
         assert_eq!(config.core_health_url(), "http://127.0.0.1:3000/api/health");
@@ -2348,6 +2376,16 @@ systemd_unit = "genie-ai-runtime.service"
         config.core.bind_host = "10.0.0.5".into();
         config.core.port = 4000;
         assert_eq!(config.core_health_url(), "http://10.0.0.5:4000/api/health");
+    }
+
+    #[test]
+    fn core_health_url_brackets_ipv6_bind_host() {
+        // A bare IPv6 host must produce a valid URL authority, not
+        // `http://::1:3000/...`, which no HTTP client can parse.
+        let mut config = test_config();
+        config.core.bind_host = "::1".into();
+        config.core.port = 3000;
+        assert_eq!(config.core_health_url(), "http://[::1]:3000/api/health");
     }
 
     #[test]
