@@ -1,3 +1,4 @@
+pub mod escalation;
 mod genie_ai_runtime;
 mod llama_cpp;
 mod local_provider;
@@ -13,6 +14,9 @@ use genie_common::config::{
     ActiveLlmProviderKind, Config, LlmBackendKind, OptionalAiProviderKind, ServiceEndpoint,
 };
 
+pub use escalation::{
+    EscalationPayloadSummary, EscalationReason, may_escalate, summarize_messages,
+};
 pub use genie_ai_runtime::GenieAiRuntimeBackend;
 pub use llama_cpp::LlamaCppBackend;
 pub use local_provider::{GatedProvider, LocalProvider, Provider, gated_provider_from_config};
