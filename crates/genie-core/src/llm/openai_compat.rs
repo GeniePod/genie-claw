@@ -1,8 +1,9 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use genie_common::http::{HttpReadError, HttpResponse, HttpResponseLimits, read_response};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use super::LlmRequestHints;
@@ -205,12 +206,6 @@ pub(crate) struct Delta {
     pub(crate) content: Option<String>,
 }
 
-#[derive(Debug)]
-struct HttpResponse {
-    status: u16,
-    body: String,
-}
-
 impl RequestProfile {
     pub(crate) fn generic() -> Self {
         Self::Generic
@@ -317,6 +312,10 @@ const GENIE_RUNTIME_BODY_OVERHEAD_BYTES: usize = 512;
 const GENIE_RUNTIME_CONTEXT_MAX_BYTES: usize = 900;
 /// Cap outbound LLM HTTP bodies so a buggy backend cannot OOM genie-core.
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// Cap a single SSE/header line so a backend cannot stream an endless line
+/// between newlines and grow RSS while the idle read timeout ticks (issue #195
+/// class, outbound path).
+const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
 const GENIE_RUNTIME_COMPACT_SYSTEM: &str = "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB. Answer the user's latest request directly and concisely.";
 const GENIE_RUNTIME_COMPACT_SYSTEM_PREFIX: &str = "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB. Reply briefly for voice. Use a tool only when required. Tool calls must be ONLY JSON: {\"tool\":\"tool_name\",\"arguments\":{}}. No markdown.";
 const SYSTEM_PROMPT_PREFIX_CACHE_SCOPE: &str = "system_prompt_prefix";
@@ -685,6 +684,13 @@ impl OpenAiCompatClient {
             .timed(self.timeouts.read, "stream read", lines.next_line())
             .await?
         {
+            if line.len() > MAX_SSE_LINE_BYTES {
+                anyhow::bail!(
+                    "{} streaming line exceeded {} bytes",
+                    self.backend_name,
+                    MAX_SSE_LINE_BYTES
+                );
+            }
             // Skip HTTP headers.
             if !headers_done {
                 if line.starts_with("HTTP/") {
@@ -699,6 +705,13 @@ impl OpenAiCompatClient {
                             .timed(self.timeouts.read, "stream error read", lines.next_line())
                             .await?
                         {
+                            if line.len() > MAX_SSE_LINE_BYTES {
+                                anyhow::bail!(
+                                    "{} streaming error line exceeded {} bytes",
+                                    self.backend_name,
+                                    MAX_SSE_LINE_BYTES
+                                );
+                            }
                             if error_body.len().saturating_add(line.len())
                                 > DEFAULT_MAX_RESPONSE_BYTES
                             {
@@ -830,95 +843,17 @@ async fn read_bounded_http_response(
     max_response_bytes: usize,
 ) -> Result<HttpResponse> {
     let mut buf_reader = BufReader::new(reader);
-
-    let mut status_line = String::new();
-    buf_reader.read_line(&mut status_line).await?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or_else(|| parse_status_line(&status_line));
-
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
-
-    loop {
-        let mut line = String::new();
-        buf_reader.read_line(&mut line).await?;
-        if line.trim().is_empty() {
-            break;
-        }
-
-        let lower = line.to_lowercase();
-        if let Some(val) = lower.strip_prefix("content-length:") {
-            content_length = val.trim().parse().ok();
-        }
-        if let Some(val) = lower.strip_prefix("transfer-encoding:")
-            && val.contains("chunked")
-        {
-            chunked = true;
-        }
-    }
-
-    let body = if chunked {
-        read_chunked_body(&mut buf_reader, max_response_bytes).await?
-    } else if let Some(content_length) = content_length {
-        if content_length > max_response_bytes {
-            anyhow::bail!(
-                "LLM response Content-Length {} exceeds cap {}",
-                content_length,
-                max_response_bytes
-            );
-        }
-        let mut buf = vec![0u8; content_length];
-        buf_reader.read_exact(&mut buf).await?;
-        String::from_utf8_lossy(&buf).to_string()
-    } else {
-        let cap = max_response_bytes;
-        let mut limited = (&mut buf_reader).take(cap as u64 + 1);
-        let mut body = String::new();
-        limited.read_to_string(&mut body).await?;
-        if body.len() > cap {
-            anyhow::bail!("LLM response without Content-Length exceeded {} bytes", cap);
-        }
-        body
-    };
-
-    Ok(HttpResponse { status, body })
+    let limits = HttpResponseLimits::with_body_cap(max_response_bytes);
+    read_response(&mut buf_reader, &limits)
+        .await
+        .map_err(map_llm_http_read_error)
 }
 
-async fn read_chunked_body<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-    max_bytes: usize,
-) -> Result<String> {
-    let mut body = Vec::new();
-
-    loop {
-        let mut size_line = String::new();
-        reader.read_line(&mut size_line).await?;
-        let size_hex = size_line.trim();
-        let size = usize::from_str_radix(size_hex, 16)
-            .with_context(|| format!("invalid chunk size: {size_hex}"))?;
-
-        if size == 0 {
-            let mut trailing = String::new();
-            reader.read_line(&mut trailing).await?;
-            break;
-        }
-
-        if body.len().saturating_add(size) > max_bytes {
-            anyhow::bail!("LLM chunked response exceeded {} bytes", max_bytes);
-        }
-
-        let mut chunk = vec![0u8; size];
-        reader.read_exact(&mut chunk).await?;
-        body.extend_from_slice(&chunk);
-
-        let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf).await?;
+fn map_llm_http_read_error(err: HttpReadError) -> anyhow::Error {
+    match err {
+        HttpReadError::BodyTooLarge => anyhow::anyhow!("LLM response exceeded body cap"),
+        other => anyhow::anyhow!("{other}"),
     }
-
-    Ok(String::from_utf8_lossy(&body).to_string())
 }
 
 fn build_nvext(messages: &[Message], hints: Option<&LlmRequestHints>) -> Option<NvExt> {
@@ -1705,7 +1640,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("exceeds cap"),
+            err.contains("exceeded body cap"),
             "expected cap error, got: {err}"
         );
     }
@@ -1735,7 +1670,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("without Content-Length exceeded"),
+            err.contains("exceeded body cap"),
             "expected EOF cap error, got: {err}"
         );
     }

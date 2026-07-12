@@ -46,8 +46,34 @@ pub(crate) fn home_action_kind(action: &str) -> Result<HomeActionKind> {
 /// unambiguous synonyms, and accept the result only if it lands on a real
 /// action. `activate` is left as-is (it is its own action for scenes/scripts).
 pub(crate) fn canon_home_control_action(raw: &str) -> Option<&'static str> {
+    // Fast path: on every home_control dispatch the emitter — the LLM tool call
+    // or the deterministic quick-router — usually hands us an action that is
+    // already in canonical shape: a real verb (`turn_off`, `set_brightness`) or
+    // a normalized synonym (`switch_off`). When `raw` carries nothing for
+    // `trim`/`to_lowercase`/`replace` to rewrite, matching it directly skips the
+    // two string allocations that normalization would otherwise cost. Only the
+    // uncommon natural-language forms ("turn off", "Turn-Off") take the slow
+    // path and pay for the allocation they actually need.
+    if is_canonical_shape(raw) {
+        return map_synonym(raw);
+    }
     let normalized = raw.trim().to_lowercase().replace([' ', '-'], "_");
-    let mapped: &str = match normalized.as_str() {
+    map_synonym(&normalized)
+}
+
+/// True when `raw` is already byte-for-byte what
+/// `trim().to_lowercase().replace([' ', '-'], "_")` would produce: non-empty and
+/// made up only of ASCII lowercase letters or `_`, so it has no surrounding
+/// whitespace, spaces, or dashes and no casing to fold. For such input the
+/// normalization is a no-op and its allocations are pure overhead.
+fn is_canonical_shape(raw: &str) -> bool {
+    !raw.is_empty() && raw.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
+}
+
+/// Map the unambiguous off/on synonyms onto their canonical verb, then accept
+/// the result only if it is a real [`HOME_CONTROL_ACTIONS`] entry.
+fn map_synonym(action: &str) -> Option<&'static str> {
+    let mapped: &str = match action {
         "deactivate" | "disable" | "switch_off" | "power_off" | "shut_off" => "turn_off",
         "enable" | "switch_on" | "power_on" => "turn_on",
         other => other,

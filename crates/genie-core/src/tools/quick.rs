@@ -3097,7 +3097,13 @@ fn clean_status_target(text: &str) -> String {
         }
     }
 
-    for suffix in [
+    // A status query can trail both a state word and a time qualifier
+    // ("is the garage door open right now"). Strip trailing suffixes repeatedly
+    // so the entity is the bare device ("garage door"), not "garage door open"
+    // or "front door locked" — a single pass left the second suffix attached.
+    // Longest phrases sit before their shorter prefixes so " now" never
+    // pre-empts " right now" within a pass.
+    const STATUS_SUFFIXES: &[&str] = &[
         " are on",
         " are off",
         " are open",
@@ -3120,11 +3126,12 @@ fn clean_status_target(text: &str) -> String {
         " active",
         " right now",
         " now",
-    ] {
-        if let Some(stripped) = target.strip_suffix(suffix) {
-            target = stripped.to_string();
-            break;
-        }
+    ];
+    while let Some(stripped) = STATUS_SUFFIXES
+        .iter()
+        .find_map(|suffix| target.strip_suffix(suffix))
+    {
+        target = stripped.trim_end().to_string();
     }
 
     target.trim().to_string()
@@ -4602,6 +4609,26 @@ mod tests {
         let call = route("Jared: What's the current water pressure?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "water pressure");
+    }
+
+    #[test]
+    fn status_entity_drops_both_state_word_and_time_qualifier() {
+        // A status query can trail a state word AND a time qualifier. The entity
+        // must be the bare device, not "garage door open" / "front door locked"
+        // (a single suffix strip left the second word attached).
+        for (utterance, entity) in [
+            ("Is the garage door open right now?", "garage door"),
+            ("Is the front door locked now?", "front door"),
+            ("Are the upstairs lights on right now?", "upstairs lights"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+
+        // Single-suffix queries are unchanged.
+        let call = route("Is the garage door open?").unwrap();
+        assert_eq!(call.arguments["entity"], "garage door");
     }
 
     #[test]
