@@ -2494,6 +2494,13 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     let (seconds, unit_end_index) = fractional_duration(&tokens)
         .or_else(|| couple_duration(&tokens))
         .or_else(|| parse_duration(&tokens))?;
+    // `fractional_duration` and `couple_duration` return as soon as they match
+    // their idiom, unlike `parse_duration`'s own trailing-span sum, so "half an
+    // hour and 15 minutes" silently dropped the second span, emitting a
+    // confidently-wrong 1800s instead of 2700s. Extending every path here makes
+    // compound summing uniform regardless of which detector matched first.
+    let (seconds, unit_end_index) =
+        extend_duration_with_trailing_spans(&tokens, seconds, unit_end_index);
     if seconds == 0 {
         return None;
     }
@@ -2702,14 +2709,8 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
             .trim();
         // Drop a trailing time qualifier ("apple today" -> "apple") so it does
         // not leak into the subject and defeat the company_ticker lookup (which
-        // matches the bare company name). Longest phrase first.
-        let subject = subject
-            .trim_end_matches(" right now")
-            .trim_end_matches(" today")
-            .trim_end_matches(" now")
-            .trim_end_matches(" currently")
-            .trim_end_matches(" this week")
-            .trim();
+        // matches the bare company name).
+        let subject = strip_trailing_time_qualifier(subject);
         let query = if subject.is_empty() {
             "stock price".to_string()
         } else {
@@ -2777,15 +2778,12 @@ fn company_ticker(subject: &str) -> Option<&'static str> {
     }
 }
 
-fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
-    let (_, location) = text.rsplit_once(marker)?;
-    let location = location
-        .trim()
-        .trim_start_matches("the ")
-        // Drop a trailing time qualifier so "weather in Denver tonight" yields
-        // "denver", not "denver tonight". Longest phrases first so a shorter
-        // suffix (" now") does not pre-empt a longer one (" right now"). Forecast
-        // detection reads the whole utterance, so trimming here never changes it.
+/// Strip a trailing time qualifier ("denver tonight" -> "denver", "apple this
+/// morning" -> "apple") so it does not leak into an extracted location or stock
+/// subject and defeat downstream matching. Longest phrases first so a shorter
+/// suffix (" now") does not pre-empt a longer one (" right now").
+fn strip_trailing_time_qualifier(subject: &str) -> &str {
+    subject
         .trim_end_matches(" right now")
         .trim_end_matches(" this weekend")
         .trim_end_matches(" this week")
@@ -2799,7 +2797,14 @@ fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
         .trim_end_matches(" later")
         .trim_end_matches(" currently")
         .trim()
-        .to_string();
+}
+
+fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
+    let (_, location) = text.rsplit_once(marker)?;
+    // Forecast detection reads the whole utterance, so trimming a trailing time
+    // qualifier here never changes it.
+    let location =
+        strip_trailing_time_qualifier(location.trim().trim_start_matches("the ")).to_string();
     if location.is_empty() {
         None
     } else {
@@ -3067,6 +3072,35 @@ fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
     None
 }
 
+/// Sum any further `<number> <unit>` spans immediately following an
+/// already-matched duration (optionally joined by a single "and"), the same
+/// accumulation `parse_duration` applies to its own first span. Applying this
+/// after `fractional_duration` / `couple_duration` as well makes compound
+/// summing uniform across all three duration detectors — see the caller in
+/// `timer_request`.
+fn extend_duration_with_trailing_spans(
+    tokens: &[&str],
+    mut total: u64,
+    mut last_unit_index: usize,
+) -> (u64, usize) {
+    loop {
+        let mut next = last_unit_index + 1;
+        if tokens.get(next).copied() == Some("and") {
+            next += 1;
+        }
+        let Some((amount, unit_index)) = super::number_words::parse_spoken_number(tokens, next)
+        else {
+            break;
+        };
+        let Some(multiplier) = duration_unit_seconds(tokens.get(unit_index).copied()) else {
+            break;
+        };
+        total = total.saturating_add(amount.saturating_mul(multiplier));
+        last_unit_index = unit_index;
+    }
+    (total, last_unit_index)
+}
+
 fn reminder_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
     let after_unit = tokens.get(unit_end_index + 1..)?;
     let to_index = after_unit.iter().position(|token| *token == "to")?;
@@ -3114,7 +3148,13 @@ fn clean_status_target(text: &str) -> String {
         }
     }
 
-    for suffix in [
+    // A status query can trail both a state word and a time qualifier
+    // ("is the garage door open right now"). Strip trailing suffixes repeatedly
+    // so the entity is the bare device ("garage door"), not "garage door open"
+    // or "front door locked" — a single pass left the second suffix attached.
+    // Longest phrases sit before their shorter prefixes so " now" never
+    // pre-empts " right now" within a pass.
+    const STATUS_SUFFIXES: &[&str] = &[
         " are on",
         " are off",
         " are open",
@@ -3137,11 +3177,12 @@ fn clean_status_target(text: &str) -> String {
         " active",
         " right now",
         " now",
-    ] {
-        if let Some(stripped) = target.strip_suffix(suffix) {
-            target = stripped.to_string();
-            break;
-        }
+    ];
+    while let Some(stripped) = STATUS_SUFFIXES
+        .iter()
+        .find_map(|suffix| target.strip_suffix(suffix))
+    {
+        target = stripped.trim_end().to_string();
     }
 
     target.trim().to_string()
@@ -4622,6 +4663,26 @@ mod tests {
     }
 
     #[test]
+    fn status_entity_drops_both_state_word_and_time_qualifier() {
+        // A status query can trail a state word AND a time qualifier. The entity
+        // must be the bare device, not "garage door open" / "front door locked"
+        // (a single suffix strip left the second word attached).
+        for (utterance, entity) in [
+            ("Is the garage door open right now?", "garage door"),
+            ("Is the front door locked now?", "front door"),
+            ("Are the upstairs lights on right now?", "upstairs lights"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+
+        // Single-suffix queries are unchanged.
+        let call = route("Is the garage door open?").unwrap();
+        assert_eq!(call.arguments["entity"], "garage door");
+    }
+
+    #[test]
     fn routes_personal_write_statements_to_memory_store() {
         // #379: first-person fact/appointment statements the deterministic router
         // used to abstain on, so the local model misrouted them.
@@ -4711,6 +4772,28 @@ mod tests {
             ("stock price of Tesla right now", "TSLA stock price"),
             (
                 "what is the stock price of Microsoft now",
+                "MSFT stock price",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn stock_price_query_strips_part_of_day_time_word() {
+        // The weather-location path strips part-of-day qualifiers, but the
+        // stock path did not, so "apple stock price this morning" produced
+        // "apple this morning stock price" and company_ticker missed.
+        for (utterance, query) in [
+            (
+                "what's the stock price of apple this morning",
+                "AAPL stock price",
+            ),
+            ("stock price of tesla this afternoon", "TSLA stock price"),
+            (
+                "what is the stock price of microsoft this evening",
                 "MSFT stock price",
             ),
         ] {
@@ -4879,6 +4962,33 @@ mod tests {
         let call = route("remind me in 5 minutes to feed the couple cats").unwrap();
         assert_eq!(call.arguments["seconds"], 300);
         assert_eq!(call.arguments["label"], "feed the couple cats");
+    }
+
+    #[test]
+    fn routes_fractional_and_couple_compound_timer() {
+        // Regression: fractional_duration/couple_duration return as soon as they
+        // match their idiom, unlike parse_duration's own trailing-span sum, so a
+        // second span after "half an hour"/"a couple of minutes" was silently
+        // dropped, emitting a confidently-wrong 1800s instead of 2700s.
+        let call = route("set a timer for half an hour and 15 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 1800 + 15 * 60);
+
+        // The connective "and" is optional here too, matching parse_duration.
+        let call = route("set a timer for quarter of an hour 5 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 900 + 5 * 60);
+
+        let call = route("set a timer for a couple of minutes and 30 seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 120 + 30);
+
+        // The summed span is carried past the label boundary too.
+        let call = route("remind me in half an hour and 15 minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 1800 + 15 * 60);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // A single fractional/idiom span with nothing trailing is unchanged.
+        let call = route("set a timer for half an hour").unwrap();
+        assert_eq!(call.arguments["seconds"], 1800);
     }
 
     #[test]

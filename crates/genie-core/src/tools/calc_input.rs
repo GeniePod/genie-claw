@@ -37,21 +37,28 @@ fn flanked_by_digits(chars: &[char], index: usize) -> bool {
 
 fn fold_spoken_decimals(text: &str) -> String {
     let tokens: Vec<&str> = text.split_whitespace().collect();
-    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    // Build the single-space-joined result directly instead of collecting a
+    // `Vec<String>` (one heap allocation per passthrough token via `to_string`)
+    // and then `join`-ing it. The common utterance has no "point" token, so this
+    // path is pure passthrough and previously allocated one `String` per word
+    // plus the join buffer; now it fills one `String`. Output is byte-identical.
+    let mut out = String::with_capacity(text.len());
+
     let mut index = 0;
-
     while index < tokens.len() {
-        if let Some((consumed, decimal)) = match_decimal_fold_at(&tokens, index) {
-            out.push(decimal);
-            index += consumed;
-            continue;
+        if !out.is_empty() {
+            out.push(' ');
         }
-
-        out.push(tokens[index].to_string());
-        index += 1;
+        if let Some((consumed, decimal)) = match_decimal_fold_at(&tokens, index) {
+            out.push_str(&decimal);
+            index += consumed;
+        } else {
+            out.push_str(tokens[index]);
+            index += 1;
+        }
     }
 
-    out.join(" ")
+    out
 }
 
 /// Fold `<int> point <frac>` into a single decimal token.
