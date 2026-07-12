@@ -5,10 +5,15 @@
 //! shared turn-processing entry point, plus a small `ChannelRegistry` for
 //! tracking active channels.
 //!
-//! This module only defines the types, the trait, and the registry (#563).
-//! Porting the existing voice loop, HTTP routes, and Telegram handler onto
-//! `Channel` — and actually funneling them through one agent entry point —
-//! is tracked separately (#564); no existing call sites are touched here.
+//! Reference adapters for #564 live in [`scripted`] and [`http`]; porting the
+//! existing voice loop, HTTP routes, and Telegram handler onto `Channel` is
+//! tracked in #564.
+
+pub mod http;
+pub mod scripted;
+
+pub use http::incoming_turn_from_chat_json;
+pub use scripted::ScriptedChannel;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -240,39 +245,6 @@ impl ChannelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-
-    struct MockChannel {
-        kind: ChannelKind,
-        inbox: VecDeque<IncomingTurn>,
-        pub sent: Vec<OutgoingResponse>,
-    }
-
-    impl MockChannel {
-        fn new(kind: ChannelKind, inbox: Vec<IncomingTurn>) -> Self {
-            Self {
-                kind,
-                inbox: inbox.into(),
-                sent: Vec::new(),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Channel for MockChannel {
-        fn kind(&self) -> ChannelKind {
-            self.kind
-        }
-
-        async fn recv(&mut self) -> Option<IncomingTurn> {
-            self.inbox.pop_front()
-        }
-
-        async fn send(&mut self, response: OutgoingResponse) -> Result<()> {
-            self.sent.push(response);
-            Ok(())
-        }
-    }
 
     #[test]
     fn session_key_uses_channel_and_speaker_when_name_present() {
@@ -377,9 +349,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_channel_recv_send_round_trip() {
+    async fn scripted_channel_recv_send_round_trip() {
         let turn = IncomingTurn::new("what's the weather?", "sess-1", ChannelKind::Telegram);
-        let mut channel = MockChannel::new(ChannelKind::Telegram, vec![turn]);
+        let mut channel = ScriptedChannel::new(ChannelKind::Telegram, [turn]);
 
         let received = channel.recv().await.expect("turn should be queued");
         assert_eq!(received.text, "what's the weather?");
@@ -389,8 +361,8 @@ mod tests {
             .send(OutgoingResponse::new("sunny", &received.session_id))
             .await
             .unwrap();
-        assert_eq!(channel.sent.len(), 1);
-        assert_eq!(channel.sent[0].text, "sunny");
+        assert_eq!(channel.sent_responses().len(), 1);
+        assert_eq!(channel.sent_responses()[0].text, "sunny");
     }
 
     #[test]
@@ -398,9 +370,9 @@ mod tests {
         let mut registry = ChannelRegistry::new();
         assert!(registry.is_empty());
 
-        registry.register(Box::new(MockChannel::new(ChannelKind::Voice, vec![])));
-        registry.register(Box::new(MockChannel::new(ChannelKind::Telegram, vec![])));
-        registry.register(Box::new(MockChannel::new(ChannelKind::Telegram, vec![])));
+        registry.register(Box::new(ScriptedChannel::new(ChannelKind::Voice, [])));
+        registry.register(Box::new(ScriptedChannel::new(ChannelKind::Telegram, [])));
+        registry.register(Box::new(ScriptedChannel::new(ChannelKind::Telegram, [])));
 
         assert_eq!(registry.len(), 3);
         assert_eq!(registry.by_kind(ChannelKind::Telegram).len(), 2);

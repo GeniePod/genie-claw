@@ -136,7 +136,11 @@ jobs:
           if [ "$EVENT" = "issues" ]; then
             [ "$author_label" = "maintainer" ] && add maintainer-issue || true
           elif [ "$EVENT" = "pull_request_target" ]; then
-            refs="$(printf '%s' "$BODY" | grep -oiE '(clos|fix|resolv)[a-z]*[[:space:]]+#[0-9]+' | grep -oE '[0-9]+' | sort -u)"
+            # `|| true`: GitHub runs this step under `bash -e`, so the grep
+            # returning 1 on a PR body with no issue reference would abort the
+            # whole step (regression from #626). Tolerate no-match like the
+            # other guarded commands here.
+            refs="$(printf '%s' "$BODY" | grep -oiE '(clos|fix|resolv)[a-z]*[[:space:]]+#[0-9]+' | grep -oE '[0-9]+' | sort -u || true)"
             for iss in $refs; do
               if gh api "repos/$REPO/issues/$iss/labels" --jq '.[].name' 2>/dev/null | grep -qx "maintainer-issue"; then
                 add maintainer-issue

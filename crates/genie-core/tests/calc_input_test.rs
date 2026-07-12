@@ -76,6 +76,36 @@ fn spoken_cardinals_in_percentage_and_temperature() {
 }
 
 #[test]
+fn article_before_amount_is_not_the_percentage_base() {
+    // "20 percent of a 50 dollar bill" means 50, not 1. The article word
+    // ("a"/"an") parses as the cardinal 1, so it was taken as the base and the
+    // real amount was dropped ("a 50 …" -> 1) or added to it ("a fifty …" -> 51).
+    assert_eq!(
+        expression("what is 20 percent of a 50 dollar bill"),
+        "50 * 20 / 100"
+    );
+    assert_eq!(
+        expression("what is 15 percent of an 80 dollar order"),
+        "80 * 15 / 100"
+    );
+    assert_eq!(
+        expression("what is 20 percent of a fifty dollar bill"),
+        "50 * 20 / 100"
+    );
+    // Regression guards: an article that genuinely means "one" or precedes a
+    // compound number must be unchanged.
+    assert_eq!(
+        expression("what is 20 percent of a hundred"),
+        "100 * 20 / 100"
+    );
+    assert_eq!(
+        expression("what is 20 percent of a hundred and fifty"),
+        "150 * 20 / 100"
+    );
+    assert_eq!(expression("what is 20 percent of a dollar"), "1 * 20 / 100");
+}
+
+#[test]
 fn non_math_does_not_route_to_calculate() {
     assert!(
         route("what time is it")
