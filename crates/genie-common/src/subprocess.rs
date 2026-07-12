@@ -51,9 +51,12 @@ mod tests {
     #[tokio::test]
     async fn output_with_timeout_returns_success_for_fast_command() {
         #[cfg(unix)]
-        let output = output_with_timeout(Command::new("true"), Duration::from_secs(5))
-            .await
-            .expect("fast command should succeed");
+        let output = {
+            let mut cmd = Command::new("true");
+            output_with_timeout(cmd, Duration::from_secs(5))
+                .await
+                .expect("fast command should succeed")
+        };
         #[cfg(windows)]
         let output = {
             let mut cmd = Command::new("cmd");
@@ -69,9 +72,13 @@ mod tests {
     async fn output_with_timeout_kills_slow_command() {
         let start = std::time::Instant::now();
         #[cfg(unix)]
-        let err = output_with_timeout(Command::new("sleep").arg("60"), Duration::from_millis(500))
-            .await
-            .expect_err("slow command should time out");
+        let err = {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("60");
+            output_with_timeout(cmd, Duration::from_millis(500))
+                .await
+                .expect_err("slow command should time out")
+        };
         #[cfg(windows)]
         let err = {
             let mut cmd = Command::new("powershell");

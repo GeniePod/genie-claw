@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
 
     // Load user profile from /opt/geniepod/data/profile/.
     let profile_dir = config.data_dir.join("profile");
-    match genie_core::profile::load_profile(&profile_dir, Arc::clone(&memory)).await {
+    match genie_core::profile::load_profile(&profile_dir, &memory).await {
         Ok(report) if report.total() > 0 => {
             tracing::info!(
                 toml = report.toml_facts,
