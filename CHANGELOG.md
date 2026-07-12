@@ -11,6 +11,14 @@
   `infer_metadata` until restricted, private-intent, or cautious content markers
   are present — benign household writes skip the content allocation.
 
+### Tool dispatch
+
+- **home_control**: skip the `to_lowercase` + `replace` allocations in
+  `canon_home_control_action` when the action verb is already in canonical shape
+  (`turn_off`, `set_brightness`, `switch_off`). The LLM tool call and the
+  quick-router usually emit exactly that, so the common dispatch drops two
+  `String` allocations; only natural-language forms ("turn off") still normalize.
+
 ## 1.0.0-rc.3 - 2026-07-03
 
 Third release candidate. This RC lays the **M2 foundations** — a portable

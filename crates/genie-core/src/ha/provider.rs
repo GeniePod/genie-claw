@@ -871,6 +871,7 @@ fn is_voice_relevant_domain(domain: &str) -> bool {
         domain,
         "light"
             | "switch"
+            | "fan"
             | "scene"
             | "script"
             | "climate"
@@ -920,7 +921,7 @@ fn capabilities_for(domain: &str, attributes: &serde_json::Value) -> Vec<String>
                 caps.push("set_brightness".into());
             }
         }
-        "switch" => {
+        "switch" | "fan" => {
             caps.push("turn_on".into());
             caps.push("turn_off".into());
         }
@@ -969,6 +970,7 @@ fn domain_synonyms(domain: &str) -> Vec<String> {
             "plug".into(),
             "outlet".into(),
         ],
+        "fan" => vec!["fan".into(), "fans".into()],
         "climate" => vec!["thermostat".into(), "temperature".into(), "heater".into()],
         "cover" => vec![
             "cover".into(),
@@ -1262,6 +1264,8 @@ fn domain_label(domain: &str, count: usize) -> &'static str {
         "light" => "lights",
         "switch" if count == 1 => "switch",
         "switch" => "switches",
+        "fan" if count == 1 => "fan",
+        "fan" => "fans",
         "cover" if count == 1 => "cover",
         "cover" => "covers",
         "lock" if count == 1 => "lock",
@@ -1275,6 +1279,7 @@ fn domain_plural_label(domain: &str) -> &'static str {
     match domain {
         "light" => "lights",
         "switch" => "switches",
+        "fan" => "fans",
         "cover" => "covers",
         "lock" => "locks",
         "climate" => "thermostats",
@@ -1470,6 +1475,49 @@ mod tests {
                 Some(HomeActionKind::TurnOn)
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn build_graph_admits_fan_entities_and_resolves_them() {
+        // Regression: `fan` is a controllable domain in the quick router and
+        // `infer_domain`, but `is_voice_relevant_domain` omitted it, so
+        // `build_graph` dropped every fan entity and "turn on the bedroom fan"
+        // resolved to nothing even though the fan existed.
+        let states = vec![Entity {
+            entity_id: "fan.bedroom_ceiling".into(),
+            state: "off".into(),
+            attributes: serde_json::json!({ "friendly_name": "Bedroom Ceiling Fan" }),
+        }];
+        let areas = vec![AreaTemplateEntry {
+            id: "bedroom".into(),
+            name: "Bedroom".into(),
+            entities: vec!["fan.bedroom_ceiling".into()],
+        }];
+
+        let graph = HomeAssistantProvider::build_graph(&states, &areas);
+
+        // The fan survives the voice-relevant-domain gate.
+        assert!(
+            graph
+                .entities
+                .iter()
+                .any(|entity| entity.entity_id == "fan.bedroom_ceiling"),
+            "fan entity should be admitted to the graph"
+        );
+
+        // ...and resolves for a natural "turn on the bedroom fan" request.
+        let target = HomeAssistantProvider::resolve_target_in_graph(
+            &graph,
+            "bedroom fan",
+            Some(HomeActionKind::TurnOn),
+        )
+        .expect("bedroom fan should resolve to the fan entity");
+        assert_eq!(target.domain.as_deref(), Some("fan"));
+        assert!(
+            target
+                .entity_ids
+                .contains(&"fan.bedroom_ceiling".to_string())
         );
     }
 

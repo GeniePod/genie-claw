@@ -107,6 +107,8 @@ pub enum HttpReadError {
     Malformed,
     /// The request line exceeded `max_request_line_bytes`.
     RequestLineTooLong,
+    /// The response status line exceeded `max_status_line_bytes`.
+    StatusLineTooLong,
     /// A header line exceeded `max_header_line_bytes`.
     HeaderLineTooLong,
     /// More than `max_header_count` header lines were sent.
@@ -129,6 +131,7 @@ impl HttpReadError {
     pub fn status_code(&self) -> Option<u16> {
         match self {
             HttpReadError::RequestLineTooLong
+            | HttpReadError::StatusLineTooLong
             | HttpReadError::HeaderLineTooLong
             | HttpReadError::TooManyHeaders
             | HttpReadError::HeadersTooLarge => Some(431),
@@ -154,6 +157,7 @@ impl std::fmt::Display for HttpReadError {
             HttpReadError::Closed => write!(f, "peer closed before a complete request"),
             HttpReadError::Malformed => write!(f, "malformed request line"),
             HttpReadError::RequestLineTooLong => write!(f, "request line too long"),
+            HttpReadError::StatusLineTooLong => write!(f, "response status line too long"),
             HttpReadError::HeaderLineTooLong => write!(f, "header line too long"),
             HttpReadError::TooManyHeaders => write!(f, "too many headers"),
             HttpReadError::HeadersTooLarge => write!(f, "headers too large"),
@@ -280,6 +284,202 @@ where
         content_length,
         body,
     })
+}
+
+/// Bounds enforced while reading one outbound HTTP/1.1 response.
+///
+/// Header ceilings mirror the inbound [`HttpLimits`] defaults so a peer that
+/// streams an endless status line or header cannot OOM an outbound client the
+/// way issue #195 fixed for inbound servers.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpResponseLimits {
+    /// Max bytes in the status line (`HTTP/1.1 200 OK\r\n`), newline included.
+    pub max_status_line_bytes: usize,
+    /// Max bytes in any single header line, newline included.
+    pub max_header_line_bytes: usize,
+    /// Max number of header lines.
+    pub max_header_count: usize,
+    /// Max total bytes across all header lines.
+    pub max_header_bytes: usize,
+    /// Max decoded response body bytes.
+    pub max_body_bytes: usize,
+}
+
+impl HttpResponseLimits {
+    /// Build limits with shared header ceilings and a caller-supplied body cap.
+    pub fn with_body_cap(max_body_bytes: usize) -> Self {
+        // Mirror the `[http]` defaults from `HttpServerConfig` / issue #195 ceilings.
+        Self {
+            max_status_line_bytes: 8 * 1024,
+            max_header_line_bytes: 8 * 1024,
+            max_header_count: 100,
+            max_header_bytes: 64 * 1024,
+            max_body_bytes,
+        }
+    }
+}
+
+/// A parsed outbound HTTP response (status + body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+/// Read and parse one HTTP response from `reader`, enforcing every bound in
+/// `limits`. Unlike [`read_request`], chunked `Transfer-Encoding` is supported
+/// because real backends (LLM servers, Home Assistant) use it.
+pub async fn read_response<R>(
+    reader: &mut R,
+    limits: &HttpResponseLimits,
+) -> Result<HttpResponse, HttpReadError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    read_response_inner(reader, limits).await
+}
+
+async fn read_response_inner<R>(
+    reader: &mut R,
+    limits: &HttpResponseLimits,
+) -> Result<HttpResponse, HttpReadError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    let n = read_line_bounded(reader, &mut line, limits.max_status_line_bytes, || {
+        HttpReadError::StatusLineTooLong
+    })
+    .await?;
+    if n == 0 {
+        return Err(HttpReadError::Closed);
+    }
+    let status_line = String::from_utf8_lossy(&line);
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    let mut header_count = 0usize;
+    let mut total_header_bytes = 0usize;
+
+    loop {
+        if header_count >= limits.max_header_count {
+            return Err(HttpReadError::TooManyHeaders);
+        }
+        line.clear();
+        let n = read_line_bounded(reader, &mut line, limits.max_header_line_bytes, || {
+            HttpReadError::HeaderLineTooLong
+        })
+        .await?;
+        if n == 0 {
+            return Err(HttpReadError::Closed);
+        }
+        total_header_bytes = total_header_bytes.saturating_add(n);
+        if total_header_bytes > limits.max_header_bytes {
+            return Err(HttpReadError::HeadersTooLarge);
+        }
+
+        let text = String::from_utf8_lossy(&line);
+        let trimmed = text.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        header_count += 1;
+
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(val) = lower.strip_prefix("content-length:") {
+            content_length = val.trim().parse().ok();
+        }
+        if let Some(val) = lower.strip_prefix("transfer-encoding:")
+            && val.contains("chunked")
+        {
+            chunked = true;
+        }
+    }
+
+    let body = if chunked {
+        read_chunked_response_body(reader, limits).await?
+    } else if let Some(content_length) = content_length {
+        if content_length > limits.max_body_bytes {
+            return Err(HttpReadError::BodyTooLarge);
+        }
+        let mut buf = vec![0u8; content_length];
+        reader
+            .read_exact(&mut buf)
+            .await
+            .map_err(HttpReadError::Io)?;
+        String::from_utf8_lossy(&buf).to_string()
+    } else {
+        let cap = limits.max_body_bytes;
+        let mut limited = reader.take(cap as u64 + 1);
+        let mut body = String::new();
+        limited
+            .read_to_string(&mut body)
+            .await
+            .map_err(HttpReadError::Io)?;
+        if body.len() > cap {
+            return Err(HttpReadError::BodyTooLarge);
+        }
+        body
+    };
+
+    Ok(HttpResponse { status, body })
+}
+
+/// Max bytes in a chunked `Transfer-Encoding` size line (hex digits + extensions).
+const MAX_CHUNK_SIZE_LINE_BYTES: usize = 32;
+
+async fn read_chunked_response_body<R>(
+    reader: &mut R,
+    limits: &HttpResponseLimits,
+) -> Result<String, HttpReadError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut body = Vec::new();
+
+    loop {
+        let mut size_line = Vec::new();
+        read_line_bounded(reader, &mut size_line, MAX_CHUNK_SIZE_LINE_BYTES, || {
+            HttpReadError::HeaderLineTooLong
+        })
+        .await?;
+        let size_line_text = String::from_utf8_lossy(&size_line);
+        let size_hex = size_line_text.trim().split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16).map_err(|_| HttpReadError::Malformed)?;
+
+        if size == 0 {
+            let mut trailing = Vec::new();
+            read_line_bounded(reader, &mut trailing, MAX_CHUNK_SIZE_LINE_BYTES, || {
+                HttpReadError::HeaderLineTooLong
+            })
+            .await?;
+            break;
+        }
+
+        if body.len().saturating_add(size) > limits.max_body_bytes {
+            return Err(HttpReadError::BodyTooLarge);
+        }
+
+        let mut chunk = vec![0u8; size];
+        reader
+            .read_exact(&mut chunk)
+            .await
+            .map_err(HttpReadError::Io)?;
+        body.extend_from_slice(&chunk);
+
+        let mut crlf = [0u8; 2];
+        reader
+            .read_exact(&mut crlf)
+            .await
+            .map_err(HttpReadError::Io)?;
+    }
+
+    Ok(String::from_utf8_lossy(&body).to_string())
 }
 
 /// Read one `\n`-terminated line into `out`, appending at most `max_bytes`.
@@ -752,6 +952,53 @@ mod tests {
         let err = read_request(&mut reader, &test_limits()).await.unwrap_err();
         assert!(matches!(err, HttpReadError::Closed));
         assert_eq!(err.status_code(), None);
+    }
+
+    fn test_response_limits() -> HttpResponseLimits {
+        HttpResponseLimits::with_body_cap(64 * 1024)
+    }
+
+    #[tokio::test]
+    async fn parses_simple_response_with_body() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+        let mut reader = reader_for(raw.as_bytes());
+        let resp = read_response(&mut reader, &test_response_limits())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, "{\"ok\":true}");
+    }
+
+    #[tokio::test]
+    async fn unterminated_response_header_is_rejected_in_bounded_memory() {
+        let mut limits = test_response_limits();
+        limits.max_header_line_bytes = 4096;
+        let prefix = Cursor::new(b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec());
+        let endless = prefix.chain(tokio::io::repeat(b'A'));
+        let mut reader = BufReader::new(endless);
+        let err = read_response(&mut reader, &limits).await.unwrap_err();
+        assert!(matches!(err, HttpReadError::HeaderLineTooLong));
+    }
+
+    #[tokio::test]
+    async fn oversized_response_status_line_is_rejected() {
+        let mut limits = test_response_limits();
+        limits.max_status_line_bytes = 64;
+        let raw = format!("HTTP/1.1 200 {}\r\n\r\n", "x".repeat(4096));
+        let mut reader = reader_for(raw.as_bytes());
+        let err = read_response(&mut reader, &limits).await.unwrap_err();
+        assert!(matches!(err, HttpReadError::StatusLineTooLong));
+    }
+
+    #[tokio::test]
+    async fn chunked_response_body_is_decoded_with_cap() {
+        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let mut reader = reader_for(raw.as_bytes());
+        let resp = read_response(&mut reader, &test_response_limits())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, "hello");
     }
 
     // --- Cross-origin request gate (issue #228) ---------------------------
