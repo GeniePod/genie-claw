@@ -23,16 +23,13 @@ const PDF_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Runs asynchronously and must be called **without** holding the process-wide
 /// `Memory` mutex so a hung poppler child cannot block daemon boot.
 pub async fn extract_pdf_text(path: &Path) -> Option<String> {
-    let output = match output_with_timeout(
-        Command::new("pdftotext").args([
-            "-layout",
-            &path.to_string_lossy(),
-            "-", // output to stdout
-        ]),
-        PDF_EXTRACT_TIMEOUT,
-    )
-    .await
-    {
+    let mut cmd = Command::new("pdftotext");
+    cmd.args([
+        "-layout",
+        &path.to_string_lossy(),
+        "-", // output to stdout
+    ]);
+    let output = match output_with_timeout(cmd, PDF_EXTRACT_TIMEOUT).await {
         Ok(output) => output,
         Err(SubprocessError::Timeout) => {
             tracing::warn!(
