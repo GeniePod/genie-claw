@@ -577,6 +577,15 @@ fn is_remote_url(url: &str) -> bool {
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
     let authority = stripped.split('/').next().unwrap_or(stripped);
+    // Strip any userinfo ("user[:pass]@") before extracting the host. Without
+    // this, a crafted authority such as "localhost:1@evil.com" masquerades as a
+    // loopback host (the ':' split grabs the userinfo), and conversely a real
+    // loopback host behind userinfo ("user:pass@[::1]:8080") is misread as
+    // remote. Both break the on-device-only guarantee this check enforces.
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
     let host = if let Some(rest) = authority.strip_prefix('[') {
         rest.find(']')
             .map(|idx| &authority[..=idx + 1])
@@ -1545,7 +1554,16 @@ impl Config {
         } else {
             host
         };
-        format!("{host}:{}", self.core.port)
+        // Bracket a bare IPv6 literal (e.g. `::1`) so the result is a valid
+        // `host:port` authority. `ensure_port` and `derive_hosts_and_origins`
+        // already bracket IPv6 for the other address paths; a naive
+        // `{host}:{port}` here would emit `::1:3000`, an unparseable address
+        // that yields a false "core DOWN" from `core_health_url`.
+        if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{}", self.core.port)
+        } else {
+            format!("{host}:{}", self.core.port)
+        }
     }
 
     /// Health-probe URL for genie-core, derived from `[core].bind_host` and
@@ -1974,6 +1992,39 @@ mod tests {
     }
 
     #[test]
+    fn is_remote_url_classifies_plain_hosts() {
+        assert!(!is_remote_url("http://127.0.0.1:8080"));
+        assert!(!is_remote_url("http://localhost:3000/v1"));
+        assert!(!is_remote_url("http://[::1]:8080"));
+        assert!(!is_remote_url("http://127.0.0.1"));
+        assert!(is_remote_url("http://evil.com"));
+        assert!(is_remote_url("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn is_remote_url_strips_userinfo_before_matching_host() {
+        // A crafted authority must not masquerade as loopback: the real host is
+        // evil.com, so these are remote even though the userinfo looks local.
+        assert!(is_remote_url("http://localhost:1@evil.com/v1"));
+        assert!(is_remote_url("http://127.0.0.1:8080@evil.com"));
+        // Conversely, a genuine loopback host behind userinfo stays local.
+        assert!(!is_remote_url("http://user:pass@[::1]:8080"));
+        assert!(!is_remote_url("http://user@localhost"));
+    }
+
+    #[test]
+    fn privacy_proxy_rejects_userinfo_masked_remote_endpoint() {
+        let proxy = PrivacyProxyConfig {
+            enabled: true,
+            base_url: "http://localhost:1@evil.com/v1".to_string(),
+            ..PrivacyProxyConfig::default()
+        };
+        // The endpoint must be rejected — raw household data may only go to a
+        // genuine on-device address, not a userinfo-masked remote host.
+        assert!(!proxy.endpoint_is_valid());
+    }
+
+    #[test]
     fn homeassistant_is_optional_by_default() {
         let config = test_config();
         assert!(config.homeassistant_service().is_none());
@@ -2323,6 +2374,25 @@ systemd_unit = "genie-ai-runtime.service"
     }
 
     #[test]
+    fn core_http_addr_brackets_ipv6_bind_host() {
+        // `::1` is a valid local bind (see `is_remote_url` and the
+        // `core_api_local_only` security summary). A bare `{host}:{port}`
+        // would emit the unparseable `::1:3000`; it must be bracketed.
+        let mut config = test_config();
+        config.core.port = 3000;
+        config.core.bind_host = "::1".into();
+        assert_eq!(config.core_http_addr(), "[::1]:3000");
+    }
+
+    #[test]
+    fn core_http_addr_keeps_already_bracketed_ipv6() {
+        let mut config = test_config();
+        config.core.port = 3000;
+        config.core.bind_host = "[::1]".into();
+        assert_eq!(config.core_http_addr(), "[::1]:3000");
+    }
+
+    #[test]
     fn core_health_url_uses_default_port() {
         let config = test_config();
         assert_eq!(config.core_health_url(), "http://127.0.0.1:3000/api/health");
@@ -2348,6 +2418,16 @@ systemd_unit = "genie-ai-runtime.service"
         config.core.bind_host = "10.0.0.5".into();
         config.core.port = 4000;
         assert_eq!(config.core_health_url(), "http://10.0.0.5:4000/api/health");
+    }
+
+    #[test]
+    fn core_health_url_brackets_ipv6_bind_host() {
+        // A bare IPv6 host must produce a valid URL authority, not
+        // `http://::1:3000/...`, which no HTTP client can parse.
+        let mut config = test_config();
+        config.core.bind_host = "::1".into();
+        config.core.port = 3000;
+        assert_eq!(config.core_health_url(), "http://[::1]:3000/api/health");
     }
 
     #[test]

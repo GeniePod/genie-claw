@@ -87,6 +87,27 @@ fn valid_actions_and_synonyms_pass_through() {
 }
 
 #[test]
+fn natural_language_forms_still_normalize() {
+    // These carry separators or casing, so they take the allocating slow path.
+    // Locking their output guards the fast-path split: a canonical-shape input
+    // and its de-normalized twin must resolve to the same verb.
+    for (raw, want) in [
+        ("turn off", Some(("turn_off", None))),
+        ("Turn-Off", Some(("turn_off", None))),
+        (" turn_off ", Some(("turn_off", None))),
+        ("SWITCH OFF", Some(("turn_off", None))),
+        ("power-on", Some(("turn_on", None))),
+        ("Set-Brightness", Some(("set_brightness", None))),
+    ] {
+        assert_eq!(
+            canonicalize_household_action(raw, None),
+            want,
+            "'{raw}' should normalize to {want:?}"
+        );
+    }
+}
+
+#[test]
 fn level_maps_to_set_brightness_and_keeps_value() {
     assert_eq!(
         canonicalize_household_action("set_level", Some(90.0)),
