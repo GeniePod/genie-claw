@@ -252,6 +252,7 @@ fn status_text(code: u16) -> &'static str {
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
         500 => "Internal Server Error",
         _ => "Unknown",
     }
@@ -263,6 +264,15 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    // `get_tegrastats` returns 503 on a transient SQLite busy/locked error
+    // (classify_sqlite_error, added in #299). `write_response` builds the
+    // status line as `HTTP/1.1 {code} {status_text(code)}`, so the reason
+    // phrase table must name 503 instead of falling through to "Unknown".
+    #[test]
+    fn status_text_maps_503_to_service_unavailable() {
+        assert_eq!(super::status_text(503), "Service Unavailable");
+    }
 
     /// Parse a `Config` from a TOML fragment; every field has a serde default,
     /// so the fragment only needs the `[http]` overrides under test.
