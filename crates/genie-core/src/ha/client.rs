@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
+use genie_common::http::{HttpReadError, HttpResponseLimits, read_response};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use zeroize::Zeroizing;
 
@@ -264,104 +265,22 @@ async fn read_http_response(
     max_response_bytes: usize,
 ) -> Result<HttpResponse> {
     let mut buf_reader = BufReader::new(reader);
-
-    let mut status_line = String::new();
-    buf_reader.read_line(&mut status_line).await?;
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| anyhow::anyhow!("invalid HTTP response status line: {}", status_line))?;
-
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
-
-    loop {
-        let mut line = String::new();
-        buf_reader.read_line(&mut line).await?;
-        if line.trim().is_empty() {
-            break;
-        }
-
-        let lower = line.to_lowercase();
-        if let Some(val) = lower.strip_prefix("content-length:") {
-            content_length = val.trim().parse().ok();
-        }
-        if let Some(val) = lower.strip_prefix("transfer-encoding:")
-            && val.contains("chunked")
-        {
-            chunked = true;
-        }
+    let limits = HttpResponseLimits::with_body_cap(max_response_bytes);
+    let response = read_response(&mut buf_reader, &limits)
+        .await
+        .map_err(|e| match e {
+            HttpReadError::BodyTooLarge => {
+                anyhow::anyhow!("Home Assistant response exceeded body cap")
+            }
+            other => anyhow::anyhow!("{other}"),
+        })?;
+    if response.status == 0 {
+        anyhow::bail!("invalid HTTP response status line");
     }
-
-    let body = if chunked {
-        read_chunked_body(&mut buf_reader, max_response_bytes).await?
-    } else if let Some(content_length) = content_length {
-        if content_length > max_response_bytes {
-            anyhow::bail!(
-                "Home Assistant response Content-Length {} exceeds cap {}",
-                content_length,
-                max_response_bytes
-            );
-        }
-        let mut buf = vec![0u8; content_length];
-        buf_reader.read_exact(&mut buf).await?;
-        String::from_utf8_lossy(&buf).to_string()
-    } else {
-        // No `Content-Length` and no `Transfer-Encoding: chunked`: cap the
-        // read at `max_response_bytes + 1` so we can distinguish "fits in
-        // the cap" from "ran over the cap" without ever allocating more.
-        let cap = max_response_bytes;
-        let mut limited = (&mut buf_reader).take(cap as u64 + 1);
-        let mut body = String::new();
-        limited.read_to_string(&mut body).await?;
-        if body.len() > cap {
-            anyhow::bail!(
-                "Home Assistant response without Content-Length exceeded {} bytes",
-                cap
-            );
-        }
-        body
-    };
-
-    Ok(HttpResponse { status_code, body })
-}
-
-async fn read_chunked_body<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-    max_bytes: usize,
-) -> Result<String> {
-    let mut body = Vec::new();
-
-    loop {
-        let mut size_line = String::new();
-        reader.read_line(&mut size_line).await?;
-        let size_hex = size_line.trim();
-        let size = usize::from_str_radix(size_hex, 16)
-            .with_context(|| format!("invalid chunk size: {}", size_hex))?;
-
-        if size == 0 {
-            let mut trailing = String::new();
-            reader.read_line(&mut trailing).await?;
-            break;
-        }
-
-        if body.len().saturating_add(size) > max_bytes {
-            anyhow::bail!(
-                "Home Assistant chunked response exceeded {} bytes",
-                max_bytes
-            );
-        }
-
-        let mut chunk = vec![0u8; size];
-        tokio::io::AsyncReadExt::read_exact(reader, &mut chunk).await?;
-        body.extend_from_slice(&chunk);
-
-        let mut crlf = [0u8; 2];
-        tokio::io::AsyncReadExt::read_exact(reader, &mut crlf).await?;
-    }
-
-    Ok(String::from_utf8_lossy(&body).to_string())
+    Ok(HttpResponse {
+        status_code: response.status,
+        body: response.body,
+    })
 }
 
 fn parse_http_url(url: &str) -> Result<(String, u16)> {

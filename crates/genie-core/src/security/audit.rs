@@ -33,6 +33,27 @@ pub fn log_speaker_resolved(name: &str, confidence: &str) {
     tracing::info!(speaker = name, confidence, "speaker identity resolved");
 }
 
+/// Emit a structured audit event when household data leaves the device via a
+/// gated cloud provider (PrivacyProxy today). Logs counts only — never message
+/// bodies or memory contents (#570).
+pub fn log_provider_escalation(
+    reason: &str,
+    surface: &str,
+    message_count: usize,
+    payload_chars: usize,
+    vocab_terms: usize,
+) {
+    tracing::info!(
+        escalation_reason = reason,
+        provider_surface = surface,
+        message_count,
+        payload_chars,
+        vocab_terms,
+        data_redacted = true,
+        "provider escalation: data left device via gated cloud path"
+    );
+}
+
 /// Run all startup security checks. Returns findings.
 pub fn run_audit(config_path: &Path, data_dir: &Path) -> Vec<AuditFinding> {
     let mut findings = Vec::new();
