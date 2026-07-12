@@ -12,14 +12,13 @@ use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::channel::{ChannelKind, IncomingTurn, SpeakerInfo};
+use crate::channel::{IncomingTurn, incoming_turn_from_chat_json};
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
 use crate::llm::{
     LlmBackendClient, LlmClient, LlmRequestHints, LocalProvider, Message, PrivacyProxyBackend,
     Provider,
 };
-use crate::memory::policy::IdentityConfidence;
 use crate::memory::{SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
 use crate::prompt::ModelFamily;
@@ -1178,54 +1177,6 @@ async fn handle_chat_stream(
     .await?;
 
     Ok(())
-}
-
-fn parse_speaker_field(value: &serde_json::Value) -> SpeakerInfo {
-    match value {
-        serde_json::Value::String(name) if !name.trim().is_empty() => SpeakerInfo {
-            name: Some(name.trim().to_string()),
-            confidence: IdentityConfidence::High,
-        },
-        serde_json::Value::Object(_) => {
-            let map = value.as_object().expect("object branch");
-            let name = map
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string);
-            let confidence = map
-                .get("confidence")
-                .and_then(|v| v.as_str())
-                .map(chat_identity_confidence_from_str)
-                .unwrap_or(IdentityConfidence::High);
-            SpeakerInfo { name, confidence }
-        }
-        _ => SpeakerInfo::default(),
-    }
-}
-
-fn chat_identity_confidence_from_str(value: &str) -> IdentityConfidence {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "high" => IdentityConfidence::High,
-        "medium" => IdentityConfidence::Medium,
-        "low" => IdentityConfidence::Low,
-        _ => IdentityConfidence::Unknown,
-    }
-}
-
-fn incoming_turn_from_chat_json(
-    parsed: &serde_json::Value,
-    fallback_session: &str,
-) -> IncomingTurn {
-    let text = parsed.get("message").and_then(|v| v.as_str()).unwrap_or("");
-    let mut turn = IncomingTurn::new(text, fallback_session, ChannelKind::Http);
-    if let Some(speaker) = parsed.get("speaker").map(parse_speaker_field)
-        && speaker.is_resolved()
-    {
-        turn = turn.with_speaker(speaker);
-    }
-    turn
 }
 
 async fn resolve_chat_conv_id(
