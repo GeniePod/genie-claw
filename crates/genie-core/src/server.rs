@@ -1184,15 +1184,21 @@ async fn resolve_chat_conv_id(
     parsed: &serde_json::Value,
     turn: &IncomingTurn,
 ) -> String {
+    let now_ms = session_now_ms();
     if let Some(id) = parsed
         .get("conversation_id")
         .and_then(|v| v.as_str())
         .filter(|id| !id.trim().is_empty())
     {
+        // A client-supplied conversation id still participates in the bounded,
+        // idle-expiring registry so clients that always send their own id (the
+        // web UI, Telegram) stay within the Jetson session budget instead of
+        // silently bypassing the cap. See #565.
+        let mut registry = registry.lock().await;
+        registry.track(id, now_ms);
         return id.to_string();
     }
     let session_key = turn.conversation_id(&turn.session_id);
-    let now_ms = session_now_ms();
     let mut registry = registry.lock().await;
     registry.resolve(&session_key, now_ms)
 }
@@ -2749,8 +2755,10 @@ mod tests {
     use super::{
         ConnectivityState, StreamMode, detect_stream_mode, handle_actuation_actions, handle_chat,
         handle_health, handle_runtime_contract, handle_web_search, handle_web_search_status,
-        is_client_disconnect_error, overall_health_status, should_summarize_tool_result,
+        is_client_disconnect_error, overall_health_status, resolve_chat_conv_id,
+        should_summarize_tool_result,
     };
+    use crate::channel::{ChannelKind, IncomingTurn};
     use crate::connectivity::NullConnectivityController;
     use crate::conversation::ConversationStore;
     use crate::memory::{Memory, SharedMemory};
@@ -2830,6 +2838,24 @@ mod tests {
                 self.sources.lock().unwrap().push(src);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_conversation_ids_are_bounded_by_the_session_registry() {
+        // Before #565's lifecycle wiring, a client-supplied `conversation_id`
+        // short-circuited session resolution and never entered the registry, so
+        // clients that always send their own id (web UI, Telegram) escaped the
+        // Jetson session cap entirely. Resolving many distinct explicit ids must
+        // now keep the registry bounded to its cap.
+        let registry = Mutex::new(SessionRegistry::new(2, 60_000));
+        let turn = IncomingTurn::new("hello", "default", ChannelKind::Telegram);
+        for i in 0..5 {
+            let parsed = serde_json::json!({ "conversation_id": format!("telegram-{i}") });
+            let conv_id = resolve_chat_conv_id(&registry, &parsed, &turn).await;
+            // The caller's own id is still honored verbatim for continuity.
+            assert_eq!(conv_id, format!("telegram-{i}"));
+        }
+        assert_eq!(registry.lock().await.len(), 2, "registry must stay bounded");
     }
 
     fn temp_db_paths(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {

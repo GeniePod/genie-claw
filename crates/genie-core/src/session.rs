@@ -54,22 +54,36 @@ impl SessionRegistry {
 
     /// Resolve `session_key` to a conversation id, creating one when absent.
     pub fn resolve(&mut self, session_key: &str, now_ms: i64) -> String {
+        self.track(session_key, now_ms);
+        // `track` inserts `conversation_id == session_key` when absent and never
+        // evicts the just-inserted entry (the cap is enforced before insert), so
+        // the lookup succeeds; the fallback only guards a degenerate cap of 0.
+        self.conversation_id(session_key)
+            .map(str::to_string)
+            .unwrap_or_else(|| session_key.to_string())
+    }
+
+    /// Register (or refresh) a conversation id in the bounded, idle-expiring
+    /// registry without minting a new session key.
+    ///
+    /// Used when a client supplies its own `conversation_id`: those turns must
+    /// still count against the Jetson session budget (idle expiry + LRU cap)
+    /// instead of bypassing the registry, otherwise the real clients that always
+    /// send an explicit id (web UI, Telegram) would never be bounded at all.
+    pub fn track(&mut self, conversation_id: &str, now_ms: i64) {
         self.evict_idle(now_ms);
-        if let Some(entry) = self.sessions.get(session_key) {
-            let conv_id = entry.conversation_id.clone();
-            self.touch(session_key, now_ms);
-            return conv_id;
+        if self.sessions.contains_key(conversation_id) {
+            self.touch(conversation_id, now_ms);
+            return;
         }
         self.enforce_cap();
-        let conversation_id = session_key.to_string();
         self.sessions.insert(
-            session_key.to_string(),
+            conversation_id.to_string(),
             SessionEntry {
-                conversation_id: conversation_id.clone(),
+                conversation_id: conversation_id.to_string(),
                 last_active_ms: now_ms,
             },
         );
-        conversation_id
     }
 
     pub fn touch(&mut self, session_key: &str, now_ms: i64) {
@@ -131,6 +145,42 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert!(registry.conversation_id("http:dana").is_none());
         assert_eq!(registry.conversation_id("http:maya"), Some("http:maya"));
+    }
+
+    #[test]
+    fn track_registers_client_supplied_conversation_under_the_cap() {
+        // A client-supplied conversation id must count against the cap just like
+        // a resolved session, otherwise clients that always send an explicit id
+        // would bypass the Jetson session budget entirely.
+        let mut registry = SessionRegistry::new(2, 60_000);
+        registry.track("telegram-1", 1_000);
+        registry.track("telegram-2", 2_000);
+        registry.track("telegram-3", 3_000);
+        assert_eq!(registry.len(), 2);
+        // Oldest (telegram-1) was evicted to make room.
+        assert!(registry.conversation_id("telegram-1").is_none());
+        assert_eq!(registry.conversation_id("telegram-3"), Some("telegram-3"));
+    }
+
+    #[test]
+    fn track_refreshes_activity_without_growing_the_registry() {
+        let mut registry = SessionRegistry::new(4, 60_000);
+        registry.track("http:dana", 1_000);
+        registry.track("http:dana", 5_000);
+        assert_eq!(registry.len(), 1);
+        // The refreshed entry survives an eviction sweep past the original stamp.
+        assert_eq!(registry.evict_idle(2_000 + 60_000), 0);
+        assert_eq!(registry.conversation_id("http:dana"), Some("http:dana"));
+    }
+
+    #[test]
+    fn tracked_session_idle_expires() {
+        let mut registry = SessionRegistry::new(8, 1_000);
+        registry.track("telegram-7", 1_000);
+        assert_eq!(registry.len(), 1);
+        // A later turn past the TTL sweeps the idle client session.
+        registry.track("http:maya", 3_000);
+        assert!(registry.conversation_id("telegram-7").is_none());
     }
 
     #[test]

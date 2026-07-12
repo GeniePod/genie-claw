@@ -577,6 +577,15 @@ fn is_remote_url(url: &str) -> bool {
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
     let authority = stripped.split('/').next().unwrap_or(stripped);
+    // Strip any userinfo ("user[:pass]@") before extracting the host. Without
+    // this, a crafted authority such as "localhost:1@evil.com" masquerades as a
+    // loopback host (the ':' split grabs the userinfo), and conversely a real
+    // loopback host behind userinfo ("user:pass@[::1]:8080") is misread as
+    // remote. Both break the on-device-only guarantee this check enforces.
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
     let host = if let Some(rest) = authority.strip_prefix('[') {
         rest.find(']')
             .map(|idx| &authority[..=idx + 1])
@@ -1980,6 +1989,39 @@ mod tests {
             http: HttpServerConfig::default(),
             storage: StorageConfig::default(),
         }
+    }
+
+    #[test]
+    fn is_remote_url_classifies_plain_hosts() {
+        assert!(!is_remote_url("http://127.0.0.1:8080"));
+        assert!(!is_remote_url("http://localhost:3000/v1"));
+        assert!(!is_remote_url("http://[::1]:8080"));
+        assert!(!is_remote_url("http://127.0.0.1"));
+        assert!(is_remote_url("http://evil.com"));
+        assert!(is_remote_url("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn is_remote_url_strips_userinfo_before_matching_host() {
+        // A crafted authority must not masquerade as loopback: the real host is
+        // evil.com, so these are remote even though the userinfo looks local.
+        assert!(is_remote_url("http://localhost:1@evil.com/v1"));
+        assert!(is_remote_url("http://127.0.0.1:8080@evil.com"));
+        // Conversely, a genuine loopback host behind userinfo stays local.
+        assert!(!is_remote_url("http://user:pass@[::1]:8080"));
+        assert!(!is_remote_url("http://user@localhost"));
+    }
+
+    #[test]
+    fn privacy_proxy_rejects_userinfo_masked_remote_endpoint() {
+        let proxy = PrivacyProxyConfig {
+            enabled: true,
+            base_url: "http://localhost:1@evil.com/v1".to_string(),
+            ..PrivacyProxyConfig::default()
+        };
+        // The endpoint must be rejected — raw household data may only go to a
+        // genuine on-device address, not a userinfo-masked remote host.
+        assert!(!proxy.endpoint_is_valid());
     }
 
     #[test]

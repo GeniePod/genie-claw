@@ -1173,6 +1173,27 @@ fn normalize_brightness(value: f64) -> u8 {
     }
 }
 
+/// Whether an entity's state counts as "active" in a multi-entity group status
+/// summary. Beyond the literal on/open/unlocked, this includes climate hvac
+/// modes (a thermostat reports its mode — `heat`/`cool`/`auto`/… — as its
+/// state, never `"on"`, so an actively conditioning thermostat must still
+/// count) and a `playing` media player. Idle/off states (`off`, `idle`,
+/// `paused`, `closed`, `locked`, `standby`, `unavailable`) are not active.
+fn is_active_state(state: &str) -> bool {
+    matches!(
+        state,
+        "on" | "open"
+            | "unlocked"
+            | "playing"
+            | "heat"
+            | "cool"
+            | "auto"
+            | "heat_cool"
+            | "dry"
+            | "fan_only"
+    )
+}
+
 fn summarize_state(target_name: &str, domain: Option<&str>, entities: &[Entity]) -> String {
     if entities.is_empty() {
         return format!("I couldn't read the state for {}.", target_name);
@@ -1219,7 +1240,7 @@ fn summarize_state(target_name: &str, domain: Option<&str>, entities: &[Entity])
 
     let on_like = entities
         .iter()
-        .filter(|entity| matches!(entity.state.as_str(), "on" | "open" | "unlocked"))
+        .filter(|entity| is_active_state(&entity.state))
         .count();
     let unavailable = entities
         .iter()
@@ -1712,6 +1733,41 @@ mod tests {
         assert!(
             summary.contains("brightness 100%"),
             "expected 100%, got: {summary}"
+        );
+    }
+
+    /// Regression: climate entities report their hvac mode (`heat`/`cool`/…) as
+    /// their state, never `"on"`, so a group of actively-conditioning
+    /// thermostats used to summarize as "0 of N are active". A `playing` media
+    /// player had the same problem.
+    #[test]
+    fn group_status_counts_climate_and_media_active_states() {
+        let entity = |id: &str, state: &str| Entity {
+            entity_id: id.into(),
+            state: state.into(),
+            attributes: serde_json::json!({}),
+        };
+
+        // Two thermostats actively heating/cooling: both count as active.
+        let thermostats = [
+            entity("climate.living", "heat"),
+            entity("climate.bedroom", "cool"),
+        ];
+        let summary = summarize_state("Thermostats", Some("climate"), &thermostats);
+        assert!(
+            summary.contains("2 of 2 are active"),
+            "expected both thermostats active, got: {summary}"
+        );
+
+        // An `off` thermostat is not counted; a `playing` media player is.
+        let mixed = [
+            entity("climate.study", "off"),
+            entity("media_player.den", "playing"),
+        ];
+        let summary = summarize_state("Devices", None, &mixed);
+        assert!(
+            summary.contains("1 of 2 are active"),
+            "expected only the playing media player active, got: {summary}"
         );
     }
 }

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Quick-router tool-call accuracy
+
+- **Timer/reminder**: `fractional_duration` ("half an hour") and
+  `couple_duration` ("a couple of minutes") now sum any trailing
+  `<number> <unit>` span the same way `parse_duration` already does, so
+  "half an hour and 15 minutes" emits 2700s instead of silently
+  truncating to 1800s.
+
 ### Memory
 
 - **Auto-capture**: defer the allocating `to_lowercase` in `extract_facts` until
