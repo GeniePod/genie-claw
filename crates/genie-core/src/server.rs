@@ -3,9 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use genie_common::config::{
-    EscalationTrigger, HttpServerConfig, PrivacyProxyConfig, StorageConfig,
-};
+use genie_common::config::{HttpServerConfig, PrivacyProxyConfig, StorageConfig};
 use genie_common::http::{GuardRejection, HttpLimits, OriginDecision, RequestGuard, read_request};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -16,8 +14,8 @@ use crate::channel::{IncomingTurn, incoming_turn_from_chat_json};
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
 use crate::llm::{
-    LlmBackendClient, LlmClient, LlmRequestHints, LocalProvider, Message, PrivacyProxyBackend,
-    Provider,
+    EscalationReason, LlmBackendClient, LlmClient, LlmRequestHints, LocalProvider, Message,
+    PrivacyProxyBackend, Provider, may_escalate, summarize_messages,
 };
 use crate::memory::{SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
@@ -1298,20 +1296,24 @@ pub async fn process_chat_turn(
 
     // Escalate on overflow before attempting the local model — sending a
     // context-length request to the local model would just error anyway.
-    let triggers_overflow = privacy_proxy.is_some()
-        && context_overflowed
-        && matches!(
-            privacy_proxy.map(|p| &p.trigger),
-            Some(EscalationTrigger::ContextOverflow)
-                | Some(EscalationTrigger::LocalDeclineOrContextOverflow)
-        );
+    let triggers_overflow = context_overflowed
+        && may_escalate(privacy_proxy, EscalationReason::ContextOverflow).is_some();
 
     let llm_response = if triggers_overflow {
+        let proxy =
+            may_escalate(privacy_proxy, EscalationReason::ContextOverflow).expect("checked above");
         tracing::info!(
             estimated_tokens,
             "context overflow; escalating via PrivacyProxy"
         );
-        match escalate_via_privacy_proxy(privacy_proxy.unwrap(), &messages, memory).await {
+        match escalate_via_privacy_proxy(
+            proxy,
+            &messages,
+            memory,
+            EscalationReason::ContextOverflow,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(proxy_err) => {
                 tracing::warn!(
@@ -1330,19 +1332,18 @@ pub async fn process_chat_turn(
         {
             Ok(r) => r,
             Err(local_err) => {
-                let triggers_decline = privacy_proxy.is_some()
-                    && matches!(
-                        privacy_proxy.map(|p| &p.trigger),
-                        Some(EscalationTrigger::LocalDecline)
-                            | Some(EscalationTrigger::LocalDeclineOrContextOverflow)
-                    );
-                if triggers_decline {
+                if let Some(proxy) = may_escalate(privacy_proxy, EscalationReason::LocalDecline) {
                     tracing::info!(
                         error = %local_err,
                         "local LLM declined; escalating via PrivacyProxy"
                     );
-                    match escalate_via_privacy_proxy(privacy_proxy.unwrap(), &messages, memory)
-                        .await
+                    match escalate_via_privacy_proxy(
+                        proxy,
+                        &messages,
+                        memory,
+                        EscalationReason::LocalDecline,
+                    )
+                    .await
                     {
                         Ok(r) => r,
                         Err(proxy_err) => {
@@ -1410,8 +1411,10 @@ async fn escalate_via_privacy_proxy(
     proxy: &PrivacyProxyConfig,
     messages: &[Message],
     memory: &SharedMemory,
+    reason: EscalationReason,
 ) -> Result<String> {
     let backend = PrivacyProxyBackend::from_url(&proxy.base_url, &proxy.vocab_path);
+    let summary = summarize_messages(messages);
 
     let terms: Vec<String> = with_shared_memory(memory, |mem| {
         let entries = mem.recent(500)?;
@@ -1428,6 +1431,14 @@ async fn escalate_via_privacy_proxy(
     })
     .await
     .unwrap_or_default();
+
+    crate::security::audit::log_provider_escalation(
+        reason.as_str(),
+        "privacy_proxy",
+        summary.message_count,
+        summary.payload_chars,
+        terms.len(),
+    );
 
     if let Err(e) = backend.seed_vocab(&terms).await {
         tracing::warn!(error = %e, terms = terms.len(), "vocab seed failed; continuing");
