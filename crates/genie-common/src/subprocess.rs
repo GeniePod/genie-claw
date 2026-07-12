@@ -51,12 +51,9 @@ mod tests {
     #[tokio::test]
     async fn output_with_timeout_returns_success_for_fast_command() {
         #[cfg(unix)]
-        let output = {
-            let mut cmd = Command::new("true");
-            output_with_timeout(cmd, Duration::from_secs(5))
-                .await
-                .expect("fast command should succeed")
-        };
+        let output = output_with_timeout(Command::new("true"), Duration::from_secs(5))
+            .await
+            .expect("fast command should succeed");
         #[cfg(windows)]
         let output = {
             let mut cmd = Command::new("cmd");
