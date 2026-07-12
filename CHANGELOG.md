@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Quick-router tool-call accuracy
+
+- **Timer/reminder**: `fractional_duration` ("half an hour") and
+  `couple_duration` ("a couple of minutes") now sum any trailing
+  `<number> <unit>` span the same way `parse_duration` already does, so
+  "half an hour and 15 minutes" emits 2700s instead of silently
+  truncating to 1800s.
+
 ### Memory
 
 - **Auto-capture**: defer the allocating `to_lowercase` in `extract_facts` until
@@ -10,6 +18,14 @@
 - **Policy**: defer the allocating `to_lowercase` in `assess_memory_write` and
   `infer_metadata` until restricted, private-intent, or cautious content markers
   are present — benign household writes skip the content allocation.
+
+### Tool dispatch
+
+- **home_control**: skip the `to_lowercase` + `replace` allocations in
+  `canon_home_control_action` when the action verb is already in canonical shape
+  (`turn_off`, `set_brightness`, `switch_off`). The LLM tool call and the
+  quick-router usually emit exactly that, so the common dispatch drops two
+  `String` allocations; only natural-language forms ("turn off") still normalize.
 
 ## 1.0.0-rc.3 - 2026-07-03
 

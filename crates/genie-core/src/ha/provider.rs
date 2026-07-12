@@ -871,6 +871,7 @@ fn is_voice_relevant_domain(domain: &str) -> bool {
         domain,
         "light"
             | "switch"
+            | "fan"
             | "scene"
             | "script"
             | "climate"
@@ -920,7 +921,7 @@ fn capabilities_for(domain: &str, attributes: &serde_json::Value) -> Vec<String>
                 caps.push("set_brightness".into());
             }
         }
-        "switch" => {
+        "switch" | "fan" => {
             caps.push("turn_on".into());
             caps.push("turn_off".into());
         }
@@ -969,6 +970,7 @@ fn domain_synonyms(domain: &str) -> Vec<String> {
             "plug".into(),
             "outlet".into(),
         ],
+        "fan" => vec!["fan".into(), "fans".into()],
         "climate" => vec!["thermostat".into(), "temperature".into(), "heater".into()],
         "cover" => vec![
             "cover".into(),
@@ -1171,6 +1173,27 @@ fn normalize_brightness(value: f64) -> u8 {
     }
 }
 
+/// Whether an entity's state counts as "active" in a multi-entity group status
+/// summary. Beyond the literal on/open/unlocked, this includes climate hvac
+/// modes (a thermostat reports its mode — `heat`/`cool`/`auto`/… — as its
+/// state, never `"on"`, so an actively conditioning thermostat must still
+/// count) and a `playing` media player. Idle/off states (`off`, `idle`,
+/// `paused`, `closed`, `locked`, `standby`, `unavailable`) are not active.
+fn is_active_state(state: &str) -> bool {
+    matches!(
+        state,
+        "on" | "open"
+            | "unlocked"
+            | "playing"
+            | "heat"
+            | "cool"
+            | "auto"
+            | "heat_cool"
+            | "dry"
+            | "fan_only"
+    )
+}
+
 fn summarize_state(target_name: &str, domain: Option<&str>, entities: &[Entity]) -> String {
     if entities.is_empty() {
         return format!("I couldn't read the state for {}.", target_name);
@@ -1217,7 +1240,7 @@ fn summarize_state(target_name: &str, domain: Option<&str>, entities: &[Entity])
 
     let on_like = entities
         .iter()
-        .filter(|entity| matches!(entity.state.as_str(), "on" | "open" | "unlocked"))
+        .filter(|entity| is_active_state(&entity.state))
         .count();
     let unavailable = entities
         .iter()
@@ -1262,6 +1285,8 @@ fn domain_label(domain: &str, count: usize) -> &'static str {
         "light" => "lights",
         "switch" if count == 1 => "switch",
         "switch" => "switches",
+        "fan" if count == 1 => "fan",
+        "fan" => "fans",
         "cover" if count == 1 => "cover",
         "cover" => "covers",
         "lock" if count == 1 => "lock",
@@ -1275,6 +1300,7 @@ fn domain_plural_label(domain: &str) -> &'static str {
     match domain {
         "light" => "lights",
         "switch" => "switches",
+        "fan" => "fans",
         "cover" => "covers",
         "lock" => "locks",
         "climate" => "thermostats",
@@ -1474,6 +1500,49 @@ mod tests {
     }
 
     #[test]
+    fn build_graph_admits_fan_entities_and_resolves_them() {
+        // Regression: `fan` is a controllable domain in the quick router and
+        // `infer_domain`, but `is_voice_relevant_domain` omitted it, so
+        // `build_graph` dropped every fan entity and "turn on the bedroom fan"
+        // resolved to nothing even though the fan existed.
+        let states = vec![Entity {
+            entity_id: "fan.bedroom_ceiling".into(),
+            state: "off".into(),
+            attributes: serde_json::json!({ "friendly_name": "Bedroom Ceiling Fan" }),
+        }];
+        let areas = vec![AreaTemplateEntry {
+            id: "bedroom".into(),
+            name: "Bedroom".into(),
+            entities: vec!["fan.bedroom_ceiling".into()],
+        }];
+
+        let graph = HomeAssistantProvider::build_graph(&states, &areas);
+
+        // The fan survives the voice-relevant-domain gate.
+        assert!(
+            graph
+                .entities
+                .iter()
+                .any(|entity| entity.entity_id == "fan.bedroom_ceiling"),
+            "fan entity should be admitted to the graph"
+        );
+
+        // ...and resolves for a natural "turn on the bedroom fan" request.
+        let target = HomeAssistantProvider::resolve_target_in_graph(
+            &graph,
+            "bedroom fan",
+            Some(HomeActionKind::TurnOn),
+        )
+        .expect("bedroom fan should resolve to the fan entity");
+        assert_eq!(target.domain.as_deref(), Some("fan"));
+        assert!(
+            target
+                .entity_ids
+                .contains(&"fan.bedroom_ceiling".to_string())
+        );
+    }
+
+    #[test]
     fn ambiguous_named_entity_tie_declines_instead_of_guessing() {
         // Regression for #511: both lamps score 1.0 on the shared "lamp" alias.
         // The resolver must not silently actuate whichever the graph listed first.
@@ -1664,6 +1733,41 @@ mod tests {
         assert!(
             summary.contains("brightness 100%"),
             "expected 100%, got: {summary}"
+        );
+    }
+
+    /// Regression: climate entities report their hvac mode (`heat`/`cool`/…) as
+    /// their state, never `"on"`, so a group of actively-conditioning
+    /// thermostats used to summarize as "0 of N are active". A `playing` media
+    /// player had the same problem.
+    #[test]
+    fn group_status_counts_climate_and_media_active_states() {
+        let entity = |id: &str, state: &str| Entity {
+            entity_id: id.into(),
+            state: state.into(),
+            attributes: serde_json::json!({}),
+        };
+
+        // Two thermostats actively heating/cooling: both count as active.
+        let thermostats = [
+            entity("climate.living", "heat"),
+            entity("climate.bedroom", "cool"),
+        ];
+        let summary = summarize_state("Thermostats", Some("climate"), &thermostats);
+        assert!(
+            summary.contains("2 of 2 are active"),
+            "expected both thermostats active, got: {summary}"
+        );
+
+        // An `off` thermostat is not counted; a `playing` media player is.
+        let mixed = [
+            entity("climate.study", "off"),
+            entity("media_player.den", "playing"),
+        ];
+        let summary = summarize_state("Devices", None, &mixed);
+        assert!(
+            summary.contains("1 of 2 are active"),
+            "expected only the playing media player active, got: {summary}"
         );
     }
 }
