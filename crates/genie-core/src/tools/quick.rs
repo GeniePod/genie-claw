@@ -3081,6 +3081,29 @@ fn extend_duration_with_trailing_spans(
         total = total.saturating_add(amount.saturating_mul(multiplier));
         last_unit_index = unit_index;
     }
+    // A trailing "and a half" / "and a quarter" is a fraction of the last matched
+    // unit ("an hour and a half" = 3600 + 1800). The span loop above stops at the
+    // fraction word because it is not a spoken number followed by a unit, so add
+    // it here. Advancing last_unit_index past the fraction keeps it out of the
+    // reminder-label window.
+    let mut tail = last_unit_index + 1;
+    if tokens.get(tail).copied() == Some("and") {
+        tail += 1;
+    }
+    if matches!(tokens.get(tail).copied(), Some("a" | "an")) {
+        tail += 1;
+    }
+    let fraction_divisor = tokens.get(tail).copied().and_then(|token| match token {
+        "half" => Some(2u64),
+        "quarter" => Some(4u64),
+        _ => None,
+    });
+    if let Some(divisor) = fraction_divisor
+        && let Some(unit_seconds) = duration_unit_seconds(tokens.get(last_unit_index).copied())
+    {
+        total = total.saturating_add(unit_seconds / divisor);
+        last_unit_index = tail;
+    }
     (total, last_unit_index)
 }
 
@@ -4994,6 +5017,36 @@ mod tests {
         let call = route("remind me in forty five minutes to check the oven").unwrap();
         assert_eq!(call.arguments["seconds"], 2700);
         assert_eq!(call.arguments["label"], "check the oven");
+    }
+
+    #[test]
+    fn routes_whole_plus_half_compound_timer() {
+        // Regression: the trailing-span sum reads only "<number> <unit>" spans, so
+        // a trailing "and a half" / "and a quarter" fraction of the last unit was
+        // dropped — "an hour and a half" emitted set_timer{seconds:3600} instead
+        // of 5400.
+        let call = route("set a timer for an hour and a half").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 5400);
+
+        let call = route("set a timer for 1 hour and a half").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+
+        let call = route("set a timer for two hours and a half").unwrap();
+        assert_eq!(call.arguments["seconds"], 9000);
+
+        // A quarter tail works the same way, and applies after a fractional idiom
+        // ("half an hour and a quarter" = 1800 + 900) since the extension is shared.
+        let call = route("set a timer for an hour and a quarter").unwrap();
+        assert_eq!(call.arguments["seconds"], 4500);
+
+        let call = route("set a timer for half an hour and a quarter").unwrap();
+        assert_eq!(call.arguments["seconds"], 2700);
+
+        // The fraction is carried past the reminder-label boundary.
+        let call = route("remind me in an hour and a half to stretch").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+        assert_eq!(call.arguments["label"], "stretch");
     }
 
     #[test]
