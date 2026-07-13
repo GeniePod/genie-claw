@@ -994,6 +994,14 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
             && (rest.contains(" scene") || rest.contains(" routine"))
         {
             let entity = rest
+                // A leading article is not part of the scene/routine name:
+                // "run the bedtime routine" is the "bedtime" routine, not
+                // "the bedtime". The sibling entity extractors
+                // (clean_control_entity, parse_temperature_target) already strip
+                // these; scene/routine was the one that did not.
+                .trim_start_matches("the ")
+                .trim_start_matches("a ")
+                .trim_start_matches("an ")
                 .trim_end_matches(" scene")
                 .trim_end_matches(" routine")
                 .trim()
@@ -3861,6 +3869,27 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "all off");
         assert_eq!(call.arguments["action"], "activate");
+    }
+
+    #[test]
+    fn scene_activation_drops_a_leading_article() {
+        // "run the bedtime routine" is the "bedtime" routine, not "the bedtime".
+        // The article leaked into the entity because scene/routine extraction
+        // trimmed the trailing " scene"/" routine" but not a leading article.
+        for (utterance, entity) in [
+            ("run the bedtime routine", "bedtime"),
+            ("activate the movie night scene", "movie night"),
+            ("start the away routine", "away"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["action"], "activate", "{utterance:?}");
+        }
+
+        // Without an article the name is unchanged.
+        let call = route("activate movie night scene").unwrap();
+        assert_eq!(call.arguments["entity"], "movie night");
     }
 
     #[test]
