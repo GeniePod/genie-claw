@@ -2027,9 +2027,21 @@ fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
 }
 
 fn asks_home_undo(text: &str) -> bool {
+    // Short pronoun-referent undo commands. "put it back"/"put that back" already
+    // accept both pronouns, but the undo/revert/reverse verbs only had their
+    // "that" form, so the equally common "undo it" / "revert it" / "reverse it"
+    // fell through and abstained instead of routing to home_undo.
     if matches!(
         text,
-        "undo" | "undo that" | "revert that" | "put it back" | "put that back" | "reverse that"
+        "undo"
+            | "undo that"
+            | "undo it"
+            | "revert that"
+            | "revert it"
+            | "put it back"
+            | "put that back"
+            | "reverse that"
+            | "reverse it"
     ) {
         return true;
     }
@@ -5106,6 +5118,19 @@ mod tests {
     fn routes_undo_to_home_undo() {
         let call = route("undo that").unwrap();
         assert_eq!(call.name, "home_undo");
+    }
+
+    #[test]
+    fn routes_pronoun_undo_it_variants_to_home_undo() {
+        // "put it back"/"put that back" already accept both pronouns; the
+        // undo/revert/reverse verbs only had their "that" form, so the equally
+        // common "it" form abstained. Both pronouns must now route to home_undo.
+        for phrase in ["undo it", "revert it", "reverse it"] {
+            let call = route(phrase).unwrap_or_else(|| panic!("{phrase} should route"));
+            assert_eq!(call.name, "home_undo", "{phrase}");
+        }
+        // A bare undo verb with an unrelated object still abstains for the LLM.
+        assert!(route("reverse the car").is_none());
     }
 
     #[test]
