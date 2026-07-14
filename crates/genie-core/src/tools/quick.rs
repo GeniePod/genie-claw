@@ -2748,7 +2748,12 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
             let symbol = company_ticker(&subject).unwrap_or(subject.as_str());
             format!("{symbol} stock price")
         };
-        return Some((query, web_search_is_fresh_request(text)));
+        // A stock-price query always wants the *current* price, so it is
+        // inherently fresh. Deriving freshness from `web_search_is_fresh_request`
+        // (spaced " now "/" today "/" current " markers) missed the bare
+        // "tesla stock price" / "stock price of tesla" forms — they have no such
+        // marker — so a time-sensitive price could be served from a stale cache.
+        return Some((query, true));
     }
 
     if matches!(text, "read the news" | "read news" | "what s the news") {
@@ -5029,6 +5034,22 @@ mod tests {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "web_search", "{utterance:?}");
             assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn stock_price_query_is_always_fresh() {
+        // A stock-price query always wants the current price. Bare forms carry no
+        // spaced " now "/" today "/" current " marker, so they used to route with
+        // no `fresh` flag and could be served a stale cached price.
+        for utterance in [
+            "Tesla stock price",
+            "stock price of Tesla",
+            "what is the microsoft stock price",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
         }
     }
 
