@@ -2,30 +2,87 @@
 
 ## Unreleased
 
+## 1.0.0-rc.4 - 2026-07-13
+
+Fourth release candidate. This RC drives **M2** forward: the portable
+provider/channel architecture gains a **gated optional API provider** with
+local-first escalation and a privacy audit trail, an **HTTP JSON channel
+adapter**, and **bounded per-speaker sessions** — while hardening outbound HTTP
+against memory-exhaustion, closing an actuation auth gap, and pushing
+deterministic quick-router accuracy further. The local model stays the default
+throughout; every optional surface is opt-in behind an explicit gate.
+
+### Portable providers & channels (M2)
+
+- **Gated optional API provider** (#639, #648): `GatedProvider` sits behind the
+  `Provider` trait with a local-first escalation policy — the on-device model
+  answers by default and only escalates when policy allows, with each escalation
+  written to a privacy audit trail. Off unless explicitly configured.
+- **HTTP JSON channel adapter + `ScriptedChannel`** (#640): the first transport
+  ported onto the `Channel` boundary, plus a socket-free reference channel for
+  exercising the agent loop in tests.
+- **Bounded per-speaker sessions** (#611, #631, #677): a `SessionRegistry` with
+  an LRU cap and idle expiry, resolved speaker identity wired into each session,
+  and client-supplied `conversation_id`s now enrolled in the same budget — so
+  the web UI and Telegram no longer escape the Jetson session cap.
+
+### Reliability & security
+
+- **Outbound HTTP hardening**: bound status/header/chunked-size line reads on the
+  LLM/HA clients (#655) and reject oversize chunk sizes before they overflow
+  (#627), closing the same read-line OOM vector previously fixed inbound;
+  consolidate the hand-rolled clients onto one shared TLS-capable reader (#613).
+- **Actuation auth** (#659): sensitive actuation read routes
+  (`pending`/`actions`/`audit`) now require the local API token when configured,
+  closing a confirmation-token disclosure gap.
+- **Loopback classifier** (#678): strip URL userinfo before the localhost check
+  so `localhost:1@evil.com` can no longer masquerade as on-device.
+- **IPv6 config** (#670): bracket a bare IPv6 `bind_host` so `core_http_addr` /
+  `core_health_url` emit a valid authority instead of a false-DOWN health probe.
+- **Executor** (#637): run speaker-identity filesystem I/O on `spawn_blocking`
+  so it cannot stall the shared genie-core thread.
+
 ### Quick-router tool-call accuracy
 
-- **Timer/reminder**: `fractional_duration` ("half an hour") and
-  `couple_duration` ("a couple of minutes") now sum any trailing
-  `<number> <unit>` span the same way `parse_duration` already does, so
-  "half an hour and 15 minutes" emits 2700s instead of silently
-  truncating to 1800s.
+- **Timers**: sum a trailing `<number> <unit>` span after a fractional/idiom
+  duration ("half an hour and 15 minutes" → 2700s) (#671) and a trailing
+  "and a half"/"and a quarter" fraction ("an hour and a half" → 5400s) (#684);
+  parse "a couple of minutes" (#601).
+- **Search subjects**: strip trailing time qualifiers and part-of-day words from
+  stock tickers (#644, #682) and status entities (#652); keep the named city in
+  "will it rain in `<city>`" (#615); drop a trailing directional adverb from the
+  `set_temperature` entity (#633).
+- **Calculator**: route the `%` symbol to the calculator (#622) and skip a
+  leading article before the percentage base amount (#647).
 
-### Memory
+### Home Assistant
 
-- **Auto-capture**: defer the allocating `to_lowercase` in `extract_facts` until
-  an identity, preference, or relationship trigger is present — common no-match
-  utterances (weather, questions, chit-chat) skip the allocation entirely.
-- **Policy**: defer the allocating `to_lowercase` in `assess_memory_write` and
-  `infer_metadata` until restricted, private-intent, or cautious content markers
-  are present — benign household writes skip the content allocation.
+- Count climate/media active states (`heat`/`cool`/`playing`) in group status
+  summaries instead of reporting "0 of N active" (#681); admit fan entities to
+  the graph so fans are controllable (#638); round `home_status` brightness
+  readback to the nearest percent (#596).
 
-### Tool dispatch
+### Governor
 
-- **home_control**: skip the `to_lowercase` + `replace` allocations in
-  `canon_home_control_action` when the action verb is already in canonical shape
-  (`turn_off`, `set_brightness`, `switch_off`). The LLM tool call and the
-  quick-router usually emit exactly that, so the common dispatch drops two
-  `String` allocations; only natural-language forms ("turn off") still normalize.
+- Swap the resident LLM model on **every** weight-changing mode transition,
+  fixing the omitted `NightB`↔`Pressure` case that left the 9B model resident in
+  the mode meant to relieve memory pressure (#686).
+
+### Performance
+
+- Single-pass utterance `normalize` (#683) and single-buffer spoken-decimal
+  folding (#680) on the quick-router hot path; skip action-verb normalization
+  when already canonical (#667); defer `to_lowercase` in `extract_facts` (#608),
+  `assess_memory_write` (#643), and reuse the query word set across
+  lexical-overlap scoring (#599); build the open-barrier descriptor only for
+  `Open` actions (#614); avoid building the `tool_defs` schema table just to
+  check a name (#590).
+
+### Internal & CI
+
+- Add `verify-jetson` and `maintainer-issue` labels and stop auto-label aborting
+  on PRs with no issue reference (#626, #651); lower the per-author open-PR limit
+  to 2 (#623); raise the release binary-size budget to 6.8 MB (#624).
 
 ## 1.0.0-rc.3 - 2026-07-03
 
