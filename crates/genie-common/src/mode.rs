@@ -72,10 +72,30 @@ impl fmt::Display for Mode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Mode::Day => write!(f, "day"),
-            Mode::NightA => write!(f, "night-a"),
-            Mode::NightB => write!(f, "night-b"),
+            Mode::NightA => write!(f, "night_a"),
+            Mode::NightB => write!(f, "night_b"),
             Mode::Media => write!(f, "media"),
             Mode::Pressure => write!(f, "pressure"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Display persists the mode_transitions history and prints the transition
+    // log, so it must match the snake_case identifier used everywhere else: the
+    // serde rename_all form the governor control protocol accepts/emits, the
+    // CLI (`genie-ctl mode night_a`), and the docs. Before this fix NightA and
+    // NightB emitted hyphens. The expected values below are serde's snake_case
+    // output for each variant.
+    #[test]
+    fn display_uses_snake_case_matching_serde() {
+        assert_eq!(Mode::Day.to_string(), "day");
+        assert_eq!(Mode::NightA.to_string(), "night_a");
+        assert_eq!(Mode::NightB.to_string(), "night_b");
+        assert_eq!(Mode::Media.to_string(), "media");
+        assert_eq!(Mode::Pressure.to_string(), "pressure");
     }
 }
