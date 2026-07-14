@@ -2446,7 +2446,15 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
-    if contains_any(&target, &["driveway", "icy", "ice"]) {
+    // Match "ice"/"icy" as whole words, not as substrings: a bare `contains`
+    // fired on "pr[ice]" and "sp[icy]", so "what's the price of bitcoin" and
+    // "is the food spicy" misrouted to home_status "driveway ice". "driveway"
+    // stays a substring match — it is distinctive enough not to collide.
+    if target.contains("driveway")
+        || target
+            .split_whitespace()
+            .any(|word| matches!(word, "ice" | "icy" | "iced"))
+    {
         return Some("driveway ice".into());
     }
 
@@ -4812,6 +4820,31 @@ mod tests {
         let call = route("Jared: What's the current water pressure?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "water pressure");
+    }
+
+    #[test]
+    fn ice_status_matches_whole_words_not_substrings() {
+        // "ice"/"icy" were matched as substrings, so "pr[ice]" and "sp[icy]"
+        // misrouted to home_status "driveway ice".
+        assert!(
+            route("what's the price of bitcoin")
+                .map(|c| c.arguments.get("entity").and_then(|e| e.as_str()) != Some("driveway ice"))
+                .unwrap_or(true),
+            "'price of bitcoin' must not resolve to the driveway-ice status entity"
+        );
+        assert!(
+            route("is the food spicy")
+                .map(|c| c.arguments.get("entity").and_then(|e| e.as_str()) != Some("driveway ice"))
+                .unwrap_or(true),
+            "'food spicy' must not resolve to the driveway-ice status entity"
+        );
+
+        // Genuine ice/driveway queries still resolve.
+        for utterance in ["Is the driveway icy?", "Is there ice on the driveway?"] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "driveway ice", "{utterance:?}");
+        }
     }
 
     #[test]
