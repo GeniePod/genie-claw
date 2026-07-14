@@ -348,8 +348,12 @@ fn memory_recall_query(text: &str) -> Option<String> {
     ] {
         if let Some(query) = text.strip_prefix(prefix).map(str::trim)
             && !query.is_empty()
-            && query != "that"
+            && !matches!(query, "that" | "it" | "this")
         {
+            // A bare pronoun referent ("do you remember it/this") has no concrete
+            // subject to search for — recalling the literal word returns noise.
+            // Abstain so the LLM resolves the referent from context, mirroring the
+            // sibling memory_forget_query, which already skips that/it/this.
             return Some(query.to_string());
         }
     }
@@ -3514,6 +3518,25 @@ mod tests {
         for utterance in ["forget it", "forget that", "forget about it", "delete that"] {
             assert!(route(utterance).is_none(), "{utterance} should abstain");
         }
+    }
+
+    #[test]
+    fn recall_without_referent_abstains_for_llm() {
+        // A bare pronoun referent has no concrete subject to search for; recalling
+        // the literal "it"/"this" returns noise. Abstain like the forget path.
+        for utterance in [
+            "do you remember it",
+            "do you remember this",
+            "search memory for it",
+            "recall memories for this",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance} should abstain");
+        }
+
+        // A substantive query still routes through the same prefix loop.
+        let call = route("search memory for jared").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "jared");
     }
 
     #[test]
