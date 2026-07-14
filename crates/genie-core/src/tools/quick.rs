@@ -2640,7 +2640,12 @@ fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> 
 
 fn clean_timer_label(tokens: &[&str]) -> Option<String> {
     let label = tokens.join(" ");
-    let label = label.strip_prefix("the ").unwrap_or(&label).trim();
+    let label = label
+        .strip_prefix("the ")
+        .or_else(|| label.strip_prefix("a "))
+        .or_else(|| label.strip_prefix("an "))
+        .unwrap_or(&label)
+        .trim();
     if label.is_empty() {
         None
     } else {
@@ -5304,6 +5309,20 @@ mod tests {
         // No trailing label -> still the generic default (unchanged).
         let call = route("set a timer for 5 minutes").unwrap();
         assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn timer_label_drops_leading_indefinite_article() {
+        // clean_timer_label stripped a leading "the " but left "a"/"an", so
+        // "timer for a break" produced label "a break".
+        let call = route("set a 5 minute timer for a break").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "break");
+
+        let call = route("set a timer for 10 minutes for an errand").unwrap();
+        assert_eq!(call.arguments["seconds"], 600);
+        assert_eq!(call.arguments["label"], "errand");
     }
 
     #[test]
