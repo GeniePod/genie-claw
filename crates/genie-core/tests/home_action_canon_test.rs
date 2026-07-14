@@ -114,11 +114,11 @@ fn separator_runs_fold_to_a_single_underscore() {
     // matched no real action and silently failed to actuate (the light stayed
     // on). Every one of these must land on the canonical verb.
     for (raw, want) in [
-        ("turn  off", Some(("turn_off", None))),     // double space
-        ("turn - off", Some(("turn_off", None))),    // spaced hyphen
-        ("turn\toff", Some(("turn_off", None))),     // tab
-        ("turn__off", Some(("turn_off", None))),     // doubled underscore
-        ("SWITCH  OFF", Some(("turn_off", None))),   // run + casing + synonym
+        ("turn  off", Some(("turn_off", None))),   // double space
+        ("turn - off", Some(("turn_off", None))),  // spaced hyphen
+        ("turn\toff", Some(("turn_off", None))),   // tab
+        ("turn__off", Some(("turn_off", None))),   // doubled underscore
+        ("SWITCH  OFF", Some(("turn_off", None))), // run + casing + synonym
         ("set  brightness", Some(("set_brightness", None))),
         ("power  on", Some(("turn_on", None))),
         ("  turn   off  ", Some(("turn_off", None))), // leading/trailing + inner run
