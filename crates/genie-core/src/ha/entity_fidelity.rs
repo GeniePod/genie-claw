@@ -143,7 +143,10 @@ mod tests {
     #[test]
     fn command_particles_do_not_admit_foreign_rooms() {
         let entities = kitchen_light_home();
-        for command in ["turn on the upstairs lights", "turn off the living room light"] {
+        for command in [
+            "turn on the upstairs lights",
+            "turn off the living room light",
+        ] {
             assert!(
                 !whole_home_resolution_is_trustworthy(&entities, command),
                 "'{command}' names a foreign/deviceless room and must still be rejected"
