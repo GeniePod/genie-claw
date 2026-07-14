@@ -108,6 +108,30 @@ fn natural_language_forms_still_normalize() {
 }
 
 #[test]
+fn separator_runs_fold_to_a_single_underscore() {
+    // Regression: the old `replace([' ', '-'], "_")` mapped separators 1:1, so a
+    // *run* of separators became a run of `_` ("turn  off" -> "turn__off") that
+    // matched no real action and silently failed to actuate (the light stayed
+    // on). Every one of these must land on the canonical verb.
+    for (raw, want) in [
+        ("turn  off", Some(("turn_off", None))),     // double space
+        ("turn - off", Some(("turn_off", None))),    // spaced hyphen
+        ("turn\toff", Some(("turn_off", None))),     // tab
+        ("turn__off", Some(("turn_off", None))),     // doubled underscore
+        ("SWITCH  OFF", Some(("turn_off", None))),   // run + casing + synonym
+        ("set  brightness", Some(("set_brightness", None))),
+        ("power  on", Some(("turn_on", None))),
+        ("  turn   off  ", Some(("turn_off", None))), // leading/trailing + inner run
+    ] {
+        assert_eq!(
+            canonicalize_household_action(raw, None),
+            want,
+            "'{raw}' should fold separator runs to {want:?}"
+        );
+    }
+}
+
+#[test]
 fn level_maps_to_set_brightness_and_keeps_value() {
     assert_eq!(
         canonicalize_household_action("set_level", Some(90.0)),

@@ -57,17 +57,47 @@ pub(crate) fn canon_home_control_action(raw: &str) -> Option<&'static str> {
     if is_canonical_shape(raw) {
         return map_synonym(raw);
     }
-    let normalized = raw.trim().to_lowercase().replace([' ', '-'], "_");
+    let normalized = normalize_action(raw);
     map_synonym(&normalized)
 }
 
-/// True when `raw` is already byte-for-byte what
-/// `trim().to_lowercase().replace([' ', '-'], "_")` would produce: non-empty and
-/// made up only of ASCII lowercase letters or `_`, so it has no surrounding
-/// whitespace, spaces, or dashes and no casing to fold. For such input the
-/// normalization is a no-op and its allocations are pure overhead.
+/// True when `raw` is already byte-for-byte what [`normalize_action`] would
+/// produce: non-empty, made up only of ASCII lowercase letters or `_`, with no
+/// leading/trailing `_` and no `__` run — so it has no surrounding whitespace,
+/// separators, or casing to fold. For such input the normalization is a no-op
+/// and its allocations are pure overhead.
 fn is_canonical_shape(raw: &str) -> bool {
-    !raw.is_empty() && raw.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
+    !raw.is_empty()
+        && !raw.starts_with('_')
+        && !raw.ends_with('_')
+        && !raw.contains("__")
+        && raw.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
+}
+
+/// Lowercase and fold every *run* of separators — ASCII/Unicode whitespace,
+/// `-`, and `_` — down to a single `_`, dropping leading and trailing
+/// separators. So "turn off", "Turn-Off", "turn  off" (double space),
+/// "turn - off", and "turn\toff" all canonicalize to "turn_off".
+///
+/// The previous `trim().to_lowercase().replace([' ', '-'], "_")` mapped each
+/// separator 1:1, so any run of separators produced a run of `_`
+/// ("turn  off" -> "turn__off") that matched no real action and silently failed
+/// to actuate — the light stayed on. Folding runs closes that whole class.
+fn normalize_action(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_sep = false;
+    for ch in raw.chars() {
+        if ch.is_whitespace() || ch == '-' || ch == '_' {
+            pending_sep = true;
+        } else {
+            if pending_sep && !out.is_empty() {
+                out.push('_');
+            }
+            pending_sep = false;
+            out.extend(ch.to_lowercase());
+        }
+    }
+    out
 }
 
 /// Map the unambiguous off/on synonyms onto their canonical verb, then accept
