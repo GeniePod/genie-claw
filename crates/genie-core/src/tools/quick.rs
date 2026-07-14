@@ -1921,6 +1921,8 @@ fn clean_control_entity(text: &str) -> String {
     let text = text
         .trim()
         .trim_start_matches("the ")
+        .trim_start_matches("a ")
+        .trim_start_matches("an ")
         .trim_end_matches(" please");
     if let Some((device, room)) = text.split_once(" in the ") {
         format!("{} {}", room.trim(), device.trim())
@@ -4683,6 +4685,27 @@ mod tests {
         let call = route("Jared: What's the current water pressure?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "water pressure");
+    }
+
+    #[test]
+    fn control_entity_drops_leading_indefinite_article() {
+        // clean_control_entity stripped a leading "the " but left "a"/"an", so
+        // "turn on a fan" produced entity "a fan". The sibling
+        // parse_temperature_target already strips all three articles.
+        let call = route("turn on a fan").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "fan");
+        assert_eq!(call.arguments["action"], "turn_on");
+
+        let call = route("turn off a fireplace").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "fireplace");
+        assert_eq!(call.arguments["action"], "turn_off");
+
+        let call = route("turn on an office fan").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "office fan");
+        assert_eq!(call.arguments["action"], "turn_on");
     }
 
     #[test]

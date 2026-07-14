@@ -32,6 +32,41 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
+/// Which HTTP server is asking for route-token policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutePolicySurface {
+    GenieCore,
+    GenieApi,
+}
+
+/// Shared route-token policy for local HTTP servers.
+///
+/// Returns true when `method`+`path` must present a valid local API token when
+/// one is configured. This is centralized here so `genie-core` and `genie-api`
+/// cannot silently drift on sensitive route classification.
+pub fn route_requires_local_token(surface: RoutePolicySurface, method: &str, path: &str) -> bool {
+    match (method, path) {
+        // Sensitive actuation routes.
+        ("POST", "/api/actuation/confirm")
+        | ("GET", "/api/actuation/pending")
+        | ("GET", "/api/actuation/actions") => true,
+        ("GET", "/api/actuation/audit") => matches!(surface, RoutePolicySurface::GenieApi),
+
+        // Other mutating routes.
+        ("POST", "/api/memories/update")
+        | ("POST", "/api/memories/delete")
+        | ("POST", "/api/memories/reorder")
+        | ("POST", "/api/mode")
+        | ("POST", "/api/chat/stream")
+        | ("POST", "/api/chat")
+        | ("POST", "/api/chat/clear")
+        | ("POST", "/api/web-search")
+        | ("POST", "/v1/chat/completions") => true,
+
+        _ => false,
+    }
+}
+
 /// Bounds enforced while reading one inbound HTTP request.
 ///
 /// Construct with [`HttpLimits::from_config`] to pull the shared knobs from the
@@ -1119,5 +1154,37 @@ mod tests {
         let bare = cors_response_headers(None);
         assert!(!bare.contains("Access-Control-Allow-Origin"));
         assert_eq!(bare, "Vary: Origin\r\n");
+    }
+
+    #[test]
+    fn shared_route_token_policy_covers_sensitive_actuation_reads() {
+        for surface in [RoutePolicySurface::GenieCore, RoutePolicySurface::GenieApi] {
+            assert!(route_requires_local_token(
+                surface,
+                "GET",
+                "/api/actuation/pending"
+            ));
+            assert!(route_requires_local_token(
+                surface,
+                "GET",
+                "/api/actuation/actions"
+            ));
+            assert!(route_requires_local_token(
+                surface,
+                "POST",
+                "/api/actuation/confirm"
+            ));
+        }
+
+        assert!(!route_requires_local_token(
+            RoutePolicySurface::GenieCore,
+            "GET",
+            "/api/actuation/audit"
+        ));
+        assert!(route_requires_local_token(
+            RoutePolicySurface::GenieApi,
+            "GET",
+            "/api/actuation/audit"
+        ));
     }
 }
