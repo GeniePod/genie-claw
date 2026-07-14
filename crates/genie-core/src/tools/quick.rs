@@ -2885,7 +2885,11 @@ fn strip_trailing_time_qualifier(subject: &str) -> &str {
     subject
         .trim_end_matches(" right now")
         .trim_end_matches(" this weekend")
+        .trim_end_matches(" next weekend")
         .trim_end_matches(" this week")
+        .trim_end_matches(" next week")
+        .trim_end_matches(" this month")
+        .trim_end_matches(" next month")
         .trim_end_matches(" this morning")
         .trim_end_matches(" this afternoon")
         .trim_end_matches(" this evening")
@@ -5596,6 +5600,14 @@ mod tests {
             ("weather in Tokyo right now", "tokyo", false),
             ("forecast for Boston this weekend", "boston", true),
             ("what's the weather in Paris now", "paris", false),
+            // The "next …" family leaked into the city ("denver next week").
+            ("forecast for Denver next week", "denver", true),
+            (
+                "what's the weather in Seattle next weekend",
+                "seattle",
+                true,
+            ),
+            ("weather in Austin this month", "austin", false),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "get_weather", "{utterance:?}");
