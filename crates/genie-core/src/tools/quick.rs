@@ -2726,23 +2726,26 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
     }
 
     if text.contains("stock price") {
-        let subject = text
-            .split_once("stock price of ")
-            .map(|(_, subject)| subject)
-            .or_else(|| {
-                text.split_once("stock price for ")
-                    .map(|(_, subject)| subject)
-            })
-            .unwrap_or("")
-            .trim();
-        // Drop a trailing time qualifier ("apple today" -> "apple") so it does
-        // not leak into the subject and defeat the company_ticker lookup (which
-        // matches the bare company name).
-        let subject = strip_trailing_time_qualifier(subject);
+        // The company can be named after the keyword ("stock price of apple") or
+        // before it ("apple stock price", "what's the nvidia stock price"). The
+        // before-keyword order matched neither "of"/"for" split, fell through to
+        // an empty subject, and emitted a company-less
+        // `web_search{query:"stock price"}` — dropping the very company the caller
+        // asked about. A trailing time qualifier ("apple today" -> "apple") is
+        // stripped in every branch so it never defeats the company_ticker lookup.
+        let subject = if let Some((_, after)) = text.split_once("stock price of ") {
+            strip_trailing_time_qualifier(after.trim()).to_string()
+        } else if let Some((_, after)) = text.split_once("stock price for ") {
+            strip_trailing_time_qualifier(after.trim()).to_string()
+        } else if let Some((before, _)) = text.split_once("stock price") {
+            stock_subject_before(before)
+        } else {
+            String::new()
+        };
         let query = if subject.is_empty() {
             "stock price".to_string()
         } else {
-            let symbol = company_ticker(subject).unwrap_or(subject);
+            let symbol = company_ticker(&subject).unwrap_or(subject.as_str());
             format!("{symbol} stock price")
         };
         return Some((query, web_search_is_fresh_request(text)));
@@ -2804,6 +2807,29 @@ fn company_ticker(subject: &str) -> Option<&'static str> {
         "netflix" => Some("NFLX"),
         _ => None,
     }
+}
+
+/// Extract the stock subject stated *before* the "stock price" keyword, e.g.
+/// `"what is the current nvidia stock price"` -> `"nvidia"` and
+/// `"tesla stock price"` -> `"tesla"`. Collects the maximal trailing run of
+/// non-filler words to the left of the keyword, so leading question/filler words
+/// are skipped, and drops a possessive tail (`"apple's"` normalizes to
+/// `"apple s"`). Returns an empty string when only filler precedes the keyword,
+/// so a company-less "how has the stock price changed" still abstains.
+fn stock_subject_before(before: &str) -> String {
+    const FILLER: &[&str] = &[
+        "what", "whats", "is", "are", "the", "a", "an", "current", "s", "tell", "me", "show",
+        "get", "give", "check", "hey", "please", "of", "for",
+    ];
+    let mut words: Vec<&str> = before.split_whitespace().collect();
+    if words.last() == Some(&"s") {
+        words.pop();
+    }
+    let mut start = words.len();
+    while start > 0 && !FILLER.contains(&words[start - 1]) {
+        start -= 1;
+    }
+    strip_trailing_time_qualifier(&words[start..].join(" ")).to_string()
 }
 
 /// Strip a trailing time qualifier ("denver tonight" -> "denver", "apple this
@@ -3282,14 +3308,23 @@ fn clean_status_target(text: &str) -> String {
 }
 
 fn asks_current_time(text: &str) -> bool {
+    // `text` is already `normalize`d, which maps an apostrophe to a space, so the
+    // very common "What's the time?" arrives as "what s the time" — never the
+    // apostrophe-less "whats the time" this list originally stored, so it fell
+    // through to the LLM. Match the normalized `what s ...` forms (and add the
+    // missing date counterpart for parity with the time phrasings).
     matches!(
         text,
         "what time is it"
             | "what is the time"
             | "whats the time"
+            | "what s the time"
             | "current time"
             | "tell me the time"
             | "what date is it"
+            | "what is the date"
+            | "whats the date"
+            | "what s the date"
             | "what is today"
             | "what day is it"
             | "date and time"
@@ -4975,6 +5010,29 @@ mod tests {
     }
 
     #[test]
+    fn stock_price_query_resolves_company_named_before_the_keyword() {
+        // The company can precede the keyword ("apple stock price") instead of
+        // following "of"/"for". This order used to fall through to an empty
+        // subject and emit a company-less web_search{query:"stock price"},
+        // dropping the company; now it resolves the ticker like the "of" form.
+        for (utterance, query) in [
+            ("Tesla stock price", "TSLA stock price"),
+            ("What's the Apple stock price?", "AAPL stock price"),
+            ("what is the current nvidia stock price", "NVDA stock price"),
+            ("microsoft stock price today", "MSFT stock price"),
+            ("google stock price right now", "GOOGL stock price"),
+            ("Apple's stock price", "AAPL stock price"),
+            ("what's Tesla's stock price today", "TSLA stock price"),
+            // Unknown company still passes through unchanged.
+            ("what is the wendys stock price", "wendys stock price"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_word_form_arithmetic_to_calculate() {
         // BFCL single-key-calculate: "two plus two" -> "2 + 2".
         let call = route("Leo: What is two plus two?").unwrap();
@@ -5051,6 +5109,23 @@ mod tests {
     fn routes_time_question_to_get_time() {
         let call = route("what time is it?").unwrap();
         assert_eq!(call.name, "get_time");
+    }
+
+    #[test]
+    fn routes_apostrophe_time_and_date_questions_to_get_time() {
+        // normalize() maps the apostrophe to a space, so "What's the time?"
+        // arrives as "what s the time"; the exact-match set must include that
+        // normalized form (and its date counterpart) or the most common phrasing
+        // silently falls through to the LLM.
+        for utterance in [
+            "What's the time?",
+            "what's the time",
+            "What's the date?",
+            "What is the date?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_time", "{utterance:?}");
+        }
     }
 
     #[test]
