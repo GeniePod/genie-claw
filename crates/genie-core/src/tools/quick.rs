@@ -1911,6 +1911,17 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
             text.strip_prefix("turn off ")
                 .map(|rest| (rest, "turn_off"))
         })?;
+    // A trailing "in <duration>" is a schedule, not a room: "turn on the lights in
+    // 5 minutes" must be grounded by the LLM (which can arm the timer), not
+    // actuated immediately. clean_control_entity would split it as a room and emit
+    // a garbled "5 minutes lights" entity that fires now. The weather path guards
+    // the same way via is_time_expression.
+    if let Some((_, tail)) = rest.rsplit_once(" in ") {
+        let tail = tail.trim().trim_start_matches("the ").trim();
+        if is_time_expression(tail) {
+            return None;
+        }
+    }
     let entity = clean_control_entity(rest);
     if entity.is_empty() {
         return None;
@@ -5026,6 +5037,32 @@ mod tests {
             ("turn off the fans", "fans"),
             ("turn on the ceiling fan", "ceiling fan"),
             ("turn on the gas fireplace", "gas fireplace"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn turn_command_with_scheduled_delay_abstains_instead_of_firing_now() {
+        // "turn on the lights in 5 minutes" is a schedule. clean_control_entity
+        // split the "in <duration>" tail as a room and emitted a garbled
+        // "5 minutes lights" entity that actuates immediately. The router must
+        // abstain so the LLM can arm the timer.
+        for utterance in [
+            "turn on the lights in 5 minutes",
+            "turn off the fan in an hour",
+            "turn on the lights in the evening",
+            "turn on the bedroom lights in 10 minutes",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // A genuine room after "in [the]" is unaffected — it is not a time word.
+        for (utterance, entity) in [
+            ("turn on the lights in the bedroom", "bedroom lights"),
+            ("turn off the fan in the office", "office fan"),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "home_control", "{utterance:?}");
