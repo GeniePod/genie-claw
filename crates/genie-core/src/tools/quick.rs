@@ -1915,16 +1915,20 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
     if entity.is_empty() {
         return None;
     }
-    // Abstain on conditional, multi-clause, or whole-house phrasings ("turn off
-    // everything downstairs except the kitchen lights", "...lights only when I
-    // pull in"): these aren't a single named device, so the LLM grounds them.
+    // Abstain on conditional, multi-clause, coordinated, or whole-house phrasings
+    // ("turn off everything downstairs except the kitchen lights", "...lights only
+    // when I pull in", "turn on the porch light and the garage light"): these
+    // aren't a single named device, so the LLM grounds them. Without the " and "
+    // guard the coordinated form emitted one home_control with a garbled entity
+    // ("porch light and the garage light").
     let scoped = format!(" {rest} ");
     let is_multi_clause = scoped.contains(" everything ")
         || scoped.contains(" except ")
         || scoped.contains(" only ")
         || scoped.contains(" when ")
         || scoped.contains(" unless ")
-        || scoped.contains(" if ");
+        || scoped.contains(" if ")
+        || scoped.contains(" and ");
     if is_multi_clause {
         return None;
     }
@@ -2640,7 +2644,12 @@ fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> 
 
 fn clean_timer_label(tokens: &[&str]) -> Option<String> {
     let label = tokens.join(" ");
-    let label = label.strip_prefix("the ").unwrap_or(&label).trim();
+    let label = label
+        .strip_prefix("the ")
+        .or_else(|| label.strip_prefix("a "))
+        .or_else(|| label.strip_prefix("an "))
+        .unwrap_or(&label)
+        .trim();
     if label.is_empty() {
         None
     } else {
@@ -2810,7 +2819,10 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
         "lookup ",
     ] {
         if let Some(query) = text.strip_prefix(prefix) {
-            let query = query.trim();
+            // A trailing "please" is politeness, not part of the search query
+            // ("look up the best mesh router please"). Strip it, mirroring the
+            // clean_control_entity / memory_forget / play_media handling.
+            let query = query.trim().trim_end_matches(" please").trim_end();
             if !query.is_empty() {
                 return Some((query.to_string(), web_search_is_fresh_request(text)));
             }
@@ -2885,7 +2897,11 @@ fn strip_trailing_time_qualifier(subject: &str) -> &str {
     subject
         .trim_end_matches(" right now")
         .trim_end_matches(" this weekend")
+        .trim_end_matches(" next weekend")
         .trim_end_matches(" this week")
+        .trim_end_matches(" next week")
+        .trim_end_matches(" this month")
+        .trim_end_matches(" next month")
         .trim_end_matches(" this morning")
         .trim_end_matches(" this afternoon")
         .trim_end_matches(" this evening")
@@ -2918,13 +2934,22 @@ fn calculation_request(text: &str) -> Option<String> {
 }
 
 fn temperature_conversion_expression(text: &str) -> Option<String> {
-    if !(text.contains("to celsius") || text.contains("to celcius")) {
+    // Both directions: "72 degrees to celsius" -> (72 - 32) * 5 / 9 and the
+    // previously-unhandled "100 celsius to fahrenheit" -> 100 * 9 / 5 + 32, which
+    // used to fall through to the LLM.
+    let to_celsius = text.contains("to celsius") || text.contains("to celcius");
+    let to_fahrenheit = text.contains("to fahrenheit") || text.contains("to farenheit");
+    if !to_celsius && !to_fahrenheit {
         return None;
     }
     let tokens = text.split_whitespace().collect::<Vec<_>>();
     let to_idx = tokens.iter().position(|token| *token == "to")?;
-    let fahrenheit = calc_number_before_to(&tokens, to_idx)?;
-    Some(format!("({fahrenheit} - 32) * 5 / 9"))
+    let value = calc_number_before_to(&tokens, to_idx)?;
+    Some(if to_celsius {
+        format!("({value} - 32) * 5 / 9")
+    } else {
+        format!("{value} * 9 / 5 + 32")
+    })
 }
 
 fn percentage_expression(text: &str) -> Option<String> {
@@ -3031,11 +3056,13 @@ fn calc_number_starting_at(tokens: &[&str], start: usize) -> Option<f64> {
     if start >= tokens.len() {
         return None;
     }
-    // A leading article ("a"/"an") is not the amount: "20 percent of a 50 dollar
-    // bill" means 50, not 1 (the article word parses as the cardinal 1). Skip it
-    // and read the number that follows — but only when a real number actually
-    // follows, so "a dollar" (no number after) still falls through to 1.
-    if matches!(tokens[start], "a" | "an") && start + 1 < tokens.len() {
+    // A leading article ("a"/"an"/"the") precedes the amount, not the amount
+    // itself: "20 percent of a 50 dollar bill" means 50, not 1 (an "a"/"an"
+    // parses as the cardinal 1; a bare "the" fails to parse and made the whole
+    // percentage abstain). Skip it and read the number that follows — but only
+    // when a real number actually follows, so "a dollar" / "the total" (no
+    // number after) still fall through.
+    if matches!(tokens[start], "a" | "an" | "the") && start + 1 < tokens.len() {
         if let Some((value, _)) = super::number_words::parse_spoken_number(tokens, start + 1) {
             return Some(value as f64);
         }
@@ -3049,8 +3076,9 @@ fn calc_number_starting_at(tokens: &[&str], start: usize) -> Option<f64> {
     parse_decimal_token(tokens[start])
 }
 
-/// Fahrenheit value before a `to celsius` tail, tolerating a trailing `f` token
-/// and optional unit words (`degrees`, `fahrenheit`).
+/// The numeric temperature before a `to <unit>` tail, tolerating a trailing `f`
+/// token and optional unit words (`degrees`, `fahrenheit`, `celsius`) so both
+/// "72 fahrenheit to celsius" and "100 celsius to fahrenheit" read the value.
 fn calc_number_before_to(tokens: &[&str], to_idx: usize) -> Option<f64> {
     if to_idx == 0 {
         return None;
@@ -3059,7 +3087,15 @@ fn calc_number_before_to(tokens: &[&str], to_idx: usize) -> Option<f64> {
     if end > 0 && tokens[end - 1] == "f" {
         end -= 1;
     }
-    const SKIP_BEFORE_TO: &[&str] = &["degrees", "degree", "fahrenheit", "f"];
+    const SKIP_BEFORE_TO: &[&str] = &[
+        "degrees",
+        "degree",
+        "fahrenheit",
+        "f",
+        "celsius",
+        "celcius",
+        "c",
+    ];
     while end > 0 && SKIP_BEFORE_TO.contains(&tokens[end - 1]) {
         end -= 1;
     }
@@ -5307,6 +5343,20 @@ mod tests {
     }
 
     #[test]
+    fn timer_label_drops_leading_indefinite_article() {
+        // clean_timer_label stripped a leading "the " but left "a"/"an", so
+        // "timer for a break" produced label "a break".
+        let call = route("set a 5 minute timer for a break").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "break");
+
+        let call = route("set a timer for 10 minutes for an errand").unwrap();
+        assert_eq!(call.arguments["seconds"], 600);
+        assert_eq!(call.arguments["label"], "errand");
+    }
+
+    #[test]
     fn routes_reminder_task_before_duration() {
         // Regression (#591): the task-first order dropped the label and fell back
         // to the generic "reminder"; it must now recover the same label as the
@@ -5596,6 +5646,14 @@ mod tests {
             ("weather in Tokyo right now", "tokyo", false),
             ("forecast for Boston this weekend", "boston", true),
             ("what's the weather in Paris now", "paris", false),
+            // The "next …" family leaked into the city ("denver next week").
+            ("forecast for Denver next week", "denver", true),
+            (
+                "what's the weather in Seattle next weekend",
+                "seattle",
+                true,
+            ),
+            ("weather in Austin this month", "austin", false),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "get_weather", "{utterance:?}");
@@ -5658,6 +5716,18 @@ mod tests {
     }
 
     #[test]
+    fn web_search_query_drops_trailing_please() {
+        // A trailing "please" is politeness, not part of the search query.
+        let call = route("look up the best mesh router please").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "the best mesh router");
+
+        let call = route("search the web for matter support please").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "matter support");
+    }
+
+    #[test]
     fn routes_simple_arithmetic() {
         let call = route("what is 12 plus 30").unwrap();
         assert_eq!(call.name, "calculate");
@@ -5690,6 +5760,15 @@ mod tests {
         let call = route("Convert 350 degrees to Celsius").unwrap();
         assert_eq!(call.name, "calculate");
         assert_eq!(call.arguments["expression"], "(350 - 32) * 5 / 9");
+
+        // The reverse direction used to fall through to the LLM.
+        let call = route("Convert 100 Celsius to Fahrenheit").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "100 * 9 / 5 + 32");
+
+        let call = route("convert 37 c to fahrenheit").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "37 * 9 / 5 + 32");
     }
 
     #[test]
@@ -5743,6 +5822,21 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "lights");
         assert_eq!(call.arguments["action"], "turn_off");
+    }
+
+    #[test]
+    fn coordinated_turn_command_abstains_instead_of_garbling_the_entity() {
+        // "turn on A and B" names two devices — not a single entity. It used to
+        // emit one home_control with a garbled entity ("porch light and the
+        // garage light"); it must abstain (like the other multi-clause forms) so
+        // the LLM grounds both devices.
+        assert!(route("turn on the porch light and the garage light").is_none());
+        assert!(route("turn off the fan and the lights").is_none());
+
+        // A single device whose name merely contains the substring "and" (e.g.
+        // "island") is unaffected — the guard matches a spaced " and ".
+        let call = route("turn on the island lights").unwrap();
+        assert_eq!(call.arguments["entity"], "island lights");
     }
 
     #[test]

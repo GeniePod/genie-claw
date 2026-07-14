@@ -593,7 +593,37 @@ fn is_remote_url(url: &str) -> bool {
     } else {
         authority.split(':').next().unwrap_or(authority)
     };
-    !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    !is_loopback_host(host)
+}
+
+/// True when `host` is a loopback target: the literal name `localhost`, or an
+/// IPv4/IPv6 address in the loopback range (`127.0.0.0/8`, `::1`) — not just
+/// the single literal string `127.0.0.1`.
+///
+/// This mirrors `genie_core::security::sandbox::is_loopback_host` exactly.
+/// This crate (`genie-common`) sits below `genie-core` in the dependency
+/// graph, so it cannot import that function; both must independently parse
+/// the address rather than pattern-match a short literal list, which is what
+/// let this exact check regress once already (issue #327, "remote_url()
+/// blocks 127.0.0.0/8 except 127.0.0.1") in the `genie-core` copy — this
+/// `genie-common` copy had drifted from that fix and still only recognized
+/// the single literal `127.0.0.1`.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let ip_str = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    ip_str
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2010,6 +2040,20 @@ mod tests {
         // Conversely, a genuine loopback host behind userinfo stays local.
         assert!(!is_remote_url("http://user:pass@[::1]:8080"));
         assert!(!is_remote_url("http://user@localhost"));
+    }
+
+    #[test]
+    fn is_remote_url_recognizes_the_full_loopback_range_not_just_127_0_0_1() {
+        // Regression test (issue #327's exact bug class, reintroduced by this
+        // function's independent, drifted duplicate of the genie-core check):
+        // 127.0.0.0/8 is entirely loopback, not just the single address
+        // 127.0.0.1. A naive exact-string match on "127.0.0.1" wrongly treats
+        // every other address in that range as remote.
+        assert!(!is_remote_url("http://127.0.0.2:8080/v1"));
+        assert!(!is_remote_url("http://127.1.2.3:9090"));
+        assert!(!is_remote_url("http://127.255.255.255"));
+        // Real remote hosts are unaffected.
+        assert!(is_remote_url("http://8.8.8.8"));
     }
 
     #[test]

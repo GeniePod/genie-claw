@@ -10,6 +10,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -24,10 +25,12 @@ use crate::memory::{SharedMemory, with_shared_memory};
 use crate::memory::{extract, inject};
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
+use crate::session::SessionRegistry;
 use crate::tools::ToolDispatcher;
 use crate::voice::identity::{self, SpeakerIdentityProvider};
 use crate::voice::intent::{self, VoiceIntentDecision};
 use crate::voice::{aec, format, streaming, stt, tts};
+use tokio::sync::Mutex;
 
 /// Configuration for the voice loop.
 pub struct VoiceConfig {
@@ -155,6 +158,11 @@ pub async fn run(
         eprintln!("{}", llm_unreachable_message(llm.backend_name()));
     }
 
+    // One bounded, idle-expiring session registry for the whole voice runtime
+    // (voice runs as its own mode, separate from the HTTP daemon), so voice
+    // turns are capped and expire like HTTP/Telegram sessions (#702).
+    let session_registry = Mutex::new(SessionRegistry::with_defaults());
+
     let use_wakeword = !voice_cfg.wakeword_script.is_empty()
         && std::path::Path::new(&voice_cfg.wakeword_script).exists();
 
@@ -176,6 +184,7 @@ pub async fn run(
             max_history,
             model_family,
             &conv_id,
+            &session_registry,
         )
         .await
     } else {
@@ -196,6 +205,7 @@ pub async fn run(
             max_history,
             model_family,
             &conv_id,
+            &session_registry,
         )
         .await
     }
@@ -214,6 +224,7 @@ async fn run_with_wakeword(
     max_history: usize,
     model_family: ModelFamily,
     conv_id: &str,
+    session_registry: &Mutex<SessionRegistry>,
 ) -> Result<()> {
     // Outer loop: restarts the wake word listener if it crashes or pipe breaks.
     loop {
@@ -296,6 +307,7 @@ async fn run_with_wakeword(
                 max_history,
                 model_family,
                 conv_id,
+                session_registry,
             )
             .await;
 
@@ -369,6 +381,8 @@ async fn run_with_wakeword(
                                 speaker.name.as_deref().unwrap_or("unknown"),
                                 speaker.confidence.as_str(),
                             );
+                            // Continuous-listen follow-up turns enroll too (#702).
+                            track_voice_session(session_registry, speaker.name.as_deref()).await;
                             let _ = tokio::fs::remove_file(&followup_path).await;
 
                             if let VoiceIntentDecision::Reject(reason) =
@@ -525,6 +539,7 @@ async fn run_push_to_talk(
     max_history: usize,
     model_family: ModelFamily,
     conv_id: &str,
+    session_registry: &Mutex<SessionRegistry>,
 ) -> Result<()> {
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -554,6 +569,7 @@ async fn run_push_to_talk(
             max_history,
             model_family,
             conv_id,
+            session_registry,
         )
         .await;
 
@@ -862,6 +878,10 @@ async fn handle_quick_tool_for_voice(
     Some(response)
 }
 
+/// Hard deadline for wake-tone `aplay` — ~150ms of audio; 5s is ample headroom
+/// but prevents a hung ALSA child from wedging the single voice loop (#617).
+const WAKE_TONE_PLAYBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Play a short confirmation tone when wake word is detected.
 /// Gives the user immediate feedback that the device heard them.
 async fn play_wake_tone(audio_device: &str) {
@@ -901,13 +921,25 @@ async fn play_wake_tone(audio_device: &str) {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
         .spawn();
 
     if let Ok(mut child) = child {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, &pcm).await;
         }
-        let _ = child.wait().await;
+        match tokio::time::timeout(WAKE_TONE_PLAYBACK_TIMEOUT, child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "aplay wake tone failed");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = WAKE_TONE_PLAYBACK_TIMEOUT.as_secs(),
+                    "aplay wake tone timed out — voice loop continuing"
+                );
+            }
+        }
     }
 }
 
@@ -925,6 +957,7 @@ async fn voice_cycle(
     max_history: usize,
     model_family: ModelFamily,
     conv_id: &str,
+    session_registry: &Mutex<SessionRegistry>,
 ) -> bool {
     // Step 1: Record (fixed duration — reliable).
     //
@@ -1000,6 +1033,7 @@ async fn voice_cycle(
             max_history,
             model_family,
             conv_id,
+            session_registry,
             wav_path: Some(&wav_path),
             tts_engine_override: None,
             t_preprocess_done,
@@ -1024,6 +1058,10 @@ pub struct ProcessTranscriptInputs<'a> {
     pub max_history: usize,
     pub model_family: ModelFamily,
     pub conv_id: &'a str,
+    /// Bounded, idle-expiring registry of active (channel, speaker) sessions.
+    /// Each processed voice turn enrolls its `"voice:<speaker>"` session so the
+    /// voice channel counts against the Jetson session budget (#702).
+    pub session_registry: &'a Mutex<SessionRegistry>,
     /// Recording path for speaker identity + cleanup. `None` in tests
     /// where the transcript came from `SttEngine::mock` and no WAV
     /// exists on disk.
@@ -1050,6 +1088,35 @@ pub struct ProcessTranscriptInputs<'a> {
 /// Returns `false` only when the caller should exit the outer voice
 /// loop — today nothing here ever signals exit, so this always returns
 /// `true`.
+/// Session key for a voice turn: `"voice:<speaker>"`, matching the
+/// `"<channel>:<speaker>"` convention the HTTP/Telegram paths use (e.g.
+/// `"http:dana"`). An unresolved speaker collapses to `"voice:unknown"` so the
+/// shared-device turns still enroll as one bounded session.
+fn voice_session_key(speaker_name: Option<&str>) -> String {
+    format!("voice:{}", speaker_name.unwrap_or("unknown"))
+}
+
+fn voice_session_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Enroll a resolved voice turn in the bounded, idle-expiring session registry
+/// so voice sessions count against the Jetson session budget exactly like the
+/// HTTP and Telegram channels (#565 / #677 / #702).
+async fn track_voice_session(
+    session_registry: &Mutex<SessionRegistry>,
+    speaker_name: Option<&str>,
+) {
+    let key = voice_session_key(speaker_name);
+    session_registry
+        .lock()
+        .await
+        .track(&key, voice_session_now_ms());
+}
+
 pub async fn process_transcript(
     transcript: stt::Transcript,
     inputs: ProcessTranscriptInputs<'_>,
@@ -1065,6 +1132,7 @@ pub async fn process_transcript(
         max_history,
         model_family,
         conv_id,
+        session_registry,
         wav_path,
         tts_engine_override,
         t_preprocess_done,
@@ -1107,6 +1175,9 @@ pub async fn process_transcript(
         speaker.name.as_deref().unwrap_or("unknown"),
         speaker.confidence.as_str(),
     );
+    // Enroll this (voice, speaker) turn in the bounded session registry so voice
+    // counts against the Jetson session budget like HTTP/Telegram (#702).
+    track_voice_session(session_registry, speaker.name.as_deref()).await;
     if let Some(path) = wav_path {
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -1410,6 +1481,32 @@ fn llm_unreachable_message(backend_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_session_key_follows_channel_speaker_convention() {
+        assert_eq!(voice_session_key(Some("dana")), "voice:dana");
+        // An unresolved speaker collapses to one shared-device session.
+        assert_eq!(voice_session_key(None), "voice:unknown");
+    }
+
+    #[test]
+    fn voice_sessions_are_bounded_and_idle_expire() {
+        // The voice channel enrolls "voice:<speaker>" keys in the same bounded,
+        // idle-expiring registry HTTP/Telegram use (#702).
+        let mut registry = SessionRegistry::new(2, 1_000);
+        registry.track(&voice_session_key(Some("alice")), 1_000);
+        registry.track(&voice_session_key(Some("bob")), 1_100);
+        registry.track(&voice_session_key(Some("carol")), 1_200);
+
+        // LRU cap: the oldest voice session is evicted once the third arrives.
+        assert!(registry.conversation_id("voice:alice").is_none());
+        assert_eq!(registry.conversation_id("voice:carol"), Some("voice:carol"));
+        assert_eq!(registry.len(), 2);
+
+        // Idle expiry: after the TTL elapses, an untouched voice session is gone.
+        registry.track(&voice_session_key(Some("dave")), 5_000);
+        assert!(registry.conversation_id("voice:bob").is_none());
+    }
 
     #[test]
     fn llm_status_messages_include_backend_name() {
