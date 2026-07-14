@@ -2755,7 +2755,12 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
             let symbol = company_ticker(&subject).unwrap_or(subject.as_str());
             format!("{symbol} stock price")
         };
-        return Some((query, web_search_is_fresh_request(text)));
+        // A stock-price query always wants the *current* price, so it is
+        // inherently fresh. Deriving freshness from `web_search_is_fresh_request`
+        // (spaced " now "/" today "/" current " markers) missed the bare
+        // "tesla stock price" / "stock price of tesla" forms — they have no such
+        // marker — so a time-sensitive price could be served from a stale cache.
+        return Some((query, true));
     }
 
     if matches!(text, "read the news" | "read news" | "what s the news") {
@@ -2903,10 +2908,16 @@ fn percentage_expression(text: &str) -> Option<String> {
 }
 
 fn arithmetic_expression(text: &str) -> Option<String> {
+    // `text` comes from `calc_input::prepare`, which maps an apostrophe to a
+    // space, so "What's 2 plus 2?" arrives as "what s 2 plus 2". Without the
+    // normalized "what s " prefix the question words survived, the leftover
+    // letters failed the all-math-chars gate below, and the calculator abstained
+    // — even though the identical "what is" phrasing routed fine.
     let expression = text
         .strip_prefix("calculate ")
         .or_else(|| text.strip_prefix("what is "))
         .or_else(|| text.strip_prefix("whats "))
+        .or_else(|| text.strip_prefix("what s "))
         .or_else(|| text.strip_prefix("what's "))
         .unwrap_or(text)
         .replace(" plus ", " + ")
@@ -3254,8 +3265,14 @@ fn clean_status_target(text: &str) -> String {
     for prefix in [
         "what is the ",
         "what are the ",
+        // `normalize` folds the apostrophe in "what's" to a space, yielding
+        // "what s the ...". Without these the generic "what " prefix stripped
+        // only "what ", leaving a dangling "s" in the entity
+        // ("what's the temperature in the bedroom" -> "s the temperature ...").
+        "what s the ",
         "what is ",
         "what are ",
+        "what s ",
         "what ",
         "which ",
         "is the ",
@@ -4896,6 +4913,29 @@ mod tests {
     }
 
     #[test]
+    fn whats_contraction_matches_spelled_out_status_prefix() {
+        // `normalize` folds "what's" -> "what s", so the status prefix strip left
+        // a dangling "s" ("what's the temperature in the bedroom" -> entity
+        // "s the temperature in the bedroom"). The contraction must behave like
+        // the spelled-out "what is the ...".
+        for utterance in [
+            "what's the temperature in the bedroom",
+            "what's the water pressure",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            let entity = call.arguments["entity"].as_str().unwrap();
+            assert!(
+                !entity.starts_with("s the") && !entity.starts_with("s "),
+                "{utterance:?} left a dangling 's': {entity:?}"
+            );
+        }
+        // Identical to the spelled-out form.
+        let contracted = route("what's the temperature in the bedroom").unwrap();
+        let spelled = route("what is the temperature in the bedroom").unwrap();
+        assert_eq!(contracted.arguments["entity"], spelled.arguments["entity"]);
+    }
+
+    #[test]
     fn status_entity_drops_both_state_word_and_time_qualifier() {
         // A status query can trail a state word AND a time qualifier. The entity
         // must be the bare device, not "garage door open" / "front door locked"
@@ -5056,6 +5096,22 @@ mod tests {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "web_search", "{utterance:?}");
             assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn stock_price_query_is_always_fresh() {
+        // A stock-price query always wants the current price. Bare forms carry no
+        // spaced " now "/" today "/" current " marker, so they used to route with
+        // no `fresh` flag and could be served a stale cached price.
+        for utterance in [
+            "Tesla stock price",
+            "stock price of Tesla",
+            "what is the microsoft stock price",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
         }
     }
 
@@ -5526,6 +5582,23 @@ mod tests {
         let call = route("what is 12 plus 30").unwrap();
         assert_eq!(call.name, "calculate");
         assert_eq!(call.arguments["expression"], "12 + 30");
+    }
+
+    #[test]
+    fn routes_apostrophe_arithmetic_to_calculate() {
+        // calc_input::prepare maps the apostrophe to a space, so "What's 2 plus
+        // 2?" arrives as "what s 2 plus 2"; the prefix set must include that
+        // normalized form or the question words survive and the calculator
+        // abstains, unlike the identical "what is" phrasing.
+        for (utterance, expression) in [
+            ("What's 2 plus 2?", "2 + 2"),
+            ("what's 5 times 3", "5 * 3"),
+            ("What's two plus three?", "2 + 3"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "calculate", "{utterance:?}");
+            assert_eq!(call.arguments["expression"], expression, "{utterance:?}");
+        }
     }
 
     #[test]
