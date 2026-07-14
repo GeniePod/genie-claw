@@ -1923,25 +1923,34 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
     if entity.is_empty() {
         return None;
     }
-    // Abstain on conditional, multi-clause, or whole-house phrasings ("turn off
-    // everything downstairs except the kitchen lights", "...lights only when I
-    // pull in"): these aren't a single named device, so the LLM grounds them.
+    // Abstain on conditional, multi-clause, coordinated, or whole-house phrasings
+    // ("turn off everything downstairs except the kitchen lights", "...lights only
+    // when I pull in", "turn on the porch light and the garage light"): these
+    // aren't a single named device, so the LLM grounds them. Without the " and "
+    // guard the coordinated form emitted one home_control with a garbled entity
+    // ("porch light and the garage light").
     let scoped = format!(" {rest} ");
     let is_multi_clause = scoped.contains(" everything ")
         || scoped.contains(" except ")
         || scoped.contains(" only ")
         || scoped.contains(" when ")
         || scoped.contains(" unless ")
-        || scoped.contains(" if ");
+        || scoped.contains(" if ")
+        || scoped.contains(" and ");
     if is_multi_clause {
         return None;
     }
     // Only emit a deterministic call for device classes the router can name
     // unambiguously: fans, fireplaces, and lights (#523, e.g. "turn on the
     // kitchen lights"). The light gate matches the device itself (a trailing
-    // "light"/"lights" or the bare word).
-    let known_device = entity.contains("fan")
-        || entity.contains("fireplace")
+    // "light"/"lights" or the bare word); match fan/fireplace as whole words the
+    // same way. A substring test ("infant monitor".contains("fan")) misfires on a
+    // device whose *name* merely contains those letters, actuating a turn_on the
+    // caller never asked for instead of falling through to the LLM.
+    let names_fan_or_fireplace = entity
+        .split_whitespace()
+        .any(|word| matches!(word, "fan" | "fans" | "fireplace" | "fireplaces"));
+    let known_device = names_fan_or_fireplace
         || entity == "light"
         || entity == "lights"
         || entity.ends_with(" light")
@@ -2823,7 +2832,10 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
         "lookup ",
     ] {
         if let Some(query) = text.strip_prefix(prefix) {
-            let query = query.trim();
+            // A trailing "please" is politeness, not part of the search query
+            // ("look up the best mesh router please"). Strip it, mirroring the
+            // clean_control_entity / memory_forget / play_media handling.
+            let query = query.trim().trim_end_matches(" please").trim_end();
             if !query.is_empty() {
                 return Some((query.to_string(), web_search_is_fresh_request(text)));
             }
@@ -2847,7 +2859,17 @@ fn web_search_is_fresh_request(text: &str) -> bool {
             " the current",
             " current ",
         ],
-    )
+    ) || {
+        // The markers above are space-delimited, so a freshness word at the very
+        // END of the utterance — the most natural phrasing ("look up the news
+        // today", "search the web for the bitcoin price now") — has no trailing
+        // space and slips through, leaving the query un-fresh and answerable from
+        // a stale cache. Honor the trailing form too. A leading space is required
+        // so "melt snow" / "how it works" do not trip it.
+        [" now", " today", " currently", " latest"]
+            .iter()
+            .any(|suffix| text.ends_with(suffix))
+    }
 }
 
 /// Map a well-known company name to its stock ticker, so a price query reads
@@ -5019,6 +5041,30 @@ mod tests {
     }
 
     #[test]
+    fn turn_command_matches_fan_as_a_whole_word_not_a_substring() {
+        // The fan/fireplace gate used `entity.contains("fan")`, so a device whose
+        // NAME merely contains those letters ("infant monitor", the "Infant
+        // Optics" baby-monitor brand) was misclassified as a fan and actuated a
+        // turn_on the caller never asked for. It must abstain so the LLM grounds
+        // the real device.
+        assert!(route("turn on the infant monitor").is_none());
+        assert!(route("turn off the infant optics").is_none());
+
+        // Genuine fans and fireplaces still route (whole-word match, incl. plural
+        // and room-qualified forms).
+        for (utterance, entity) in [
+            ("turn on the fan", "fan"),
+            ("turn off the fans", "fans"),
+            ("turn on the ceiling fan", "ceiling fan"),
+            ("turn on the gas fireplace", "gas fireplace"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn whats_contraction_matches_spelled_out_status_prefix() {
         // `normalize` folds "what's" -> "what s", so the status prefix strip left
         // a dangling "s" ("what's the temperature in the bedroom" -> entity
@@ -5740,6 +5786,45 @@ mod tests {
     }
 
     #[test]
+    fn web_search_query_drops_trailing_please() {
+        // A trailing "please" is politeness, not part of the search query.
+        let call = route("look up the best mesh router please").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "the best mesh router");
+
+        let call = route("search the web for matter support please").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "matter support");
+    }
+
+    #[test]
+    fn lookup_with_trailing_time_word_is_fresh() {
+        // A freshness word at the END of the utterance has no trailing space, so
+        // the space-delimited markers miss it and the query could be served from
+        // a stale cache. The trailing form must still flag the request fresh.
+        for utterance in [
+            "search the web for the bitcoin price now",
+            "look up the news today",
+            "look up the bitcoin price currently",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
+        }
+
+        // A non-time-sensitive lookup stays un-fresh (no bogus "fresh" flag), and
+        // a word merely ending in a freshness token ("snow") does not trip it.
+        for utterance in [
+            "look up esp32 c6 thread support",
+            "look up how to melt snow",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert!(call.arguments.get("fresh").is_none(), "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_simple_arithmetic() {
         let call = route("what is 12 plus 30").unwrap();
         assert_eq!(call.name, "calculate");
@@ -5834,6 +5919,21 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "lights");
         assert_eq!(call.arguments["action"], "turn_off");
+    }
+
+    #[test]
+    fn coordinated_turn_command_abstains_instead_of_garbling_the_entity() {
+        // "turn on A and B" names two devices — not a single entity. It used to
+        // emit one home_control with a garbled entity ("porch light and the
+        // garage light"); it must abstain (like the other multi-clause forms) so
+        // the LLM grounds both devices.
+        assert!(route("turn on the porch light and the garage light").is_none());
+        assert!(route("turn off the fan and the lights").is_none());
+
+        // A single device whose name merely contains the substring "and" (e.g.
+        // "island") is unaffected — the guard matches a spaced " and ".
+        let call = route("turn on the island lights").unwrap();
+        assert_eq!(call.arguments["entity"], "island lights");
     }
 
     #[test]

@@ -44,6 +44,7 @@ fn from_config_selects_optional_openai_compatible_provider() {
         provider: OptionalAiProviderKind::OpenAiCompatible,
         auth_mode: OptionalAiProviderAuthMode::ApiKey,
         base_url: "http://127.0.0.1:11434/v1".into(),
+        model: "test-model".into(),
         api_key_env: "PROVIDER_CONFIG_TEST_KEY".into(),
         oauth_token_env: String::new(),
         context_window_tokens: 4096,

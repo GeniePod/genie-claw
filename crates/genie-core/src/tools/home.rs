@@ -51,38 +51,24 @@ pub async fn control(
         }
     }
 
-    if !confirmed
-        && matches!(
-            request_origin,
-            RequestOrigin::Voice | RequestOrigin::Telegram
-        )
-        && !matches!(policy.risk, crate::ha::ActionRisk::Low)
-    {
-        return Ok(ControlOutcome::ConfirmationRequired {
-            reason: format!(
-                "{} from {} requires local confirmation",
-                action.target.display_name,
-                match request_origin {
-                    RequestOrigin::Voice => "voice",
-                    RequestOrigin::Telegram => "telegram",
-                    _ => "this origin",
-                }
-            ),
-            target_display: action.target.display_name,
-        });
-    }
-
-    if !confirmed
-        && matches!(request_origin, RequestOrigin::Api)
-        && !matches!(policy.risk, crate::ha::ActionRisk::Low)
-    {
-        return Ok(ControlOutcome::ConfirmationRequired {
-            reason: format!(
-                "{} from the API requires local confirmation",
-                action.target.display_name
-            ),
-            target_display: action.target.display_name,
-        });
+    if !confirmed && !matches!(policy.risk, crate::ha::ActionRisk::Low) {
+        let origin_label = match request_origin {
+            RequestOrigin::Voice => Some("voice"),
+            RequestOrigin::Telegram => Some("telegram"),
+            RequestOrigin::Api => Some("the API"),
+            RequestOrigin::Dashboard => Some("the dashboard"),
+            RequestOrigin::Repl => Some("the REPL"),
+            RequestOrigin::Unknown | RequestOrigin::Confirmation => None,
+        };
+        if let Some(label) = origin_label {
+            return Ok(ControlOutcome::ConfirmationRequired {
+                reason: format!(
+                    "{} from {} requires local confirmation",
+                    action.target.display_name, label
+                ),
+                target_display: action.target.display_name,
+            });
+        }
     }
 
     let health = home.health().await;
@@ -260,6 +246,61 @@ mod tests {
         match result {
             ControlOutcome::Executed(output, _) => assert!(output.contains("TurnOn")),
             ControlOutcome::ConfirmationRequired { .. } => panic!("expected execution"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_requires_confirmation_for_medium_risk_dashboard_action() {
+        let home = StubHome {
+            domain: "climate",
+            voice_safe: true,
+        };
+
+        let result = control(
+            &home,
+            "Thermostat",
+            "set_temperature",
+            Some(90.0),
+            &ActuationSafetyConfig::default(),
+            RequestOrigin::Dashboard,
+            false,
+        )
+        .await
+        .unwrap();
+
+        match result {
+            ControlOutcome::ConfirmationRequired { reason, .. } => {
+                assert!(reason.contains("the dashboard"));
+                assert!(reason.contains("requires local confirmation"));
+            }
+            ControlOutcome::Executed(_, _) => panic!("expected confirmation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_requires_confirmation_for_medium_risk_repl_action() {
+        let home = StubHome {
+            domain: "climate",
+            voice_safe: true,
+        };
+
+        let result = control(
+            &home,
+            "Thermostat",
+            "set_temperature",
+            Some(72.0),
+            &ActuationSafetyConfig::default(),
+            RequestOrigin::Repl,
+            false,
+        )
+        .await
+        .unwrap();
+
+        match result {
+            ControlOutcome::ConfirmationRequired { reason, .. } => {
+                assert!(reason.contains("the REPL"));
+            }
+            ControlOutcome::Executed(_, _) => panic!("expected confirmation"),
         }
     }
 

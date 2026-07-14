@@ -2238,6 +2238,11 @@ impl Memory {
             None => existing.kind.clone(),
         };
 
+        let write_policy = policy::assess_memory_write(&next_kind, &content);
+        if !write_policy.allowed {
+            anyhow::bail!("{}", write_policy.reason);
+        }
+
         let metadata = policy::infer_metadata(&next_kind, &content);
         let changed = existing.kind != next_kind
             || existing.content != content
@@ -15033,6 +15038,23 @@ mod tests {
         let text = std::fs::read_to_string(root).unwrap();
         assert!(!text.contains("green"));
         assert!(text.contains("blue"));
+    }
+
+    #[test]
+    fn update_managed_rejects_restricted_secret_content() {
+        let mem = temp_memory();
+        let id = mem
+            .store("fact", "Kitchen light is on the east wall")
+            .unwrap();
+
+        let err = mem
+            .update_managed(id, "the gate code is 5829", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("access codes"), "{err}");
+
+        let entry = mem.get_by_id(id).unwrap().unwrap();
+        assert_eq!(entry.content, "Kitchen light is on the east wall");
     }
 
     #[test]
