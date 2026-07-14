@@ -1060,10 +1060,17 @@ fn play_media_request(text: &str) -> Option<String> {
 }
 
 fn shopping_list_add_request(text: &str) -> Option<String> {
-    let rest = text.strip_prefix("add ")?;
+    // "add <items> to the shopping list" and the equally common "put <items> on
+    // the shopping list". Without the "put …/on …" form the latter fell through
+    // to memory_recall, searching memory for the command instead of adding.
+    let rest = text
+        .strip_prefix("add ")
+        .or_else(|| text.strip_prefix("put "))?;
     let items = rest
         .strip_suffix(" to the shopping list")
-        .or_else(|| rest.strip_suffix(" to shopping list"))?
+        .or_else(|| rest.strip_suffix(" to shopping list"))
+        .or_else(|| rest.strip_suffix(" on the shopping list"))
+        .or_else(|| rest.strip_suffix(" on shopping list"))?
         .trim();
     if items.is_empty() {
         None
@@ -4029,6 +4036,26 @@ mod tests {
         let call = route("Play my study playlist please").unwrap();
         assert_eq!(call.name, "play_media");
         assert_eq!(call.arguments["query"], "my study playlist");
+    }
+
+    #[test]
+    fn put_on_the_shopping_list_adds_like_add_to_the_shopping_list() {
+        // "put <items> on the shopping list" is as common as "add <items> to the
+        // shopping list"; without it the command fell through to memory_recall.
+        let call = route("Put the milk on the shopping list").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "shopping");
+        assert_eq!(call.arguments["content"], "shopping list pending: the milk");
+
+        let call = route("Put eggs and bread on the shopping list").unwrap();
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list pending: eggs, bread"
+        );
+
+        // The media "put on ..." path is unaffected.
+        let call = route("Put on the morning news").unwrap();
+        assert_eq!(call.name, "play_media");
     }
 
     #[test]
