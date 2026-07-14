@@ -3137,10 +3137,44 @@ fn fractional_duration(tokens: &[&str]) -> Option<(u64, usize)> {
             Some("hour" | "hours" | "hr" | "hrs") => 3600,
             _ => continue,
         };
+        // A leading "<whole> and [a] <fraction> <unit>" ("two and a half hours")
+        // modifies the same unit: the fraction sits *between* the number and the
+        // unit, so the scan above only saw "half … hours" and dropped the whole
+        // number, emitting a 5x-too-short timer (1800s for "two and a half
+        // hours"). Fold the whole part back in. The reversed order
+        // "<whole> <unit> and a <fraction>" is summed by
+        // `extend_duration_with_trailing_spans` instead, so it never reaches here.
+        let mut whole_seconds = 0u64;
+        let mut lead = i;
+        if lead > 0 && matches!(tokens.get(lead - 1).copied(), Some("a" | "an")) {
+            lead -= 1;
+        }
+        if lead > 0 && tokens.get(lead - 1).copied() == Some("and") {
+            let and_index = lead - 1;
+            // The whole part is the spoken number ending immediately before "and"
+            // ("twenty five and a half" -> 25). Take the leftmost start that lands
+            // exactly on `and_index` so multi-token numbers are read in full.
+            // Parse over `tokens[..and_index]` (not the full slice) because
+            // parse_spoken_number folds a trailing "and a" into the number itself
+            // ("two and a" -> 3); slicing off "and" onward keeps "two" as 2.
+            let head = &tokens[..and_index];
+            for start in 0..and_index {
+                if let Some((amount, consumed)) =
+                    super::number_words::parse_spoken_number(head, start)
+                    && consumed == and_index
+                {
+                    whole_seconds = amount.saturating_mul(unit_seconds);
+                    break;
+                }
+            }
+        }
         // Integer math is exact for the recognized fractions of a minute/hour;
         // sub-second results (e.g. "half a second") floor to 0 and the caller's
         // `seconds == 0` guard abstains, letting the LLM handle it.
-        return Some((unit_seconds * numerator / denominator, unit_index));
+        return Some((
+            whole_seconds.saturating_add(unit_seconds * numerator / denominator),
+            unit_index,
+        ));
     }
     None
 }
@@ -5529,6 +5563,33 @@ mod tests {
         let call = route("remind me in an hour and a half to stretch").unwrap();
         assert_eq!(call.arguments["seconds"], 5400);
         assert_eq!(call.arguments["label"], "stretch");
+    }
+
+    #[test]
+    fn routes_number_and_a_half_before_unit_timer() {
+        // The fraction can sit *between* the number and the unit ("two and a half
+        // hours"), the natural spoken order. fractional_duration grabbed only the
+        // "half … hours" part and dropped the leading "two", so a 2.5-hour timer
+        // came back as 30 minutes (1800s). The reversed order "two hours and a
+        // half" already returns 9000 (see routes_whole_plus_half_compound_timer);
+        // both orders now agree.
+        let call = route("set a timer for two and a half hours").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 9000);
+
+        let call = route("set a timer for 2 and a half hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 9000);
+
+        // "quarter" and the minute unit fold in the same way (2.25h, 3.5min).
+        let call = route("set a timer for two and a quarter hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 8100);
+
+        let call = route("set a timer for three and a half minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 210);
+
+        // A bare fraction with no leading "<number> and" is unchanged.
+        let call = route("set a timer for half an hour").unwrap();
+        assert_eq!(call.arguments["seconds"], 1800);
     }
 
     #[test]
