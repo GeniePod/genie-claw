@@ -77,6 +77,55 @@ impl ToolDispatcher {
         self.timers
             .set(seconds, label)
             .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(format!("Timer set for {} seconds: {}", seconds, label))
+        Ok(format!(
+            "Timer set for {}: {}",
+            format_timer_duration(seconds),
+            label
+        ))
+    }
+}
+
+/// Render a timer duration in spoken-friendly units instead of raw seconds, so
+/// a 10-minute timer confirms as "10 minutes" and an hour as "1 hour" rather
+/// than "600 seconds" / "3600 seconds" (which the voice path reads verbatim).
+/// Zero-valued components are dropped and every unit is count-correct
+/// ("1 minute", not "1 minutes").
+fn format_timer_duration(total_seconds: u64) -> String {
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    let mut parts = Vec::new();
+    if hours > 0 {
+        parts.push(super::count_noun(hours as usize, "hour", "hours"));
+    }
+    if minutes > 0 {
+        parts.push(super::count_noun(minutes as usize, "minute", "minutes"));
+    }
+    if seconds > 0 {
+        parts.push(super::count_noun(seconds as usize, "second", "seconds"));
+    }
+    // `seconds` is validated >= 1 upstream, so `parts` is never empty; keep a
+    // defensive fallback rather than an unreachable panic.
+    if parts.is_empty() {
+        return super::count_noun(total_seconds as usize, "second", "seconds");
+    }
+    parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_timer_duration_in_spoken_units() {
+        assert_eq!(format_timer_duration(1), "1 second");
+        assert_eq!(format_timer_duration(30), "30 seconds");
+        assert_eq!(format_timer_duration(60), "1 minute");
+        assert_eq!(format_timer_duration(90), "1 minute 30 seconds");
+        assert_eq!(format_timer_duration(600), "10 minutes");
+        assert_eq!(format_timer_duration(3600), "1 hour");
+        assert_eq!(format_timer_duration(5400), "1 hour 30 minutes");
+        assert_eq!(format_timer_duration(3661), "1 hour 1 minute 1 second");
     }
 }
