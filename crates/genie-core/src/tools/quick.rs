@@ -1915,16 +1915,20 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
     if entity.is_empty() {
         return None;
     }
-    // Abstain on conditional, multi-clause, or whole-house phrasings ("turn off
-    // everything downstairs except the kitchen lights", "...lights only when I
-    // pull in"): these aren't a single named device, so the LLM grounds them.
+    // Abstain on conditional, multi-clause, coordinated, or whole-house phrasings
+    // ("turn off everything downstairs except the kitchen lights", "...lights only
+    // when I pull in", "turn on the porch light and the garage light"): these
+    // aren't a single named device, so the LLM grounds them. Without the " and "
+    // guard the coordinated form emitted one home_control with a garbled entity
+    // ("porch light and the garage light").
     let scoped = format!(" {rest} ");
     let is_multi_clause = scoped.contains(" everything ")
         || scoped.contains(" except ")
         || scoped.contains(" only ")
         || scoped.contains(" when ")
         || scoped.contains(" unless ")
-        || scoped.contains(" if ");
+        || scoped.contains(" if ")
+        || scoped.contains(" and ");
     if is_multi_clause {
         return None;
     }
@@ -2645,7 +2649,12 @@ fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> 
 
 fn clean_timer_label(tokens: &[&str]) -> Option<String> {
     let label = tokens.join(" ");
-    let label = label.strip_prefix("the ").unwrap_or(&label).trim();
+    let label = label
+        .strip_prefix("the ")
+        .or_else(|| label.strip_prefix("a "))
+        .or_else(|| label.strip_prefix("an "))
+        .unwrap_or(&label)
+        .trim();
     if label.is_empty() {
         None
     } else {
@@ -2815,7 +2824,10 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
         "lookup ",
     ] {
         if let Some(query) = text.strip_prefix(prefix) {
-            let query = query.trim();
+            // A trailing "please" is politeness, not part of the search query
+            // ("look up the best mesh router please"). Strip it, mirroring the
+            // clean_control_entity / memory_forget / play_media handling.
+            let query = query.trim().trim_end_matches(" please").trim_end();
             if !query.is_empty() {
                 return Some((query.to_string(), web_search_is_fresh_request(text)));
             }
@@ -2839,7 +2851,17 @@ fn web_search_is_fresh_request(text: &str) -> bool {
             " the current",
             " current ",
         ],
-    )
+    ) || {
+        // The markers above are space-delimited, so a freshness word at the very
+        // END of the utterance — the most natural phrasing ("look up the news
+        // today", "search the web for the bitcoin price now") — has no trailing
+        // space and slips through, leaving the query un-fresh and answerable from
+        // a stale cache. Honor the trailing form too. A leading space is required
+        // so "melt snow" / "how it works" do not trip it.
+        [" now", " today", " currently", " latest"]
+            .iter()
+            .any(|suffix| text.ends_with(suffix))
+    }
 }
 
 /// Map a well-known company name to its stock ticker, so a price query reads
@@ -3049,11 +3071,13 @@ fn calc_number_starting_at(tokens: &[&str], start: usize) -> Option<f64> {
     if start >= tokens.len() {
         return None;
     }
-    // A leading article ("a"/"an") is not the amount: "20 percent of a 50 dollar
-    // bill" means 50, not 1 (the article word parses as the cardinal 1). Skip it
-    // and read the number that follows — but only when a real number actually
-    // follows, so "a dollar" (no number after) still falls through to 1.
-    if matches!(tokens[start], "a" | "an") && start + 1 < tokens.len() {
+    // A leading article ("a"/"an"/"the") precedes the amount, not the amount
+    // itself: "20 percent of a 50 dollar bill" means 50, not 1 (an "a"/"an"
+    // parses as the cardinal 1; a bare "the" fails to parse and made the whole
+    // percentage abstain). Skip it and read the number that follows — but only
+    // when a real number actually follows, so "a dollar" / "the total" (no
+    // number after) still fall through.
+    if matches!(tokens[start], "a" | "an" | "the") && start + 1 < tokens.len() {
         if let Some((value, _)) = super::number_words::parse_spoken_number(tokens, start + 1) {
             return Some(value as f64);
         }
@@ -5358,6 +5382,20 @@ mod tests {
     }
 
     #[test]
+    fn timer_label_drops_leading_indefinite_article() {
+        // clean_timer_label stripped a leading "the " but left "a"/"an", so
+        // "timer for a break" produced label "a break".
+        let call = route("set a 5 minute timer for a break").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "break");
+
+        let call = route("set a timer for 10 minutes for an errand").unwrap();
+        assert_eq!(call.arguments["seconds"], 600);
+        assert_eq!(call.arguments["label"], "errand");
+    }
+
+    #[test]
     fn routes_reminder_task_before_duration() {
         // Regression (#591): the task-first order dropped the label and fell back
         // to the generic "reminder"; it must now recover the same label as the
@@ -5717,6 +5755,45 @@ mod tests {
     }
 
     #[test]
+    fn web_search_query_drops_trailing_please() {
+        // A trailing "please" is politeness, not part of the search query.
+        let call = route("look up the best mesh router please").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "the best mesh router");
+
+        let call = route("search the web for matter support please").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "matter support");
+    }
+
+    #[test]
+    fn lookup_with_trailing_time_word_is_fresh() {
+        // A freshness word at the END of the utterance has no trailing space, so
+        // the space-delimited markers miss it and the query could be served from
+        // a stale cache. The trailing form must still flag the request fresh.
+        for utterance in [
+            "search the web for the bitcoin price now",
+            "look up the news today",
+            "look up the bitcoin price currently",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
+        }
+
+        // A non-time-sensitive lookup stays un-fresh (no bogus "fresh" flag), and
+        // a word merely ending in a freshness token ("snow") does not trip it.
+        for utterance in [
+            "look up esp32 c6 thread support",
+            "look up how to melt snow",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert!(call.arguments.get("fresh").is_none(), "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_simple_arithmetic() {
         let call = route("what is 12 plus 30").unwrap();
         assert_eq!(call.name, "calculate");
@@ -5811,6 +5888,21 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "lights");
         assert_eq!(call.arguments["action"], "turn_off");
+    }
+
+    #[test]
+    fn coordinated_turn_command_abstains_instead_of_garbling_the_entity() {
+        // "turn on A and B" names two devices — not a single entity. It used to
+        // emit one home_control with a garbled entity ("porch light and the
+        // garage light"); it must abstain (like the other multi-clause forms) so
+        // the LLM grounds both devices.
+        assert!(route("turn on the porch light and the garage light").is_none());
+        assert!(route("turn off the fan and the lights").is_none());
+
+        // A single device whose name merely contains the substring "and" (e.g.
+        // "island") is unaffected — the guard matches a spaced " and ".
+        let call = route("turn on the island lights").unwrap();
+        assert_eq!(call.arguments["entity"], "island lights");
     }
 
     #[test]

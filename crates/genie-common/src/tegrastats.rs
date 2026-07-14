@@ -243,4 +243,53 @@ mod tests {
         let snap = parse_line(SAMPLE, 0).unwrap();
         assert_eq!(snap.power_mw, Some(4500));
     }
+
+    /// RAM is the required anchor field — a line missing it must be a hard
+    /// `Err`, not a zeroed-out snapshot.
+    #[test]
+    fn parse_line_without_ram_field_errors() {
+        let line = "SWAP 0/3810MB (cached 0MB) CPU [20%@1510] GR3D_FREQ 50% gpu@42C cpu@38.5C VDD_IN 4500mW/4500mW";
+        assert!(parse_line(line, 0).is_err());
+    }
+
+    /// Every field except RAM must degrade to its documented default when
+    /// absent, so a minimal RAM-only line still yields a usable snapshot.
+    #[test]
+    fn parse_line_ram_only_uses_documented_defaults() {
+        let line = "RAM 1000/8000MB (lfb 10x4MB)";
+        let snap = parse_line(line, 0).unwrap();
+        assert_eq!(snap.ram_used_mb, 1000);
+        assert_eq!(snap.ram_total_mb, 8000);
+        assert_eq!(snap.swap_used_mb, 0);
+        assert_eq!(snap.swap_total_mb, 0);
+        assert_eq!(snap.gpu_freq_pct, 0);
+        assert!(snap.cpu_loads.is_empty());
+        assert_eq!(snap.gpu_temp_c, None);
+        assert_eq!(snap.cpu_temp_c, None);
+        assert_eq!(snap.power_mw, None);
+    }
+
+    /// `parse_cpus` drops `off` cores but surviving cores must keep their
+    /// physical bracket index rather than being renumbered densely.
+    #[test]
+    fn parse_cpus_keeps_physical_index_across_off_cores() {
+        let line = "RAM 1000/8000MB CPU [off,30%@1000,off,45%@2000]";
+        let snap = parse_line(line, 0).unwrap();
+        assert_eq!(snap.cpu_loads.len(), 2);
+        assert_eq!(snap.cpu_loads[0].id, 1);
+        assert_eq!(snap.cpu_loads[0].load_pct, 30);
+        assert_eq!(snap.cpu_loads[0].freq_mhz, 1000);
+        assert_eq!(snap.cpu_loads[1].id, 3);
+        assert_eq!(snap.cpu_loads[1].load_pct, 45);
+        assert_eq!(snap.cpu_loads[1].freq_mhz, 2000);
+    }
+
+    /// All cores reported `off` is a valid state (idle low-power cluster)
+    /// and must yield an empty core list rather than an error.
+    #[test]
+    fn parse_cpus_all_off_yields_empty_list() {
+        let line = "RAM 1000/8000MB CPU [off,off,off,off]";
+        let snap = parse_line(line, 0).unwrap();
+        assert!(snap.cpu_loads.is_empty());
+    }
 }

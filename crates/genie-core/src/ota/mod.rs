@@ -280,8 +280,10 @@ fn compare_semver(a: &SemVer, b: &SemVer) -> std::cmp::Ordering {
 /// Compare semver strings. Returns true if `latest` is strictly newer than
 /// `current`, with full SemVer §11 pre-release precedence — so
 /// `1.0.0-alpha.12` is newer than `1.0.0-alpha.11`, and `1.0.0` is newer than
-/// any `1.0.0-alpha.N`.
-fn version_is_newer(latest: &str, current: &str) -> bool {
+/// any `1.0.0-alpha.N`. Numeric core components compare numerically, so
+/// `1.10.0 > 1.9.0` (a plain string compare gets that backwards). Shared with
+/// the `genie-ctl update-check` command so both update paths agree.
+pub fn version_is_newer(latest: &str, current: &str) -> bool {
     compare_semver(&parse_semver(latest), &parse_semver(current)) == std::cmp::Ordering::Greater
 }
 
@@ -359,6 +361,17 @@ mod tests {
         assert!(version_is_newer("1.0.1", "1.0.0"));
         assert!(!version_is_newer("1.0.0", "1.0.0"));
         assert!(!version_is_newer("0.9.0", "1.0.0"));
+    }
+
+    #[test]
+    fn version_comparison_double_digit_components() {
+        // Numeric core components compare numerically, not lexically. This is
+        // the boundary the genie-ctl update-check relied on once a component
+        // reaches two digits (a plain string `>` says "1.10.0" < "1.9.0").
+        assert!(version_is_newer("1.10.0", "1.9.0"));
+        assert!(version_is_newer("1.0.10", "1.0.9"));
+        assert!(version_is_newer("v0.10.0", "v0.9.0"));
+        assert!(!version_is_newer("1.9.0", "1.10.0"));
     }
 
     #[test]
