@@ -3346,6 +3346,15 @@ fn reminder_label(tokens: &[&str], unit_end_index: usize, reminder_style: bool) 
 fn label_after_duration(tokens: &[&str], unit_end_index: usize) -> Option<String> {
     let after_unit = tokens.get(unit_end_index + 1..)?;
     let to_index = after_unit.iter().position(|token| *token == "to")?;
+    // A "for" before this "to" means the "to" sits inside a `for <label>` clause
+    // ("<duration> timer for the walk to school"), not a `to <task>` connective.
+    // Splitting on it here would truncate the label to the tail ("school"), so
+    // defer to the named-timer path (extract_named_timer_label), which keeps the
+    // whole "walk to school". A real "<duration> timer to <task>" has no "for"
+    // before its "to" and is unaffected.
+    if after_unit[..to_index].contains(&"for") {
+        return None;
+    }
     let label_tokens = after_unit.get(to_index + 1..)?;
     if label_tokens.is_empty() {
         return None;
@@ -5444,6 +5453,27 @@ mod tests {
         // No trailing label -> still the generic default (unchanged).
         let call = route("set a timer for 5 minutes").unwrap();
         assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn plain_timer_keeps_a_for_label_containing_to() {
+        // "<duration> timer for <label>" where the label itself contains "to":
+        // label_after_duration split on that "to" and kept only the tail
+        // ("school"), dropping "walk to". A "for" before the "to" marks a label
+        // clause, not a "to <task>" connective, so the whole label is recovered.
+        let call = route("set a 15 minute timer for the walk to school").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 900);
+        assert_eq!(call.arguments["label"], "walk to school");
+
+        let call = route("set a 20 minute timer for the drive to work").unwrap();
+        assert_eq!(call.arguments["seconds"], 1200);
+        assert_eq!(call.arguments["label"], "drive to work");
+
+        // A genuine "<duration> timer to <task>" (no "for") still labels the task.
+        let call = route("set a 5 minute timer to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "check the oven");
     }
 
     #[test]
