@@ -2939,10 +2939,19 @@ fn strip_trailing_time_qualifier(subject: &str) -> &str {
 
 fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
     let (_, location) = text.rsplit_once(marker)?;
+    // A trailing "please" is politeness, not part of the place name ("weather in
+    // Paris please" names Paris, not "paris please"), mirroring the other
+    // quick-router paths that strip it. Drop it before the article/time trims.
     // Forecast detection reads the whole utterance, so trimming a trailing time
     // qualifier here never changes it.
-    let location =
-        strip_trailing_time_qualifier(location.trim().trim_start_matches("the ")).to_string();
+    let location = strip_trailing_time_qualifier(
+        location
+            .trim()
+            .trim_end_matches(" please")
+            .trim_end()
+            .trim_start_matches("the "),
+    )
+    .to_string();
     if location.is_empty() {
         None
     } else {
@@ -5764,6 +5773,21 @@ mod tests {
         assert_eq!(call.name, "get_weather");
         assert_eq!(call.arguments["location"], "new york");
         assert_eq!(call.arguments["forecast"], true);
+    }
+
+    #[test]
+    fn weather_location_drops_trailing_please() {
+        // A trailing "please" is politeness, not part of the city: the location
+        // argument must be just the city, not "paris please". Mirrors the other
+        // quick-router paths that strip a trailing " please".
+        let call = route("what's the weather in Paris please").unwrap();
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["location"], "paris");
+
+        // Same on the rain branch, which shares extract_location_after_marker.
+        let call = route("will it rain in Seattle please").unwrap();
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["location"], "seattle");
     }
 
     #[test]
