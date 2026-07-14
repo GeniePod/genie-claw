@@ -2623,18 +2623,29 @@ fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> 
     if *first != "for" || rest.is_empty() {
         return None;
     }
-    // `"cookie timer for 12 minutes"` — duration after `for`, not a label.
+    // `"cookie timer for 12 minutes"` — duration after `for`, not a label. But
+    // `"timer for 5 minutes for the pasta"` puts the label after a *second*
+    // `for`; recover it instead of dropping it to the generic "timer" label.
     if parse_duration(rest).is_some() {
+        if let Some(for_pos) = rest.iter().position(|token| *token == "for") {
+            let label_tokens = &rest[for_pos + 1..];
+            if !label_tokens.is_empty() && parse_duration(label_tokens).is_none() {
+                return clean_timer_label(label_tokens);
+            }
+        }
         return None;
     }
-    let mut label = rest.join(" ");
-    if let Some(stripped) = label.strip_prefix("the ") {
-        label = stripped.to_string();
-    }
+    clean_timer_label(rest)
+}
+
+fn clean_timer_label(tokens: &[&str]) -> Option<String> {
+    let label = tokens.join(" ");
+    let label = label.strip_prefix("the ").unwrap_or(&label).trim();
     if label.is_empty() {
-        return None;
+        None
+    } else {
+        Some(label.to_string())
     }
-    Some(label)
 }
 
 fn strip_trailing_duration_prefix<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
@@ -2782,7 +2793,11 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
     }
 
     if matches!(text, "read the news" | "read news" | "what s the news") {
-        return Some(("top news headlines".into(), false));
+        // News headlines are inherently time-sensitive — the caller always wants
+        // the current top stories — so mark the query fresh, the same as a
+        // stock-price query. Returning `false` here let a stale cached result
+        // stand in for today's news.
+        return Some(("top news headlines".into(), true));
     }
 
     for prefix in [
@@ -5274,6 +5289,24 @@ mod tests {
     }
 
     #[test]
+    fn routes_named_timer_label_after_duration() {
+        // "timer for <duration> for <label>" — the label sits after a second
+        // "for", past the duration. It was dropped to the generic "timer".
+        let call = route("set a timer for 5 minutes for the pasta").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "pasta");
+
+        let call = route("set a timer for 10 minutes for the eggs").unwrap();
+        assert_eq!(call.arguments["seconds"], 600);
+        assert_eq!(call.arguments["label"], "eggs");
+
+        // No trailing label -> still the generic default (unchanged).
+        let call = route("set a timer for 5 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
     fn routes_reminder_task_before_duration() {
         // Regression (#591): the task-first order dropped the label and fell back
         // to the generic "reminder"; it must now recover the same label as the
@@ -5612,6 +5645,9 @@ mod tests {
         let call = route("Read the news").unwrap();
         assert_eq!(call.name, "web_search");
         assert_eq!(call.arguments["query"], "top news headlines");
+        // News is time-sensitive, so the query must be fresh (no stale cache),
+        // the same as a stock-price query.
+        assert_eq!(call.arguments["fresh"], true);
     }
 
     #[test]
