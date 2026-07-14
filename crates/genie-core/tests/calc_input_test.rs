@@ -106,6 +106,21 @@ fn article_before_amount_is_not_the_percentage_base() {
 }
 
 #[test]
+fn definite_article_before_percentage_base_is_not_the_amount() {
+    // "20 percent of the 50 dollar bill" means 50. Like "a"/"an", the definite
+    // article "the" precedes the amount; without skipping it the percentage
+    // abstained entirely instead of reading the number that follows.
+    assert_eq!(
+        expression("what is 20 percent of the 50 dollar bill"),
+        "50 * 20 / 100"
+    );
+    assert_eq!(
+        expression("what is 15 percent of the 80 dollar order"),
+        "80 * 15 / 100"
+    );
+}
+
+#[test]
 fn non_math_does_not_route_to_calculate() {
     assert!(
         route("what time is it")

@@ -3031,11 +3031,13 @@ fn calc_number_starting_at(tokens: &[&str], start: usize) -> Option<f64> {
     if start >= tokens.len() {
         return None;
     }
-    // A leading article ("a"/"an") is not the amount: "20 percent of a 50 dollar
-    // bill" means 50, not 1 (the article word parses as the cardinal 1). Skip it
-    // and read the number that follows — but only when a real number actually
-    // follows, so "a dollar" (no number after) still falls through to 1.
-    if matches!(tokens[start], "a" | "an") && start + 1 < tokens.len() {
+    // A leading article ("a"/"an"/"the") precedes the amount, not the amount
+    // itself: "20 percent of a 50 dollar bill" means 50, not 1 (an "a"/"an"
+    // parses as the cardinal 1; a bare "the" fails to parse and made the whole
+    // percentage abstain). Skip it and read the number that follows — but only
+    // when a real number actually follows, so "a dollar" / "the total" (no
+    // number after) still fall through.
+    if matches!(tokens[start], "a" | "an" | "the") && start + 1 < tokens.len() {
         if let Some((value, _)) = super::number_words::parse_spoken_number(tokens, start + 1) {
             return Some(value as f64);
         }
