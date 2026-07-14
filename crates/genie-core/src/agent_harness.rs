@@ -224,6 +224,7 @@ mod tests {
             provider: OptionalAiProviderKind::OpenAiCompatible,
             auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: "https://provider.example/v1".into(),
+            model: "test-model".into(),
             api_key_env: "GENIE_PROVIDER_KEY".into(),
             oauth_token_env: "GENIE_PROVIDER_OAUTH_TOKEN".into(),
             context_window_tokens: 8192,

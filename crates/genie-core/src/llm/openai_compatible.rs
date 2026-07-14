@@ -50,6 +50,26 @@ impl OpenAiCompatibleBackend {
             .with_bearer_token_env(env_var),
         }
     }
+
+    /// Same as [`Self::from_url_with_bearer_token_env_and_timeouts`], but with
+    /// an operator-configured `model` instead of the `"default"` placeholder
+    /// (#620) — required for OpenAI-compatible backends that reject it.
+    pub fn from_url_with_bearer_token_env_and_model(
+        url: &str,
+        env_var: impl AsRef<str>,
+        model: impl Into<String>,
+        timeouts: LlmTimeouts,
+    ) -> Self {
+        Self {
+            inner: OpenAiCompatClient::from_url_with_profile_and_timeouts(
+                "openai-compatible",
+                url,
+                RequestProfile::generic_with_model(model),
+                timeouts,
+            )
+            .with_bearer_token_env(env_var),
+        }
+    }
 }
 
 #[async_trait]
