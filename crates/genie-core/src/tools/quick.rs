@@ -998,6 +998,14 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
             && (rest.contains(" scene") || rest.contains(" routine"))
         {
             let entity = rest
+                // A leading article is not part of the scene/routine name:
+                // "run the bedtime routine" is the "bedtime" routine, not
+                // "the bedtime". The sibling entity extractors
+                // (clean_control_entity, parse_temperature_target) already strip
+                // these; scene/routine was the one that did not.
+                .trim_start_matches("the ")
+                .trim_start_matches("a ")
+                .trim_start_matches("an ")
                 .trim_end_matches(" scene")
                 .trim_end_matches(" routine")
                 .trim()
@@ -2495,6 +2503,10 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
         return None;
     }
 
+    // "remind me/us to <task> in <duration>" phrasing puts the task clause before
+    // the duration; only these utterances get the task-first label scan so plain
+    // "<X> timer …" phrasings keep their existing named-timer handling.
+    let reminder_style = text.starts_with("remind me ") || text.starts_with("remind us ");
     let tokens = text.split_whitespace().collect::<Vec<_>>();
     // Try a fractional duration ("half an hour", "quarter of an hour") before the
     // whole-number parser: `parse_duration` skips the fraction word and reads the
@@ -2513,7 +2525,7 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
         return None;
     }
 
-    let label = reminder_label(&tokens, unit_end_index)
+    let label = reminder_label(&tokens, unit_end_index, reminder_style)
         .filter(|label| !label.is_empty())
         .or_else(|| extract_named_timer_label(&tokens, unit_end_index))
         .unwrap_or_else(|| {
@@ -2706,23 +2718,26 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
     }
 
     if text.contains("stock price") {
-        let subject = text
-            .split_once("stock price of ")
-            .map(|(_, subject)| subject)
-            .or_else(|| {
-                text.split_once("stock price for ")
-                    .map(|(_, subject)| subject)
-            })
-            .unwrap_or("")
-            .trim();
-        // Drop a trailing time qualifier ("apple today" -> "apple") so it does
-        // not leak into the subject and defeat the company_ticker lookup (which
-        // matches the bare company name).
-        let subject = strip_trailing_time_qualifier(subject);
+        // The company can be named after the keyword ("stock price of apple") or
+        // before it ("apple stock price", "what's the nvidia stock price"). The
+        // before-keyword order matched neither "of"/"for" split, fell through to
+        // an empty subject, and emitted a company-less
+        // `web_search{query:"stock price"}` — dropping the very company the caller
+        // asked about. A trailing time qualifier ("apple today" -> "apple") is
+        // stripped in every branch so it never defeats the company_ticker lookup.
+        let subject = if let Some((_, after)) = text.split_once("stock price of ") {
+            strip_trailing_time_qualifier(after.trim()).to_string()
+        } else if let Some((_, after)) = text.split_once("stock price for ") {
+            strip_trailing_time_qualifier(after.trim()).to_string()
+        } else if let Some((before, _)) = text.split_once("stock price") {
+            stock_subject_before(before)
+        } else {
+            String::new()
+        };
         let query = if subject.is_empty() {
             "stock price".to_string()
         } else {
-            let symbol = company_ticker(subject).unwrap_or(subject);
+            let symbol = company_ticker(&subject).unwrap_or(subject.as_str());
             format!("{symbol} stock price")
         };
         return Some((query, web_search_is_fresh_request(text)));
@@ -2784,6 +2799,29 @@ fn company_ticker(subject: &str) -> Option<&'static str> {
         "netflix" => Some("NFLX"),
         _ => None,
     }
+}
+
+/// Extract the stock subject stated *before* the "stock price" keyword, e.g.
+/// `"what is the current nvidia stock price"` -> `"nvidia"` and
+/// `"tesla stock price"` -> `"tesla"`. Collects the maximal trailing run of
+/// non-filler words to the left of the keyword, so leading question/filler words
+/// are skipped, and drops a possessive tail (`"apple's"` normalizes to
+/// `"apple s"`). Returns an empty string when only filler precedes the keyword,
+/// so a company-less "how has the stock price changed" still abstains.
+fn stock_subject_before(before: &str) -> String {
+    const FILLER: &[&str] = &[
+        "what", "whats", "is", "are", "the", "a", "an", "current", "s", "tell", "me", "show",
+        "get", "give", "check", "hey", "please", "of", "for",
+    ];
+    let mut words: Vec<&str> = before.split_whitespace().collect();
+    if words.last() == Some(&"s") {
+        words.pop();
+    }
+    let mut start = words.len();
+    while start > 0 && !FILLER.contains(&words[start - 1]) {
+        start -= 1;
+    }
+    strip_trailing_time_qualifier(&words[start..].join(" ")).to_string()
 }
 
 /// Strip a trailing time qualifier ("denver tonight" -> "denver", "apple this
@@ -3132,10 +3170,52 @@ fn extend_duration_with_trailing_spans(
     (total, last_unit_index)
 }
 
-fn reminder_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
+fn reminder_label(tokens: &[&str], unit_end_index: usize, reminder_style: bool) -> Option<String> {
+    // Reversed order: "remind me in 5 minutes to check the oven" — the task
+    // clause follows the duration. Original, primary case; applies to both the
+    // reminder and "<duration> timer to <task>" phrasings, so it stays ungated.
+    if let Some(label) = label_after_duration(tokens, unit_end_index) {
+        return Some(label);
+    }
+
+    // Task-first order: "remind me to check the oven in 5 minutes" — the task
+    // clause precedes the duration. Scoped to "remind me/us …" so plain timer
+    // phrasings are unaffected.
+    if reminder_style {
+        return label_before_duration(tokens, unit_end_index);
+    }
+
+    None
+}
+
+/// Recover the task label from the reversed phrasing
+/// `remind me in <duration> to <task>`, where the `to <task>` clause follows the
+/// duration. This is the original extraction, unchanged.
+fn label_after_duration(tokens: &[&str], unit_end_index: usize) -> Option<String> {
     let after_unit = tokens.get(unit_end_index + 1..)?;
     let to_index = after_unit.iter().position(|token| *token == "to")?;
     let label_tokens = after_unit.get(to_index + 1..)?;
+    if label_tokens.is_empty() {
+        return None;
+    }
+    Some(label_tokens.join(" "))
+}
+
+/// Recover the task label from the task-first phrasing
+/// `remind me to <task> in|after <duration>`, where the `to <task>` clause sits
+/// before the duration (the reversed `… in <duration> to <task>` order is
+/// handled by the caller). Requires an `in`/`after` connective between the task
+/// and the duration, so a bare `to <n> <unit>` with no task clause keeps the
+/// generic fallback. Uses the connective closest to the duration so a task that
+/// itself contains `in`/`after` ("put the cake in the oven in 5 minutes") keeps
+/// its full label.
+fn label_before_duration(tokens: &[&str], unit_end_index: usize) -> Option<String> {
+    let to_index = tokens.iter().position(|token| *token == "to")?;
+    let end = unit_end_index.min(tokens.len());
+    let connective_index = (to_index + 1..end)
+        .rev()
+        .find(|&i| matches!(tokens[i], "in" | "after"))?;
+    let label_tokens = tokens.get(to_index + 1..connective_index)?;
     if label_tokens.is_empty() {
         return None;
     }
@@ -3884,6 +3964,27 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "all off");
         assert_eq!(call.arguments["action"], "activate");
+    }
+
+    #[test]
+    fn scene_activation_drops_a_leading_article() {
+        // "run the bedtime routine" is the "bedtime" routine, not "the bedtime".
+        // The article leaked into the entity because scene/routine extraction
+        // trimmed the trailing " scene"/" routine" but not a leading article.
+        for (utterance, entity) in [
+            ("run the bedtime routine", "bedtime"),
+            ("activate the movie night scene", "movie night"),
+            ("start the away routine", "away"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["action"], "activate", "{utterance:?}");
+        }
+
+        // Without an article the name is unchanged.
+        let call = route("activate movie night scene").unwrap();
+        assert_eq!(call.arguments["entity"], "movie night");
     }
 
     #[test]
@@ -4876,6 +4977,29 @@ mod tests {
     }
 
     #[test]
+    fn stock_price_query_resolves_company_named_before_the_keyword() {
+        // The company can precede the keyword ("apple stock price") instead of
+        // following "of"/"for". This order used to fall through to an empty
+        // subject and emit a company-less web_search{query:"stock price"},
+        // dropping the company; now it resolves the ticker like the "of" form.
+        for (utterance, query) in [
+            ("Tesla stock price", "TSLA stock price"),
+            ("What's the Apple stock price?", "AAPL stock price"),
+            ("what is the current nvidia stock price", "NVDA stock price"),
+            ("microsoft stock price today", "MSFT stock price"),
+            ("google stock price right now", "GOOGL stock price"),
+            ("Apple's stock price", "AAPL stock price"),
+            ("what's Tesla's stock price today", "TSLA stock price"),
+            // Unknown company still passes through unchanged.
+            ("what is the wendys stock price", "wendys stock price"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_word_form_arithmetic_to_calculate() {
         // BFCL single-key-calculate: "two plus two" -> "2 + 2".
         let call = route("Leo: What is two plus two?").unwrap();
@@ -4987,6 +5111,42 @@ mod tests {
         // Plain timer still defaults; reminder "to …" path unchanged.
         let call = route("set a timer for 10 minutes").unwrap();
         assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn routes_reminder_task_before_duration() {
+        // Regression (#591): the task-first order dropped the label and fell back
+        // to the generic "reminder"; it must now recover the same label as the
+        // reversed order.
+        let call = route("remind me to check the oven in 5 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        let call = route("remind me in 5 minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // "after" connective and the "remind us" prefix are covered too.
+        let call = route("remind me to stretch after 90 seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 90);
+        assert_eq!(call.arguments["label"], "stretch");
+
+        let call = route("remind us to water the plants in 2 hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 7200);
+        assert_eq!(call.arguments["label"], "water the plants");
+
+        // A task that itself contains the connective keeps its full label.
+        let call = route("remind me to put the cake in the oven in 5 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "put the cake in the oven");
+
+        // A bare "remind me in <duration>" with no task clause keeps the generic
+        // fallback rather than inventing a label.
+        let call = route("remind me in 10 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "reminder");
+
+        // Named-timer phrasings are untouched by the task-first scan.
+        let call = route("set a cookie timer for 12 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "cookie");
     }
 
     #[test]

@@ -75,6 +75,18 @@ cargo run -p genie-ctl -- bfcl-score-llm \
 This generates local-model predictions, scores them immediately, and optionally
 writes the raw prediction JSONL through `--out`.
 
+Add `--min-strict PCT` to fail (non-zero exit) when strict accuracy drops below
+a floor, the same gate `bfcl-score` already supports for the quick-router path
+(issue #695) — useful for a local pre-push check, or a future CI job once a
+CI-sized local-LLM backend is wired up there:
+
+```bash
+GENIEPOD_CONFIG=deploy/config/geniepod.dev.toml \
+cargo run -p genie-ctl -- bfcl-score-llm \
+  --cases tests/bfcl/local/ha_home_cases.jsonl \
+  --min-strict 90
+```
+
 Use the older two-step path when you already have predictions or want to inspect
 raw model output before scoring:
 
