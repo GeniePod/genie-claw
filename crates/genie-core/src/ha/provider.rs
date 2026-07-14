@@ -184,7 +184,9 @@ struct AreaTemplateEntry {
 
 #[derive(Debug, Clone)]
 struct CachedGraph {
-    graph: HomeGraph,
+    // `Arc` so a cache hit shares the graph by refcount bump instead of
+    // deep-cloning every entity/alias on every home request.
+    graph: Arc<HomeGraph>,
     synced_at: Instant,
 }
 
@@ -200,13 +202,15 @@ impl HomeAssistantProvider {
         Ok(Self::new(HaClient::from_url(url, token)?))
     }
 
-    async fn graph(&self) -> Result<(HomeGraph, bool)> {
+    async fn graph(&self) -> Result<(Arc<HomeGraph>, bool)> {
         if let Some(cached) = self.cache.read().await.clone()
             && cached.synced_at.elapsed() < GRAPH_CACHE_TTL
         {
+            // Cloning the cached `CachedGraph` now only bumps the `Arc`
+            // refcount (and copies the `Instant`), not the whole graph.
             return Ok((cached.graph, true));
         }
-        Ok((self.sync_structure().await?, false))
+        Ok((Arc::new(self.sync_structure().await?), false))
     }
 
     async fn load_areas(&self) -> Result<Vec<AreaTemplateEntry>> {
@@ -625,7 +629,7 @@ impl HomeAutomationProvider for HomeAssistantProvider {
 
         let graph = Self::build_graph(&states, &areas);
         *self.cache.write().await = Some(CachedGraph {
-            graph: graph.clone(),
+            graph: Arc::new(graph.clone()),
             synced_at: Instant::now(),
         });
         Ok(graph)
@@ -838,12 +842,13 @@ impl HomeAutomationProvider for HomeAssistantProvider {
         let room = room.map(normalize);
         Ok(graph
             .scenes
-            .into_iter()
+            .iter()
             .filter(|scene| match (&room, &scene.area) {
                 (Some(room), Some(area)) => normalize(area) == *room,
                 (Some(_), None) => false,
                 (None, _) => true,
             })
+            .cloned()
             .collect())
     }
 
@@ -852,12 +857,13 @@ impl HomeAutomationProvider for HomeAssistantProvider {
         let room = room.map(normalize);
         Ok(graph
             .devices
-            .into_iter()
+            .iter()
             .filter(|device| match (&room, &device.area) {
                 (Some(room), Some(area)) => normalize(area) == *room,
                 (Some(_), None) => false,
                 (None, _) => true,
             })
+            .cloned()
             .collect())
     }
 }
@@ -1788,5 +1794,56 @@ mod tests {
         assert_eq!(domain_label("sensor", 2), "devices");
         // The plural matches the whole-home label helper for the same domain.
         assert_eq!(domain_label("climate", 2), domain_plural_label("climate"));
+    }
+
+    /// Microbench for the `Arc<HomeGraph>` cache change: a cache hit used to
+    /// deep-clone the whole graph on every home request; now it is an
+    /// `Arc::clone`. Ignored by default (timing, not a correctness gate) — run
+    /// with `cargo test -p genie-core --release graph_clone_cost -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "microbench; run manually with --ignored --nocapture"]
+    fn graph_clone_cost_deep_vs_arc() {
+        // A ~200-entity, 20-area home — a large-but-plausible household.
+        let states: Vec<Entity> = (0..200)
+            .map(|i| Entity {
+                entity_id: format!("light.room_{i}"),
+                state: "off".into(),
+                attributes: serde_json::json!({ "friendly_name": format!("Room {i} Light") }),
+            })
+            .collect();
+        let areas: Vec<AreaTemplateEntry> = (0..20)
+            .map(|a| AreaTemplateEntry {
+                id: format!("area_{a}"),
+                name: format!("Area {a}"),
+                entities: (0..10)
+                    .map(|j| format!("light.room_{}", a * 10 + j))
+                    .collect(),
+            })
+            .collect();
+        let graph = HomeAssistantProvider::build_graph(&states, &areas);
+
+        const ITERS: usize = 10_000;
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(graph.clone());
+        }
+        let deep = start.elapsed();
+
+        let arc = std::sync::Arc::new(graph);
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(std::sync::Arc::clone(&arc));
+        }
+        let shared = start.elapsed();
+
+        println!(
+            "graph clone x{ITERS}: deep={deep:?}  arc={shared:?}  (~{}x faster)",
+            deep.as_nanos() / shared.as_nanos().max(1)
+        );
+        assert!(
+            shared < deep,
+            "Arc::clone must be cheaper than a deep clone"
+        );
     }
 }
