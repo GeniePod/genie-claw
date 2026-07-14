@@ -4,7 +4,8 @@ use std::time::Duration;
 use anyhow::Result;
 use genie_common::config::Config;
 use genie_common::http::{
-    GuardRejection, HttpLimits, OriginDecision, RequestGuard, cors_response_headers, read_request,
+    GuardRejection, HttpLimits, OriginDecision, RequestGuard, RoutePolicySurface,
+    cors_response_headers, read_request, route_requires_local_token,
 };
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -138,7 +139,9 @@ async fn handle_connection(
     let path = request.path.as_str();
 
     // Mutating/actuating endpoints additionally require the shared local token.
-    if is_mutating(method, path) && !guard.token_ok(&request) {
+    if route_requires_local_token(RoutePolicySurface::GenieApi, method, path)
+        && !guard.token_ok(&request)
+    {
         tracing::debug!("mutating request without a valid local API token");
         let response = guard_rejection(GuardRejection::MissingToken);
         return write_response(&mut writer, &response, echo_origin.as_deref()).await;
@@ -177,22 +180,6 @@ async fn handle_connection(
     };
 
     write_response(&mut writer, &response, echo_origin.as_deref()).await
-}
-
-/// State-changing or sensitive actuation routes that require the shared local
-/// API token when one is configured (issue #228, #658).
-fn is_mutating(method: &str, path: &str) -> bool {
-    matches!(
-        (method, path),
-        ("POST", "/api/actuation/confirm")
-            | ("GET", "/api/actuation/pending")
-            | ("GET", "/api/actuation/actions")
-            | ("GET", "/api/actuation/audit")
-            | ("POST", "/api/memories/update")
-            | ("POST", "/api/memories/delete")
-            | ("POST", "/api/memories/reorder")
-            | ("POST", "/api/mode")
-    )
 }
 
 /// `403` response for a gated-out request, reusing the shared rejection reason.
@@ -252,6 +239,7 @@ fn status_text(code: u16) -> &'static str {
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
         500 => "Internal Server Error",
         _ => "Unknown",
     }
@@ -263,6 +251,15 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    // `get_tegrastats` returns 503 on a transient SQLite busy/locked error
+    // (classify_sqlite_error, added in #299). `write_response` builds the
+    // status line as `HTTP/1.1 {code} {status_text(code)}`, so the reason
+    // phrase table must name 503 instead of falling through to "Unknown".
+    #[test]
+    fn status_text_maps_503_to_service_unavailable() {
+        assert_eq!(super::status_text(503), "Service Unavailable");
+    }
 
     /// Parse a `Config` from a TOML fragment; every field has a serde default,
     /// so the fragment only needs the `[http]` overrides under test.
@@ -432,6 +429,19 @@ mod tests {
         assert!(no_tok.starts_with("HTTP/1.1 403"), "{no_tok:?}");
         assert!(no_tok.contains("local API token"), "{no_tok:?}");
 
+        // Sensitive actuation reads are token-gated.
+        for path in [
+            "/api/actuation/pending",
+            "/api/actuation/actions",
+            "/api/actuation/audit",
+        ] {
+            let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let resp = roundtrip(port, &request).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 403"),
+                "path {path} response: {resp:?}"
+            );
+        }
         // Sensitive actuation read without the token is also rejected.
         let actuation_no_tok = roundtrip(
             port,

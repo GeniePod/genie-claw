@@ -1291,7 +1291,8 @@ fn domain_label(domain: &str, count: usize) -> &'static str {
         "cover" => "covers",
         "lock" if count == 1 => "lock",
         "lock" => "locks",
-        "climate" => "thermostat",
+        "climate" if count == 1 => "thermostat",
+        "climate" => "thermostats",
         _ => "devices",
     }
 }
@@ -1769,5 +1770,23 @@ mod tests {
             summary.contains("1 of 2 are active"),
             "expected only the playing media player active, got: {summary}"
         );
+    }
+
+    /// Regression: `domain_label` pluralizes every domain by count, but the
+    /// `climate` arm had no count guard, so a room group of thermostats was
+    /// labeled in the singular ("Living Room thermostat: 2 of 2 are active").
+    /// `domain_plural_label` already returns "thermostats", so the two paths
+    /// disagreed.
+    #[test]
+    fn domain_label_pluralizes_climate_by_count() {
+        assert_eq!(domain_label("climate", 1), "thermostat");
+        assert_eq!(domain_label("climate", 2), "thermostats");
+        // Sibling domains still behave; unknown domains fall back to "devices".
+        assert_eq!(domain_label("light", 1), "light");
+        assert_eq!(domain_label("light", 3), "lights");
+        assert_eq!(domain_label("fan", 2), "fans");
+        assert_eq!(domain_label("sensor", 2), "devices");
+        // The plural matches the whole-home label helper for the same domain.
+        assert_eq!(domain_label("climate", 2), domain_plural_label("climate"));
     }
 }

@@ -139,3 +139,45 @@ fn chinese_punctuation_still_segments_immediately() {
     assert!(output.contains("第三句"));
     assert!(!output.contains("第四句"));
 }
+
+// The no-URL path skips `strip_raw_urls` and normalizes whitespace directly.
+// These pin the exact output so the optimization stays byte-identical to the
+// always-strip-then-normalize behavior it replaced.
+
+#[test]
+fn no_url_collapses_whitespace_exactly() {
+    assert_eq!(
+        for_voice("multiple    spaces   collapse here"),
+        "multiple spaces collapse here"
+    );
+    assert_eq!(
+        for_voice("tabs\tand\tnewlines\n\nbecome spaces here"),
+        "tabs and newlines become spaces here"
+    );
+    assert_eq!(
+        for_voice("  leading and trailing whitespace here  "),
+        "leading and trailing whitespace here"
+    );
+}
+
+#[test]
+fn url_path_still_strips_and_normalizes() {
+    // A raw-URL marker keeps the strip pass, which also collapses whitespace.
+    assert_eq!(
+        for_voice("see   www.example.org and https://a.b/c here"),
+        "see and here"
+    );
+    assert_eq!(
+        for_voice("visit http://foo.bar   now for more"),
+        "visit now for more"
+    );
+}
+
+#[test]
+fn non_url_http_substring_is_kept() {
+    // "http" without "://" is not a URL and must survive on the no-URL path.
+    assert_eq!(
+        for_voice("email me not a url http but plain"),
+        "email me not a url http but plain"
+    );
+}
