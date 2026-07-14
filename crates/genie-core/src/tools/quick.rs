@@ -2842,7 +2842,17 @@ fn web_search_is_fresh_request(text: &str) -> bool {
             " the current",
             " current ",
         ],
-    )
+    ) || {
+        // The markers above are space-delimited, so a freshness word at the very
+        // END of the utterance — the most natural phrasing ("look up the news
+        // today", "search the web for the bitcoin price now") — has no trailing
+        // space and slips through, leaving the query un-fresh and answerable from
+        // a stale cache. Honor the trailing form too. A leading space is required
+        // so "melt snow" / "how it works" do not trip it.
+        [" now", " today", " currently", " latest"]
+            .iter()
+            .any(|suffix| text.ends_with(suffix))
+    }
 }
 
 /// Map a well-known company name to its stock ticker, so a price query reads
@@ -5721,6 +5731,34 @@ mod tests {
         let call = route("search the web for matter support please").unwrap();
         assert_eq!(call.name, "web_search");
         assert_eq!(call.arguments["query"], "matter support");
+    }
+
+    #[test]
+    fn lookup_with_trailing_time_word_is_fresh() {
+        // A freshness word at the END of the utterance has no trailing space, so
+        // the space-delimited markers miss it and the query could be served from
+        // a stale cache. The trailing form must still flag the request fresh.
+        for utterance in [
+            "search the web for the bitcoin price now",
+            "look up the news today",
+            "search online for the weather right now",
+            "web search the exchange rate currently",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
+        }
+
+        // A non-time-sensitive lookup stays un-fresh (no bogus "fresh" flag), and
+        // a word merely ending in a freshness token ("snow") does not trip it.
+        for utterance in [
+            "look up esp32 c6 thread support",
+            "look up how to melt snow",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert!(call.arguments.get("fresh").is_none(), "{utterance:?}");
+        }
     }
 
     #[test]
