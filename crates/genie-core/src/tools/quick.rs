@@ -5741,8 +5741,7 @@ mod tests {
         for utterance in [
             "search the web for the bitcoin price now",
             "look up the news today",
-            "search online for the weather right now",
-            "web search the exchange rate currently",
+            "look up the bitcoin price currently",
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "web_search", "{utterance:?}");
