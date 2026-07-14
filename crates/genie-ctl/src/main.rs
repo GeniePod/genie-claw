@@ -2115,15 +2115,10 @@ async fn cmd_update_check() -> Result<()> {
             println!("  Latest:  {}", tag);
             println!("  Published: {}", published);
 
-            let latest_clean = tag
-                .strip_prefix('v')
-                .unwrap_or(tag)
-                .split('-')
-                .next()
-                .unwrap_or(tag);
-            let current_clean = current.split('-').next().unwrap_or(current);
-
-            if latest_clean > current_clean {
+            // Compare with full SemVer precedence (numeric components compare
+            // numerically, so 1.10.0 > 1.9.0). A plain string compare gets this
+            // backwards; reuse the same comparator the OTA checker uses.
+            if genie_core::ota::version_is_newer(tag, current) {
                 println!("\n  Update available! Download from:");
                 println!(
                     "  https://github.com/GeniePod/genie-claw/releases/tag/{}",
