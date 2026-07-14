@@ -1060,10 +1060,17 @@ fn play_media_request(text: &str) -> Option<String> {
 }
 
 fn shopping_list_add_request(text: &str) -> Option<String> {
-    let rest = text.strip_prefix("add ")?;
+    // "add <items> to the shopping list" and the equally common "put <items> on
+    // the shopping list". Without the "put …/on …" form the latter fell through
+    // to memory_recall, searching memory for the command instead of adding.
+    let rest = text
+        .strip_prefix("add ")
+        .or_else(|| text.strip_prefix("put "))?;
     let items = rest
         .strip_suffix(" to the shopping list")
-        .or_else(|| rest.strip_suffix(" to shopping list"))?
+        .or_else(|| rest.strip_suffix(" to shopping list"))
+        .or_else(|| rest.strip_suffix(" on the shopping list"))
+        .or_else(|| rest.strip_suffix(" on shopping list"))?
         .trim();
     if items.is_empty() {
         None
@@ -2027,9 +2034,21 @@ fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
 }
 
 fn asks_home_undo(text: &str) -> bool {
+    // Short pronoun-referent undo commands. "put it back"/"put that back" already
+    // accept both pronouns, but the undo/revert/reverse verbs only had their
+    // "that" form, so the equally common "undo it" / "revert it" / "reverse it"
+    // fell through and abstained instead of routing to home_undo.
     if matches!(
         text,
-        "undo" | "undo that" | "revert that" | "put it back" | "put that back" | "reverse that"
+        "undo"
+            | "undo that"
+            | "undo it"
+            | "revert that"
+            | "revert it"
+            | "put it back"
+            | "put that back"
+            | "reverse that"
+            | "reverse it"
     ) {
         return true;
     }
@@ -2759,11 +2778,20 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
             let symbol = company_ticker(&subject).unwrap_or(subject.as_str());
             format!("{symbol} stock price")
         };
-        return Some((query, web_search_is_fresh_request(text)));
+        // A stock-price query always wants the *current* price, so it is
+        // inherently fresh. Deriving freshness from `web_search_is_fresh_request`
+        // (spaced " now "/" today "/" current " markers) missed the bare
+        // "tesla stock price" / "stock price of tesla" forms — they have no such
+        // marker — so a time-sensitive price could be served from a stale cache.
+        return Some((query, true));
     }
 
     if matches!(text, "read the news" | "read news" | "what s the news") {
-        return Some(("top news headlines".into(), false));
+        // News headlines are inherently time-sensitive — the caller always wants
+        // the current top stories — so mark the query fresh, the same as a
+        // stock-price query. Returning `false` here let a stale cached result
+        // stand in for today's news.
+        return Some(("top news headlines".into(), true));
     }
 
     for prefix in [
@@ -4055,6 +4083,26 @@ mod tests {
     }
 
     #[test]
+    fn put_on_the_shopping_list_adds_like_add_to_the_shopping_list() {
+        // "put <items> on the shopping list" is as common as "add <items> to the
+        // shopping list"; without it the command fell through to memory_recall.
+        let call = route("Put the milk on the shopping list").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "shopping");
+        assert_eq!(call.arguments["content"], "shopping list pending: the milk");
+
+        let call = route("Put eggs and bread on the shopping list").unwrap();
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list pending: eggs, bread"
+        );
+
+        // The media "put on ..." path is unaffected.
+        let call = route("Put on the morning news").unwrap();
+        assert_eq!(call.name, "play_media");
+    }
+
+    #[test]
     fn routes_shopping_and_temperature_home_requests() {
         let call = route("Add milk and eggs to the shopping list").unwrap();
         assert_eq!(call.name, "memory_store");
@@ -5079,6 +5127,22 @@ mod tests {
     }
 
     #[test]
+    fn stock_price_query_is_always_fresh() {
+        // A stock-price query always wants the current price. Bare forms carry no
+        // spaced " now "/" today "/" current " marker, so they used to route with
+        // no `fresh` flag and could be served a stale cached price.
+        for utterance in [
+            "Tesla stock price",
+            "stock price of Tesla",
+            "what is the microsoft stock price",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_word_form_arithmetic_to_calculate() {
         // BFCL single-key-calculate: "two plus two" -> "2 + 2".
         let call = route("Leo: What is two plus two?").unwrap();
@@ -5117,6 +5181,19 @@ mod tests {
     fn routes_undo_to_home_undo() {
         let call = route("undo that").unwrap();
         assert_eq!(call.name, "home_undo");
+    }
+
+    #[test]
+    fn routes_pronoun_undo_it_variants_to_home_undo() {
+        // "put it back"/"put that back" already accept both pronouns; the
+        // undo/revert/reverse verbs only had their "that" form, so the equally
+        // common "it" form abstained. Both pronouns must now route to home_undo.
+        for phrase in ["undo it", "revert it", "reverse it"] {
+            let call = route(phrase).unwrap_or_else(|| panic!("{phrase} should route"));
+            assert_eq!(call.name, "home_undo", "{phrase}");
+        }
+        // A bare undo verb with an unrelated object still abstains for the LLM.
+        assert!(route("reverse the car").is_none());
     }
 
     #[test]
@@ -5549,6 +5626,9 @@ mod tests {
         let call = route("Read the news").unwrap();
         assert_eq!(call.name, "web_search");
         assert_eq!(call.arguments["query"], "top news headlines");
+        // News is time-sensitive, so the query must be fresh (no stale cache),
+        // the same as a stock-price query.
+        assert_eq!(call.arguments["fresh"], true);
     }
 
     #[test]
