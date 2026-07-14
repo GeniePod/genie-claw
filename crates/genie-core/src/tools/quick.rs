@@ -2890,7 +2890,11 @@ fn strip_trailing_time_qualifier(subject: &str) -> &str {
     subject
         .trim_end_matches(" right now")
         .trim_end_matches(" this weekend")
+        .trim_end_matches(" next weekend")
         .trim_end_matches(" this week")
+        .trim_end_matches(" next week")
+        .trim_end_matches(" this month")
+        .trim_end_matches(" next month")
         .trim_end_matches(" this morning")
         .trim_end_matches(" this afternoon")
         .trim_end_matches(" this evening")
@@ -2923,13 +2927,22 @@ fn calculation_request(text: &str) -> Option<String> {
 }
 
 fn temperature_conversion_expression(text: &str) -> Option<String> {
-    if !(text.contains("to celsius") || text.contains("to celcius")) {
+    // Both directions: "72 degrees to celsius" -> (72 - 32) * 5 / 9 and the
+    // previously-unhandled "100 celsius to fahrenheit" -> 100 * 9 / 5 + 32, which
+    // used to fall through to the LLM.
+    let to_celsius = text.contains("to celsius") || text.contains("to celcius");
+    let to_fahrenheit = text.contains("to fahrenheit") || text.contains("to farenheit");
+    if !to_celsius && !to_fahrenheit {
         return None;
     }
     let tokens = text.split_whitespace().collect::<Vec<_>>();
     let to_idx = tokens.iter().position(|token| *token == "to")?;
-    let fahrenheit = calc_number_before_to(&tokens, to_idx)?;
-    Some(format!("({fahrenheit} - 32) * 5 / 9"))
+    let value = calc_number_before_to(&tokens, to_idx)?;
+    Some(if to_celsius {
+        format!("({value} - 32) * 5 / 9")
+    } else {
+        format!("{value} * 9 / 5 + 32")
+    })
 }
 
 fn percentage_expression(text: &str) -> Option<String> {
@@ -3054,8 +3067,9 @@ fn calc_number_starting_at(tokens: &[&str], start: usize) -> Option<f64> {
     parse_decimal_token(tokens[start])
 }
 
-/// Fahrenheit value before a `to celsius` tail, tolerating a trailing `f` token
-/// and optional unit words (`degrees`, `fahrenheit`).
+/// The numeric temperature before a `to <unit>` tail, tolerating a trailing `f`
+/// token and optional unit words (`degrees`, `fahrenheit`, `celsius`) so both
+/// "72 fahrenheit to celsius" and "100 celsius to fahrenheit" read the value.
 fn calc_number_before_to(tokens: &[&str], to_idx: usize) -> Option<f64> {
     if to_idx == 0 {
         return None;
@@ -3064,7 +3078,15 @@ fn calc_number_before_to(tokens: &[&str], to_idx: usize) -> Option<f64> {
     if end > 0 && tokens[end - 1] == "f" {
         end -= 1;
     }
-    const SKIP_BEFORE_TO: &[&str] = &["degrees", "degree", "fahrenheit", "f"];
+    const SKIP_BEFORE_TO: &[&str] = &[
+        "degrees",
+        "degree",
+        "fahrenheit",
+        "f",
+        "celsius",
+        "celcius",
+        "c",
+    ];
     while end > 0 && SKIP_BEFORE_TO.contains(&tokens[end - 1]) {
         end -= 1;
     }
@@ -5615,6 +5637,14 @@ mod tests {
             ("weather in Tokyo right now", "tokyo", false),
             ("forecast for Boston this weekend", "boston", true),
             ("what's the weather in Paris now", "paris", false),
+            // The "next …" family leaked into the city ("denver next week").
+            ("forecast for Denver next week", "denver", true),
+            (
+                "what's the weather in Seattle next weekend",
+                "seattle",
+                true,
+            ),
+            ("weather in Austin this month", "austin", false),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "get_weather", "{utterance:?}");
@@ -5709,6 +5739,15 @@ mod tests {
         let call = route("Convert 350 degrees to Celsius").unwrap();
         assert_eq!(call.name, "calculate");
         assert_eq!(call.arguments["expression"], "(350 - 32) * 5 / 9");
+
+        // The reverse direction used to fall through to the LLM.
+        let call = route("Convert 100 Celsius to Fahrenheit").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "100 * 9 / 5 + 32");
+
+        let call = route("convert 37 c to fahrenheit").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "37 * 9 / 5 + 32");
     }
 
     #[test]

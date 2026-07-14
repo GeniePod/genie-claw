@@ -10,6 +10,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -862,6 +863,10 @@ async fn handle_quick_tool_for_voice(
     Some(response)
 }
 
+/// Hard deadline for wake-tone `aplay` — ~150ms of audio; 5s is ample headroom
+/// but prevents a hung ALSA child from wedging the single voice loop (#617).
+const WAKE_TONE_PLAYBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Play a short confirmation tone when wake word is detected.
 /// Gives the user immediate feedback that the device heard them.
 async fn play_wake_tone(audio_device: &str) {
@@ -901,13 +906,25 @@ async fn play_wake_tone(audio_device: &str) {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
         .spawn();
 
     if let Ok(mut child) = child {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, &pcm).await;
         }
-        let _ = child.wait().await;
+        match tokio::time::timeout(WAKE_TONE_PLAYBACK_TIMEOUT, child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "aplay wake tone failed");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = WAKE_TONE_PLAYBACK_TIMEOUT.as_secs(),
+                    "aplay wake tone timed out — voice loop continuing"
+                );
+            }
+        }
     }
 }
 
