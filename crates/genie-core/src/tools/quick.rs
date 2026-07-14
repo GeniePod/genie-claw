@@ -3220,14 +3220,23 @@ fn clean_status_target(text: &str) -> String {
 }
 
 fn asks_current_time(text: &str) -> bool {
+    // `text` is already `normalize`d, which maps an apostrophe to a space, so the
+    // very common "What's the time?" arrives as "what s the time" — never the
+    // apostrophe-less "whats the time" this list originally stored, so it fell
+    // through to the LLM. Match the normalized `what s ...` forms (and add the
+    // missing date counterpart for parity with the time phrasings).
     matches!(
         text,
         "what time is it"
             | "what is the time"
             | "whats the time"
+            | "what s the time"
             | "current time"
             | "tell me the time"
             | "what date is it"
+            | "what is the date"
+            | "whats the date"
+            | "what s the date"
             | "what is today"
             | "what day is it"
             | "date and time"
@@ -4943,6 +4952,23 @@ mod tests {
     fn routes_time_question_to_get_time() {
         let call = route("what time is it?").unwrap();
         assert_eq!(call.name, "get_time");
+    }
+
+    #[test]
+    fn routes_apostrophe_time_and_date_questions_to_get_time() {
+        // normalize() maps the apostrophe to a space, so "What's the time?"
+        // arrives as "what s the time"; the exact-match set must include that
+        // normalized form (and its date counterpart) or the most common phrasing
+        // silently falls through to the LLM.
+        for utterance in [
+            "What's the time?",
+            "what's the time",
+            "What's the date?",
+            "What is the date?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_time", "{utterance:?}");
+        }
     }
 
     #[test]
