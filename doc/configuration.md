@@ -43,6 +43,7 @@ home harness.
 | `provider` | `open_ai_compatible`, `open_ai`, `anthropic`, `gemini`, or `custom` |
 | `auth_mode` | `api_key` for provider keys or `oauth_bearer` for OAuth access tokens |
 | `base_url` | Provider endpoint, for example `https://api.openai.com/v1` |
+| `model` | Model id sent as `model` in outbound requests. Required when enabled — most OpenAI-compatible backends reject the `"default"` placeholder |
 | `api_key_env` | Env var that stores an API key when `auth_mode = "api_key"` |
 | `oauth_token_env` | Env var that stores an OAuth access token when `auth_mode = "oauth_bearer"` |
 | `context_window_tokens` | Provider context budget, which must fit the agent budget |
@@ -57,6 +58,7 @@ enabled = true
 provider = "open_ai"
 auth_mode = "oauth_bearer"
 base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
 oauth_token_env = "OPENAI_OAUTH_ACCESS_TOKEN"
 context_window_tokens = 4096
 allow_remote_base_url = true

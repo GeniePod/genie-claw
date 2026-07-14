@@ -2248,7 +2248,7 @@ async fn cmd_diag() -> Result<()> {
         && let Some(secs) = uptime.split_whitespace().next()
         && let Ok(s) = secs.parse::<f64>()
     {
-        println!("  Uptime: {:.0}h {:.0}m", s / 3600.0, (s % 3600.0) / 60.0);
+        println!("  Uptime: {}", format_uptime_hm(s as u64));
     }
 
     // Disk.
@@ -2718,6 +2718,14 @@ async fn governor_cmd(json: &str) -> Option<serde_json::Value> {
     line.and_then(|l| serde_json::from_str(&l).ok())
 }
 
+/// Format elapsed seconds as "<h>h <m>m", flooring each component like the
+/// governor status/uptime lines. The `diag` command formerly rounded each
+/// component with `{:.0}`, so a 50-minute uptime printed "1h 50m" (the hour
+/// field rounded up off the minutes) instead of "0h 50m".
+fn format_uptime_hm(total_secs: u64) -> String {
+    format!("{}h {}m", total_secs / 3600, (total_secs % 3600) / 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2728,6 +2736,14 @@ mod tests {
 
     fn default_test_config() -> Config {
         toml::from_str("").expect("default config should parse from empty TOML")
+    }
+
+    #[test]
+    fn format_uptime_hm_floors_each_component() {
+        assert_eq!(format_uptime_hm(3000), "0h 50m");
+        assert_eq!(format_uptime_hm(5400), "1h 30m");
+        assert_eq!(format_uptime_hm(3599), "0h 59m");
+        assert_eq!(format_uptime_hm(3600), "1h 0m");
     }
 
     fn expect_probe_target(target: &ServiceProbeTarget) -> (&str, &str, bool) {

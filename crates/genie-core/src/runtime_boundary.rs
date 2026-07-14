@@ -125,6 +125,7 @@ mod tests {
             provider: OptionalAiProviderKind::OpenAi,
             auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             oauth_token_env: "OPENAI_OAUTH_ACCESS_TOKEN".into(),
             context_window_tokens: 8192,
