@@ -1063,6 +1063,9 @@ fn shopping_list_add_request(text: &str) -> Option<String> {
     // "add <items> to the shopping list" and the equally common "put <items> on
     // the shopping list". Without the "put …/on …" form the latter fell through
     // to memory_recall, searching memory for the command instead of adding.
+    // A trailing "please" sits after the list suffix ("... shopping list please")
+    // and defeated the suffix match, so a polite request added nothing.
+    let text = text.trim_end_matches(" please").trim_end();
     let rest = text
         .strip_prefix("add ")
         .or_else(|| text.strip_prefix("put "))?;
@@ -1080,6 +1083,9 @@ fn shopping_list_add_request(text: &str) -> Option<String> {
 }
 
 fn shopping_list_remove_request(text: &str) -> Option<String> {
+    // Drop a trailing "please" so a polite "... off the shopping list please"
+    // still matches the list suffix, mirroring shopping_list_add_request.
+    let text = text.trim_end_matches(" please").trim_end();
     let items = text
         .strip_prefix("take ")
         .and_then(|rest| rest.strip_suffix(" off the shopping list"))
@@ -4100,6 +4106,19 @@ mod tests {
         let call = route("Take milk off the shopping list").unwrap();
         assert_eq!(call.name, "memory_store");
         assert_eq!(call.arguments["category"], "shopping");
+        assert_eq!(call.arguments["content"], "shopping list removed: milk");
+
+        // A trailing "please" sits after the list suffix and used to defeat the
+        // match, so a polite request added/removed nothing.
+        let call = route("Add milk and eggs to the shopping list please").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list pending: milk, eggs"
+        );
+
+        let call = route("Take milk off the shopping list please").unwrap();
+        assert_eq!(call.name, "memory_store");
         assert_eq!(call.arguments["content"], "shopping list removed: milk");
 
         let call = route("Don't let the kids play video games until homework is done").unwrap();
