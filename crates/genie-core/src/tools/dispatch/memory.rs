@@ -485,10 +485,13 @@ impl ToolDispatcher {
             if replaced > 0 {
                 Ok(format!(
                     "I've updated that memory: {}.",
-                    stored[0].to_lowercase()
+                    lowercase_first(&stored[0])
                 ))
             } else {
-                Ok(format!("I'll remember that {}.", stored[0].to_lowercase()))
+                Ok(format!(
+                    "I'll remember that {}.",
+                    lowercase_first(&stored[0])
+                ))
             }
         } else {
             let prefix = if replaced > 0 {
@@ -502,5 +505,43 @@ impl ToolDispatcher {
             }
             Ok(response)
         }
+    }
+}
+
+/// Lowercase only the first character of a stored fact so it reads naturally
+/// after "I'll remember that …" / "I've updated that memory: …" while keeping
+/// the user's own words intact. Facts are canonicalized to start with
+/// "User"/"User's" (see `extract_facts`), so this only lowercases that leading
+/// word. The previous `to_lowercase()` on the whole string mangled the exact
+/// proper nouns the user gave — "User's name is Bob" became "user's name is
+/// bob", "User lives in Paris" became "... paris".
+fn lowercase_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowercase_first_preserves_interior_proper_nouns() {
+        // The leading canonical "User('s)" is lowercased; user-provided values
+        // (name, city, employer) keep their capitalization.
+        assert_eq!(lowercase_first("User's name is Bob"), "user's name is Bob");
+        assert_eq!(
+            lowercase_first("User lives in Paris"),
+            "user lives in Paris"
+        );
+        assert_eq!(
+            lowercase_first("User works at Google"),
+            "user works at Google"
+        );
+        // Degenerate inputs are handled.
+        assert_eq!(lowercase_first(""), "");
+        assert_eq!(lowercase_first("apples"), "apples");
     }
 }
