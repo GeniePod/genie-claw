@@ -1086,12 +1086,20 @@ fn shopping_list_remove_request(text: &str) -> Option<String> {
     // Drop a trailing "please" so a polite "... off the shopping list please"
     // still matches the list suffix, mirroring shopping_list_add_request.
     let text = text.trim_end_matches(" please").trim_end();
+    // The article before "shopping list" is optional, exactly as on the add
+    // path (" off shopping list" / " from shopping list"): without the
+    // article-less variants the removal fell through to memory_recall.
     let items = text
         .strip_prefix("take ")
-        .and_then(|rest| rest.strip_suffix(" off the shopping list"))
+        .and_then(|rest| {
+            rest.strip_suffix(" off the shopping list")
+                .or_else(|| rest.strip_suffix(" off shopping list"))
+        })
         .or_else(|| {
-            text.strip_prefix("remove ")
-                .and_then(|rest| rest.strip_suffix(" from the shopping list"))
+            text.strip_prefix("remove ").and_then(|rest| {
+                rest.strip_suffix(" from the shopping list")
+                    .or_else(|| rest.strip_suffix(" from shopping list"))
+            })
         })?
         .trim();
     if items.is_empty() {
@@ -4135,6 +4143,29 @@ mod tests {
         // The media "put on ..." path is unaffected.
         let call = route("Put on the morning news").unwrap();
         assert_eq!(call.name, "play_media");
+    }
+
+    #[test]
+    fn shopping_list_removal_accepts_the_article_less_suffix() {
+        // The article before "shopping list" is optional on the add path
+        // ("add milk to shopping list"); the removal mirror must accept it too.
+        // Without it, "take milk off shopping list" fell through to memory_recall
+        // and removed nothing.
+        let call = route("Take milk off shopping list").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "shopping");
+        assert_eq!(call.arguments["content"], "shopping list removed: milk");
+
+        let call = route("Remove eggs and bread from shopping list").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list removed: eggs, bread"
+        );
+
+        // The articled form still works.
+        let call = route("Take milk off the shopping list").unwrap();
+        assert_eq!(call.arguments["content"], "shopping list removed: milk");
     }
 
     #[test]
