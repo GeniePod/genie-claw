@@ -47,6 +47,7 @@ use genie_core::conversation::ConversationStore;
 use genie_core::llm::{LlmClient, Message};
 use genie_core::memory::{Memory, SharedMemory};
 use genie_core::prompt::ModelFamily;
+use genie_core::session::SessionRegistry;
 use genie_core::tools::{ToolDispatcher, ToolExecutionContext, try_tool_call_with_context};
 use genie_core::voice::identity::SpeakerIdentityProvider;
 use genie_core::voice::streaming::stream_and_speak;
@@ -428,6 +429,7 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
         language: None,
     };
 
+    let session_registry = tokio::sync::Mutex::new(SessionRegistry::with_defaults());
     let kept_running = process_transcript(
         transcript,
         ProcessTranscriptInputs {
@@ -441,6 +443,7 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
             max_history: 8,
             model_family: ModelFamily::Phi,
             conv_id,
+            session_registry: &session_registry,
             wav_path: None,
             tts_engine_override: Some(&tts),
             t_preprocess_done: std::time::Instant::now(),
@@ -449,6 +452,14 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
     .await;
 
     assert!(kept_running, "process_transcript should return true");
+
+    // (voice #702) the processed turn enrolled its (voice, speaker) session in
+    // the bounded session registry, so voice counts against the Jetson budget.
+    assert_eq!(
+        session_registry.lock().await.len(),
+        1,
+        "a processed voice turn should enroll exactly one session"
+    );
 
     // (a) Transcript flow — the user message ended up in the conversation
     //     store, sourced from the transcript text.
@@ -514,6 +525,7 @@ async fn process_transcript_ignores_empty_transcript() {
         language: None,
     };
 
+    let session_registry = tokio::sync::Mutex::new(SessionRegistry::with_defaults());
     let kept_running = process_transcript(
         transcript,
         ProcessTranscriptInputs {
@@ -527,6 +539,7 @@ async fn process_transcript_ignores_empty_transcript() {
             max_history: 8,
             model_family: ModelFamily::Phi,
             conv_id,
+            session_registry: &session_registry,
             wav_path: None,
             tts_engine_override: Some(&tts),
             t_preprocess_done: std::time::Instant::now(),
