@@ -2757,7 +2757,11 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
     }
 
     if matches!(text, "read the news" | "read news" | "what s the news") {
-        return Some(("top news headlines".into(), false));
+        // News headlines are inherently time-sensitive — the caller always wants
+        // the current top stories — so mark the query fresh, the same as a
+        // stock-price query. Returning `false` here let a stale cached result
+        // stand in for today's news.
+        return Some(("top news headlines".into(), true));
     }
 
     for prefix in [
@@ -5541,6 +5545,9 @@ mod tests {
         let call = route("Read the news").unwrap();
         assert_eq!(call.name, "web_search");
         assert_eq!(call.arguments["query"], "top news headlines");
+        // News is time-sensitive, so the query must be fresh (no stale cache),
+        // the same as a stock-price query.
+        assert_eq!(call.arguments["fresh"], true);
     }
 
     #[test]
