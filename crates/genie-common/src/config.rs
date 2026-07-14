@@ -350,6 +350,12 @@ pub struct OptionalAiProviderConfig {
     #[serde(default)]
     pub base_url: String,
 
+    /// Model id sent as `model` in outbound OpenAI-compatible chat requests.
+    /// Required when enabled — most OpenAI-compatible backends reject the
+    /// placeholder `"default"` model string, so there is no safe default (#620).
+    #[serde(default)]
+    pub model: String,
+
     /// Environment variable that contains the API key. The key value itself is
     /// never stored in config and is not included in support summaries.
     #[serde(default = "defaults::optional_ai_provider_api_key_env")]
@@ -415,6 +421,9 @@ impl OptionalAiProviderConfig {
         if self.base_url.trim().is_empty() {
             reasons.push("[optional_ai_provider].base_url must be set when enabled");
         }
+        if self.model.trim().is_empty() {
+            reasons.push("[optional_ai_provider].model must be set when enabled");
+        }
         if is_remote_url(&self.base_url) && !self.allow_remote_base_url {
             reasons.push(
                 "[optional_ai_provider].base_url is remote; set allow_remote_base_url = true to opt in",
@@ -464,6 +473,7 @@ impl Default for OptionalAiProviderConfig {
             provider: OptionalAiProviderKind::OpenAiCompatible,
             auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: String::new(),
+            model: String::new(),
             api_key_env: defaults::optional_ai_provider_api_key_env(),
             oauth_token_env: defaults::optional_ai_provider_oauth_token_env(),
             context_window_tokens: defaults::agent_context_window_tokens(),
@@ -593,7 +603,37 @@ fn is_remote_url(url: &str) -> bool {
     } else {
         authority.split(':').next().unwrap_or(authority)
     };
-    !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    !is_loopback_host(host)
+}
+
+/// True when `host` is a loopback target: the literal name `localhost`, or an
+/// IPv4/IPv6 address in the loopback range (`127.0.0.0/8`, `::1`) — not just
+/// the single literal string `127.0.0.1`.
+///
+/// This mirrors `genie_core::security::sandbox::is_loopback_host` exactly.
+/// This crate (`genie-common`) sits below `genie-core` in the dependency
+/// graph, so it cannot import that function; both must independently parse
+/// the address rather than pattern-match a short literal list, which is what
+/// let this exact check regress once already (issue #327, "remote_url()
+/// blocks 127.0.0.0/8 except 127.0.0.1") in the `genie-core` copy — this
+/// `genie-common` copy had drifted from that fix and still only recognized
+/// the single literal `127.0.0.1`.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let ip_str = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    ip_str
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2013,6 +2053,20 @@ mod tests {
     }
 
     #[test]
+    fn is_remote_url_recognizes_the_full_loopback_range_not_just_127_0_0_1() {
+        // Regression test (issue #327's exact bug class, reintroduced by this
+        // function's independent, drifted duplicate of the genie-core check):
+        // 127.0.0.0/8 is entirely loopback, not just the single address
+        // 127.0.0.1. A naive exact-string match on "127.0.0.1" wrongly treats
+        // every other address in that range as remote.
+        assert!(!is_remote_url("http://127.0.0.2:8080/v1"));
+        assert!(!is_remote_url("http://127.1.2.3:9090"));
+        assert!(!is_remote_url("http://127.255.255.255"));
+        // Real remote hosts are unaffected.
+        assert!(is_remote_url("http://8.8.8.8"));
+    }
+
+    #[test]
     fn privacy_proxy_rejects_userinfo_masked_remote_endpoint() {
         let proxy = PrivacyProxyConfig {
             enabled: true,
@@ -2143,11 +2197,26 @@ home_runtime_boundary = "external_runtime"
     }
 
     #[test]
+    fn validate_llm_provider_rejects_enabled_optional_provider_without_model() {
+        let mut config = test_config();
+        config.optional_ai_provider.enabled = true;
+        config.optional_ai_provider.base_url = "http://127.0.0.1:11434/v1".into();
+        config.optional_ai_provider.model.clear();
+        let err = config
+            .optional_ai_provider
+            .ensure_enabled_ready(&config.agent)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("model must be set"));
+    }
+
+    #[test]
     fn validate_llm_provider_rejects_unwired_optional_provider_kind() {
         let mut config = test_config();
         config.optional_ai_provider.enabled = true;
         config.optional_ai_provider.provider = OptionalAiProviderKind::Anthropic;
         config.optional_ai_provider.base_url = "http://127.0.0.1:11434/v1".into();
+        config.optional_ai_provider.model = "some-model".into();
         let err = config
             .optional_ai_provider
             .ensure_enabled_ready(&config.agent)

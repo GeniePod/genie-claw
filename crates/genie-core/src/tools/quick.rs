@@ -1915,16 +1915,20 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
     if entity.is_empty() {
         return None;
     }
-    // Abstain on conditional, multi-clause, or whole-house phrasings ("turn off
-    // everything downstairs except the kitchen lights", "...lights only when I
-    // pull in"): these aren't a single named device, so the LLM grounds them.
+    // Abstain on conditional, multi-clause, coordinated, or whole-house phrasings
+    // ("turn off everything downstairs except the kitchen lights", "...lights only
+    // when I pull in", "turn on the porch light and the garage light"): these
+    // aren't a single named device, so the LLM grounds them. Without the " and "
+    // guard the coordinated form emitted one home_control with a garbled entity
+    // ("porch light and the garage light").
     let scoped = format!(" {rest} ");
     let is_multi_clause = scoped.contains(" everything ")
         || scoped.contains(" except ")
         || scoped.contains(" only ")
         || scoped.contains(" when ")
         || scoped.contains(" unless ")
-        || scoped.contains(" if ");
+        || scoped.contains(" if ")
+        || scoped.contains(" and ");
     if is_multi_clause {
         return None;
     }
@@ -5855,6 +5859,21 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "lights");
         assert_eq!(call.arguments["action"], "turn_off");
+    }
+
+    #[test]
+    fn coordinated_turn_command_abstains_instead_of_garbling_the_entity() {
+        // "turn on A and B" names two devices — not a single entity. It used to
+        // emit one home_control with a garbled entity ("porch light and the
+        // garage light"); it must abstain (like the other multi-clause forms) so
+        // the LLM grounds both devices.
+        assert!(route("turn on the porch light and the garage light").is_none());
+        assert!(route("turn off the fan and the lights").is_none());
+
+        // A single device whose name merely contains the substring "and" (e.g.
+        // "island") is unaffected — the guard matches a spaced " and ".
+        let call = route("turn on the island lights").unwrap();
+        assert_eq!(call.arguments["entity"], "island lights");
     }
 
     #[test]
