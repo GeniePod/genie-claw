@@ -3247,8 +3247,14 @@ fn clean_status_target(text: &str) -> String {
     for prefix in [
         "what is the ",
         "what are the ",
+        // `normalize` folds the apostrophe in "what's" to a space, yielding
+        // "what s the ...". Without these the generic "what " prefix stripped
+        // only "what ", leaving a dangling "s" in the entity
+        // ("what's the temperature in the bedroom" -> "s the temperature ...").
+        "what s the ",
         "what is ",
         "what are ",
+        "what s ",
         "what ",
         "which ",
         "is the ",
@@ -4866,6 +4872,29 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "office fan");
         assert_eq!(call.arguments["action"], "turn_on");
+    }
+
+    #[test]
+    fn whats_contraction_matches_spelled_out_status_prefix() {
+        // `normalize` folds "what's" -> "what s", so the status prefix strip left
+        // a dangling "s" ("what's the temperature in the bedroom" -> entity
+        // "s the temperature in the bedroom"). The contraction must behave like
+        // the spelled-out "what is the ...".
+        for utterance in [
+            "what's the temperature in the bedroom",
+            "what's the water pressure",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            let entity = call.arguments["entity"].as_str().unwrap();
+            assert!(
+                !entity.starts_with("s the") && !entity.starts_with("s "),
+                "{utterance:?} left a dangling 's': {entity:?}"
+            );
+        }
+        // Identical to the spelled-out form.
+        let contracted = route("what's the temperature in the bedroom").unwrap();
+        let spelled = route("what is the temperature in the bedroom").unwrap();
+        assert_eq!(contracted.arguments["entity"], spelled.arguments["entity"]);
     }
 
     #[test]
