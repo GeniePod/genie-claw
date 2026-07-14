@@ -772,8 +772,8 @@ async fn set_timer_accepts_whole_number_float_seconds_and_audits() {
         result.output
     );
     assert!(
-        result.output.contains("300"),
-        "output should mention duration, got: {}",
+        result.output.contains("5 minutes"),
+        "output should mention the humanized duration, got: {}",
         result.output
     );
 
