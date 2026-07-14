@@ -1931,9 +1931,14 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
     // Only emit a deterministic call for device classes the router can name
     // unambiguously: fans, fireplaces, and lights (#523, e.g. "turn on the
     // kitchen lights"). The light gate matches the device itself (a trailing
-    // "light"/"lights" or the bare word).
-    let known_device = entity.contains("fan")
-        || entity.contains("fireplace")
+    // "light"/"lights" or the bare word); match fan/fireplace as whole words the
+    // same way. A substring test ("infant monitor".contains("fan")) misfires on a
+    // device whose *name* merely contains those letters, actuating a turn_on the
+    // caller never asked for instead of falling through to the LLM.
+    let names_fan_or_fireplace = entity
+        .split_whitespace()
+        .any(|word| matches!(word, "fan" | "fans" | "fireplace" | "fireplaces"));
+    let known_device = names_fan_or_fireplace
         || entity == "light"
         || entity == "lights"
         || entity.ends_with(" light")
@@ -4978,6 +4983,30 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "office fan");
         assert_eq!(call.arguments["action"], "turn_on");
+    }
+
+    #[test]
+    fn turn_command_matches_fan_as_a_whole_word_not_a_substring() {
+        // The fan/fireplace gate used `entity.contains("fan")`, so a device whose
+        // NAME merely contains those letters ("infant monitor", the "Infant
+        // Optics" baby-monitor brand) was misclassified as a fan and actuated a
+        // turn_on the caller never asked for. It must abstain so the LLM grounds
+        // the real device.
+        assert!(route("turn on the infant monitor").is_none());
+        assert!(route("turn off the infant optics").is_none());
+
+        // Genuine fans and fireplaces still route (whole-word match, incl. plural
+        // and room-qualified forms).
+        for (utterance, entity) in [
+            ("turn on the fan", "fan"),
+            ("turn off the fans", "fans"),
+            ("turn on the ceiling fan", "ceiling fan"),
+            ("turn on the gas fireplace", "gas fireplace"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
     }
 
     #[test]
