@@ -91,9 +91,9 @@ impl AuthorizationHeader {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum RequestProfile {
-    Generic,
+    Generic(String),
     GenieAiRuntime,
 }
 
@@ -208,7 +208,13 @@ pub(crate) struct Delta {
 
 impl RequestProfile {
     pub(crate) fn generic() -> Self {
-        Self::Generic
+        Self::Generic("default".to_string())
+    }
+
+    /// Generic OpenAI-compatible profile with an operator-configured model id
+    /// (#620) instead of the placeholder `"default"`.
+    pub(crate) fn generic_with_model(model: impl Into<String>) -> Self {
+        Self::Generic(model.into())
     }
 
     pub(crate) fn genie_ai_runtime() -> Self {
@@ -269,30 +275,30 @@ impl RequestProfile {
         Ok(serde_json::to_string(&request)?)
     }
 
-    fn model(self) -> &'static str {
+    fn model(&self) -> &str {
         match self {
-            Self::Generic => "default",
+            Self::Generic(model) => model,
             Self::GenieAiRuntime => "jetson-llm",
         }
     }
 
-    fn think_override(self) -> Option<bool> {
+    fn think_override(&self) -> Option<bool> {
         match self {
-            Self::Generic => None,
+            Self::Generic(_) => None,
             Self::GenieAiRuntime => Some(false),
         }
     }
 
     fn compact_messages(&self, messages: &[Message], max_body_bytes: usize) -> Vec<Message> {
         match self {
-            Self::Generic => messages.to_vec(),
+            Self::Generic(_) => messages.to_vec(),
             Self::GenieAiRuntime => compact_genie_runtime_messages(messages, max_body_bytes),
         }
     }
 
     fn runtime_session_id(&self, hints: Option<&LlmRequestHints>) -> Option<String> {
         match self {
-            Self::Generic => None,
+            Self::Generic(_) => None,
             Self::GenieAiRuntime => hints
                 .and_then(|h| h.session_id.as_deref())
                 .and_then(normalize_runtime_session_id),
@@ -301,7 +307,7 @@ impl RequestProfile {
 
     fn nvext(&self, messages: &[Message], hints: Option<&LlmRequestHints>) -> Option<NvExt> {
         match self {
-            Self::Generic => None,
+            Self::Generic(_) => None,
             Self::GenieAiRuntime => build_nvext(messages, hints),
         }
     }
@@ -1434,6 +1440,24 @@ mod tests {
                 .unwrap()
                 .contains("keep this full instruction")
         );
+    }
+
+    /// `[optional_ai_provider].model` (#620) must be emitted verbatim instead
+    /// of the `"default"` placeholder once the operator configures it.
+    #[test]
+    fn generic_with_model_profile_emits_configured_model() {
+        let profile = RequestProfile::generic_with_model("gpt-4o-mini");
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "turn on the lights".into(),
+        }];
+
+        let prepared = profile
+            .prepare_body(&messages, Some(64), false, None, None)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
+
+        assert_eq!(json["model"], "gpt-4o-mini");
     }
 
     #[test]

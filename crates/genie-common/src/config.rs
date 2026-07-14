@@ -350,6 +350,12 @@ pub struct OptionalAiProviderConfig {
     #[serde(default)]
     pub base_url: String,
 
+    /// Model id sent as `model` in outbound OpenAI-compatible chat requests.
+    /// Required when enabled — most OpenAI-compatible backends reject the
+    /// placeholder `"default"` model string, so there is no safe default (#620).
+    #[serde(default)]
+    pub model: String,
+
     /// Environment variable that contains the API key. The key value itself is
     /// never stored in config and is not included in support summaries.
     #[serde(default = "defaults::optional_ai_provider_api_key_env")]
@@ -415,6 +421,9 @@ impl OptionalAiProviderConfig {
         if self.base_url.trim().is_empty() {
             reasons.push("[optional_ai_provider].base_url must be set when enabled");
         }
+        if self.model.trim().is_empty() {
+            reasons.push("[optional_ai_provider].model must be set when enabled");
+        }
         if is_remote_url(&self.base_url) && !self.allow_remote_base_url {
             reasons.push(
                 "[optional_ai_provider].base_url is remote; set allow_remote_base_url = true to opt in",
@@ -464,6 +473,7 @@ impl Default for OptionalAiProviderConfig {
             provider: OptionalAiProviderKind::OpenAiCompatible,
             auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: String::new(),
+            model: String::new(),
             api_key_env: defaults::optional_ai_provider_api_key_env(),
             oauth_token_env: defaults::optional_ai_provider_oauth_token_env(),
             context_window_tokens: defaults::agent_context_window_tokens(),
@@ -2143,11 +2153,26 @@ home_runtime_boundary = "external_runtime"
     }
 
     #[test]
+    fn validate_llm_provider_rejects_enabled_optional_provider_without_model() {
+        let mut config = test_config();
+        config.optional_ai_provider.enabled = true;
+        config.optional_ai_provider.base_url = "http://127.0.0.1:11434/v1".into();
+        config.optional_ai_provider.model.clear();
+        let err = config
+            .optional_ai_provider
+            .ensure_enabled_ready(&config.agent)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("model must be set"));
+    }
+
+    #[test]
     fn validate_llm_provider_rejects_unwired_optional_provider_kind() {
         let mut config = test_config();
         config.optional_ai_provider.enabled = true;
         config.optional_ai_provider.provider = OptionalAiProviderKind::Anthropic;
         config.optional_ai_provider.base_url = "http://127.0.0.1:11434/v1".into();
+        config.optional_ai_provider.model = "some-model".into();
         let err = config
             .optional_ai_provider
             .ensure_enabled_ready(&config.agent)
