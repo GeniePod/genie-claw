@@ -2810,7 +2810,10 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
         "lookup ",
     ] {
         if let Some(query) = text.strip_prefix(prefix) {
-            let query = query.trim();
+            // A trailing "please" is politeness, not part of the search query
+            // ("look up the best mesh router please"). Strip it, mirroring the
+            // clean_control_entity / memory_forget / play_media handling.
+            let query = query.trim().trim_end_matches(" please").trim_end();
             if !query.is_empty() {
                 return Some((query.to_string(), web_search_is_fresh_request(text)));
             }
@@ -5655,6 +5658,18 @@ mod tests {
         let call = route("look up ESP32 C6 Thread support").unwrap();
         assert_eq!(call.name, "web_search");
         assert_eq!(call.arguments["query"], "esp32 c6 thread support");
+    }
+
+    #[test]
+    fn web_search_query_drops_trailing_please() {
+        // A trailing "please" is politeness, not part of the search query.
+        let call = route("look up the best mesh router please").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "the best mesh router");
+
+        let call = route("search the web for matter support please").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "matter support");
     }
 
     #[test]
