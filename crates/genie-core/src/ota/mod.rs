@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// OTA update system for GeniePod.
 ///
@@ -286,19 +287,28 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
 
 /// GET request to GitHub API (api.github.com).
 /// Uses curl for TLS — available on all Jetson images.
+const GITHUB_API_TIMEOUT: Duration = Duration::from_secs(15);
+
 async fn github_api_get(path: &str) -> Result<String> {
     let url = format!("https://api.github.com{}", path);
-    let output = tokio::process::Command::new("curl")
-        .args([
-            "-sS",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: GeniePod-OTA",
-            &url,
-        ])
-        .output()
-        .await?;
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args([
+        "-sS",
+        "--max-time",
+        "15",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "User-Agent: GeniePod-OTA",
+        &url,
+    ])
+    .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(GITHUB_API_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => anyhow::bail!("GitHub API curl failed: {e}"),
+        Err(_) => anyhow::bail!("GitHub API request timed out after {GITHUB_API_TIMEOUT:?}"),
+    };
 
     if !output.status.success() {
         anyhow::bail!(

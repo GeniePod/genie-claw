@@ -432,6 +432,10 @@ fn memory_forget_query(text: &str) -> Option<String> {
         "delete the note on ",
     ] {
         if let Some(query) = text.strip_prefix(prefix).map(str::trim) {
+            // A trailing "please" is politeness, not part of the memory to
+            // forget ("forget my old locker combination please"). Strip it so
+            // the query matches the stored fact, mirroring clean_control_entity.
+            let query = query.trim_end_matches(" please").trim_end();
             if query.is_empty() || matches!(query, "that" | "it" | "this") {
                 return None;
             }
@@ -1039,7 +1043,9 @@ fn play_media_request(text: &str) -> Option<String> {
         if let Some(rest) = text.strip_prefix(prefix).map(str::trim)
             && rest.contains("playlist")
         {
-            return Some(rest.to_string());
+            // Drop a trailing "please" so the query is the playlist name, not
+            // "my study playlist please".
+            return Some(rest.trim_end_matches(" please").trim_end().to_string());
         }
     }
     None
@@ -1921,6 +1927,8 @@ fn clean_control_entity(text: &str) -> String {
     let text = text
         .trim()
         .trim_start_matches("the ")
+        .trim_start_matches("a ")
+        .trim_start_matches("an ")
         .trim_end_matches(" please");
     if let Some((device, room)) = text.split_once(" in the ") {
         format!("{} {}", room.trim(), device.trim())
@@ -3282,6 +3290,12 @@ mod tests {
             ("Sarah: forget my gym schedule", "gym schedule"),
             ("delete the note about the spare key", "the spare key"),
             ("delete what you know about my car", "my car"),
+            // A trailing "please" is politeness, not part of the query.
+            (
+                "forget my old locker combination please",
+                "old locker combination",
+            ),
+            ("forget the wifi password please", "wifi password"),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("{utterance} should route"));
             assert_eq!(call.name, "memory_forget", "{utterance}");
@@ -3892,6 +3906,11 @@ mod tests {
         let call = route("Play the weather report").unwrap();
         assert_eq!(call.name, "play_media");
         assert_eq!(call.arguments["query"], "local weather report");
+
+        // A trailing "please" is politeness, not part of the playlist name.
+        let call = route("Play my study playlist please").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "my study playlist");
     }
 
     #[test]
@@ -4683,6 +4702,27 @@ mod tests {
         let call = route("Jared: What's the current water pressure?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "water pressure");
+    }
+
+    #[test]
+    fn control_entity_drops_leading_indefinite_article() {
+        // clean_control_entity stripped a leading "the " but left "a"/"an", so
+        // "turn on a fan" produced entity "a fan". The sibling
+        // parse_temperature_target already strips all three articles.
+        let call = route("turn on a fan").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "fan");
+        assert_eq!(call.arguments["action"], "turn_on");
+
+        let call = route("turn off a fireplace").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "fireplace");
+        assert_eq!(call.arguments["action"], "turn_off");
+
+        let call = route("turn on an office fan").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "office fan");
+        assert_eq!(call.arguments["action"], "turn_on");
     }
 
     #[test]

@@ -4,7 +4,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use genie_common::config::{HttpServerConfig, PrivacyProxyConfig, StorageConfig};
-use genie_common::http::{GuardRejection, HttpLimits, OriginDecision, RequestGuard, read_request};
+use genie_common::http::{
+    GuardRejection, HttpLimits, OriginDecision, RequestGuard, RoutePolicySurface, read_request,
+    route_requires_local_token,
+};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -694,7 +697,12 @@ async fn handle_request(
         }
     };
     let route = classify_route(&request.method, &request.path);
-    if route.is_mutating() && !guard.token_ok(&request) {
+    if route_requires_local_token(
+        RoutePolicySurface::GenieCore,
+        &request.method,
+        &request.path,
+    ) && !guard.token_ok(&request)
+    {
         tracing::debug!("mutating request without a valid local API token");
         let _ = write_guard_rejection(
             &mut writer,
@@ -3984,12 +3992,19 @@ mod tests {
                 assert!(with_tok.starts_with("HTTP/1.1 200"), "{with_tok:?}");
 
                 // Sensitive actuation reads are token-gated as well.
-                let actuation_no_tok = http_roundtrip(
+                let pending_no_tok = http_roundtrip(
                     port,
                     "GET /api/actuation/pending HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 )
                 .await;
-                assert!(actuation_no_tok.starts_with("HTTP/1.1 403"), "{actuation_no_tok:?}");
+                assert!(pending_no_tok.starts_with("HTTP/1.1 403"), "{pending_no_tok:?}");
+
+                let actions_no_tok = http_roundtrip(
+                    port,
+                    "GET /api/actuation/actions HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await;
+                assert!(actions_no_tok.starts_with("HTTP/1.1 403"), "{actions_no_tok:?}");
 
                 // A read route stays open without a token.
                 let read = http_roundtrip(
