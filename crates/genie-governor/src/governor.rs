@@ -98,13 +98,16 @@ impl Governor {
             Command::MediaStop => {
                 let ts = store::now_ms();
                 let mem_avail = tegrastats::mem_available_mb_async().await.unwrap_or(4096);
-                let target = self.determine_mode(mem_avail);
                 let result: Result<Mode, anyhow::Error> = async {
                     if let Err(error) = tokio::fs::remove_file("/run/geniepod/media_mode").await
                         && error.kind() != std::io::ErrorKind::NotFound
                     {
                         return Err(error.into());
                     }
+                    // Marker cleared -> resolve the real post-media mode. Reading
+                    // it before the removal returned Media, making the transition
+                    // a no-op that left the system stuck in Media (#767).
+                    let target = self.determine_mode(mem_avail, false);
                     self.transition(ts, target).await?;
                     Ok(target)
                 }
@@ -140,8 +143,8 @@ impl Governor {
             }
         }
 
-        // 3. Determine target mode.
-        let target = self.determine_mode(mem_avail);
+        // 3. Determine target mode from the live marker state.
+        let target = self.determine_mode(mem_avail, media_marker_active());
 
         // 4. Transition if needed.
         if target != self.current_mode {
@@ -161,14 +164,18 @@ impl Governor {
         Ok(())
     }
 
-    fn determine_mode(&self, mem_avail_mb: u64) -> Mode {
+    /// Pure mode decision. `media_active` is passed in (not read from the
+    /// filesystem here) so a caller that just changed the marker — notably
+    /// `MediaStop`, which removes it — sees the post-change state instead of the
+    /// stale on-disk value.
+    fn determine_mode(&self, mem_avail_mb: u64, media_active: bool) -> Mode {
         // Priority: Pressure > Media (external trigger) > Time-based.
 
         if mem_avail_mb < self.config.governor.pressure.stop_optins_mb {
             return Mode::Pressure;
         }
 
-        if std::path::Path::new("/run/geniepod/media_mode").exists() {
+        if media_active {
             return Mode::Media;
         }
 
@@ -444,6 +451,13 @@ fn llm_rollback_action(from: Mode, target: Mode) -> LlmRollback {
     }
 }
 
+/// Whether the external media-mode marker is present on disk. Read once by the
+/// caller and passed into [`Governor::determine_mode`] so the decision is a pure
+/// function of explicit inputs.
+fn media_marker_active() -> bool {
+    std::path::Path::new("/run/geniepod/media_mode").exists()
+}
+
 fn current_hour() -> u8 {
     // Use libc localtime for correct timezone on production.
     // Falls back to UTC if localtime fails.
@@ -549,7 +563,7 @@ mod tests {
     fn determine_mode_day_with_plenty_of_memory() {
         let gov = make_governor();
         // 3000 MB available, well above all thresholds.
-        let mode = gov.determine_mode(3000);
+        let mode = gov.determine_mode(3000, false);
         // Without media trigger file, should be Day or NightA depending on time.
         // At minimum, it should NOT be Pressure or Media.
         assert_ne!(mode, Mode::Pressure);
@@ -560,7 +574,7 @@ mod tests {
     fn determine_mode_pressure_on_low_memory() {
         let gov = make_governor();
         // 400 MB available, below stop_optins_mb (500).
-        let mode = gov.determine_mode(400);
+        let mode = gov.determine_mode(400, false);
         assert_eq!(mode, Mode::Pressure);
     }
 
@@ -568,8 +582,20 @@ mod tests {
     fn determine_mode_pressure_takes_priority() {
         let gov = make_governor();
         // Even with 0 MB, pressure should override everything.
-        let mode = gov.determine_mode(0);
+        let mode = gov.determine_mode(0, false);
         assert_eq!(mode, Mode::Pressure);
+    }
+
+    #[test]
+    fn determine_mode_uses_media_active_argument() {
+        let gov = make_governor();
+        // The marker state is an explicit input: active -> Media, cleared -> a
+        // real time/day mode. This is what lets MediaStop (which clears the
+        // marker first) actually leave Media (#767).
+        assert_eq!(gov.determine_mode(3000, true), Mode::Media);
+        assert_ne!(gov.determine_mode(3000, false), Mode::Media);
+        // Pressure still outranks an active media marker.
+        assert_eq!(gov.determine_mode(0, true), Mode::Pressure);
     }
 
     #[test]
@@ -624,7 +650,7 @@ mod tests {
         if is_night_always {
             // With huge day_start, determine_mode at any hour with enough RAM
             // should pick NightB (since night_model_swap=true).
-            let mode = gov.determine_mode(3000);
+            let mode = gov.determine_mode(3000, false);
             assert_eq!(mode, Mode::NightB);
         }
     }
