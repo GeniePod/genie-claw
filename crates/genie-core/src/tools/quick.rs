@@ -998,6 +998,14 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
             && (rest.contains(" scene") || rest.contains(" routine"))
         {
             let entity = rest
+                // A leading article is not part of the scene/routine name:
+                // "run the bedtime routine" is the "bedtime" routine, not
+                // "the bedtime". The sibling entity extractors
+                // (clean_control_entity, parse_temperature_target) already strip
+                // these; scene/routine was the one that did not.
+                .trim_start_matches("the ")
+                .trim_start_matches("a ")
+                .trim_start_matches("an ")
                 .trim_end_matches(" scene")
                 .trim_end_matches(" routine")
                 .trim()
@@ -2495,6 +2503,10 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
         return None;
     }
 
+    // "remind me/us to <task> in <duration>" phrasing puts the task clause before
+    // the duration; only these utterances get the task-first label scan so plain
+    // "<X> timer …" phrasings keep their existing named-timer handling.
+    let reminder_style = text.starts_with("remind me ") || text.starts_with("remind us ");
     let tokens = text.split_whitespace().collect::<Vec<_>>();
     // Try a fractional duration ("half an hour", "quarter of an hour") before the
     // whole-number parser: `parse_duration` skips the fraction word and reads the
@@ -2513,7 +2525,7 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
         return None;
     }
 
-    let label = reminder_label(&tokens, unit_end_index)
+    let label = reminder_label(&tokens, unit_end_index, reminder_style)
         .filter(|label| !label.is_empty())
         .or_else(|| extract_named_timer_label(&tokens, unit_end_index))
         .unwrap_or_else(|| {
@@ -3158,10 +3170,52 @@ fn extend_duration_with_trailing_spans(
     (total, last_unit_index)
 }
 
-fn reminder_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
+fn reminder_label(tokens: &[&str], unit_end_index: usize, reminder_style: bool) -> Option<String> {
+    // Reversed order: "remind me in 5 minutes to check the oven" — the task
+    // clause follows the duration. Original, primary case; applies to both the
+    // reminder and "<duration> timer to <task>" phrasings, so it stays ungated.
+    if let Some(label) = label_after_duration(tokens, unit_end_index) {
+        return Some(label);
+    }
+
+    // Task-first order: "remind me to check the oven in 5 minutes" — the task
+    // clause precedes the duration. Scoped to "remind me/us …" so plain timer
+    // phrasings are unaffected.
+    if reminder_style {
+        return label_before_duration(tokens, unit_end_index);
+    }
+
+    None
+}
+
+/// Recover the task label from the reversed phrasing
+/// `remind me in <duration> to <task>`, where the `to <task>` clause follows the
+/// duration. This is the original extraction, unchanged.
+fn label_after_duration(tokens: &[&str], unit_end_index: usize) -> Option<String> {
     let after_unit = tokens.get(unit_end_index + 1..)?;
     let to_index = after_unit.iter().position(|token| *token == "to")?;
     let label_tokens = after_unit.get(to_index + 1..)?;
+    if label_tokens.is_empty() {
+        return None;
+    }
+    Some(label_tokens.join(" "))
+}
+
+/// Recover the task label from the task-first phrasing
+/// `remind me to <task> in|after <duration>`, where the `to <task>` clause sits
+/// before the duration (the reversed `… in <duration> to <task>` order is
+/// handled by the caller). Requires an `in`/`after` connective between the task
+/// and the duration, so a bare `to <n> <unit>` with no task clause keeps the
+/// generic fallback. Uses the connective closest to the duration so a task that
+/// itself contains `in`/`after` ("put the cake in the oven in 5 minutes") keeps
+/// its full label.
+fn label_before_duration(tokens: &[&str], unit_end_index: usize) -> Option<String> {
+    let to_index = tokens.iter().position(|token| *token == "to")?;
+    let end = unit_end_index.min(tokens.len());
+    let connective_index = (to_index + 1..end)
+        .rev()
+        .find(|&i| matches!(tokens[i], "in" | "after"))?;
+    let label_tokens = tokens.get(to_index + 1..connective_index)?;
     if label_tokens.is_empty() {
         return None;
     }
@@ -3901,6 +3955,27 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "all off");
         assert_eq!(call.arguments["action"], "activate");
+    }
+
+    #[test]
+    fn scene_activation_drops_a_leading_article() {
+        // "run the bedtime routine" is the "bedtime" routine, not "the bedtime".
+        // The article leaked into the entity because scene/routine extraction
+        // trimmed the trailing " scene"/" routine" but not a leading article.
+        for (utterance, entity) in [
+            ("run the bedtime routine", "bedtime"),
+            ("activate the movie night scene", "movie night"),
+            ("start the away routine", "away"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["action"], "activate", "{utterance:?}");
+        }
+
+        // Without an article the name is unchanged.
+        let call = route("activate movie night scene").unwrap();
+        assert_eq!(call.arguments["entity"], "movie night");
     }
 
     #[test]
@@ -5010,6 +5085,42 @@ mod tests {
         // Plain timer still defaults; reminder "to …" path unchanged.
         let call = route("set a timer for 10 minutes").unwrap();
         assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn routes_reminder_task_before_duration() {
+        // Regression (#591): the task-first order dropped the label and fell back
+        // to the generic "reminder"; it must now recover the same label as the
+        // reversed order.
+        let call = route("remind me to check the oven in 5 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        let call = route("remind me in 5 minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // "after" connective and the "remind us" prefix are covered too.
+        let call = route("remind me to stretch after 90 seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 90);
+        assert_eq!(call.arguments["label"], "stretch");
+
+        let call = route("remind us to water the plants in 2 hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 7200);
+        assert_eq!(call.arguments["label"], "water the plants");
+
+        // A task that itself contains the connective keeps its full label.
+        let call = route("remind me to put the cake in the oven in 5 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "put the cake in the oven");
+
+        // A bare "remind me in <duration>" with no task clause keeps the generic
+        // fallback rather than inventing a label.
+        let call = route("remind me in 10 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "reminder");
+
+        // Named-timer phrasings are untouched by the task-first scan.
+        let call = route("set a cookie timer for 12 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "cookie");
     }
 
     #[test]
