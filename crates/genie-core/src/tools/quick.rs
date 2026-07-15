@@ -302,6 +302,11 @@ fn asks_memory_status(text: &str) -> bool {
 }
 
 fn memory_recall_query(text: &str) -> Option<String> {
+    // "who am i" has to *end* the utterance. As a bare `contains` needle it also
+    // swallowed continuations that ask something else entirely — the rhetorical
+    // "who am i kidding" and "who am i talking to" both answered with the
+    // speaker's name instead of abstaining for the LLM. The remaining needles are
+    // specific enough to stay substring matches.
     if contains_any(
         text,
         &[
@@ -311,9 +316,10 @@ fn memory_recall_query(text: &str) -> Option<String> {
             "do you know my name",
             "do you remember my name",
             "remember my name",
-            "who am i",
         ],
-    ) {
+    ) || text == "who am i"
+        || text.ends_with(" who am i")
+    {
         return Some("name".into());
     }
 
@@ -3569,6 +3575,27 @@ mod tests {
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "name");
         assert_eq!(call.arguments["limit"], 3);
+    }
+
+    #[test]
+    fn who_am_i_identity_recall_requires_the_phrase_to_end_the_utterance() {
+        // "who am i" was a bare substring needle, so continuations that ask
+        // something else were answered with the speaker's name: the rhetorical
+        // "Who am I kidding?" and "who am i talking to" both recalled "name".
+        // They have no identity referent here, so they abstain for the LLM.
+        assert!(route("Who am I kidding?").is_none());
+        assert!(route("who am i talking to").is_none());
+
+        // The real identity question still recalls the name, including when a
+        // wake phrase precedes it (the phrase still ends the utterance).
+        let call = route("Who am I?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "name");
+        assert_eq!(call.arguments["limit"], 3);
+
+        let call = route("hey genieclaw who am i").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "name");
     }
 
     #[test]
