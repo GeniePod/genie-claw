@@ -2418,7 +2418,14 @@ fn home_status_target(text: &str) -> Option<String> {
         return None;
     }
 
-    if contains_any(&target, &["light", "lights", "lamp", "lamps"]) {
+    // Match the light/lamp device words as whole words: a substring test made
+    // "night[light]"/"flash[light]" collapse to the whole-home "lights" status,
+    // silently widening a single-device question to every light in the house.
+    let names_light_or_lamp = target
+        .split_whitespace()
+        .any(|word| matches!(word, "light" | "lights" | "lamp" | "lamps"));
+
+    if names_light_or_lamp {
         return Some(if target.split_whitespace().count() == 1 {
             "lights".into()
         } else {
@@ -2520,11 +2527,18 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
-    if target.contains("tire pressure") && target.contains("car") {
+    // Match "car" as a whole word: a substring test ("[car]bon monoxide alarm")
+    // reports on the car when the caller asked about a different device, instead
+    // of falling through to the LLM. Same handling as fan/fireplace and ice/icy.
+    let names_car = target
+        .split_whitespace()
+        .any(|word| matches!(word, "car" | "cars"));
+
+    if target.contains("tire pressure") && names_car {
         return Some("car tire pressure".into());
     }
 
-    if target.contains("car") {
+    if names_car {
         return Some("car".into());
     }
 
@@ -5050,6 +5064,28 @@ mod tests {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "home_status", "{utterance:?}");
             assert_eq!(call.arguments["entity"], "driveway ice", "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn car_and_light_status_match_whole_words_not_substrings() {
+        // "car" and "light" were matched as substrings, so "[car]bon monoxide
+        // alarm" reported on the car and "night[light]" collapsed to a
+        // whole-home "lights" status. Genuine car/light queries are covered by
+        // routes_household_status_targets / routes_whole_home_light_status.
+        for (utterance, wrong_entity) in [
+            ("is the carbon monoxide alarm on", "car"),
+            ("is the carbon monoxide detector working", "car"),
+            ("is the nightlight on", "lights"),
+            ("is the flashlight on", "lights"),
+        ] {
+            assert!(
+                route(utterance)
+                    .map(|c| c.arguments.get("entity").and_then(|e| e.as_str())
+                        != Some(wrong_entity))
+                    .unwrap_or(true),
+                "{utterance:?} must not resolve to the {wrong_entity:?} status entity"
+            );
         }
     }
 
