@@ -99,10 +99,7 @@ fn ingest_text(text: &str, source: &str, memory: &Memory) -> usize {
                     Err(_) => continue,
                 }
 
-                if memory
-                    .store_evergreen(&fact.category, &content_with_source)
-                    .is_ok()
-                {
+                if super::store_evergreen_if_allowed(memory, &fact.category, &content_with_source) {
                     total_stored += 1;
                 }
             }
@@ -116,7 +113,7 @@ fn ingest_text(text: &str, source: &str, memory: &Memory) -> usize {
                 Ok(false) => {}
                 Err(_) => continue,
             }
-            if memory.store_evergreen(&category, &content).is_ok() {
+            if super::store_evergreen_if_allowed(memory, &category, &content) {
                 total_stored += 1;
             }
         }
@@ -328,6 +325,19 @@ mod tests {
         let count2 = ingest_text(text, "file2.md", &mem);
         assert_eq!(count1, 1);
         assert_eq!(count2, 0, "second ingest should be deduplicated");
+    }
+
+    #[test]
+    fn ingest_rejects_restricted_secret_content() {
+        let mem = temp_memory();
+        let count = ingest_text("The gate code is 5829.", "notes.txt", &mem);
+        assert_eq!(
+            count, 0,
+            "restricted secrets must not be stored from profile ingest"
+        );
+
+        let results = mem.search("5829", 10).unwrap();
+        assert!(results.is_empty());
     }
 
     #[test]
