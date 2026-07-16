@@ -8,6 +8,10 @@
   (`take milk off shopping list` / `remove eggs from shopping list`), matching
   the add path — previously only the articled `off/from the shopping list`
   matched, so the article-less removal fell through to memory_recall (#747).
+- **Weather**: strip a trailing `please` from the parsed weather location, so
+  `what's the weather in Paris please` geocodes `paris`, not `paris please` —
+  mirroring the other paths that already drop it. Covers both the weather and
+  `will it rain in <city>` branches (#758).
 
 ## 1.0.0-rc.4 - 2026-07-13
 

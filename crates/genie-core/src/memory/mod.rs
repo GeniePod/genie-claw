@@ -8511,7 +8511,15 @@ fn secret_reference_query(query: &str) -> Option<(&'static str, String)> {
 
 fn format_profile_attribute_answer(attr: &HouseholdProfileAttribute) -> String {
     match attr.attribute.as_str() {
-        "age" => format!("{} is {} years old.", attr.name, attr.value),
+        "age" => {
+            // "1 year old", not "1 years old" (common for infants / young pets).
+            let unit = if attr.value.trim() == "1" {
+                "year"
+            } else {
+                "years"
+            };
+            format!("{} is {} {} old.", attr.name, attr.value, unit)
+        }
         "likes" => format!("{} likes {}.", attr.name, attr.value),
         "shoe_size" => format!("{} currently wears shoe size {}.", attr.name, attr.value),
         attribute if attribute.starts_with("favorite_") => {
@@ -8646,9 +8654,12 @@ fn format_everyone_task_log_answer(profiles: &[String], logs: &[HouseholdTaskLog
             join_names(&completed)
         );
     }
+    // "Leo has logged" when one person has, "Leo and Mia have logged" when more.
+    let verb = if completed.len() == 1 { "has" } else { "have" };
     format!(
-        "{} have logged brushing teeth. Not logged yet: {}.",
+        "{} {} logged brushing teeth. Not logged yet: {}.",
         join_names(&completed),
+        verb,
         join_names(&not_logged)
     )
 }
@@ -9952,6 +9963,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(answer, "Leo is 8 years old.");
+    }
+
+    #[test]
+    fn age_answer_uses_singular_year_for_one() {
+        let mem = temp_memory();
+        mem.store("fact", "Rex is 1 years old").unwrap();
+
+        let answer = mem
+            .structured_household_answer("How old is Rex?")
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer, "Rex is 1 year old.");
+    }
+
+    #[test]
+    fn everyone_brush_answer_uses_has_for_a_single_logger() {
+        let mem = temp_memory();
+        for (role, name) in [("son", "Leo"), ("daughter", "Mia")] {
+            mem.store("fact", &format!("{name} is the {role} in this house"))
+                .unwrap();
+        }
+        mem.store(
+            "chore_completion_log",
+            "Leo brushed teeth complete today at 8:05 PM",
+        )
+        .unwrap();
+
+        let answer = mem
+            .structured_household_answer("Did everyone brush their teeth?")
+            .unwrap()
+            .unwrap();
+        assert!(
+            answer.contains("Leo has logged"),
+            "a single logger should read 'has', got: {answer}"
+        );
+        assert!(answer.contains("Not logged yet: Mia"), "got: {answer}");
     }
 
     #[test]

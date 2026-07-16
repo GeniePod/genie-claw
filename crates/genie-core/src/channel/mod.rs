@@ -7,13 +7,16 @@
 //!
 //! Reference adapters for #564 live in [`scripted`] and [`http`]; porting the
 //! existing voice loop, HTTP routes, and Telegram handler onto `Channel` is
-//! tracked in #564.
+//! tracked in #564. [`serve_channel`] is the shared `recv -> handle -> send`
+//! driver each transport is wired onto as it ports (#672, #700).
 
 pub mod http;
 pub mod scripted;
+pub mod serve;
 
 pub use http::incoming_turn_from_chat_json;
 pub use scripted::ScriptedChannel;
+pub use serve::serve_channel;
 
 use anyhow::Result;
 use async_trait::async_trait;
