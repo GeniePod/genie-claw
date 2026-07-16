@@ -12,6 +12,14 @@ use zeroize::Zeroizing;
 
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
+/// Deadlines for the Telegram voice adapter's subprocess calls, so a hung
+/// piper/ffmpeg/whisper-cli child can't wedge the handler forever (#617).
+/// Generous relative to typical Telegram voice-message lengths (seconds to
+/// low tens of seconds of audio), not a tight latency budget.
+const PIPER_SYNTHESIS_TIMEOUT: Duration = Duration::from_secs(30);
+const FFMPEG_TIMEOUT: Duration = Duration::from_secs(15);
+const WHISPER_CLI_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Process-local monotonic counter for telegram tempfile suffixes. Paired
 /// with the PID at every use site so two concurrent voice handlers in the
 /// same process cannot collide on `/tmp/geniepod-tg-{voice,reply}-*.{ogg,wav}`.
@@ -520,6 +528,7 @@ impl TelegramApi {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to spawn piper at {:?}", voice_cfg.piper_path))?;
 
@@ -534,7 +543,13 @@ impl TelegramApi {
             stdin.write_all(b"\n").await.context("write piper stdin")?;
         }
 
-        let output = piper.wait_with_output().await.context("await piper")?;
+        // Bounded so a hung piper process can't wedge the Telegram handler
+        // forever (#617).
+        let output =
+            match tokio::time::timeout(PIPER_SYNTHESIS_TIMEOUT, piper.wait_with_output()).await {
+                Ok(result) => result.context("await piper")?,
+                Err(_) => anyhow::bail!("piper timed out after {PIPER_SYNTHESIS_TIMEOUT:?}"),
+            };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("piper failed: {}", stderr.trim());
@@ -558,27 +573,34 @@ impl TelegramApi {
         // defaults that comfortably fit voice-message reads under the
         // sendVoice 1 MB cap for typical Piper output lengths.
         let voice_cfg = &self.config.voice;
-        let output = Command::new(&voice_cfg.ffmpeg_path)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                wav_path,
-                "-c:a",
-                "libopus",
-                "-b:a",
-                "24k",
-                "-ac",
-                "1",
-                "-f",
-                "ogg",
-                ogg_path,
-            ])
-            .output()
-            .await
-            .with_context(|| format!("failed to spawn ffmpeg at {:?}", voice_cfg.ffmpeg_path))?;
+        let mut cmd = Command::new(&voice_cfg.ffmpeg_path);
+        cmd.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            wav_path,
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "24k",
+            "-ac",
+            "1",
+            "-f",
+            "ogg",
+            ogg_path,
+        ])
+        .kill_on_drop(true);
+
+        // Bounded so a hung ffmpeg process can't wedge the Telegram handler
+        // forever (#617).
+        let output = match tokio::time::timeout(FFMPEG_TIMEOUT, cmd.output()).await {
+            Ok(result) => result.with_context(|| {
+                format!("failed to spawn ffmpeg at {:?}", voice_cfg.ffmpeg_path)
+            })?,
+            Err(_) => anyhow::bail!("ffmpeg ogg/opus encode timed out after {FFMPEG_TIMEOUT:?}"),
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -679,25 +701,32 @@ impl TelegramApi {
 
     async fn transcode_to_wav(&self, ogg_path: &str, wav_path: &str) -> Result<()> {
         let ffmpeg = &self.config.voice.ffmpeg_path;
-        let output = Command::new(ffmpeg)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                ogg_path,
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-f",
-                "wav",
-                wav_path,
-            ])
-            .output()
-            .await
-            .with_context(|| format!("failed to spawn ffmpeg at {ffmpeg:?}"))?;
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            ogg_path,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-f",
+            "wav",
+            wav_path,
+        ])
+        .kill_on_drop(true);
+
+        // Bounded so a hung ffmpeg process can't wedge the Telegram handler
+        // forever (#617).
+        let output = match tokio::time::timeout(FFMPEG_TIMEOUT, cmd.output()).await {
+            Ok(result) => {
+                result.with_context(|| format!("failed to spawn ffmpeg at {ffmpeg:?}"))?
+            }
+            Err(_) => anyhow::bail!("ffmpeg transcode timed out after {FFMPEG_TIMEOUT:?}"),
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -791,11 +820,17 @@ impl TelegramApi {
             args.push(lang);
         }
 
-        let output = Command::new(cli)
-            .args(&args)
-            .output()
-            .await
-            .with_context(|| format!("failed to spawn whisper-cli at {cli:?}"))?;
+        let mut cmd = Command::new(cli);
+        cmd.args(&args).kill_on_drop(true);
+
+        // Bounded so a hung whisper-cli process can't wedge the Telegram
+        // handler forever (#617).
+        let output = match tokio::time::timeout(WHISPER_CLI_TIMEOUT, cmd.output()).await {
+            Ok(result) => {
+                result.with_context(|| format!("failed to spawn whisper-cli at {cli:?}"))?
+            }
+            Err(_) => anyhow::bail!("whisper-cli timed out after {WHISPER_CLI_TIMEOUT:?}"),
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1386,6 +1421,34 @@ mod tests {
             locks.len(),
             2,
             "recently accessed entries must not be evicted"
+        );
+    }
+
+    /// Regression for #617: the piper/ffmpeg/whisper-cli calls in this file
+    /// wrap their command in `tokio::time::timeout` + `kill_on_drop(true)`.
+    /// Those binaries aren't guaranteed to hang predictably in a test
+    /// sandbox, so this exercises the exact same wrap-and-kill idiom
+    /// directly against `sleep` (always present on the Linux targets this
+    /// project supports) to prove a hung child is bounded and does not
+    /// block the caller.
+    #[tokio::test]
+    async fn timeout_wrap_bounds_a_hung_child() {
+        use std::time::Duration;
+
+        let mut cmd = super::Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_millis(200), cmd.output()).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "200ms timeout must fire before `sleep 30` exits"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must fail fast on the timeout, not wait for the child: took {elapsed:?}"
         );
     }
 }
