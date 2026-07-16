@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use genie_common::config::{HttpServerConfig, PrivacyProxyConfig, StorageConfig};
+use genie_common::config::{
+    AgentConfig, HttpServerConfig, OptionalAiProviderConfig, PrivacyProxyConfig, StorageConfig,
+};
 use genie_common::http::{
     GuardRejection, HttpLimits, OriginDecision, RequestGuard, RoutePolicySurface, read_request,
     route_requires_local_token,
@@ -17,8 +19,9 @@ use crate::channel::{IncomingTurn, incoming_turn_from_chat_json};
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
 use crate::llm::{
-    EscalationReason, LlmBackendClient, LlmClient, LlmRequestHints, LocalProvider, Message,
-    PrivacyProxyBackend, Provider, may_escalate, summarize_messages,
+    EscalationReason, LlmBackendClient, LlmClient, LlmRequestHints, Message, OptionalProviderPlan,
+    PrivacyProxyBackend, Provider, ProviderReadiness, gated_provider_for_http, may_escalate,
+    summarize_messages,
 };
 use crate::memory::{SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
@@ -110,6 +113,10 @@ pub struct ChatServer {
     /// Optional on-device anonymising gateway for cloud escalation (issue #418).
     /// `None` means escalation is disabled and every turn is handled locally.
     privacy_proxy: Option<PrivacyProxyConfig>,
+    /// Agent budget used by the optional API completion gate (#649 / #569).
+    agent_config: AgentConfig,
+    /// Optional API provider gate config for HTTP chat paths (#649 / #569).
+    optional_ai_provider: OptionalAiProviderConfig,
     /// Storage lifecycle config — pruning intervals, retention limits, and the
     /// disk-size threshold that surfaces as `degraded` in `/api/health`.
     storage_config: StorageConfig,
@@ -157,6 +164,8 @@ impl ChatServer {
             http_config: HttpServerConfig::default(),
             origin_resolver: OriginResolver::default(),
             privacy_proxy: None,
+            agent_config: AgentConfig::default(),
+            optional_ai_provider: OptionalAiProviderConfig::default(),
             storage_config: StorageConfig::default(),
         })
     }
@@ -185,6 +194,17 @@ impl ChatServer {
     /// seeded; `Private`/`Restricted` facts are never forwarded.
     pub fn with_privacy_proxy(mut self, cfg: PrivacyProxyConfig) -> Self {
         self.privacy_proxy = Some(cfg);
+        self
+    }
+
+    /// Wire optional API provider gate config for HTTP chat paths (#649).
+    pub fn with_provider_gate(
+        mut self,
+        agent_config: AgentConfig,
+        optional_ai_provider: OptionalAiProviderConfig,
+    ) -> Self {
+        self.agent_config = agent_config;
+        self.optional_ai_provider = optional_ai_provider;
         self
     }
 
@@ -744,6 +764,8 @@ async fn handle_request(
             max_history,
             model_family,
             request_origin,
+            &ctx.agent_config,
+            &ctx.optional_ai_provider,
             echo_origin.as_deref(),
         )
         .await
@@ -774,6 +796,8 @@ async fn handle_request(
                     model_family,
                     request_origin,
                     privacy_proxy,
+                    &ctx.agent_config,
+                    &ctx.optional_ai_provider,
                 )
                 .await
             }
@@ -914,6 +938,20 @@ struct MemoryReorderRequest {
     ids: Vec<i64>,
 }
 
+fn provider_gate_blocked_error(
+    agent: &AgentConfig,
+    optional: &OptionalAiProviderConfig,
+) -> Option<String> {
+    if !optional.enabled {
+        return None;
+    }
+    let plan = OptionalProviderPlan::from_config(optional)?;
+    match plan.readiness(agent) {
+        ProviderReadiness::Blocked(reasons) => Some(reasons.join(", ")),
+        _ => None,
+    }
+}
+
 async fn handle_chat_stream(
     writer: &mut OwnedWriteHalf,
     body: Option<&str>,
@@ -927,6 +965,8 @@ async fn handle_chat_stream(
     max_history: usize,
     model_family: ModelFamily,
     request_origin: RequestOrigin,
+    agent_config: &AgentConfig,
+    optional_ai_provider: &OptionalAiProviderConfig,
     reflect_origin: Option<&str>,
 ) -> Result<()> {
     let Some(body) = body else {
@@ -1011,6 +1051,19 @@ async fn handle_chat_stream(
                 "response": final_response,
                 "tool": tool_result.tool.clone(),
                 "conversation_id": conv_id
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if let Some(reasons) = provider_gate_blocked_error(agent_config, optional_ai_provider) {
+        write_stream_headers(writer, 503, reflect_origin).await?;
+        write_stream_event(
+            writer,
+            &serde_json::json!({
+                "type":"error",
+                "message": format!("optional_ai_provider misconfigured: {reasons}")
             }),
         )
         .await?;
@@ -1127,7 +1180,7 @@ async fn handle_chat_stream(
         crate::tools::try_tool_call_with_context(&llm_response, tools, tool_ctx).await
     {
         tool_name = Some(tool_result.tool.clone());
-        let provider = LocalProvider::new(llm);
+        let provider = gated_provider_for_http(llm, agent_config, optional_ai_provider);
         let summary = finalize_tool_turn(
             &provider,
             conversations,
@@ -1674,6 +1727,8 @@ async fn handle_chat(
     model_family: ModelFamily,
     request_origin: RequestOrigin,
     privacy_proxy: Option<&PrivacyProxyConfig>,
+    agent_config: &AgentConfig,
+    optional_ai_provider: &OptionalAiProviderConfig,
 ) -> (u16, &'static str, String) {
     let Some(body) = body else {
         return (
@@ -1707,7 +1762,18 @@ async fn handle_chat(
     let turn = incoming_turn_from_chat_json(&parsed, &current);
     let conv_id = resolve_chat_conv_id(session_registry, &parsed, &turn).await;
 
-    let provider = LocalProvider::new(llm);
+    if let Some(reasons) = provider_gate_blocked_error(agent_config, optional_ai_provider) {
+        return (
+            503,
+            "application/json",
+            format!(
+                r#"{{"error":"optional_ai_provider misconfigured: {}"}}"#,
+                reasons
+            ),
+        );
+    }
+
+    let provider = gated_provider_for_http(llm, agent_config, optional_ai_provider);
     let chat_turn = match process_chat_turn(
         &provider,
         tools,
@@ -2885,6 +2951,8 @@ mod tests {
 
     #[test]
     fn chat_path_scans_user_input_for_injection() {
+        use genie_common::config::{AgentConfig, OptionalAiProviderConfig};
+
         let (memory_path, conversations_path) = temp_db_paths("genie-injection-chat");
 
         let capture = InjectionWarnCapture::default();
@@ -2922,6 +2990,8 @@ mod tests {
                     ModelFamily::Phi,
                     RequestOrigin::Api,
                     None,
+                    &AgentConfig::default(),
+                    &OptionalAiProviderConfig::default(),
                 )
                 .await;
             });
