@@ -58,6 +58,17 @@ fn integer_math_is_unchanged() {
 }
 
 #[test]
+fn thousands_separator_comma_is_not_a_split() {
+    // A comma between digits is a thousands separator, not a token break. Left as
+    // a separator, "1,000" became "1 000" and the calculator took only "1".
+    assert_eq!(expression("what's 20 percent of 1,000"), "1000 * 20 / 100");
+    assert_eq!(expression("what is 15 percent of 1,500"), "1500 * 15 / 100");
+    assert_eq!(expression("what is 1,000,000 divided by 4"), "1000000 / 4");
+    // A decimal point between digits is still a decimal point (unchanged).
+    assert_eq!(expression("what is 3.5 plus 2.5"), "3.5 + 2.5");
+}
+
+#[test]
 fn spoken_cardinals_in_percentage_and_temperature() {
     assert_eq!(expression("what is twenty percent of 80"), "80 * 20 / 100");
     assert_eq!(expression("what is 20 percent of eighty"), "80 * 20 / 100");

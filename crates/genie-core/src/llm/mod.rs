@@ -19,7 +19,9 @@ pub use escalation::{
 };
 pub use genie_ai_runtime::GenieAiRuntimeBackend;
 pub use llama_cpp::LlamaCppBackend;
-pub use local_provider::{GatedProvider, LocalProvider, Provider, gated_provider_from_config};
+pub use local_provider::{
+    GatedProvider, LocalProvider, Provider, gated_provider_for_http, gated_provider_from_config,
+};
 pub use mock::MockLlmBackend;
 pub use openai_compat::{LlmTimeouts, Message, ResponseFormat};
 pub use openai_compatible::OpenAiCompatibleBackend;

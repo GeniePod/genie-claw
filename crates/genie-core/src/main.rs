@@ -386,7 +386,9 @@ async fn main() -> Result<()> {
             chat_server
         };
 
-        let chat_server = chat_server.with_storage_config(config.storage.clone());
+        let chat_server = chat_server
+            .with_provider_gate(config.agent.clone(), config.optional_ai_provider.clone())
+            .with_storage_config(config.storage.clone());
 
         tracing::info!(port, "starting HTTP chat API");
         if config.telegram.enabled {
