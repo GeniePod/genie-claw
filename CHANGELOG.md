@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Quick-router tool-call accuracy
+
+- **Shopping list**: accept the article-less list suffix on removals
+  (`take milk off shopping list` / `remove eggs from shopping list`), matching
+  the add path — previously only the articled `off/from the shopping list`
+  matched, so the article-less removal fell through to memory_recall (#747).
+
 ## 1.0.0-rc.4 - 2026-07-13
 
 Fourth release candidate. This RC drives **M2** forward: the portable

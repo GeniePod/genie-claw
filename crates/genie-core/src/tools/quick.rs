@@ -1086,12 +1086,20 @@ fn shopping_list_remove_request(text: &str) -> Option<String> {
     // Drop a trailing "please" so a polite "... off the shopping list please"
     // still matches the list suffix, mirroring shopping_list_add_request.
     let text = text.trim_end_matches(" please").trim_end();
+    // The article before "shopping list" is optional, exactly as on the add
+    // path (" off shopping list" / " from shopping list"): without the
+    // article-less variants the removal fell through to memory_recall.
     let items = text
         .strip_prefix("take ")
-        .and_then(|rest| rest.strip_suffix(" off the shopping list"))
+        .and_then(|rest| {
+            rest.strip_suffix(" off the shopping list")
+                .or_else(|| rest.strip_suffix(" off shopping list"))
+        })
         .or_else(|| {
-            text.strip_prefix("remove ")
-                .and_then(|rest| rest.strip_suffix(" from the shopping list"))
+            text.strip_prefix("remove ").and_then(|rest| {
+                rest.strip_suffix(" from the shopping list")
+                    .or_else(|| rest.strip_suffix(" from shopping list"))
+            })
         })?
         .trim();
     if items.is_empty() {
@@ -1911,6 +1919,17 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
             text.strip_prefix("turn off ")
                 .map(|rest| (rest, "turn_off"))
         })?;
+    // A trailing "in <duration>" is a schedule, not a room: "turn on the lights in
+    // 5 minutes" must be grounded by the LLM (which can arm the timer), not
+    // actuated immediately. clean_control_entity would split it as a room and emit
+    // a garbled "5 minutes lights" entity that fires now. The weather path guards
+    // the same way via is_time_expression.
+    if let Some((_, tail)) = rest.rsplit_once(" in ") {
+        let tail = tail.trim().trim_start_matches("the ").trim();
+        if is_time_expression(tail) {
+            return None;
+        }
+    }
     let entity = clean_control_entity(rest);
     if entity.is_empty() {
         return None;
@@ -3156,10 +3175,44 @@ fn fractional_duration(tokens: &[&str]) -> Option<(u64, usize)> {
             Some("hour" | "hours" | "hr" | "hrs") => 3600,
             _ => continue,
         };
+        // A leading "<whole> and [a] <fraction> <unit>" ("two and a half hours")
+        // modifies the same unit: the fraction sits *between* the number and the
+        // unit, so the scan above only saw "half … hours" and dropped the whole
+        // number, emitting a 5x-too-short timer (1800s for "two and a half
+        // hours"). Fold the whole part back in. The reversed order
+        // "<whole> <unit> and a <fraction>" is summed by
+        // `extend_duration_with_trailing_spans` instead, so it never reaches here.
+        let mut whole_seconds = 0u64;
+        let mut lead = i;
+        if lead > 0 && matches!(tokens.get(lead - 1).copied(), Some("a" | "an")) {
+            lead -= 1;
+        }
+        if lead > 0 && tokens.get(lead - 1).copied() == Some("and") {
+            let and_index = lead - 1;
+            // The whole part is the spoken number ending immediately before "and"
+            // ("twenty five and a half" -> 25). Take the leftmost start that lands
+            // exactly on `and_index` so multi-token numbers are read in full.
+            // Parse over `tokens[..and_index]` (not the full slice) because
+            // parse_spoken_number folds a trailing "and a" into the number itself
+            // ("two and a" -> 3); slicing off "and" onward keeps "two" as 2.
+            let head = &tokens[..and_index];
+            for start in 0..and_index {
+                if let Some((amount, consumed)) =
+                    super::number_words::parse_spoken_number(head, start)
+                    && consumed == and_index
+                {
+                    whole_seconds = amount.saturating_mul(unit_seconds);
+                    break;
+                }
+            }
+        }
         // Integer math is exact for the recognized fractions of a minute/hour;
         // sub-second results (e.g. "half a second") floor to 0 and the caller's
         // `seconds == 0` guard abstains, letting the LLM handle it.
-        return Some((unit_seconds * numerator / denominator, unit_index));
+        return Some((
+            whole_seconds.saturating_add(unit_seconds * numerator / denominator),
+            unit_index,
+        ));
     }
     None
 }
@@ -4160,6 +4213,29 @@ mod tests {
     }
 
     #[test]
+    fn shopping_list_removal_accepts_the_article_less_suffix() {
+        // The article before "shopping list" is optional on the add path
+        // ("add milk to shopping list"); the removal mirror must accept it too.
+        // Without it, "take milk off shopping list" fell through to memory_recall
+        // and removed nothing.
+        let call = route("Take milk off shopping list").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "shopping");
+        assert_eq!(call.arguments["content"], "shopping list removed: milk");
+
+        let call = route("Remove eggs and bread from shopping list").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list removed: eggs, bread"
+        );
+
+        // The articled form still works.
+        let call = route("Take milk off the shopping list").unwrap();
+        assert_eq!(call.arguments["content"], "shopping list removed: milk");
+    }
+
+    #[test]
     fn routes_shopping_and_temperature_home_requests() {
         let call = route("Add milk and eggs to the shopping list").unwrap();
         assert_eq!(call.name, "memory_store");
@@ -5034,6 +5110,32 @@ mod tests {
     }
 
     #[test]
+    fn turn_command_with_scheduled_delay_abstains_instead_of_firing_now() {
+        // "turn on the lights in 5 minutes" is a schedule. clean_control_entity
+        // split the "in <duration>" tail as a room and emitted a garbled
+        // "5 minutes lights" entity that actuates immediately. The router must
+        // abstain so the LLM can arm the timer.
+        for utterance in [
+            "turn on the lights in 5 minutes",
+            "turn off the fan in an hour",
+            "turn on the lights in the evening",
+            "turn on the bedroom lights in 10 minutes",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // A genuine room after "in [the]" is unaffected — it is not a time word.
+        for (utterance, entity) in [
+            ("turn on the lights in the bedroom", "bedroom lights"),
+            ("turn off the fan in the office", "office fan"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn whats_contraction_matches_spelled_out_status_prefix() {
         // `normalize` folds "what's" -> "what s", so the status prefix strip left
         // a dangling "s" ("what's the temperature in the bedroom" -> entity
@@ -5572,6 +5674,33 @@ mod tests {
         let call = route("remind me in an hour and a half to stretch").unwrap();
         assert_eq!(call.arguments["seconds"], 5400);
         assert_eq!(call.arguments["label"], "stretch");
+    }
+
+    #[test]
+    fn routes_number_and_a_half_before_unit_timer() {
+        // The fraction can sit *between* the number and the unit ("two and a half
+        // hours"), the natural spoken order. fractional_duration grabbed only the
+        // "half … hours" part and dropped the leading "two", so a 2.5-hour timer
+        // came back as 30 minutes (1800s). The reversed order "two hours and a
+        // half" already returns 9000 (see routes_whole_plus_half_compound_timer);
+        // both orders now agree.
+        let call = route("set a timer for two and a half hours").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 9000);
+
+        let call = route("set a timer for 2 and a half hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 9000);
+
+        // "quarter" and the minute unit fold in the same way (2.25h, 3.5min).
+        let call = route("set a timer for two and a quarter hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 8100);
+
+        let call = route("set a timer for three and a half minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 210);
+
+        // A bare fraction with no leading "<number> and" is unchanged.
+        let call = route("set a timer for half an hour").unwrap();
+        assert_eq!(call.arguments["seconds"], 1800);
     }
 
     #[test]
