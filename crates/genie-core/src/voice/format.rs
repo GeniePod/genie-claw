@@ -286,8 +286,9 @@ fn is_cjk_terminator(ch: char) -> bool {
 }
 
 /// True when the clause's final whitespace-delimited token is a known
-/// abbreviation, so its trailing `.` should not end the sentence.
-fn ends_with_abbreviation(current: &str) -> bool {
+/// abbreviation, so its trailing `.` should not end the sentence. Shared with
+/// `voice::streaming::SentenceStreamer` so both voice paths apply the same rule.
+pub(crate) fn ends_with_abbreviation(current: &str) -> bool {
     let last_token = current
         .split_whitespace()
         .next_back()

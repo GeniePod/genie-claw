@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use genie_common::config::{ActiveLlmProviderKind, AgentConfig, Config};
+use genie_common::config::{ActiveLlmProviderKind, AgentConfig, Config, OptionalAiProviderConfig};
 
 use super::provider::{OptionalProviderPlan, ProviderReadiness};
 use super::{LlmClient, LlmRequestHints, Message};
@@ -67,6 +67,27 @@ impl<'a> GatedProvider<'a> {
 /// Build the runtime completion [`Provider`] from config (#630).
 pub fn gated_provider_from_config<'a>(config: &'a Config, llm: &'a LlmClient) -> GatedProvider<'a> {
     GatedProvider::from_config(config, llm)
+}
+
+/// Build a [`GatedProvider`] for HTTP chat handlers without holding a full [`Config`].
+pub fn gated_provider_for_http<'a>(
+    llm: &'a LlmClient,
+    agent: &'a AgentConfig,
+    optional: &'a OptionalAiProviderConfig,
+) -> GatedProvider<'a> {
+    let gate = if optional.enabled {
+        CompletionGate::OptionalApi(
+            OptionalProviderPlan::from_config(optional)
+                .expect("optional AI enabled implies a valid plan"),
+        )
+    } else {
+        CompletionGate::Local
+    };
+    GatedProvider {
+        inner: LocalProvider::new(llm),
+        gate,
+        agent,
+    }
 }
 
 #[async_trait]
