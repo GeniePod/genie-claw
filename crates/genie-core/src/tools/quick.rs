@@ -1010,6 +1010,13 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
                 .trim_start_matches("the ")
                 .trim_start_matches("a ")
                 .trim_start_matches("an ")
+                // A trailing "please" is politeness, not part of the name. It has
+                // to come off *before* the " scene"/" routine" suffix trim below,
+                // or it defeats that trim and leaks straight into the entity:
+                // "activate the movie scene please" otherwise routes the garbled
+                // scene "movie scene please" instead of "movie".
+                .trim_end_matches(" please")
+                .trim_end()
                 .trim_end_matches(" scene")
                 .trim_end_matches(" routine")
                 .trim()
@@ -4195,6 +4202,16 @@ mod tests {
         // Without an article the name is unchanged.
         let call = route("activate movie night scene").unwrap();
         assert_eq!(call.arguments["entity"], "movie night");
+
+        // A trailing "please" must be dropped before the " scene"/" routine"
+        // suffix trim, or it defeats that trim and leaks a garbled scene name.
+        let call = route("activate the movie scene please").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "movie");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("run the away routine please").unwrap();
+        assert_eq!(call.arguments["entity"], "away");
     }
 
     #[test]
