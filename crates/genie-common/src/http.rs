@@ -52,8 +52,9 @@ pub fn route_requires_local_token(surface: RoutePolicySurface, method: &str, pat
         | ("GET", "/api/actuation/actions") => true,
         ("GET", "/api/actuation/audit") => matches!(surface, RoutePolicySurface::GenieApi),
 
-        // Other mutating routes.
-        ("POST", "/api/memories/update")
+        // Sensitive memory routes (list exposes full household memory content).
+        ("GET", "/api/memories")
+        | ("POST", "/api/memories/update")
         | ("POST", "/api/memories/delete")
         | ("POST", "/api/memories/reorder")
         | ("POST", "/api/mode")
@@ -1186,5 +1187,17 @@ mod tests {
             "GET",
             "/api/actuation/audit"
         ));
+    }
+
+    #[test]
+    fn shared_route_token_policy_covers_sensitive_memory_reads() {
+        for surface in [RoutePolicySurface::GenieCore, RoutePolicySurface::GenieApi] {
+            assert!(route_requires_local_token(surface, "GET", "/api/memories"));
+            assert!(route_requires_local_token(
+                surface,
+                "POST",
+                "/api/memories/update"
+            ));
+        }
     }
 }

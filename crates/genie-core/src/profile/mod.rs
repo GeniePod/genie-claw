@@ -21,6 +21,20 @@ use anyhow::Result;
 
 use crate::memory::Memory;
 
+/// Store an evergreen profile memory only when household write policy allows it.
+pub(crate) fn store_evergreen_if_allowed(memory: &Memory, kind: &str, content: &str) -> bool {
+    let policy = crate::memory::policy::assess_memory_write(kind, content);
+    if !policy.allowed {
+        tracing::debug!(
+            kind,
+            reason = policy.reason,
+            "skipping profile memory by write policy"
+        );
+        return false;
+    }
+    memory.store_evergreen(kind, content).is_ok()
+}
+
 /// Ingest all profile data from the profile directory into memory.
 ///
 /// Called once at startup. Skips files that have already been ingested

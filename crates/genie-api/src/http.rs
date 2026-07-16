@@ -434,6 +434,7 @@ mod tests {
             "/api/actuation/pending",
             "/api/actuation/actions",
             "/api/actuation/audit",
+            "/api/memories",
         ] {
             let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
             let resp = roundtrip(port, &request).await;
