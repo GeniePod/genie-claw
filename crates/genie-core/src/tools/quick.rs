@@ -352,15 +352,20 @@ fn memory_recall_query(text: &str) -> Option<String> {
         "recall memory for ",
         "recall memories for ",
     ] {
-        if let Some(query) = text.strip_prefix(prefix).map(str::trim)
-            && !query.is_empty()
-            && !matches!(query, "that" | "it" | "this")
-        {
+        if let Some(query) = text.strip_prefix(prefix).map(str::trim) {
+            // A trailing "please" is politeness, not part of the memory to
+            // recall ("search memory for jared please" searches for "jared", not
+            // "jared please"). The sibling memory_forget_query and the other
+            // quick-router extractors (clean_control_entity, web_search_request)
+            // already strip it; the recall prefix loop was the lone holdout.
+            let query = query.trim_end_matches(" please").trim_end();
             // A bare pronoun referent ("do you remember it/this") has no concrete
             // subject to search for — recalling the literal word returns noise.
             // Abstain so the LLM resolves the referent from context, mirroring the
             // sibling memory_forget_query, which already skips that/it/this.
-            return Some(query.to_string());
+            if !query.is_empty() && !matches!(query, "that" | "it" | "this") {
+                return Some(query.to_string());
+            }
         }
     }
 
@@ -5496,6 +5501,12 @@ mod tests {
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "jared");
         assert_eq!(call.arguments["limit"], 3);
+
+        // A trailing "please" is politeness, not part of the recall query — it
+        // must be stripped like the sibling memory_forget path does.
+        let call = route("search memory for Jared please").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "jared");
     }
 
     #[test]
