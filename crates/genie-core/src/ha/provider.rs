@@ -346,11 +346,29 @@ impl HomeAssistantProvider {
         let area_match = best_area_match(&graph.areas, &query_lower);
         let domain_match = infer_domain(&query_lower);
 
-        if let (Some((area_name, area_score)), Some(domain)) = (area_match.clone(), domain_match)
-            && let Some(target) =
-                Self::resolve_group_target(graph, query, &domain, &area_name, area_score)
-        {
-            return Some(target);
+        if let (Some((area_name, area_score)), Some(domain)) = (area_match.clone(), domain_match) {
+            if query_is_bare_area_domain(&query_lower, &area_name, &domain) {
+                // Bare "<area> <domain>" (e.g. "living room lights") means the
+                // whole-room group.
+                if let Some(target) =
+                    Self::resolve_group_target(graph, query, &domain, &area_name, area_score)
+                {
+                    return Some(target);
+                }
+            } else {
+                // An extra descriptive token (e.g. "living room floor lamp")
+                // names one device in the room, not the whole group. Resolve it
+                // by name first; only fall back to the room group if nothing
+                // named matches.
+                if let Some(target) = Self::resolve_named_entity(graph, query, action_hint) {
+                    return Some(target);
+                }
+                if let Some(target) =
+                    Self::resolve_group_target(graph, query, &domain, &area_name, area_score)
+                {
+                    return Some(target);
+                }
+            }
         }
 
         let domain_match = infer_domain(&query_lower);
@@ -1091,6 +1109,27 @@ fn ambiguous_named_entity_candidates(graph: &HomeGraph, query: &str) -> Option<V
     }
 }
 
+/// Whether `query_lower` is a bare "<area> <domain>" phrase — every token is
+/// accounted for by the matched area's name, a synonym of the inferred domain,
+/// or a domain word. "living room lights" is bare and means the whole-room
+/// group; "living room floor lamp" carries the extra token "floor", which names
+/// one specific device in the room, so it must not collapse to every light.
+fn query_is_bare_area_domain(query_lower: &str, area_name: &str, domain: &str) -> bool {
+    let area_tokens: HashSet<String> = normalize(area_name)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let domain_tokens: HashSet<String> = domain_synonyms(domain)
+        .iter()
+        .flat_map(|synonym| synonym.split_whitespace().map(str::to_string))
+        .collect();
+    query_lower.split_whitespace().all(|token| {
+        area_tokens.contains(token)
+            || domain_tokens.contains(token)
+            || entity_fidelity::domain_of_word(token) == Some(domain)
+    })
+}
+
 fn best_area_match(areas: &[AreaRef], query: &str) -> Option<(String, f32)> {
     let query_words: Vec<&str> = query.split_whitespace().collect();
     let mut best: Option<(String, f32)> = None;
@@ -1623,6 +1662,53 @@ mod tests {
         assert_eq!(target.kind, HomeTargetKind::Group);
         assert_eq!(target.domain.as_deref(), Some("light"));
         assert_eq!(target.entity_ids, vec!["light.living_room_lamp"]);
+    }
+
+    #[test]
+    fn resolve_prefers_named_device_over_room_group() {
+        // Regression: a room with two lights. "living room floor lamp" names a
+        // single device and used to collapse to the whole-room group (both
+        // lights turn on). It must resolve to only the floor lamp, while a bare
+        // "living room lights" still means the group.
+        let states = vec![
+            Entity {
+                entity_id: "light.living_room_ceiling".into(),
+                state: "off".into(),
+                attributes: serde_json::json!({ "friendly_name": "Ceiling Light" }),
+            },
+            Entity {
+                entity_id: "light.living_room_floor_lamp".into(),
+                state: "off".into(),
+                attributes: serde_json::json!({ "friendly_name": "Floor Lamp" }),
+            },
+        ];
+        let areas = vec![AreaTemplateEntry {
+            id: "living_room".into(),
+            name: "Living Room".into(),
+            entities: vec![
+                "light.living_room_ceiling".into(),
+                "light.living_room_floor_lamp".into(),
+            ],
+        }];
+        let graph = HomeAssistantProvider::build_graph(&states, &areas);
+
+        let named = HomeAssistantProvider::resolve_target_in_graph(
+            &graph,
+            "living room floor lamp",
+            Some(HomeActionKind::TurnOn),
+        )
+        .expect("the named floor lamp should resolve");
+        assert_eq!(named.kind, HomeTargetKind::Entity);
+        assert_eq!(named.entity_ids, vec!["light.living_room_floor_lamp"]);
+
+        let group = HomeAssistantProvider::resolve_target_in_graph(
+            &graph,
+            "living room lights",
+            Some(HomeActionKind::TurnOn),
+        )
+        .expect("the bare room phrase should resolve to the group");
+        assert_eq!(group.kind, HomeTargetKind::Group);
+        assert_eq!(group.entity_ids.len(), 2);
     }
 
     #[test]
