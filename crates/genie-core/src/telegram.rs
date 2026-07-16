@@ -806,9 +806,10 @@ impl TelegramApi {
     }
 
     async fn chat_core(&self, chat_id: i64, text: &str) -> Result<String> {
+        let turn = crate::channel::incoming_turn_from_telegram(chat_id, text);
         let request = CoreChatRequest {
-            message: text.to_string(),
-            conversation_id: Some(format!("telegram-{chat_id}")),
+            message: turn.text,
+            conversation_id: Some(turn.session_id),
         };
 
         let mut builder = self
