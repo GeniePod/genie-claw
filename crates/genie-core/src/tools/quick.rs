@@ -1056,8 +1056,18 @@ fn play_media_request(text: &str) -> Option<String> {
             && rest.contains("playlist")
         {
             // Drop a trailing "please" so the query is the playlist name, not
-            // "my study playlist please".
-            return Some(rest.trim_end_matches(" please").trim_end().to_string());
+            // "my study playlist please". A leading article is not part of the
+            // name either ("put on the party playlist" is the "party playlist"),
+            // so strip it like the sibling extractors (clean_control_entity,
+            // scene_or_routine_activation_request) — but keep a leading "my",
+            // which resolve_speaker_possessive resolves against the speaker.
+            let name = rest
+                .trim_end_matches(" please")
+                .trim_end()
+                .trim_start_matches("the ")
+                .trim_start_matches("a ")
+                .trim_start_matches("an ");
+            return Some(name.to_string());
         }
     }
     None
@@ -4231,6 +4241,17 @@ mod tests {
         let call = route("Play my study playlist please").unwrap();
         assert_eq!(call.name, "play_media");
         assert_eq!(call.arguments["query"], "my study playlist");
+
+        // A leading article is not part of the playlist name either — it must be
+        // dropped like the sibling entity extractors do, while a leading "my"
+        // (a possessive) is kept for speaker resolution.
+        let call = route("Put on the party playlist").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "party playlist");
+
+        let call = route("Play the workout playlist please").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "workout playlist");
     }
 
     #[test]
