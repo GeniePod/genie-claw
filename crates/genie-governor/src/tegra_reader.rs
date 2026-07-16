@@ -1,7 +1,13 @@
 use genie_common::tegrastats::{self, TegraSnapshot};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::watch;
+
+/// Bound the final reap of the `tegrastats` child so a process that closes
+/// its stdout pipe without actually exiting can't wedge this task forever
+/// (issue #617).
+const TEGRASTATS_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Spawn `tegrastats` as a child process, parse each line, and broadcast
 /// the latest snapshot via a watch channel.
@@ -67,9 +73,18 @@ pub async fn spawn(interval_ms: u64) -> Option<watch::Receiver<TegraSnapshot>> {
             }
         }
 
-        // If tegrastats exits, try to reap the child.
-        let _ = child.wait().await;
-        tracing::warn!("tegrastats process exited");
+        // If tegrastats exits, try to reap the child. Bounded: a process that
+        // closed its stdout pipe without actually exiting must not wedge this
+        // task forever.
+        match tokio::time::timeout(TEGRASTATS_REAP_TIMEOUT, child.wait()).await {
+            Ok(_) => tracing::warn!("tegrastats process exited"),
+            Err(_) => {
+                tracing::warn!(
+                    timeout = ?TEGRASTATS_REAP_TIMEOUT,
+                    "tegrastats reap timed out — process may be orphaned"
+                );
+            }
+        }
     });
 
     Some(rx)
