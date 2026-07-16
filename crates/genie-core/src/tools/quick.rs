@@ -3487,6 +3487,13 @@ fn clean_status_target(text: &str) -> String {
         }
     }
 
+    // A trailing "please" is politeness, not part of the device name. It has to
+    // come off *before* the suffix trim below, or it defeats that trim entirely:
+    // no STATUS_SUFFIXES entry matches "... open please", so the loop stops on
+    // its first pass and the whole tail leaks into the entity ("garage door open
+    // please" instead of "garage door"). Mirrors the scene/routine trim.
+    target = target.trim_end_matches(" please").trim_end().to_string();
+
     // A status query can trail both a state word and a time qualifier
     // ("is the garage door open right now"). Strip trailing suffixes repeatedly
     // so the entity is the bare device ("garage door"), not "garage door open"
@@ -5318,6 +5325,34 @@ mod tests {
         // Single-suffix queries are unchanged.
         let call = route("Is the garage door open?").unwrap();
         assert_eq!(call.arguments["entity"], "garage door");
+    }
+
+    #[test]
+    fn status_entity_drops_a_trailing_please() {
+        // A trailing "please" is politeness, not part of the device name, and it
+        // has to come off before the state-word/time-qualifier trim — otherwise
+        // it defeats that trim entirely (no suffix matches "... open please", so
+        // the loop stops on its first pass) and the whole tail leaks into the
+        // entity: "garage door open please" instead of "garage door".
+        // Same class as the scene/routine trim in #777.
+        for (utterance, entity) in [
+            ("Is the garage door open please?", "garage door"),
+            ("Is the front door locked please?", "front door"),
+            ("Are the lights on please?", "lights"),
+            ("Is the kitchen light off please?", "kitchen light"),
+            // "please" stacks after a state word AND a time qualifier.
+            ("Is the garage door open right now please?", "garage door"),
+            ("What is the thermostat status please?", "thermostat"),
+            ("Check the back door please", "back door"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+
+        // A device whose name merely ends in those letters is untouched.
+        let call = route("Is the please light on?").unwrap();
+        assert_eq!(call.arguments["entity"], "please light");
     }
 
     #[test]
