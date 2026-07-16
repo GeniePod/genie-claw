@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::memory::{SharedMemory, with_shared_memory};
+use crate::memory::{Memory, SharedMemory, with_shared_memory};
 
 /// Store an evergreen profile memory only when household write policy allows it.
 pub(crate) fn store_evergreen_if_allowed(memory: &Memory, kind: &str, content: &str) -> bool {
