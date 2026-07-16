@@ -527,6 +527,155 @@ async fn run_with_wakeword(
 }
 
 /// Push-to-talk mode: Enter key triggers recording.
+/// Steps 1-3 of a voice cycle: flush stale mic samples, record a
+/// fixed-duration utterance, run AEC, and transcribe it.
+///
+/// Mirrors the recording/STT prefix of [`voice_cycle`] exactly (same calls,
+/// same log lines); kept as its own copy rather than a shared extraction so
+/// porting push-to-talk onto `Channel` (#700) cannot change anything on the
+/// wake-word path, which stays on `voice_cycle` unchanged.
+///
+/// Returns `None` (already logged) on a recording or transcription failure so
+/// callers can just retry.
+async fn record_and_transcribe(
+    voice_cfg: &VoiceConfig,
+    audio_device: &str,
+    stt_engine: &stt::SttEngine,
+    cycle_start: std::time::Instant,
+) -> Option<RecordedUtterance> {
+    stt::flush_mic_buffer(audio_device, voice_cfg.sample_rate).await;
+    eprintln!(
+        "[voice] Recording {} seconds — speak now!",
+        voice_cfg.record_secs
+    );
+    stt::reset_audio_captured_marker();
+    tts::reset_first_audio_marker();
+
+    let wav_path = match stt::record_audio(
+        audio_device,
+        voice_cfg.sample_rate,
+        voice_cfg.record_secs,
+        stt::Denoiser::from_config(
+            &voice_cfg.audio_denoiser,
+            &voice_cfg.deep_filter_path,
+            voice_cfg.deep_filter_atten_lim_db,
+        ),
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("[voice] Recording failed: {}", e);
+            return None;
+        }
+    };
+    let t_preprocess_done = std::time::Instant::now();
+
+    aec::process_aec(&wav_path, voice_cfg.sample_rate).await;
+
+    eprintln!("[voice] Transcribing...");
+    let transcript = match stt_engine.transcribe_file(&wav_path).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[voice] STT failed: {}", e);
+            let _ = tokio::fs::remove_file(&wav_path).await;
+            return None;
+        }
+    };
+
+    Some(RecordedUtterance {
+        transcript,
+        wav_path,
+        t_preprocess_done,
+        cycle_start,
+    })
+}
+
+/// A completed recv-side capture, stashed for the paired `handle` call to
+/// consume — `IncomingTurn` only carries plain text, but
+/// [`process_transcript`] also needs the raw [`stt::Transcript`] (language,
+/// duration) and the WAV path (speaker identity, cleanup).
+struct RecordedUtterance {
+    transcript: stt::Transcript,
+    wav_path: String,
+    t_preprocess_done: std::time::Instant,
+    /// When this cycle's recording began — threaded through so the paired
+    /// `handle` call can print a single "Total cycle" duration spanning
+    /// record+STT+process, matching the pre-#700 hand-rolled loop exactly.
+    cycle_start: std::time::Instant,
+}
+
+/// Push-to-talk `Channel` adapter (#700): `recv` waits for Enter then runs
+/// [`record_and_transcribe`]; `send` is a deliberate no-op because
+/// [`process_transcript`] already speaks the reply via streaming TTS *during*
+/// LLM generation (issue #26) — by the time the handler returns there is
+/// nothing left to deliver.
+struct PushToTalkVoiceChannel<'a> {
+    voice_cfg: &'a VoiceConfig,
+    audio_device: &'a str,
+    stt_engine: &'a stt::SttEngine,
+    conv_id: String,
+    lines: tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+    /// Set by `recv` and consumed by the paired `handle` closure — see
+    /// [`RecordedUtterance`].
+    pending: std::sync::Arc<std::sync::Mutex<Option<RecordedUtterance>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::channel::Channel for PushToTalkVoiceChannel<'_> {
+    fn kind(&self) -> crate::channel::ChannelKind {
+        crate::channel::ChannelKind::Voice
+    }
+
+    async fn recv(&mut self) -> Option<crate::channel::IncomingTurn> {
+        loop {
+            eprint!("[voice] Press Enter to speak > ");
+
+            let line = match self.lines.next_line().await {
+                Ok(Some(l)) => l,
+                Ok(None) => return None,
+                Err(e) => {
+                    eprintln!("[voice] stdin read failed: {}", e);
+                    return None;
+                }
+            };
+            if line.trim() == "quit" || line.trim() == "exit" {
+                return None;
+            }
+
+            let cycle_start = std::time::Instant::now();
+            let Some(utterance) = record_and_transcribe(
+                self.voice_cfg,
+                self.audio_device,
+                self.stt_engine,
+                cycle_start,
+            )
+            .await
+            else {
+                // Matches voice_cycle's early-return behavior on a failed
+                // recording/transcription: log, print the cycle time, and go
+                // back to waiting for the next Enter press without emitting
+                // a turn.
+                let total_ms = cycle_start.elapsed().as_millis();
+                eprintln!("[voice] Total cycle: {} ms\n", total_ms);
+                continue;
+            };
+
+            let text = utterance.transcript.text.clone();
+            *self.pending.lock().expect("pending mutex poisoned") = Some(utterance);
+            return Some(crate::channel::IncomingTurn::new(
+                text,
+                self.conv_id.clone(),
+                crate::channel::ChannelKind::Voice,
+            ));
+        }
+    }
+
+    async fn send(&mut self, _response: crate::channel::OutgoingResponse) -> Result<()> {
+        Ok(())
+    }
+}
+
 async fn run_push_to_talk(
     voice_cfg: &VoiceConfig,
     audio_device: &str,
@@ -541,45 +690,58 @@ async fn run_push_to_talk(
     conv_id: &str,
     session_registry: &Mutex<SessionRegistry>,
 ) -> Result<()> {
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let pending: std::sync::Arc<std::sync::Mutex<Option<RecordedUtterance>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
 
-    loop {
-        eprint!("[voice] Press Enter to speak > ");
+    let mut channel = PushToTalkVoiceChannel {
+        voice_cfg,
+        audio_device,
+        stt_engine,
+        conv_id: conv_id.to_string(),
+        lines: tokio::io::BufReader::new(tokio::io::stdin()).lines(),
+        pending: std::sync::Arc::clone(&pending),
+    };
 
-        let line = match lines.next_line().await? {
-            Some(l) => l,
-            None => break,
-        };
-        if line.trim() == "quit" || line.trim() == "exit" {
-            break;
+    crate::channel::serve_channel(&mut channel, |turn| {
+        let pending = std::sync::Arc::clone(&pending);
+        async move {
+            let utterance = pending
+                .lock()
+                .expect("pending mutex poisoned")
+                .take()
+                .expect("recv always stashes an utterance before returning a turn");
+            let cycle_start = utterance.cycle_start;
+
+            process_transcript(
+                utterance.transcript,
+                ProcessTranscriptInputs {
+                    voice_cfg,
+                    audio_device,
+                    llm,
+                    tools,
+                    memory,
+                    conversations,
+                    system_prompt,
+                    max_history,
+                    model_family,
+                    conv_id,
+                    session_registry,
+                    wav_path: Some(&utterance.wav_path),
+                    tts_engine_override: None,
+                    t_preprocess_done: utterance.t_preprocess_done,
+                },
+            )
+            .await;
+            let total_ms = cycle_start.elapsed().as_millis();
+            eprintln!("[voice] Total cycle: {} ms\n", total_ms);
+
+            Ok(crate::channel::OutgoingResponse::new(
+                turn.text,
+                turn.session_id,
+            ))
         }
-
-        let cycle_start = std::time::Instant::now();
-
-        let should_continue = voice_cycle(
-            voice_cfg,
-            audio_device,
-            stt_engine,
-            llm,
-            tools,
-            memory,
-            conversations,
-            system_prompt,
-            max_history,
-            model_family,
-            conv_id,
-            session_registry,
-        )
-        .await;
-
-        let total_ms = cycle_start.elapsed().as_millis();
-        eprintln!("[voice] Total cycle: {} ms\n", total_ms);
-
-        if !should_continue {
-            break;
-        }
-    }
+    })
+    .await?;
 
     tracing::info!("voice loop exited");
     Ok(())
