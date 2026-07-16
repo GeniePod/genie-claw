@@ -8,6 +8,10 @@ pub(crate) fn prepare(text: &str) -> String {
             cleaned.push(current);
         } else if current == '.' && flanked_by_digits(&chars, index) {
             cleaned.push('.');
+        } else if current == ',' && flanked_by_digits(&chars, index) {
+            // Thousands separator: drop it so "1,000" reads as 1000. Left as a
+            // plain separator it became "1 000", and the calculator took only the
+            // leading "1" (e.g. "20 percent of 1,000" -> "1 * 20 / 100").
         } else if current == '%' {
             // Keep the percent sign as its own token so "15% of 200" routes the
             // same as the spelled-out "15 percent of 200". `percentage_expression`

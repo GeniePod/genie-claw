@@ -6,7 +6,7 @@ use genie_common::config::{
 };
 use genie_core::llm::{
     GatedProvider, LlmClient, LocalProvider, Message, OptionalProviderPlan, Provider,
-    ProviderReadiness, gated_provider_from_config,
+    ProviderReadiness, gated_provider_for_http, gated_provider_from_config,
 };
 
 fn user(text: &str) -> Message {
@@ -127,4 +127,13 @@ async fn gated_provider_key_missing_returns_clear_error() {
         "expected clear config error, got: {err}"
     );
     assert!(err.contains("api_key_env"));
+}
+
+#[test]
+fn gated_provider_for_http_defaults_to_local_gate() {
+    let llm = LlmClient::mock(["unused"]);
+    let agent = AgentConfig::default();
+    let optional = OptionalAiProviderConfig::default();
+    let provider = gated_provider_for_http(&llm, &agent, &optional);
+    assert_eq!(provider.readiness(), ProviderReadiness::Ready);
 }

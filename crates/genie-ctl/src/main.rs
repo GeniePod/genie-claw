@@ -2082,8 +2082,10 @@ async fn cmd_conversations() -> Result<()> {
 async fn cmd_update_check() -> Result<()> {
     println!("Checking for updates...\n");
 
-    // Check GitHub Releases via curl (handles TLS).
-    let output = tokio::process::Command::new("curl")
+    // Check GitHub Releases via curl (handles TLS). Bounded so a stalled
+    // connection can't hang the CLI forever (#617).
+    let mut update_check_cmd = tokio::process::Command::new("curl");
+    update_check_cmd
         .args([
             "-sS",
             "-H",
@@ -2092,11 +2094,15 @@ async fn cmd_update_check() -> Result<()> {
             "User-Agent: GeniePod-OTA",
             "https://api.github.com/repos/GeniePod/genie-claw/releases/latest",
         ])
-        .output()
-        .await;
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        update_check_cmd.output(),
+    )
+    .await;
 
     match output {
-        Ok(out) if out.status.success() => {
+        Ok(Ok(out)) if out.status.success() => {
             let body = String::from_utf8_lossy(&out.stdout);
             let release: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
@@ -2128,11 +2134,14 @@ async fn cmd_update_check() -> Result<()> {
                 println!("\n  You're up to date.");
             }
         }
-        Ok(out) => {
+        Ok(Ok(out)) => {
             eprintln!("GitHub API error: {}", String::from_utf8_lossy(&out.stderr));
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("Failed to check (is curl installed?): {}", e);
+        }
+        Err(_) => {
+            eprintln!("Failed to check: request timed out");
         }
     }
 
@@ -2251,12 +2260,11 @@ async fn cmd_diag() -> Result<()> {
         println!("  Uptime: {}", format_uptime_hm(s as u64));
     }
 
-    // Disk.
-    let df = tokio::process::Command::new("df")
-        .args(["-h", "/opt/geniepod"])
-        .output()
-        .await;
-    if let Ok(out) = df
+    // Disk. Bounded so a stalled mount can't hang the CLI forever (#617).
+    let mut df_cmd = tokio::process::Command::new("df");
+    df_cmd.args(["-h", "/opt/geniepod"]).kill_on_drop(true);
+    let df = tokio::time::timeout(std::time::Duration::from_secs(5), df_cmd.output()).await;
+    if let Ok(Ok(out)) = df
         && out.status.success()
     {
         let output = String::from_utf8_lossy(&out.stdout);
@@ -2494,12 +2502,11 @@ fn read_file_lines(path: &str, limit: usize) -> Vec<String> {
 }
 
 async fn disk_summary(path: &str) -> serde_json::Value {
-    match tokio::process::Command::new("df")
-        .args(["-h", path])
-        .output()
-        .await
-    {
-        Ok(out) if out.status.success() => {
+    let mut cmd = tokio::process::Command::new("df");
+    cmd.args(["-h", path]).kill_on_drop(true);
+    // Bounded so a stalled mount can't hang the caller forever (#617).
+    match tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => {
             let output = String::from_utf8_lossy(&out.stdout);
             let columns = output
                 .lines()
@@ -2511,13 +2518,17 @@ async fn disk_summary(path: &str) -> serde_json::Value {
                 "summary": columns,
             })
         }
-        Ok(out) => serde_json::json!({
+        Ok(Ok(out)) => serde_json::json!({
             "path": path,
             "error": String::from_utf8_lossy(&out.stderr).trim(),
         }),
-        Err(e) => serde_json::json!({
+        Ok(Err(e)) => serde_json::json!({
             "path": path,
             "error": e.to_string(),
+        }),
+        Err(_) => serde_json::json!({
+            "path": path,
+            "error": "timed out",
         }),
     }
 }
@@ -3581,6 +3592,32 @@ mod tests {
         assert_eq!(
             format_agent_harness_health_line(&harness).as_deref(),
             Some("  [FAIL] harness (memory_hydration_budget)")
+        );
+    }
+
+    /// Regression for #617: the `curl`/`df` calls in this file wrap their
+    /// command in `tokio::time::timeout` + `kill_on_drop(true)`. `curl`/`df`
+    /// aren't guaranteed to hang predictably in a test sandbox, so this
+    /// exercises the exact same wrap-and-kill idiom directly against `sleep`
+    /// (always present on the Linux targets this project supports) to prove
+    /// a hung child is bounded and does not block the caller.
+    #[tokio::test]
+    async fn timeout_wrap_bounds_a_hung_child() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+
+        let start = std::time::Instant::now();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), cmd.output()).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "200ms timeout must fire before `sleep 30` exits"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must fail fast on the timeout, not wait for the child: took {elapsed:?}"
         );
     }
 }
