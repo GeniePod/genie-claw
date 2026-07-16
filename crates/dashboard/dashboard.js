@@ -77,10 +77,16 @@ function setText(id, val) {
   if (el) el.textContent = val;
 }
 
+// Local API token for authenticated API calls (issue #228). genie-api injects
+// it into the meta tag; left blank when token enforcement is disabled.
+const LOCAL_TOKEN = document.querySelector('meta[name="genie-local-token"]')?.content || '';
+
 // --- Fetch helpers ---
 async function fetchJson(url) {
   try {
-    const r = await fetch(url);
+    const headers = {};
+    if (LOCAL_TOKEN) headers['X-Genie-Token'] = LOCAL_TOKEN;
+    const r = await fetch(url, { headers });
     return await r.json();
   } catch {
     return null;
@@ -229,10 +235,6 @@ async function pollSecurity() {
   setText('security-risk-count', riskFlags.length);
   setText('security-detail', details);
 }
-
-// Local API token for mutating calls (issue #228). genie-api injects it into
-// the meta tag; left blank when token enforcement is disabled.
-const LOCAL_TOKEN = document.querySelector('meta[name="genie-local-token"]')?.content || '';
 
 async function postJson(url, payload) {
   const headers = { 'Content-Type': 'application/json' };
