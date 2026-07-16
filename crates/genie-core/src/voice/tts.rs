@@ -10,6 +10,12 @@ const APLAY_TIMEOUT_MARGIN: Duration = Duration::from_secs(10);
 const APLAY_TIMEOUT_MAX: Duration = Duration::from_secs(120);
 /// Fixed deadline for WAV file playback (duration unknown without parsing).
 const APLAY_WAV_TIMEOUT: Duration = Duration::from_secs(120);
+/// Deadline for one-shot Piper synthesis calls (pipe-mode `synthesize_only`
+/// and file-mode `synthesize_to_file`), so a hung Piper process can't wedge
+/// the single-per-device voice loop forever (#617). Generous relative to
+/// typical reply-length synthesis, not a tight latency budget — matches the
+/// Telegram voice adapter's `PIPER_SYNTHESIS_TIMEOUT`.
+const PIPER_SYNTHESIS_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn aplay_timeout_for_pcm(pcm_len: usize, sample_rate: u32) -> Duration {
     let bytes_per_sec = (sample_rate as usize).saturating_mul(2).max(1);
@@ -325,6 +331,7 @@ impl TtsEngine {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()?;
 
         if let Some(mut stdin) = piper.stdin.take() {
@@ -332,7 +339,14 @@ impl TtsEngine {
             stdin.write_all(b"\n").await?;
         }
 
-        let out = piper.wait_with_output().await?;
+        // Bounded so a hung piper process can't wedge the single-per-device
+        // voice loop forever (#617).
+        let out = match tokio::time::timeout(PIPER_SYNTHESIS_TIMEOUT, piper.wait_with_output())
+            .await
+        {
+            Ok(result) => result?,
+            Err(_) => anyhow::bail!("Piper synthesis timed out after {PIPER_SYNTHESIS_TIMEOUT:?}"),
+        };
         if !out.status.success() {
             anyhow::bail!("Piper failed: {}", String::from_utf8_lossy(&out.stderr));
         }
@@ -412,16 +426,23 @@ impl TtsEngine {
 
         let clean = text.replace('\'', "'\\''");
 
-        let output = Command::new("sh")
-            .args([
-                "-c",
-                &format!(
-                    "echo '{}' | '{}' --model '{}' --output_file '{}'",
-                    clean, self.piper_path, self.model_path, output_path,
-                ),
-            ])
-            .output()
-            .await?;
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "echo '{}' | '{}' --model '{}' --output_file '{}'",
+                clean, self.piper_path, self.model_path, output_path,
+            ),
+        ])
+        .kill_on_drop(true);
+
+        // Bounded so a hung piper process can't wedge the caller forever (#617).
+        let output = match tokio::time::timeout(PIPER_SYNTHESIS_TIMEOUT, cmd.output()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                anyhow::bail!("piper (file mode) timed out after {PIPER_SYNTHESIS_TIMEOUT:?}")
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -626,5 +647,33 @@ mod tests {
         );
         assert_eq!(engine.piper_path, "/opt/geniepod/piper/piper");
         assert_eq!(engine.audio_device, "plughw:0,0");
+    }
+
+    /// Regression for #617: the two remaining unbounded Piper call sites
+    /// (`synthesize_only`'s `wait_with_output`, `synthesize_to_file`'s
+    /// `sh -c` shell-out) now wrap their command in `tokio::time::timeout` +
+    /// `kill_on_drop(true)`, the same idiom already proven for this file's
+    /// `aplay` sites via `wait_aplay_or_timeout`/`APLAY_WAV_TIMEOUT`. Piper
+    /// isn't guaranteed to hang predictably in a test sandbox, so this
+    /// exercises the exact same wrap-and-kill idiom directly against `sleep`
+    /// (always present on the Linux targets this project supports) to prove
+    /// a hung child is bounded and does not block the caller.
+    #[tokio::test]
+    async fn timeout_wrap_bounds_a_hung_child() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_millis(200), cmd.output()).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "200ms timeout must fire before `sleep 30` exits"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must fail fast on the timeout, not wait for the child: took {elapsed:?}"
+        );
     }
 }
