@@ -1089,10 +1089,17 @@ fn shopping_list_add_request(text: &str) -> Option<String> {
     let rest = text
         .strip_prefix("add ")
         .or_else(|| text.strip_prefix("put "))?;
+    // The word before "shopping list" is optional and may be a possessive:
+    // "the shopping list", the article-less "shopping list", or the equally
+    // common "my shopping list". Without the "my" variants a natural "add milk
+    // to my shopping list" matched no suffix and fell through to memory_recall,
+    // searching memory for the command instead of adding the item.
     let items = rest
         .strip_suffix(" to the shopping list")
+        .or_else(|| rest.strip_suffix(" to my shopping list"))
         .or_else(|| rest.strip_suffix(" to shopping list"))
         .or_else(|| rest.strip_suffix(" on the shopping list"))
+        .or_else(|| rest.strip_suffix(" on my shopping list"))
         .or_else(|| rest.strip_suffix(" on shopping list"))?
         .trim();
     if items.is_empty() {
@@ -1113,11 +1120,13 @@ fn shopping_list_remove_request(text: &str) -> Option<String> {
         .strip_prefix("take ")
         .and_then(|rest| {
             rest.strip_suffix(" off the shopping list")
+                .or_else(|| rest.strip_suffix(" off my shopping list"))
                 .or_else(|| rest.strip_suffix(" off shopping list"))
         })
         .or_else(|| {
             text.strip_prefix("remove ").and_then(|rest| {
                 rest.strip_suffix(" from the shopping list")
+                    .or_else(|| rest.strip_suffix(" from my shopping list"))
                     .or_else(|| rest.strip_suffix(" from shopping list"))
             })
         })?
@@ -4313,6 +4322,19 @@ mod tests {
         // The media "put on ..." path is unaffected.
         let call = route("Put on the morning news").unwrap();
         assert_eq!(call.name, "play_media");
+
+        // The possessive "my shopping list" is as common as "the shopping list";
+        // without it "add milk to my shopping list" fell through to memory_recall.
+        let call = route("Add milk to my shopping list").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "shopping");
+        assert_eq!(call.arguments["content"], "shopping list pending: milk");
+
+        let call = route("Put eggs and bread on my shopping list").unwrap();
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list pending: eggs, bread"
+        );
     }
 
     #[test]
@@ -4336,6 +4358,16 @@ mod tests {
         // The articled form still works.
         let call = route("Take milk off the shopping list").unwrap();
         assert_eq!(call.arguments["content"], "shopping list removed: milk");
+
+        // The possessive "my shopping list" mirrors the add path.
+        let call = route("Take milk off my shopping list").unwrap();
+        assert_eq!(call.arguments["content"], "shopping list removed: milk");
+
+        let call = route("Remove eggs and bread from my shopping list").unwrap();
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list removed: eggs, bread"
+        );
     }
 
     #[test]
