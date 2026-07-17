@@ -2842,7 +2842,17 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
 
     let location = extract_location_after_marker(text, " in ")
         .or_else(|| extract_location_after_marker(text, " for "))?;
-    if location.is_empty() || location == "today" || location == "tomorrow" {
+    // "what's the weather in the morning" / "... in an hour" names a *time*, not a
+    // place — the marker after "in"/"for" is a time expression, so there is no
+    // city to look up and the query must fall back to the default local forecast
+    // (grounded by the LLM). The rain path already guards this with
+    // is_time_expression; the general weather/forecast path only rejected the
+    // bare "today"/"tomorrow" and otherwise emitted get_weather{location:"morning"}.
+    if location.is_empty()
+        || location == "today"
+        || location == "tomorrow"
+        || is_time_expression(&location)
+    {
         return None;
     }
 
@@ -6160,6 +6170,30 @@ mod tests {
         assert_eq!(call.name, "get_weather");
         assert_eq!(call.arguments["location"], "new york");
         assert_eq!(call.arguments["forecast"], true);
+    }
+
+    #[test]
+    fn weather_time_of_day_is_not_a_location() {
+        // "what's the weather in the morning" / "... in an hour" names a time,
+        // not a place — it must abstain (default local forecast via the LLM), not
+        // emit get_weather{location:"morning"}. The rain path already guarded
+        // this; the general weather/forecast path did not.
+        for utterance in [
+            "what's the weather in the morning",
+            "what's the weather in the evening",
+            "what's the weather in an hour",
+            "what's the weather in 3 days",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} should abstain, not route a time as a place"
+            );
+        }
+
+        // A real city with a trailing time qualifier still routes to that city.
+        let call = route("what's the weather in Denver tonight").unwrap();
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["location"], "denver");
     }
 
     #[test]
