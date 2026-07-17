@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::channel::{IncomingTurn, incoming_turn_from_chat_json};
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
-use crate::conversation::ConversationStore;
+use crate::conversation::{BatchMessage, ConversationStore};
 use crate::llm::{
     EscalationReason, LlmBackendClient, LlmClient, LlmRequestHints, Message, OptionalProviderPlan,
     PrivacyProxyBackend, Provider, ProviderReadiness, gated_provider_for_http, may_escalate,
@@ -120,6 +120,12 @@ pub struct ChatServer {
     /// Storage lifecycle config — pruning intervals, retention limits, and the
     /// disk-size threshold that surfaces as `degraded` in `/api/health`.
     storage_config: StorageConfig,
+    /// Which transport(s) `main.rs` actually started alongside this HTTP
+    /// server (always includes `"http"`; `"telegram"` when that adapter is
+    /// really running) — surfaced in the runtime contract's hydration
+    /// snapshot (#785). Defaults to `["http"]`; override with
+    /// [`Self::with_active_channels`].
+    active_channels: Vec<&'static str>,
 }
 
 pub struct ChatTurnResult {
@@ -167,6 +173,7 @@ impl ChatServer {
             agent_config: AgentConfig::default(),
             optional_ai_provider: OptionalAiProviderConfig::default(),
             storage_config: StorageConfig::default(),
+            active_channels: vec!["http"],
         })
     }
 
@@ -213,6 +220,15 @@ impl ChatServer {
     /// Defaults to [`StorageConfig::default`].
     pub fn with_storage_config(mut self, cfg: StorageConfig) -> Self {
         self.storage_config = cfg;
+        self
+    }
+
+    /// Override which transport(s) are reported as active in the runtime
+    /// contract's hydration snapshot (#785). Defaults to `["http"]`; pass
+    /// `["http", "telegram"]` when `main.rs` has actually started the
+    /// Telegram adapter alongside this server.
+    pub fn with_active_channels(mut self, channels: Vec<&'static str>) -> Self {
+        self.active_channels = channels;
         self
     }
 
@@ -817,6 +833,7 @@ async fn handle_request(
                 max_history,
                 model_family,
                 expected_runtime_contract_hash,
+                &ctx.active_channels,
             )
             .await
         }
@@ -837,6 +854,7 @@ async fn handle_request(
                 chat_gate,
                 &ctx.boot_harness,
                 ctx.storage_config.warn_threshold_mb,
+                &ctx.active_channels,
             )
             .await
         }
@@ -1014,9 +1032,17 @@ async fn handle_chat_stream(
     let conv_id = resolve_chat_conv_id(session_registry, &parsed, &turn).await;
     let tool_ctx = turn.tool_execution_context(request_origin, false);
 
-    conversations.ensure(&conv_id, "New conversation").await?;
     conversations
-        .append(&conv_id, "user", &turn.text, None, turn.speaker_name())
+        .ensure_and_append_batch(
+            &conv_id,
+            "New conversation",
+            vec![BatchMessage::new(
+                "user",
+                turn.text.as_str(),
+                None,
+                turn.speaker_name(),
+            )],
+        )
         .await?;
 
     if let Some(call) = crate::tools::quick::route_for_available_tools(
@@ -1305,9 +1331,17 @@ pub async fn process_chat_turn(
     request_origin: RequestOrigin,
     privacy_proxy: Option<&PrivacyProxyConfig>,
 ) -> Result<ChatTurnResult> {
-    conversations.ensure(conv_id, "New conversation").await?;
     conversations
-        .append(conv_id, "user", &turn.text, None, turn.speaker_name())
+        .ensure_and_append_batch(
+            conv_id,
+            "New conversation",
+            vec![BatchMessage::new(
+                "user",
+                turn.text.as_str(),
+                None,
+                turn.speaker_name(),
+            )],
+        )
         .await?;
 
     let tool_ctx = turn.tool_execution_context(request_origin, false);
@@ -1527,24 +1561,6 @@ async fn finalize_direct_tool_turn(
         "arguments": call.arguments,
     })
     .to_string();
-    conversations
-        .append_or_log(
-            conv_id,
-            "assistant",
-            &tool_json,
-            Some(&tool_result.tool),
-            None,
-        )
-        .await;
-    conversations
-        .append_or_log(
-            conv_id,
-            "system",
-            &format!("Tool result: {}", tool_result.output),
-            None,
-            None,
-        )
-        .await;
 
     let response = if tool_result.success {
         tool_result.output.clone()
@@ -1553,7 +1569,20 @@ async fn finalize_direct_tool_turn(
     };
     let sanitized = crate::security::sandbox::sanitize_output(&response);
     conversations
-        .append_or_log(conv_id, "assistant", &sanitized, None, None)
+        .ensure_and_append_batch_or_log(
+            conv_id,
+            "New conversation",
+            vec![
+                BatchMessage::new("assistant", tool_json, Some(&tool_result.tool), None),
+                BatchMessage::new(
+                    "system",
+                    format!("Tool result: {}", tool_result.output),
+                    None,
+                    None,
+                ),
+                BatchMessage::new("assistant", sanitized.clone(), None, None),
+            ],
+        )
         .await;
     sanitized
 }
@@ -1852,6 +1881,7 @@ async fn handle_health(
     chat_gate: &ChatTurnGate,
     boot_harness: &crate::agent_harness::LimitedContextHarnessReport,
     warn_threshold_mb: u64,
+    active_channels: &[&str],
 ) -> (u16, &'static str, String) {
     let llm_ok = llm.health().await;
     let connectivity_health = connectivity.health().await;
@@ -1880,6 +1910,7 @@ async fn handle_health(
         max_history,
         model_family,
         &connectivity_health,
+        active_channels,
     );
     let runtime_contract =
         runtime_contract_summary_json(&runtime_contract, expected_runtime_contract_hash);
@@ -2005,6 +2036,7 @@ async fn handle_runtime_contract(
     max_history: usize,
     model_family: ModelFamily,
     expected_runtime_contract_hash: &str,
+    active_channels: &[&str],
 ) -> (u16, &'static str, String) {
     let connectivity_health = connectivity.health().await;
     let (mem_count, mem_promoted_count) = with_shared_memory(memory, |memory| {
@@ -2024,6 +2056,7 @@ async fn handle_runtime_contract(
         max_history,
         model_family,
         &connectivity_health,
+        active_channels,
     );
     let body = runtime_contract_json(&contract, expected_runtime_contract_hash);
     let body = serde_json::to_string(&body).unwrap_or_else(|e| {
@@ -2042,6 +2075,7 @@ pub fn build_runtime_contract_snapshot(
     max_history: usize,
     model_family: ModelFamily,
     connectivity_health: &ConnectivityHealth,
+    active_channels: &[&str],
 ) -> crate::runtime_contract::RuntimeContract {
     let tool_defs = tools.tool_defs();
     let hydration = serde_json::json!({
@@ -2060,6 +2094,15 @@ pub fn build_runtime_contract_snapshot(
             "state": connectivity_health.state,
             "transport": connectivity_health.transport.clone(),
             "device": connectivity_health.device.clone(),
+        },
+        // Which transport(s) are live in this process (#785) — sourced from
+        // ChannelRegistry via ActiveChannelMarker. Folded into hydration (and
+        // so into hydration_hash / contract_hash) rather than a separate
+        // top-level field: a restart that silently changes operating mode
+        // (e.g. voice -> daemon, or drops the Telegram adapter) is exactly
+        // the kind of deployment drift this contract exists to catch.
+        "channels": {
+            "active": active_channels,
         },
     });
 
@@ -2827,13 +2870,13 @@ async fn write_status_response(writer: &mut OwnedWriteHalf, status: u16) -> Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectivityState, StreamMode, detect_stream_mode, handle_actuation_actions, handle_chat,
-        handle_health, handle_runtime_contract, handle_web_search, handle_web_search_status,
-        is_client_disconnect_error, overall_health_status, resolve_chat_conv_id,
-        should_summarize_tool_result,
+        ConnectivityState, StreamMode, build_runtime_contract_snapshot, detect_stream_mode,
+        handle_actuation_actions, handle_chat, handle_health, handle_runtime_contract,
+        handle_web_search, handle_web_search_status, is_client_disconnect_error,
+        overall_health_status, resolve_chat_conv_id, should_summarize_tool_result,
     };
     use crate::channel::{ChannelKind, IncomingTurn};
-    use crate::connectivity::NullConnectivityController;
+    use crate::connectivity::{ConnectivityController, NullConnectivityController};
     use crate::conversation::ConversationStore;
     use crate::memory::{Memory, SharedMemory};
     use crate::prompt::ModelFamily;
@@ -3148,6 +3191,7 @@ mod tests {
             &gate,
             &boot_harness,
             0,
+            &["http"],
         )
         .await;
 
@@ -3243,6 +3287,7 @@ mod tests {
             12,
             ModelFamily::Phi,
             "expected-hash",
+            &["http"],
         )
         .await;
 
@@ -3264,8 +3309,51 @@ mod tests {
         );
         assert_eq!(parsed["hydration"]["conversations"]["count"], 1);
         assert_eq!(parsed["hydration"]["connectivity"]["state"], "disabled");
+        assert_eq!(
+            parsed["hydration"]["channels"]["active"],
+            serde_json::json!(["http"])
+        );
         assert_eq!(parsed["validation"]["status"], "drift");
         assert_eq!(parsed["validation"]["drift"], true);
+    }
+
+    #[tokio::test]
+    async fn runtime_contract_hash_changes_when_active_channels_differ() {
+        // #785: active_channels is folded into hydration (and so into
+        // contract_hash) rather than kept as an unhashed sibling field, so a
+        // restart that silently changes operating mode is a catchable
+        // contract drift, not a silent no-op.
+        let tools = ToolDispatcher::new(None);
+        let connectivity_health =
+            NullConnectivityController::from_config(&ConnectivityConfig::default())
+                .health()
+                .await;
+
+        let http_only = build_runtime_contract_snapshot(
+            &tools,
+            0,
+            0,
+            0,
+            "system prompt",
+            12,
+            ModelFamily::Phi,
+            &connectivity_health,
+            &["http"],
+        );
+        let http_and_telegram = build_runtime_contract_snapshot(
+            &tools,
+            0,
+            0,
+            0,
+            "system prompt",
+            12,
+            ModelFamily::Phi,
+            &connectivity_health,
+            &["http", "telegram"],
+        );
+
+        assert_ne!(http_only.contract_hash, http_and_telegram.contract_hash);
+        assert_ne!(http_only.hydration_hash, http_and_telegram.hydration_hash);
     }
 
     #[test]

@@ -1,9 +1,29 @@
 use anyhow::Result;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+
+/// Hard deadline for one-shot `whisper-cli` invocations (#617).
+/// Long enough for real utterances on Jetson CPU fallback; short enough that a
+/// hung CUDA/NvMap child cannot wedge the single per-device voice loop forever.
+const WHISPER_CLI_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run `whisper-cli` under a deadline, reaping the child on timeout via
+/// `kill_on_drop`.
+async fn whisper_cli_output(mut cmd: Command) -> Result<std::process::Output> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(WHISPER_CLI_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => anyhow::bail!(
+            "whisper-cli timed out after {}s",
+            WHISPER_CLI_TIMEOUT.as_secs()
+        ),
+    }
+}
 
 /// Monotonic per-process counter for unique temp-file suffixes. Pairs with
 /// the PID so two concurrent `transcribe_pcm` calls in the same process
@@ -417,7 +437,9 @@ impl SttEngine {
             args.push("--no-gpu".to_string());
         }
 
-        let output = Command::new(&self.cli_path).args(&args).output().await?;
+        let mut cmd = Command::new(&self.cli_path);
+        cmd.args(&args);
+        let output = whisper_cli_output(cmd).await?;
 
         // If GPU allocation fails (NvMap error), retry with --no-gpu.
         if !output.status.success() && !self.no_gpu {
@@ -431,7 +453,9 @@ impl SttEngine {
                     stderr.lines().next().unwrap_or("")
                 );
                 args.push("--no-gpu".to_string());
-                let retry = Command::new(&self.cli_path).args(&args).output().await?;
+                let mut retry_cmd = Command::new(&self.cli_path);
+                retry_cmd.args(&args);
+                let retry = whisper_cli_output(retry_cmd).await?;
                 if !retry.status.success() {
                     let stderr2 = String::from_utf8_lossy(&retry.stderr);
                     anyhow::bail!("whisper-cli failed (CPU retry): {}", stderr2);

@@ -13,9 +13,10 @@ home_runtime_boundary = "transitional_adapter"
 
 [optional_ai_provider]
 enabled = false
-provider = "open_ai_compatible"
+provider = "open_ai_compatible"   # Only open_ai_compatible / open_ai are wired.
 auth_mode = "api_key"
-base_url = ""
+base_url = ""                     # e.g. "http://127.0.0.1:11434/v1"
+model = ""                        # Required when enabled.
 api_key_env = "GENIEPOD_AI_PROVIDER_API_KEY"
 oauth_token_env = "GENIEPOD_AI_PROVIDER_OAUTH_TOKEN"
 context_window_tokens = 4096
