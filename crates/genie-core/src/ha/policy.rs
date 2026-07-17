@@ -80,6 +80,23 @@ pub fn assess_home_action(action: &HomeAction) -> ActionPolicyDecision {
     let target = &action.target;
     let domain = target.domain.as_deref().unwrap_or("");
 
+    // Activating a script that is not marked voice-safe is a hard deny, never a
+    // confirmable prompt. This has to be checked before the generic voice_safe
+    // guard below: that guard returns `require_confirmation` for every
+    // non-voice-safe target, so it used to swallow this case and leave the deny
+    // branch unreachable — the caller then offered a confirmation for a script
+    // the policy was written to refuse outright, and on confirm fell through to
+    // execution (only the provider's own re-check stopped it).
+    if matches!(action.kind, HomeActionKind::Activate)
+        && matches!(target.kind, HomeTargetKind::Script)
+        && !target.voice_safe
+    {
+        return ActionPolicyDecision::deny(format!(
+            "{} is not a voice-safe script",
+            target.display_name
+        ));
+    }
+
     if !target.voice_safe {
         return ActionPolicyDecision::require_confirmation(
             ActionRisk::High,
@@ -115,16 +132,6 @@ pub fn assess_home_action(action: &HomeAction) -> ActionPolicyDecision {
             ActionRisk::High,
             format!("opening {} requires confirmation", target.display_name),
         );
-    }
-
-    if matches!(action.kind, HomeActionKind::Activate)
-        && matches!(target.kind, HomeTargetKind::Script)
-        && !target.voice_safe
-    {
-        return ActionPolicyDecision::deny(format!(
-            "{} is not a voice-safe script",
-            target.display_name
-        ));
     }
 
     let risk = match (domain, action.kind) {
@@ -281,6 +288,30 @@ mod tests {
             assess_home_action(&action("cover", HomeActionKind::Open, "Garage door", true));
         assert!(!decision.allowed);
         assert!(decision.requires_confirmation);
+    }
+
+    #[test]
+    fn denies_non_voice_safe_script_activation() {
+        // A non-voice-safe script is a hard deny, not a confirmable prompt: the
+        // generic voice_safe guard used to return first, so the caller offered a
+        // confirmation the policy was written to refuse outright.
+        let mut action = action("script", HomeActionKind::Activate, "Disarm alarm", false);
+        action.target.kind = HomeTargetKind::Script;
+
+        let decision = assess_home_action(&action);
+
+        assert!(!decision.allowed);
+        assert!(
+            !decision.requires_confirmation,
+            "a non-voice-safe script must be refused outright, got a confirmable prompt: {}",
+            decision.reason
+        );
+        assert_eq!(decision.risk, ActionRisk::High);
+        assert!(
+            decision.reason.contains("not a voice-safe script"),
+            "got: {}",
+            decision.reason
+        );
     }
 
     fn health() -> IntegrationHealth {

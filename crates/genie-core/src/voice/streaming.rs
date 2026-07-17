@@ -185,7 +185,13 @@ impl SentenceStreamer {
             if self.awaiting_ascii_boundary {
                 self.awaiting_ascii_boundary = false;
                 if ch.is_whitespace() {
-                    if let Some(sentence) = self.try_emit() {
+                    // A `.` closing a known abbreviation (`p.m.`, `Dr.`, `e.g.`)
+                    // is part of the token, not a sentence end, even before
+                    // whitespace — mirror `format::truncate_for_voice` (#386) so
+                    // both voice paths segment the same way.
+                    if !super::format::ends_with_abbreviation(&self.pending_sentence)
+                        && let Some(sentence) = self.try_emit()
+                    {
                         out.push(sentence);
                         if self.emitted >= self.max_sentences {
                             return out;
@@ -436,6 +442,21 @@ mod tests {
         }
         assert_eq!(emitted.len(), 2);
         assert!(emitted[1].contains("second one"));
+    }
+
+    #[test]
+    fn does_not_split_at_a_known_abbreviation() {
+        // "The meeting is at 5 p.m. today." is ONE sentence: the period in the
+        // abbreviation "p.m." must not end it, matching the non-streaming
+        // format::truncate_for_voice guard (#386). Before this fix the streamer
+        // emitted "The meeting is at 5 p.m." and started a new sentence at
+        // "today", so the first spoken sentence would not contain "today".
+        let mut s = SentenceStreamer::new(3);
+        let mut emitted = feed_all(&mut s, &["The meeting is at 5 p.m. today. Bye."]);
+        if let Some(tail) = s.finish() {
+            emitted.push(tail);
+        }
+        assert!(emitted[0].contains("today"));
     }
 
     #[test]
