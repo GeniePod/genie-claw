@@ -5,15 +5,20 @@
 //! shared turn-processing entry point, plus a small `ChannelRegistry` for
 //! tracking active channels.
 //!
-//! Reference adapters for #564 live in [`scripted`] and [`http`]; porting the
-//! existing voice loop, HTTP routes, and Telegram handler onto `Channel` is
-//! tracked in #564.
+//! Reference adapters for #564 live in [`scripted`], [`http`], and [`telegram`];
+//! porting the existing voice loop, HTTP routes, and Telegram handler onto
+//! `Channel` is tracked in #564. [`serve_channel`] is the shared `recv -> handle -> send`
+//! driver each transport is wired onto as it ports (#672, #700).
 
 pub mod http;
 pub mod scripted;
+pub mod serve;
+pub mod telegram;
 
 pub use http::incoming_turn_from_chat_json;
 pub use scripted::ScriptedChannel;
+pub use serve::serve_channel;
+pub use telegram::{incoming_turn_from_telegram, telegram_chat_json, telegram_session_id};
 
 use anyhow::Result;
 use async_trait::async_trait;

@@ -32,8 +32,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
                 continue;
             }
             let fact = format!("User's {} is {}", key, text);
-            if !memory.has_similar(&fact).unwrap_or(false) {
-                memory.store_evergreen("identity", &fact)?;
+            if !memory.has_similar(&fact).unwrap_or(false)
+                && super::store_evergreen_if_allowed(memory, "identity", &fact)
+            {
                 stored += 1;
             }
         }
@@ -50,8 +51,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
                 toml::Value::Array(_) => format!("User's {} preferences: {}", key, text),
                 _ => format!("User prefers {} {}", key, text),
             };
-            if !memory.has_similar(&fact).unwrap_or(false) {
-                memory.store_evergreen("preference", &fact)?;
+            if !memory.has_similar(&fact).unwrap_or(false)
+                && super::store_evergreen_if_allowed(memory, "preference", &fact)
+            {
                 stored += 1;
             }
         }
@@ -66,8 +68,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
                     continue;
                 }
                 let fact = format!("User's {} is {}", relation, text);
-                if !memory.has_similar(&fact).unwrap_or(false) {
-                    memory.store_evergreen("relationship", &fact)?;
+                if !memory.has_similar(&fact).unwrap_or(false)
+                    && super::store_evergreen_if_allowed(memory, "relationship", &fact)
+                {
                     stored += 1;
                 }
             }
@@ -82,8 +85,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
                 continue;
             }
             let fact = format!("{} routine: {}", name, text);
-            if !memory.has_similar(&fact).unwrap_or(false) {
-                memory.store_evergreen("context", &fact)?;
+            if !memory.has_similar(&fact).unwrap_or(false)
+                && super::store_evergreen_if_allowed(memory, "context", &fact)
+            {
                 stored += 1;
             }
         }
@@ -97,8 +101,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
                 continue;
             }
             let fact = format!("User's work {}: {}", key, text);
-            if !memory.has_similar(&fact).unwrap_or(false) {
-                memory.store_evergreen("identity", &fact)?;
+            if !memory.has_similar(&fact).unwrap_or(false)
+                && super::store_evergreen_if_allowed(memory, "identity", &fact)
+            {
                 stored += 1;
             }
         }
@@ -112,8 +117,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
             if sentence.len() > 10 {
                 let facts = crate::memory::extract::extract_facts(sentence);
                 for fact in facts {
-                    if !memory.has_similar(&fact.content).unwrap_or(false) {
-                        memory.store_evergreen(&fact.category, &fact.content)?;
+                    if !memory.has_similar(&fact.content).unwrap_or(false)
+                        && super::store_evergreen_if_allowed(memory, &fact.category, &fact.content)
+                    {
                         stored += 1;
                     }
                 }
@@ -255,6 +261,30 @@ name = "Jared"
         let count2 = load_toml_profile(&dir.join("profile.toml"), &mem).unwrap();
         assert_eq!(count1, 1);
         assert_eq!(count2, 0, "second load should be deduplicated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rejects_restricted_secret_content() {
+        let mem = temp_memory();
+        let dir = std::env::temp_dir().join(format!("geniepod-secret-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        std::fs::write(
+            dir.join("profile.toml"),
+            r#"about = "The gate code is 5829.""#,
+        )
+        .unwrap();
+
+        let count = load_toml_profile(&dir.join("profile.toml"), &mem).unwrap();
+        assert_eq!(
+            count, 0,
+            "restricted secrets must not be stored from profile.toml"
+        );
+
+        let results = mem.search("5829", 10).unwrap();
+        assert!(results.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

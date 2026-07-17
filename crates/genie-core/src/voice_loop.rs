@@ -149,8 +149,7 @@ pub async fn run(
             .with_language_hint(Some(voice_cfg.stt_language.clone()))
     };
 
-    let conv_id = conversations.create().await?;
-    tracing::info!(conv_id = %conv_id, "voice conversation started");
+    tracing::info!("voice runtime starting (per-speaker conversation ids)");
 
     if llm.health().await {
         eprintln!("{}", llm_connected_message(llm.backend_name()));
@@ -183,7 +182,6 @@ pub async fn run(
             system_prompt,
             max_history,
             model_family,
-            &conv_id,
             &session_registry,
         )
         .await
@@ -204,7 +202,6 @@ pub async fn run(
             system_prompt,
             max_history,
             model_family,
-            &conv_id,
             &session_registry,
         )
         .await
@@ -223,7 +220,6 @@ async fn run_with_wakeword(
     system_prompt: &str,
     max_history: usize,
     model_family: ModelFamily,
-    conv_id: &str,
     session_registry: &Mutex<SessionRegistry>,
 ) -> Result<()> {
     // Outer loop: restarts the wake word listener if it crashes or pipe breaks.
@@ -306,7 +302,6 @@ async fn run_with_wakeword(
                 system_prompt,
                 max_history,
                 model_family,
-                conv_id,
                 session_registry,
             )
             .await;
@@ -381,8 +376,14 @@ async fn run_with_wakeword(
                                 speaker.name.as_deref().unwrap_or("unknown"),
                                 speaker.confidence.as_str(),
                             );
-                            // Continuous-listen follow-up turns enroll too (#702).
-                            track_voice_session(session_registry, speaker.name.as_deref()).await;
+                            // Continuous-listen follow-up turns resolve per-speaker
+                            // conversation history (#565 / #774).
+                            let conv_id = resolve_voice_conv_id(
+                                session_registry,
+                                conversations,
+                                speaker.name.as_deref(),
+                            )
+                            .await;
                             let _ = tokio::fs::remove_file(&followup_path).await;
 
                             if let VoiceIntentDecision::Reject(reason) =
@@ -404,7 +405,7 @@ async fn run_with_wakeword(
                             // (we already have the text).
                             conversations
                                 .append_or_log(
-                                    conv_id,
+                                    &conv_id,
                                     "user",
                                     &text,
                                     None,
@@ -415,7 +416,7 @@ async fn run_with_wakeword(
                             if handle_quick_tool_for_voice(
                                 tools,
                                 conversations,
-                                conv_id,
+                                &conv_id,
                                 &text,
                                 read_context,
                                 voice_cfg,
@@ -442,7 +443,7 @@ async fn run_with_wakeword(
                                 system_prompt, memory_context
                             );
                             let history = conversations
-                                .get_recent(conv_id, max_history)
+                                .get_recent(&conv_id, max_history)
                                 .await
                                 .unwrap_or_default();
                             let mut messages = vec![crate::llm::Message {
@@ -457,7 +458,7 @@ async fn run_with_wakeword(
                                 audio_device,
                                 response_language.as_deref(),
                             ));
-                            let request_hints = LlmRequestHints::agent_turn(conv_id, 256);
+                            let request_hints = LlmRequestHints::agent_turn(&conv_id, 256);
                             match streaming::stream_and_speak_with_hints(
                                 llm,
                                 &messages,
@@ -469,7 +470,7 @@ async fn run_with_wakeword(
                             {
                                 Ok(response) => {
                                     conversations
-                                        .append_or_log(conv_id, "assistant", &response, None, None)
+                                        .append_or_log(&conv_id, "assistant", &response, None, None)
                                         .await;
                                     eprintln!("[voice] GeniePod: {}", format::for_voice(&response));
                                 }
@@ -527,6 +528,156 @@ async fn run_with_wakeword(
 }
 
 /// Push-to-talk mode: Enter key triggers recording.
+/// Steps 1-3 of a voice cycle: flush stale mic samples, record a
+/// fixed-duration utterance, run AEC, and transcribe it.
+///
+/// Mirrors the recording/STT prefix of [`voice_cycle`] exactly (same calls,
+/// same log lines); kept as its own copy rather than a shared extraction so
+/// porting push-to-talk onto `Channel` (#700) cannot change anything on the
+/// wake-word path, which stays on `voice_cycle` unchanged.
+///
+/// Returns `None` (already logged) on a recording or transcription failure so
+/// callers can just retry.
+async fn record_and_transcribe(
+    voice_cfg: &VoiceConfig,
+    audio_device: &str,
+    stt_engine: &stt::SttEngine,
+    cycle_start: std::time::Instant,
+) -> Option<RecordedUtterance> {
+    stt::flush_mic_buffer(audio_device, voice_cfg.sample_rate).await;
+    eprintln!(
+        "[voice] Recording {} seconds — speak now!",
+        voice_cfg.record_secs
+    );
+    stt::reset_audio_captured_marker();
+    tts::reset_first_audio_marker();
+
+    let wav_path = match stt::record_audio(
+        audio_device,
+        voice_cfg.sample_rate,
+        voice_cfg.record_secs,
+        stt::Denoiser::from_config(
+            &voice_cfg.audio_denoiser,
+            &voice_cfg.deep_filter_path,
+            voice_cfg.deep_filter_atten_lim_db,
+        ),
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("[voice] Recording failed: {}", e);
+            return None;
+        }
+    };
+    let t_preprocess_done = std::time::Instant::now();
+
+    aec::process_aec(&wav_path, voice_cfg.sample_rate).await;
+
+    eprintln!("[voice] Transcribing...");
+    let transcript = match stt_engine.transcribe_file(&wav_path).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[voice] STT failed: {}", e);
+            let _ = tokio::fs::remove_file(&wav_path).await;
+            return None;
+        }
+    };
+
+    Some(RecordedUtterance {
+        transcript,
+        wav_path,
+        t_preprocess_done,
+        cycle_start,
+    })
+}
+
+/// A completed recv-side capture, stashed for the paired `handle` call to
+/// consume — `IncomingTurn` only carries plain text, but
+/// [`process_transcript`] also needs the raw [`stt::Transcript`] (language,
+/// duration) and the WAV path (speaker identity, cleanup).
+struct RecordedUtterance {
+    transcript: stt::Transcript,
+    wav_path: String,
+    t_preprocess_done: std::time::Instant,
+    /// When this cycle's recording began — threaded through so the paired
+    /// `handle` call can print a single "Total cycle" duration spanning
+    /// record+STT+process, matching the pre-#700 hand-rolled loop exactly.
+    cycle_start: std::time::Instant,
+}
+
+/// Push-to-talk `Channel` adapter (#700): `recv` waits for Enter then runs
+/// [`record_and_transcribe`]; `send` is a deliberate no-op because
+/// [`process_transcript`] already speaks the reply via streaming TTS *during*
+/// LLM generation (issue #26) — by the time the handler returns there is
+/// nothing left to deliver.
+struct PushToTalkVoiceChannel<'a> {
+    voice_cfg: &'a VoiceConfig,
+    audio_device: &'a str,
+    stt_engine: &'a stt::SttEngine,
+    lines: tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+    /// Set by `recv` and consumed by the paired `handle` closure — see
+    /// [`RecordedUtterance`].
+    pending: std::sync::Arc<std::sync::Mutex<Option<RecordedUtterance>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::channel::Channel for PushToTalkVoiceChannel<'_> {
+    fn kind(&self) -> crate::channel::ChannelKind {
+        crate::channel::ChannelKind::Voice
+    }
+
+    async fn recv(&mut self) -> Option<crate::channel::IncomingTurn> {
+        loop {
+            eprint!("[voice] Press Enter to speak > ");
+
+            let line = match self.lines.next_line().await {
+                Ok(Some(l)) => l,
+                Ok(None) => return None,
+                Err(e) => {
+                    eprintln!("[voice] stdin read failed: {}", e);
+                    return None;
+                }
+            };
+            if line.trim() == "quit" || line.trim() == "exit" {
+                return None;
+            }
+
+            let cycle_start = std::time::Instant::now();
+            let Some(utterance) = record_and_transcribe(
+                self.voice_cfg,
+                self.audio_device,
+                self.stt_engine,
+                cycle_start,
+            )
+            .await
+            else {
+                // Matches voice_cycle's early-return behavior on a failed
+                // recording/transcription: log, print the cycle time, and go
+                // back to waiting for the next Enter press without emitting
+                // a turn.
+                let total_ms = cycle_start.elapsed().as_millis();
+                eprintln!("[voice] Total cycle: {} ms\n", total_ms);
+                continue;
+            };
+
+            let text = utterance.transcript.text.clone();
+            *self.pending.lock().expect("pending mutex poisoned") = Some(utterance);
+            // Speaker is unknown until process_transcript runs identity; the
+            // real per-speaker conversation id is resolved there (#774).
+            return Some(crate::channel::IncomingTurn::new(
+                text,
+                "voice:pending".to_string(),
+                crate::channel::ChannelKind::Voice,
+            ));
+        }
+    }
+
+    async fn send(&mut self, _response: crate::channel::OutgoingResponse) -> Result<()> {
+        Ok(())
+    }
+}
+
 async fn run_push_to_talk(
     voice_cfg: &VoiceConfig,
     audio_device: &str,
@@ -538,48 +689,58 @@ async fn run_push_to_talk(
     system_prompt: &str,
     max_history: usize,
     model_family: ModelFamily,
-    conv_id: &str,
     session_registry: &Mutex<SessionRegistry>,
 ) -> Result<()> {
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let pending: std::sync::Arc<std::sync::Mutex<Option<RecordedUtterance>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
 
-    loop {
-        eprint!("[voice] Press Enter to speak > ");
+    let mut channel = PushToTalkVoiceChannel {
+        voice_cfg,
+        audio_device,
+        stt_engine,
+        lines: tokio::io::BufReader::new(tokio::io::stdin()).lines(),
+        pending: std::sync::Arc::clone(&pending),
+    };
 
-        let line = match lines.next_line().await? {
-            Some(l) => l,
-            None => break,
-        };
-        if line.trim() == "quit" || line.trim() == "exit" {
-            break;
+    crate::channel::serve_channel(&mut channel, |turn| {
+        let pending = std::sync::Arc::clone(&pending);
+        async move {
+            let utterance = pending
+                .lock()
+                .expect("pending mutex poisoned")
+                .take()
+                .expect("recv always stashes an utterance before returning a turn");
+            let cycle_start = utterance.cycle_start;
+
+            process_transcript(
+                utterance.transcript,
+                ProcessTranscriptInputs {
+                    voice_cfg,
+                    audio_device,
+                    llm,
+                    tools,
+                    memory,
+                    conversations,
+                    system_prompt,
+                    max_history,
+                    model_family,
+                    session_registry,
+                    wav_path: Some(&utterance.wav_path),
+                    tts_engine_override: None,
+                    t_preprocess_done: utterance.t_preprocess_done,
+                },
+            )
+            .await;
+            let total_ms = cycle_start.elapsed().as_millis();
+            eprintln!("[voice] Total cycle: {} ms\n", total_ms);
+
+            Ok(crate::channel::OutgoingResponse::new(
+                turn.text,
+                turn.session_id,
+            ))
         }
-
-        let cycle_start = std::time::Instant::now();
-
-        let should_continue = voice_cycle(
-            voice_cfg,
-            audio_device,
-            stt_engine,
-            llm,
-            tools,
-            memory,
-            conversations,
-            system_prompt,
-            max_history,
-            model_family,
-            conv_id,
-            session_registry,
-        )
-        .await;
-
-        let total_ms = cycle_start.elapsed().as_millis();
-        eprintln!("[voice] Total cycle: {} ms\n", total_ms);
-
-        if !should_continue {
-            break;
-        }
-    }
+    })
+    .await?;
 
     tracing::info!("voice loop exited");
     Ok(())
@@ -956,7 +1117,6 @@ async fn voice_cycle(
     system_prompt: &str,
     max_history: usize,
     model_family: ModelFamily,
-    conv_id: &str,
     session_registry: &Mutex<SessionRegistry>,
 ) -> bool {
     // Step 1: Record (fixed duration — reliable).
@@ -1032,7 +1192,6 @@ async fn voice_cycle(
             system_prompt,
             max_history,
             model_family,
-            conv_id,
             session_registry,
             wav_path: Some(&wav_path),
             tts_engine_override: None,
@@ -1057,10 +1216,10 @@ pub struct ProcessTranscriptInputs<'a> {
     pub system_prompt: &'a str,
     pub max_history: usize,
     pub model_family: ModelFamily,
-    pub conv_id: &'a str,
     /// Bounded, idle-expiring registry of active (channel, speaker) sessions.
-    /// Each processed voice turn enrolls its `"voice:<speaker>"` session so the
-    /// voice channel counts against the Jetson session budget (#702).
+    /// Each processed voice turn resolves `"voice:<speaker>"` to a conversation
+    /// id so history is continuous per speaker and counts against the Jetson
+    /// session budget (#565 / #702 / #774).
     pub session_registry: &'a Mutex<SessionRegistry>,
     /// Recording path for speaker identity + cleanup. `None` in tests
     /// where the transcript came from `SttEngine::mock` and no WAV
@@ -1103,18 +1262,29 @@ fn voice_session_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Enroll a resolved voice turn in the bounded, idle-expiring session registry
-/// so voice sessions count against the Jetson session budget exactly like the
-/// HTTP and Telegram channels (#565 / #677 / #702).
-async fn track_voice_session(
+/// Resolve a voice turn to its per-(channel, speaker) conversation id and
+/// ensure the conversation row exists (#565 / #774).
+///
+/// Enrolls `"voice:<speaker>"` in the bounded session registry (Jetson budget)
+/// and returns that key as the conversation id for history append/read — the
+/// same continuity model HTTP already uses via `SessionRegistry::resolve`.
+async fn resolve_voice_conv_id(
     session_registry: &Mutex<SessionRegistry>,
+    conversations: &ConversationStore,
     speaker_name: Option<&str>,
-) {
+) -> String {
     let key = voice_session_key(speaker_name);
-    session_registry
+    let conv_id = session_registry
         .lock()
         .await
-        .track(&key, voice_session_now_ms());
+        .resolve(&key, voice_session_now_ms());
+    if let Err(e) = conversations
+        .ensure(&conv_id, &format!("Voice session {conv_id}"))
+        .await
+    {
+        tracing::warn!(error = %e, conv_id = %conv_id, "failed to ensure voice conversation");
+    }
+    conv_id
 }
 
 pub async fn process_transcript(
@@ -1131,7 +1301,6 @@ pub async fn process_transcript(
         system_prompt,
         max_history,
         model_family,
-        conv_id,
         session_registry,
         wav_path,
         tts_engine_override,
@@ -1175,9 +1344,10 @@ pub async fn process_transcript(
         speaker.name.as_deref().unwrap_or("unknown"),
         speaker.confidence.as_str(),
     );
-    // Enroll this (voice, speaker) turn in the bounded session registry so voice
-    // counts against the Jetson session budget like HTTP/Telegram (#702).
-    track_voice_session(session_registry, speaker.name.as_deref()).await;
+    // Resolve per-(voice, speaker) conversation id for history continuity and
+    // Jetson session budget (#565 / #774).
+    let conv_id =
+        resolve_voice_conv_id(session_registry, conversations, speaker.name.as_deref()).await;
     if let Some(path) = wav_path {
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -1190,13 +1360,13 @@ pub async fn process_transcript(
         text, transcript.duration_ms
     );
     conversations
-        .append_or_log(conv_id, "user", &text, None, speaker.name.as_deref())
+        .append_or_log(&conv_id, "user", &text, None, speaker.name.as_deref())
         .await;
 
     if let Some(final_response) = handle_quick_tool_for_voice(
         tools,
         conversations,
-        conv_id,
+        &conv_id,
         &text,
         read_context,
         voice_cfg,
@@ -1236,7 +1406,7 @@ pub async fn process_transcript(
     );
 
     let history = conversations
-        .get_recent(conv_id, max_history)
+        .get_recent(&conv_id, max_history)
         .await
         .unwrap_or_default();
     let mut messages = vec![crate::llm::Message {
@@ -1263,7 +1433,7 @@ pub async fn process_transcript(
         None => tts_engine_for_language(voice_cfg, audio_device, response_language.as_deref()),
     });
 
-    let request_hints = LlmRequestHints::agent_turn(conv_id, 256);
+    let request_hints = LlmRequestHints::agent_turn(&conv_id, 256);
     let response = match streaming::stream_and_speak_with_hints(
         llm,
         &messages,
@@ -1321,7 +1491,7 @@ pub async fn process_transcript(
         );
         conversations
             .append_or_log(
-                conv_id,
+                &conv_id,
                 "assistant",
                 &response,
                 Some(&tool_result.tool),
@@ -1330,7 +1500,7 @@ pub async fn process_transcript(
             .await;
         conversations
             .append_or_log(
-                conv_id,
+                &conv_id,
                 "system",
                 &format!("Tool: {}", tool_result.output),
                 None,
@@ -1340,7 +1510,7 @@ pub async fn process_transcript(
 
         // Get summary and speak it.
         let recent = conversations
-            .get_recent(conv_id, 6)
+            .get_recent(&conv_id, 6)
             .await
             .unwrap_or_default();
         let mut summary_msgs = vec![crate::llm::Message {
@@ -1369,7 +1539,7 @@ pub async fn process_transcript(
             InteractionKind::ToolSummary,
         );
 
-        let summary_hints = LlmRequestHints::tool_summary(conv_id, 128);
+        let summary_hints = LlmRequestHints::tool_summary(&conv_id, 128);
         let summary = match streaming::stream_and_speak_with_hints(
             llm,
             &summary_msgs,
@@ -1394,12 +1564,12 @@ pub async fn process_transcript(
         };
 
         conversations
-            .append_or_log(conv_id, "assistant", &summary, None, None)
+            .append_or_log(&conv_id, "assistant", &summary, None, None)
             .await;
         (summary, Some(tool_result.tool))
     } else {
         conversations
-            .append_or_log(conv_id, "assistant", &response, None, None)
+            .append_or_log(&conv_id, "assistant", &response, None, None)
             .await;
         (response, None)
     };
@@ -1491,12 +1661,12 @@ mod tests {
 
     #[test]
     fn voice_sessions_are_bounded_and_idle_expire() {
-        // The voice channel enrolls "voice:<speaker>" keys in the same bounded,
-        // idle-expiring registry HTTP/Telegram use (#702).
+        // The voice channel resolves "voice:<speaker>" keys in the same bounded,
+        // idle-expiring registry HTTP/Telegram use (#702 / #774).
         let mut registry = SessionRegistry::new(2, 1_000);
-        registry.track(&voice_session_key(Some("alice")), 1_000);
-        registry.track(&voice_session_key(Some("bob")), 1_100);
-        registry.track(&voice_session_key(Some("carol")), 1_200);
+        registry.resolve(&voice_session_key(Some("alice")), 1_000);
+        registry.resolve(&voice_session_key(Some("bob")), 1_100);
+        registry.resolve(&voice_session_key(Some("carol")), 1_200);
 
         // LRU cap: the oldest voice session is evicted once the third arrives.
         assert!(registry.conversation_id("voice:alice").is_none());
@@ -1504,7 +1674,7 @@ mod tests {
         assert_eq!(registry.len(), 2);
 
         // Idle expiry: after the TTL elapses, an untouched voice session is gone.
-        registry.track(&voice_session_key(Some("dave")), 5_000);
+        registry.resolve(&voice_session_key(Some("dave")), 5_000);
         assert!(registry.conversation_id("voice:bob").is_none());
     }
 

@@ -98,13 +98,18 @@ impl Governor {
             Command::MediaStop => {
                 let ts = store::now_ms();
                 let mem_avail = tegrastats::mem_available_mb_async().await.unwrap_or(4096);
-                let target = self.determine_mode(mem_avail);
                 let result: Result<Mode, anyhow::Error> = async {
                     if let Err(error) = tokio::fs::remove_file("/run/geniepod/media_mode").await
                         && error.kind() != std::io::ErrorKind::NotFound
                     {
                         return Err(error.into());
                     }
+                    // Resolve the target AFTER clearing the marker, with media
+                    // now inactive. Computing it earlier (or re-reading the
+                    // marker we just removed) returned Media, so the transition
+                    // was a no-op that left the system stuck in Media until the
+                    // next tick and wrongly reported `mode: media` in the reply.
+                    let target = self.determine_mode(mem_avail, false);
                     self.transition(ts, target).await?;
                     Ok(target)
                 }
@@ -141,7 +146,8 @@ impl Governor {
         }
 
         // 3. Determine target mode.
-        let target = self.determine_mode(mem_avail);
+        let media_active = std::path::Path::new("/run/geniepod/media_mode").exists();
+        let target = self.determine_mode(mem_avail, media_active);
 
         // 4. Transition if needed.
         if target != self.current_mode {
@@ -161,14 +167,14 @@ impl Governor {
         Ok(())
     }
 
-    fn determine_mode(&self, mem_avail_mb: u64) -> Mode {
+    fn determine_mode(&self, mem_avail_mb: u64, media_active: bool) -> Mode {
         // Priority: Pressure > Media (external trigger) > Time-based.
 
         if mem_avail_mb < self.config.governor.pressure.stop_optins_mb {
             return Mode::Pressure;
         }
 
-        if std::path::Path::new("/run/geniepod/media_mode").exists() {
+        if media_active {
             return Mode::Media;
         }
 
@@ -549,7 +555,7 @@ mod tests {
     fn determine_mode_day_with_plenty_of_memory() {
         let gov = make_governor();
         // 3000 MB available, well above all thresholds.
-        let mode = gov.determine_mode(3000);
+        let mode = gov.determine_mode(3000, false);
         // Without media trigger file, should be Day or NightA depending on time.
         // At minimum, it should NOT be Pressure or Media.
         assert_ne!(mode, Mode::Pressure);
@@ -557,18 +563,32 @@ mod tests {
     }
 
     #[test]
+    fn determine_mode_reflects_media_active_flag() {
+        let gov = make_governor();
+        // Media active with healthy memory -> Media.
+        assert_eq!(gov.determine_mode(3000, true), Mode::Media);
+        // Media inactive (e.g. just stopped) -> resolves to a non-Media mode,
+        // never Media. MediaStop relies on this: it clears the marker and then
+        // asks for the post-media target, so passing media_active=false must not
+        // yield Media (the old code re-read the just-removed marker and stuck).
+        assert_ne!(gov.determine_mode(3000, false), Mode::Media);
+        // Pressure still overrides an active media marker.
+        assert_eq!(gov.determine_mode(0, true), Mode::Pressure);
+    }
+
+    #[test]
     fn determine_mode_pressure_on_low_memory() {
         let gov = make_governor();
         // 400 MB available, below stop_optins_mb (500).
-        let mode = gov.determine_mode(400);
+        let mode = gov.determine_mode(400, false);
         assert_eq!(mode, Mode::Pressure);
     }
 
     #[test]
     fn determine_mode_pressure_takes_priority() {
         let gov = make_governor();
-        // Even with 0 MB, pressure should override everything.
-        let mode = gov.determine_mode(0);
+        // Even with 0 MB (and media active), pressure should override everything.
+        let mode = gov.determine_mode(0, true);
         assert_eq!(mode, Mode::Pressure);
     }
 
@@ -624,7 +644,7 @@ mod tests {
         if is_night_always {
             // With huge day_start, determine_mode at any hour with enough RAM
             // should pick NightB (since night_model_swap=true).
-            let mode = gov.determine_mode(3000);
+            let mode = gov.determine_mode(3000, false);
             assert_eq!(mode, Mode::NightB);
         }
     }

@@ -352,11 +352,20 @@ fn memory_recall_query(text: &str) -> Option<String> {
         "recall memory for ",
         "recall memories for ",
     ] {
-        if let Some(query) = text.strip_prefix(prefix).map(str::trim)
-            && !query.is_empty()
-            && query != "that"
-        {
-            return Some(query.to_string());
+        if let Some(query) = text.strip_prefix(prefix).map(str::trim) {
+            // A trailing "please" is politeness, not part of the memory to
+            // recall ("search memory for jared please" searches for "jared", not
+            // "jared please"). The sibling memory_forget_query and the other
+            // quick-router extractors (clean_control_entity, web_search_request)
+            // already strip it; the recall prefix loop was the lone holdout.
+            let query = query.trim_end_matches(" please").trim_end();
+            // A bare pronoun referent ("do you remember it/this") has no concrete
+            // subject to search for — recalling the literal word returns noise.
+            // Abstain so the LLM resolves the referent from context, mirroring the
+            // sibling memory_forget_query, which already skips that/it/this.
+            if !query.is_empty() && !matches!(query, "that" | "it" | "this") {
+                return Some(query.to_string());
+            }
         }
     }
 
@@ -1012,6 +1021,13 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
                 .trim_start_matches("the ")
                 .trim_start_matches("a ")
                 .trim_start_matches("an ")
+                // A trailing "please" is politeness, not part of the name. It has
+                // to come off *before* the " scene"/" routine" suffix trim below,
+                // or it defeats that trim and leaks straight into the entity:
+                // "activate the movie scene please" otherwise routes the garbled
+                // scene "movie scene please" instead of "movie".
+                .trim_end_matches(" please")
+                .trim_end()
                 .trim_end_matches(" scene")
                 .trim_end_matches(" routine")
                 .trim()
@@ -1058,8 +1074,18 @@ fn play_media_request(text: &str) -> Option<String> {
             && rest.contains("playlist")
         {
             // Drop a trailing "please" so the query is the playlist name, not
-            // "my study playlist please".
-            return Some(rest.trim_end_matches(" please").trim_end().to_string());
+            // "my study playlist please". A leading article is not part of the
+            // name either ("put on the party playlist" is the "party playlist"),
+            // so strip it like the sibling extractors (clean_control_entity,
+            // scene_or_routine_activation_request) — but keep a leading "my",
+            // which resolve_speaker_possessive resolves against the speaker.
+            let name = rest
+                .trim_end_matches(" please")
+                .trim_end()
+                .trim_start_matches("the ")
+                .trim_start_matches("a ")
+                .trim_start_matches("an ");
+            return Some(name.to_string());
         }
     }
     None
@@ -1075,10 +1101,17 @@ fn shopping_list_add_request(text: &str) -> Option<String> {
     let rest = text
         .strip_prefix("add ")
         .or_else(|| text.strip_prefix("put "))?;
+    // The word before "shopping list" is optional and may be a possessive:
+    // "the shopping list", the article-less "shopping list", or the equally
+    // common "my shopping list". Without the "my" variants a natural "add milk
+    // to my shopping list" matched no suffix and fell through to memory_recall,
+    // searching memory for the command instead of adding the item.
     let items = rest
         .strip_suffix(" to the shopping list")
+        .or_else(|| rest.strip_suffix(" to my shopping list"))
         .or_else(|| rest.strip_suffix(" to shopping list"))
         .or_else(|| rest.strip_suffix(" on the shopping list"))
+        .or_else(|| rest.strip_suffix(" on my shopping list"))
         .or_else(|| rest.strip_suffix(" on shopping list"))?
         .trim();
     if items.is_empty() {
@@ -1099,11 +1132,13 @@ fn shopping_list_remove_request(text: &str) -> Option<String> {
         .strip_prefix("take ")
         .and_then(|rest| {
             rest.strip_suffix(" off the shopping list")
+                .or_else(|| rest.strip_suffix(" off my shopping list"))
                 .or_else(|| rest.strip_suffix(" off shopping list"))
         })
         .or_else(|| {
             text.strip_prefix("remove ").and_then(|rest| {
                 rest.strip_suffix(" from the shopping list")
+                    .or_else(|| rest.strip_suffix(" from my shopping list"))
                     .or_else(|| rest.strip_suffix(" from shopping list"))
             })
         })?
@@ -1925,6 +1960,17 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
             text.strip_prefix("turn off ")
                 .map(|rest| (rest, "turn_off"))
         })?;
+    // A trailing "in <duration>" is a schedule, not a room: "turn on the lights in
+    // 5 minutes" must be grounded by the LLM (which can arm the timer), not
+    // actuated immediately. clean_control_entity would split it as a room and emit
+    // a garbled "5 minutes lights" entity that fires now. The weather path guards
+    // the same way via is_time_expression.
+    if let Some((_, tail)) = rest.rsplit_once(" in ") {
+        let tail = tail.trim().trim_start_matches("the ").trim();
+        if is_time_expression(tail) {
+            return None;
+        }
+    }
     let entity = clean_control_entity(rest);
     if entity.is_empty() {
         return None;
@@ -2424,7 +2470,14 @@ fn home_status_target(text: &str) -> Option<String> {
         return None;
     }
 
-    if contains_any(&target, &["light", "lights", "lamp", "lamps"]) {
+    // Match the light/lamp device words as whole words: a substring test made
+    // "night[light]"/"flash[light]" collapse to the whole-home "lights" status,
+    // silently widening a single-device question to every light in the house.
+    let names_light_or_lamp = target
+        .split_whitespace()
+        .any(|word| matches!(word, "light" | "lights" | "lamp" | "lamps"));
+
+    if names_light_or_lamp {
         return Some(if target.split_whitespace().count() == 1 {
             "lights".into()
         } else {
@@ -2526,11 +2579,18 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
-    if target.contains("tire pressure") && target.contains("car") {
+    // Match "car" as a whole word: a substring test ("[car]bon monoxide alarm")
+    // reports on the car when the caller asked about a different device, instead
+    // of falling through to the LLM. Same handling as fan/fireplace and ice/icy.
+    let names_car = target
+        .split_whitespace()
+        .any(|word| matches!(word, "car" | "cars"));
+
+    if target.contains("tire pressure") && names_car {
         return Some("car tire pressure".into());
     }
 
-    if target.contains("car") {
+    if names_car {
         return Some("car".into());
     }
 
@@ -2569,6 +2629,7 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     // bare unit, so "half an hour" used to become "an hour" -> 3600s.
     let (seconds, unit_end_index) = fractional_duration(&tokens)
         .or_else(|| couple_duration(&tokens))
+        .or_else(|| dozen_duration(&tokens))
         .or_else(|| parse_duration(&tokens))?;
     // `fractional_duration` and `couple_duration` return as soon as they match
     // their idiom, unlike `parse_duration`'s own trailing-span sum, so "half an
@@ -2945,10 +3006,19 @@ fn strip_trailing_time_qualifier(subject: &str) -> &str {
 
 fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
     let (_, location) = text.rsplit_once(marker)?;
+    // A trailing "please" is politeness, not part of the place name ("weather in
+    // Paris please" names Paris, not "paris please"), mirroring the other
+    // quick-router paths that strip it. Drop it before the article/time trims.
     // Forecast detection reads the whole utterance, so trimming a trailing time
     // qualifier here never changes it.
-    let location =
-        strip_trailing_time_qualifier(location.trim().trim_start_matches("the ")).to_string();
+    let location = strip_trailing_time_qualifier(
+        location
+            .trim()
+            .trim_end_matches(" please")
+            .trim_end()
+            .trim_start_matches("the "),
+    )
+    .to_string();
     if location.is_empty() {
         None
     } else {
@@ -3231,6 +3301,45 @@ fn couple_duration(tokens: &[&str]) -> Option<(u64, usize)> {
     None
 }
 
+/// Parse the spoken idiom "a dozen minutes" (12 of the unit), "two dozen hours"
+/// (24), etc. `parse_duration` does not treat "dozen" as a number, so these
+/// utterances used to abstain (#602). "half a dozen" (= 6) is a fractional
+/// idiom, so it is deliberately left to abstain rather than emit a wrong 12.
+fn dozen_duration(tokens: &[&str]) -> Option<(u64, usize)> {
+    for i in 0..tokens.len() {
+        if tokens[i] != "dozen" {
+            continue;
+        }
+        // "half a dozen" / "half dozen" / "quarter of a dozen" are fractions of
+        // a dozen — don't emit a confidently-wrong 12 for them.
+        if tokens[..i]
+            .iter()
+            .rev()
+            .take(2)
+            .any(|&t| t == "half" || t == "quarter")
+        {
+            return None;
+        }
+        // Count immediately before "dozen": "two dozen" -> 2; "a dozen" or a
+        // bare "dozen" -> 1.
+        let count = i
+            .checked_sub(1)
+            .and_then(|j| super::number_words::parse_spoken_number(&tokens[j..=j], 0))
+            .map(|(value, _)| value)
+            .unwrap_or(1);
+        let mut unit_index = i + 1;
+        if tokens.get(unit_index).copied() == Some("of") {
+            unit_index += 1;
+        }
+        let multiplier = duration_unit_seconds(tokens.get(unit_index).copied())?;
+        return Some((
+            count.saturating_mul(12).saturating_mul(multiplier),
+            unit_index,
+        ));
+    }
+    None
+}
+
 fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
     let mut start = 0;
     while start < tokens.len() {
@@ -3352,6 +3461,15 @@ fn reminder_label(tokens: &[&str], unit_end_index: usize, reminder_style: bool) 
 fn label_after_duration(tokens: &[&str], unit_end_index: usize) -> Option<String> {
     let after_unit = tokens.get(unit_end_index + 1..)?;
     let to_index = after_unit.iter().position(|token| *token == "to")?;
+    // A "for" before this "to" means the "to" sits inside a `for <label>` clause
+    // ("<duration> timer for the walk to school"), not a `to <task>` connective.
+    // Splitting on it here would truncate the label to the tail ("school"), so
+    // defer to the named-timer path (extract_named_timer_label), which keeps the
+    // whole "walk to school". A real "<duration> timer to <task>" has no "for"
+    // before its "to" and is unaffected.
+    if after_unit[..to_index].contains(&"for") {
+        return None;
+    }
     let label_tokens = after_unit.get(to_index + 1..)?;
     if label_tokens.is_empty() {
         return None;
@@ -3422,6 +3540,13 @@ fn clean_status_target(text: &str) -> String {
             break;
         }
     }
+
+    // A trailing "please" is politeness, not part of the device name. It has to
+    // come off *before* the suffix trim below, or it defeats that trim entirely:
+    // no STATUS_SUFFIXES entry matches "... open please", so the loop stops on
+    // its first pass and the whole tail leaks into the entity ("garage door open
+    // please" instead of "garage door"). Mirrors the scene/routine trim.
+    target = target.trim_end_matches(" please").trim_end().to_string();
 
     // A status query can trail both a state word and a time qualifier
     // ("is the garage door open right now"). Strip trailing suffixes repeatedly
@@ -3562,6 +3687,25 @@ mod tests {
         for utterance in ["forget it", "forget that", "forget about it", "delete that"] {
             assert!(route(utterance).is_none(), "{utterance} should abstain");
         }
+    }
+
+    #[test]
+    fn recall_without_referent_abstains_for_llm() {
+        // A bare pronoun referent has no concrete subject to search for; recalling
+        // the literal "it"/"this" returns noise. Abstain like the forget path.
+        for utterance in [
+            "do you remember it",
+            "do you remember this",
+            "search memory for it",
+            "recall memories for this",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance} should abstain");
+        }
+
+        // A substantive query still routes through the same prefix loop.
+        let call = route("search memory for jared").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "jared");
     }
 
     #[test]
@@ -4170,6 +4314,16 @@ mod tests {
         // Without an article the name is unchanged.
         let call = route("activate movie night scene").unwrap();
         assert_eq!(call.arguments["entity"], "movie night");
+
+        // A trailing "please" must be dropped before the " scene"/" routine"
+        // suffix trim, or it defeats that trim and leaks a garbled scene name.
+        let call = route("activate the movie scene please").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "movie");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("run the away routine please").unwrap();
+        assert_eq!(call.arguments["entity"], "away");
     }
 
     #[test]
@@ -4206,6 +4360,17 @@ mod tests {
         let call = route("Play my study playlist please").unwrap();
         assert_eq!(call.name, "play_media");
         assert_eq!(call.arguments["query"], "my study playlist");
+
+        // A leading article is not part of the playlist name either — it must be
+        // dropped like the sibling entity extractors do, while a leading "my"
+        // (a possessive) is kept for speaker resolution.
+        let call = route("Put on the party playlist").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "party playlist");
+
+        let call = route("Play the workout playlist please").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "workout playlist");
     }
 
     #[test]
@@ -4226,6 +4391,19 @@ mod tests {
         // The media "put on ..." path is unaffected.
         let call = route("Put on the morning news").unwrap();
         assert_eq!(call.name, "play_media");
+
+        // The possessive "my shopping list" is as common as "the shopping list";
+        // without it "add milk to my shopping list" fell through to memory_recall.
+        let call = route("Add milk to my shopping list").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "shopping");
+        assert_eq!(call.arguments["content"], "shopping list pending: milk");
+
+        let call = route("Put eggs and bread on my shopping list").unwrap();
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list pending: eggs, bread"
+        );
     }
 
     #[test]
@@ -4249,6 +4427,16 @@ mod tests {
         // The articled form still works.
         let call = route("Take milk off the shopping list").unwrap();
         assert_eq!(call.arguments["content"], "shopping list removed: milk");
+
+        // The possessive "my shopping list" mirrors the add path.
+        let call = route("Take milk off my shopping list").unwrap();
+        assert_eq!(call.arguments["content"], "shopping list removed: milk");
+
+        let call = route("Remove eggs and bread from my shopping list").unwrap();
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list removed: eggs, bread"
+        );
     }
 
     #[test]
@@ -5081,6 +5269,28 @@ mod tests {
     }
 
     #[test]
+    fn car_and_light_status_match_whole_words_not_substrings() {
+        // "car" and "light" were matched as substrings, so "[car]bon monoxide
+        // alarm" reported on the car and "night[light]" collapsed to a
+        // whole-home "lights" status. Genuine car/light queries are covered by
+        // routes_household_status_targets / routes_whole_home_light_status.
+        for (utterance, wrong_entity) in [
+            ("is the carbon monoxide alarm on", "car"),
+            ("is the carbon monoxide detector working", "car"),
+            ("is the nightlight on", "lights"),
+            ("is the flashlight on", "lights"),
+        ] {
+            assert!(
+                route(utterance)
+                    .map(|c| c.arguments.get("entity").and_then(|e| e.as_str())
+                        != Some(wrong_entity))
+                    .unwrap_or(true),
+                "{utterance:?} must not resolve to the {wrong_entity:?} status entity"
+            );
+        }
+    }
+
+    #[test]
     fn control_entity_drops_leading_indefinite_article() {
         // clean_control_entity stripped a leading "the " but left "a"/"an", so
         // "turn on a fan" produced entity "a fan". The sibling
@@ -5118,6 +5328,32 @@ mod tests {
             ("turn off the fans", "fans"),
             ("turn on the ceiling fan", "ceiling fan"),
             ("turn on the gas fireplace", "gas fireplace"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn turn_command_with_scheduled_delay_abstains_instead_of_firing_now() {
+        // "turn on the lights in 5 minutes" is a schedule. clean_control_entity
+        // split the "in <duration>" tail as a room and emitted a garbled
+        // "5 minutes lights" entity that actuates immediately. The router must
+        // abstain so the LLM can arm the timer.
+        for utterance in [
+            "turn on the lights in 5 minutes",
+            "turn off the fan in an hour",
+            "turn on the lights in the evening",
+            "turn on the bedroom lights in 10 minutes",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // A genuine room after "in [the]" is unaffected — it is not a time word.
+        for (utterance, entity) in [
+            ("turn on the lights in the bedroom", "bedroom lights"),
+            ("turn off the fan in the office", "office fan"),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "home_control", "{utterance:?}");
@@ -5166,6 +5402,34 @@ mod tests {
         // Single-suffix queries are unchanged.
         let call = route("Is the garage door open?").unwrap();
         assert_eq!(call.arguments["entity"], "garage door");
+    }
+
+    #[test]
+    fn status_entity_drops_a_trailing_please() {
+        // A trailing "please" is politeness, not part of the device name, and it
+        // has to come off before the state-word/time-qualifier trim — otherwise
+        // it defeats that trim entirely (no suffix matches "... open please", so
+        // the loop stops on its first pass) and the whole tail leaks into the
+        // entity: "garage door open please" instead of "garage door".
+        // Same class as the scene/routine trim in #777.
+        for (utterance, entity) in [
+            ("Is the garage door open please?", "garage door"),
+            ("Is the front door locked please?", "front door"),
+            ("Are the lights on please?", "lights"),
+            ("Is the kitchen light off please?", "kitchen light"),
+            // "please" stacks after a state word AND a time qualifier.
+            ("Is the garage door open right now please?", "garage door"),
+            ("What is the thermostat status please?", "thermostat"),
+            ("Check the back door please", "back door"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+
+        // A device whose name merely ends in those letters is untouched.
+        let call = route("Is the please light on?").unwrap();
+        assert_eq!(call.arguments["entity"], "please light");
     }
 
     #[test]
@@ -5361,6 +5625,12 @@ mod tests {
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "jared");
         assert_eq!(call.arguments["limit"], 3);
+
+        // A trailing "please" is politeness, not part of the recall query — it
+        // must be stripped like the sibling memory_forget path does.
+        let call = route("search memory for Jared please").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "jared");
     }
 
     #[test]
@@ -5471,6 +5741,27 @@ mod tests {
         // No trailing label -> still the generic default (unchanged).
         let call = route("set a timer for 5 minutes").unwrap();
         assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn plain_timer_keeps_a_for_label_containing_to() {
+        // "<duration> timer for <label>" where the label itself contains "to":
+        // label_after_duration split on that "to" and kept only the tail
+        // ("school"), dropping "walk to". A "for" before the "to" marks a label
+        // clause, not a "to <task>" connective, so the whole label is recovered.
+        let call = route("set a 15 minute timer for the walk to school").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 900);
+        assert_eq!(call.arguments["label"], "walk to school");
+
+        let call = route("set a 20 minute timer for the drive to work").unwrap();
+        assert_eq!(call.arguments["seconds"], 1200);
+        assert_eq!(call.arguments["label"], "drive to work");
+
+        // A genuine "<duration> timer to <task>" (no "for") still labels the task.
+        let call = route("set a 5 minute timer to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "check the oven");
     }
 
     #[test]
@@ -5585,6 +5876,34 @@ mod tests {
         let call = route("remind me in 5 minutes to feed the couple cats").unwrap();
         assert_eq!(call.arguments["seconds"], 300);
         assert_eq!(call.arguments["label"], "feed the couple cats");
+    }
+
+    #[test]
+    fn routes_dozen_duration_timer() {
+        // #602: "a dozen minutes" is 12 of the unit (12 x 60 = 720s).
+        let call = route("set a timer for a dozen minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 720);
+
+        // The reminder label is still recovered from the task clause.
+        let call = route("remind me in a dozen minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 720);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // A count before "dozen" multiplies; other units divide too.
+        let call = route("set a timer for two dozen minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 1440);
+        let call = route("set a timer for a dozen hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 43200);
+
+        // "half a dozen" (= 6) is a fraction of a dozen — deliberately abstain
+        // rather than emit a confidently-wrong 12.
+        assert!(route("set a timer for half a dozen minutes").is_none());
+
+        // "dozen" inside a later label is not mistaken for duration.
+        let call = route("remind me in 5 minutes to sort the dozen eggs").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "sort the dozen eggs");
     }
 
     #[test]
@@ -5791,6 +6110,21 @@ mod tests {
         assert_eq!(call.name, "get_weather");
         assert_eq!(call.arguments["location"], "new york");
         assert_eq!(call.arguments["forecast"], true);
+    }
+
+    #[test]
+    fn weather_location_drops_trailing_please() {
+        // A trailing "please" is politeness, not part of the city: the location
+        // argument must be just the city, not "paris please". Mirrors the other
+        // quick-router paths that strip a trailing " please".
+        let call = route("what's the weather in Paris please").unwrap();
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["location"], "paris");
+
+        // Same on the rain branch, which shares extract_location_after_marker.
+        let call = route("will it rain in Seattle please").unwrap();
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["location"], "seattle");
     }
 
     #[test]

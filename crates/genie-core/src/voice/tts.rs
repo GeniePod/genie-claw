@@ -1,7 +1,49 @@
 use anyhow::Result;
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
+
+/// Extra headroom beyond PCM duration before we kill a stuck `aplay` (#617).
+const APLAY_TIMEOUT_MARGIN: Duration = Duration::from_secs(10);
+/// Upper bound so a pathological buffer cannot get a multi-minute deadline.
+const APLAY_TIMEOUT_MAX: Duration = Duration::from_secs(120);
+/// Fixed deadline for WAV file playback (duration unknown without parsing).
+const APLAY_WAV_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn aplay_timeout_for_pcm(pcm_len: usize, sample_rate: u32) -> Duration {
+    let bytes_per_sec = (sample_rate as usize).saturating_mul(2).max(1);
+    let audio_secs = pcm_len.saturating_div(bytes_per_sec).max(1) as u64;
+    Duration::from_secs(
+        audio_secs
+            .saturating_add(APLAY_TIMEOUT_MARGIN.as_secs())
+            .min(APLAY_TIMEOUT_MAX.as_secs()),
+    )
+}
+
+async fn wait_aplay_or_timeout(
+    mut child: Child,
+    timeout: Duration,
+    label: &'static str,
+) -> Result<()> {
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            if !status.success() {
+                tracing::warn!(label, "aplay exited with error");
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            tracing::warn!(
+                label,
+                timeout_secs = timeout.as_secs(),
+                "aplay timed out — voice loop continuing"
+            );
+            Ok(())
+        }
+    }
+}
 
 /// Phase markers for the first-voice-reply latency banner (issue #19).
 ///
@@ -328,6 +370,7 @@ impl TtsEngine {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()?;
 
         if let Some(mut stdin) = aplay.stdin.take() {
@@ -335,10 +378,12 @@ impl TtsEngine {
             stdin.write_all(pcm).await?;
         }
 
-        let status = aplay.wait().await?;
-        if !status.success() {
-            tracing::warn!("aplay exited with error");
-        }
+        wait_aplay_or_timeout(
+            aplay,
+            aplay_timeout_for_pcm(pcm.len(), self.sample_rate),
+            "play_pcm_data",
+        )
+        .await?;
         Ok(())
     }
 
@@ -501,14 +546,19 @@ pub async fn play_pcm(pcm: &[u8], sample_rate: u32, audio_device: &str) -> Resul
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
         .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(pcm).await?;
     }
 
-    child.wait().await?;
-    Ok(())
+    wait_aplay_or_timeout(
+        child,
+        aplay_timeout_for_pcm(pcm.len(), sample_rate),
+        "play_pcm",
+    )
+    .await
 }
 
 /// Play a WAV file through ALSA.
@@ -520,7 +570,21 @@ pub async fn play_wav(wav_path: &str, audio_device: &str) -> Result<()> {
         args.insert(1, audio_device.to_string());
     }
 
-    let output = Command::new("aplay").args(&args).output().await?;
+    let mut cmd = Command::new("aplay");
+    cmd.args(&args).kill_on_drop(true);
+
+    let output = match tokio::time::timeout(APLAY_WAV_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => {
+            tracing::warn!(
+                wav_path,
+                timeout_secs = APLAY_WAV_TIMEOUT.as_secs(),
+                "aplay WAV timed out"
+            );
+            return Ok(());
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
