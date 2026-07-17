@@ -56,6 +56,21 @@ impl OptionalProviderPlan {
                 OptionalAiProviderAuthMode::ApiKey => "missing_api_key_env",
                 OptionalAiProviderAuthMode::OAuthBearer => "missing_oauth_token_env",
             });
+        } else {
+            // Fail closed at complete-time if the operator unset/emptied the
+            // credential after boot (#569). Config load already checks this;
+            // readiness must too so GatedProvider cannot race a missing key.
+            match std::env::var(self.credential_env()) {
+                Ok(value) if !value.trim().is_empty() => {}
+                Ok(_) => reasons.push(match self.auth_mode {
+                    OptionalAiProviderAuthMode::ApiKey => "empty_api_key_env_value",
+                    OptionalAiProviderAuthMode::OAuthBearer => "empty_oauth_token_env_value",
+                }),
+                Err(_) => reasons.push(match self.auth_mode {
+                    OptionalAiProviderAuthMode::ApiKey => "api_key_env_unset",
+                    OptionalAiProviderAuthMode::OAuthBearer => "oauth_token_env_unset",
+                }),
+            }
         }
         if self.base_url.trim().is_empty() {
             reasons.push("missing_base_url");
@@ -110,6 +125,19 @@ fn blocked_reason_message(reason: &str) -> String {
             "[optional_ai_provider].oauth_token_env must be set when auth_mode = oauth_bearer"
                 .into()
         }
+        "api_key_env_unset" => {
+            "optional_ai_provider enabled but api_key_env environment variable is not set".into()
+        }
+        "oauth_token_env_unset" => {
+            "optional_ai_provider enabled but oauth_token_env environment variable is not set"
+                .into()
+        }
+        "empty_api_key_env_value" => {
+            "optional_ai_provider enabled but api_key_env environment variable is empty".into()
+        }
+        "empty_oauth_token_env_value" => {
+            "optional_ai_provider enabled but oauth_token_env environment variable is empty".into()
+        }
         "missing_base_url" => "[optional_ai_provider].base_url must be set when enabled".into(),
         "remote_base_url_not_allowed" => {
             "[optional_ai_provider].base_url is remote; set allow_remote_base_url = true to opt in"
@@ -136,8 +164,22 @@ mod tests {
         assert!(OptionalProviderPlan::from_config(&OptionalAiProviderConfig::default()).is_none());
     }
 
+    fn with_env(name: &str, value: &str) {
+        // SAFETY: unit tests run single-threaded and restore/remove keys they set.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+
+    fn clear_env(name: &str) {
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
     #[test]
     fn remote_provider_requires_explicit_allow_and_budget_fit() {
+        with_env("GENIE_PROVIDER_KEY", "test-token");
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAiCompatible,
@@ -158,10 +200,12 @@ mod tests {
                 "remote_base_url_not_allowed"
             ])
         );
+        clear_env("GENIE_PROVIDER_KEY");
     }
 
     #[test]
     fn local_openai_compatible_provider_can_be_ready() {
+        with_env("LOCAL_PROVIDER_KEY", "test-token");
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAiCompatible,
@@ -179,10 +223,12 @@ mod tests {
             plan.readiness(&AgentConfig::default()),
             ProviderReadiness::Ready
         );
+        clear_env("LOCAL_PROVIDER_KEY");
     }
 
     #[test]
     fn loopback_127_range_allowed_without_remote_flag() {
+        with_env("LOCAL_PROVIDER_KEY", "test-token");
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAiCompatible,
@@ -200,10 +246,12 @@ mod tests {
             plan.readiness(&AgentConfig::default()),
             ProviderReadiness::Ready
         );
+        clear_env("LOCAL_PROVIDER_KEY");
     }
 
     #[test]
     fn loopback_looking_hostname_requires_remote_allow() {
+        with_env("LOCAL_PROVIDER_KEY", "test-token");
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAiCompatible,
@@ -221,10 +269,12 @@ mod tests {
             plan.readiness(&AgentConfig::default()),
             ProviderReadiness::Blocked(vec!["remote_base_url_not_allowed"])
         );
+        clear_env("LOCAL_PROVIDER_KEY");
     }
 
     #[test]
     fn oauth_provider_uses_oauth_token_env_for_readiness() {
+        with_env("OPENAI_OAUTH_ACCESS_TOKEN", "oauth-token");
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAi,
@@ -242,6 +292,35 @@ mod tests {
         assert_eq!(
             plan.readiness(&AgentConfig::default()),
             ProviderReadiness::Ready
+        );
+        clear_env("OPENAI_OAUTH_ACCESS_TOKEN");
+    }
+
+    #[test]
+    fn readiness_fails_closed_when_credential_env_disappears() {
+        let env_name = "GATED_PROVIDER_RUNTIME_CREDS";
+        with_env(env_name, "present");
+        let provider = OptionalAiProviderConfig {
+            enabled: true,
+            provider: OptionalAiProviderKind::OpenAiCompatible,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            model: "test-model".into(),
+            api_key_env: env_name.into(),
+            oauth_token_env: String::new(),
+            context_window_tokens: 4096,
+            allow_remote_base_url: false,
+        };
+        let plan = OptionalProviderPlan::from_config(&provider).unwrap();
+        assert_eq!(
+            plan.readiness(&AgentConfig::default()),
+            ProviderReadiness::Ready
+        );
+
+        clear_env(env_name);
+        assert_eq!(
+            plan.readiness(&AgentConfig::default()),
+            ProviderReadiness::Blocked(vec!["api_key_env_unset"])
         );
     }
 }

@@ -1,4 +1,4 @@
-//! Runtime `Provider` seam (issue #567) and gated optional API completions (#630).
+//! Runtime `Provider` seam (issue #567) and gated optional API completions (#630/#569).
 
 use genie_common::config::{
     ActiveLlmProviderKind, AgentConfig, Config, OptionalAiProviderAuthMode,
@@ -78,12 +78,17 @@ async fn gated_provider_gate_off_uses_local_mock_without_optional_plan() {
 
 #[tokio::test]
 async fn gated_provider_gate_on_completes_when_plan_is_ready() {
+    let env_name = "GATED_PROVIDER_TEST_KEY";
+    // SAFETY: single-threaded test; key is unique to this test.
+    unsafe {
+        std::env::set_var(env_name, "test-token");
+    }
     let agent = AgentConfig::default();
     let plan = OptionalProviderPlan {
         provider: OptionalAiProviderKind::OpenAiCompatible,
         auth_mode: OptionalAiProviderAuthMode::ApiKey,
         base_url: "http://127.0.0.1:11434/v1".into(),
-        api_key_env: "GATED_PROVIDER_TEST_KEY".into(),
+        api_key_env: env_name.into(),
         oauth_token_env: String::new(),
         context_window_tokens: 4096,
         remote_allowed: false,
@@ -95,6 +100,9 @@ async fn gated_provider_gate_on_completes_when_plan_is_ready() {
 
     let out = provider.complete(&[user("hi")], None, None).await.unwrap();
     assert_eq!(out, "optional api path");
+    unsafe {
+        std::env::remove_var(env_name);
+    }
 }
 
 #[tokio::test]
@@ -127,6 +135,54 @@ async fn gated_provider_key_missing_returns_clear_error() {
         "expected clear config error, got: {err}"
     );
     assert!(err.contains("api_key_env"));
+}
+
+#[tokio::test]
+async fn gated_provider_fails_closed_when_credential_env_disappears() {
+    let env_name = "GATED_PROVIDER_DISAPPEARING_KEY";
+    unsafe {
+        std::env::set_var(env_name, "present-at-plan-time");
+    }
+    let agent = AgentConfig::default();
+    let plan = OptionalProviderPlan {
+        provider: OptionalAiProviderKind::OpenAiCompatible,
+        auth_mode: OptionalAiProviderAuthMode::ApiKey,
+        base_url: "http://127.0.0.1:11434/v1".into(),
+        api_key_env: env_name.into(),
+        oauth_token_env: String::new(),
+        context_window_tokens: 4096,
+        remote_allowed: false,
+    };
+    assert_eq!(plan.readiness(&agent), ProviderReadiness::Ready);
+
+    unsafe {
+        std::env::remove_var(env_name);
+    }
+
+    let llm = LlmClient::mock(["must not run"]);
+    let provider = GatedProvider::with_optional_plan(&llm, plan, &agent);
+    assert!(matches!(
+        provider.readiness(),
+        ProviderReadiness::Blocked(_)
+    ));
+
+    let err = provider
+        .complete(&[user("hi")], None, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("optional_ai_provider misconfigured"),
+        "expected clear config error, got: {err}"
+    );
+    assert!(
+        err.contains("not set") || err.contains("api_key_env"),
+        "expected missing-credential detail, got: {err}"
+    );
+    assert!(
+        !err.contains("present-at-plan-time"),
+        "secret leaked: {err}"
+    );
 }
 
 #[test]

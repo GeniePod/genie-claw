@@ -37,12 +37,21 @@ portability, and transitional validation while preserving the local Jetson
 not the product runtime and must not become a shortcut around the small-context
 home harness.
 
+When `enabled = true`, GenieClaw selects this provider instead of
+`[services.llm]`. Only `open_ai_compatible` and `open_ai` are wired today; they
+speak the OpenAI Chat Completions API over **HTTP or HTTPS**, preserve the
+configured base path (for example `/v1` → `/v1/chat/completions`), and send the
+configured `model` plus a bearer credential from the environment. Credentials
+are resolved on every request and fail closed if the env var is missing or
+empty after boot. Provider error bodies are sanitized so secrets are not
+echoed back to callers.
+
 | Key | Purpose |
 | --- | --- |
 | `enabled` | Turn optional provider planning on |
-| `provider` | `open_ai_compatible`, `open_ai`, `anthropic`, `gemini`, or `custom` |
+| `provider` | `open_ai_compatible`, `open_ai`, `anthropic`, `gemini`, or `custom` (`anthropic`/`gemini`/`custom` fail loud — not wired) |
 | `auth_mode` | `api_key` for provider keys or `oauth_bearer` for OAuth access tokens |
-| `base_url` | Provider endpoint, for example `https://api.openai.com/v1` |
+| `base_url` | Provider endpoint, for example `https://api.openai.com/v1` or `http://127.0.0.1:11434/v1` |
 | `model` | Model id sent as `model` in outbound requests. Required when enabled — most OpenAI-compatible backends reject the `"default"` placeholder |
 | `api_key_env` | Env var that stores an API key when `auth_mode = "api_key"` |
 | `oauth_token_env` | Env var that stores an OAuth access token when `auth_mode = "oauth_bearer"` |
@@ -62,6 +71,21 @@ model = "gpt-4o-mini"
 oauth_token_env = "OPENAI_OAUTH_ACCESS_TOKEN"
 context_window_tokens = 4096
 allow_remote_base_url = true
+```
+
+API-key mode against a local OpenAI-compatible server (loopback, no remote
+opt-in required):
+
+```toml
+[optional_ai_provider]
+enabled = true
+provider = "open_ai_compatible"
+auth_mode = "api_key"
+base_url = "http://127.0.0.1:11434/v1"
+model = "llama3.2"
+api_key_env = "GENIEPOD_AI_PROVIDER_API_KEY"
+context_window_tokens = 4096
+allow_remote_base_url = false
 ```
 
 Do not enable this path for household production by default. If a provider is

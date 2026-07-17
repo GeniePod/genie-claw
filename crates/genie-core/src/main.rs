@@ -194,6 +194,74 @@ async fn main() -> Result<()> {
     // Check if stdin is a terminal (REPL mode) or pipe/systemd (server-only).
     let interactive = atty_check();
 
+    // Check for voice mode: --voice flag or GENIEPOD_VOICE=1 or config voice_enabled.
+    // Decided here (ahead of the boot-contract snapshot below) so the runtime
+    // contract's hydration can report which channel(s) this process is
+    // actually starting (#785), not just at the point the mode is entered.
+    let voice_requested = std::env::args().any(|a| a == "--voice")
+        || std::env::var("GENIEPOD_VOICE").unwrap_or_default() == "1"
+        || config.core.voice_enabled;
+    let wakeword_available =
+        !config.core.wakeword_script.as_os_str().is_empty() && config.core.wakeword_script.exists();
+    let startup_decision =
+        runtime_mode::decide_startup_mode(voice_requested, interactive, wakeword_available);
+
+    // Whether the running binary actually has the voice subsystem compiled in.
+    // When voice was requested but the binary is chat-only (issue #41 feature
+    // gate), emit one warning and fall through to the chat path so an existing
+    // voice-tagged `geniepod.toml` still deploys cleanly on a chat-only build.
+    #[cfg(feature = "voice")]
+    let voice_mode = {
+        if startup_decision.blocked_push_to_talk() {
+            tracing::warn!(
+                "push-to-talk voice mode requested without an interactive terminal and no wakeword script is available; \
+                 running HTTP API only"
+            );
+        }
+        startup_decision.enters_voice()
+    };
+    #[cfg(not(feature = "voice"))]
+    let voice_mode = {
+        if voice_requested {
+            tracing::warn!(
+                "voice mode requested (--voice / GENIEPOD_VOICE=1 / core.voice_enabled) but \
+                 this genie-core build was compiled without the 'voice' feature; falling back \
+                 to chat-only mode. Rebuild with default features (or --features voice) to \
+                 enable the voice loop."
+            );
+        }
+        let _ = startup_decision;
+        false
+    };
+
+    // Which transport(s) this process is (at least intends to) start, tracked
+    // through `ChannelRegistry` (#785) purely for runtime introspection —
+    // `ChannelRegistry` itself never drives these; each transport still runs
+    // its own loop below. Telegram's entry here reflects config intent
+    // (`config.telegram.enabled`); the daemon branch below refines this to
+    // the real outcome once bot-token presence is known, since that can
+    // still fall back to HTTP-only.
+    let mut channel_registry = channel::ChannelRegistry::new();
+    if voice_mode {
+        channel_registry.register(Box::new(channel::ActiveChannelMarker(
+            channel::ChannelKind::Voice,
+        )));
+    } else {
+        channel_registry.register(Box::new(channel::ActiveChannelMarker(
+            channel::ChannelKind::Http,
+        )));
+        if config.telegram.enabled {
+            channel_registry.register(Box::new(channel::ActiveChannelMarker(
+                channel::ChannelKind::Telegram,
+            )));
+        }
+    }
+    let boot_active_channels: Vec<&'static str> = channel_registry
+        .kinds()
+        .iter()
+        .map(|k| k.as_str())
+        .collect();
+
     // Open conversation store.
     let conv_path = config.data_dir.join("conversations.db");
     let conversations = conversation::ConversationStore::open(&conv_path)?;
@@ -214,6 +282,7 @@ async fn main() -> Result<()> {
         config.core.max_history_turns,
         model_family,
         &connectivity_health,
+        &boot_active_channels,
     );
     let contract_hash = boot_contract.contract_hash.clone();
     let contract_validation = genie_core::runtime_contract::validate_runtime_contract(
@@ -251,43 +320,6 @@ async fn main() -> Result<()> {
             "failed to log runtime contract"
         ),
     }
-
-    // Check for voice mode: --voice flag or GENIEPOD_VOICE=1 or config voice_enabled.
-    let voice_requested = std::env::args().any(|a| a == "--voice")
-        || std::env::var("GENIEPOD_VOICE").unwrap_or_default() == "1"
-        || config.core.voice_enabled;
-    let wakeword_available =
-        !config.core.wakeword_script.as_os_str().is_empty() && config.core.wakeword_script.exists();
-    let startup_decision =
-        runtime_mode::decide_startup_mode(voice_requested, interactive, wakeword_available);
-
-    // Whether the running binary actually has the voice subsystem compiled in.
-    // When voice was requested but the binary is chat-only (issue #41 feature
-    // gate), emit one warning and fall through to the chat path so an existing
-    // voice-tagged `geniepod.toml` still deploys cleanly on a chat-only build.
-    #[cfg(feature = "voice")]
-    let voice_mode = {
-        if startup_decision.blocked_push_to_talk() {
-            tracing::warn!(
-                "push-to-talk voice mode requested without an interactive terminal and no wakeword script is available; \
-                 running HTTP API only"
-            );
-        }
-        startup_decision.enters_voice()
-    };
-    #[cfg(not(feature = "voice"))]
-    let voice_mode = {
-        if voice_requested {
-            tracing::warn!(
-                "voice mode requested (--voice / GENIEPOD_VOICE=1 / core.voice_enabled) but \
-                 this genie-core build was compiled without the 'voice' feature; falling back \
-                 to chat-only mode. Rebuild with default features (or --features voice) to \
-                 enable the voice loop."
-            );
-        }
-        let _ = startup_decision;
-        false
-    };
 
     if voice_mode {
         #[cfg(feature = "voice")]
@@ -453,6 +485,12 @@ async fn main() -> Result<()> {
                     max_parallel_updates = telegram_cfg.max_parallel_updates,
                     "starting Telegram adapter"
                 );
+
+                // Telegram is confirmed live past this point (feature compiled
+                // in, bot token present) — refine the runtime contract's
+                // reported channels from the boot-time "declared" guess
+                // (#785) to the real outcome.
+                let chat_server = chat_server.with_active_channels(vec!["http", "telegram"]);
 
                 tokio::try_join!(
                     chat_server.serve(&bind_host, port),
