@@ -2805,10 +2805,23 @@ fn is_time_expression(location: &str) -> bool {
         return true;
     }
     // Numeric / vague durations ending in a time unit: "20 minutes", "an hour",
-    // "a few hours", "a couple days", "the next hour".
+    // "a few hours", "a couple days", "the next hour", "a month", "the weekend".
+    // The longer calendar units (month/year/weekend) belong here too: without
+    // them "in a month" / "on the weekend" read as a place or a room, so a rain
+    // query ("will it rain in a month") and a scheduled control ("turn on the
+    // lights in a month") both mishandled them — the same class the shorter
+    // day/week units already cover.
     matches!(
         location.split_whitespace().next_back(),
-        Some(last) if is_time_unit(last) || matches!(last, "day" | "days" | "week" | "weeks")
+        Some(last) if is_time_unit(last)
+            || matches!(
+                last,
+                "day" | "days"
+                    | "week" | "weeks"
+                    | "month" | "months"
+                    | "year" | "years"
+                    | "weekend" | "weekends"
+            )
     )
 }
 
@@ -5396,6 +5409,10 @@ mod tests {
             "turn off the fan in an hour",
             "turn on the lights in the evening",
             "turn on the bedroom lights in 10 minutes",
+            // Longer calendar durations are schedules too — is_time_expression
+            // now recognizes month/year/weekend, not just minutes/hours/days/weeks.
+            "turn on the lights in a month",
+            "turn off the fan in a year",
         ] {
             assert!(route(utterance).is_none(), "{utterance:?}");
         }
@@ -6229,6 +6246,9 @@ mod tests {
             "will it rain in an hour",
             "will it rain in 20 minutes",
             "will it rain in a bit",
+            // Longer calendar durations are time expressions too.
+            "will it rain in a month",
+            "will it rain in a year",
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "get_weather", "{utterance:?}");
