@@ -352,15 +352,20 @@ fn memory_recall_query(text: &str) -> Option<String> {
         "recall memory for ",
         "recall memories for ",
     ] {
-        if let Some(query) = text.strip_prefix(prefix).map(str::trim)
-            && !query.is_empty()
-            && !matches!(query, "that" | "it" | "this")
-        {
+        if let Some(query) = text.strip_prefix(prefix).map(str::trim) {
+            // A trailing "please" is politeness, not part of the memory to
+            // recall ("search memory for jared please" searches for "jared", not
+            // "jared please"). The sibling memory_forget_query and the other
+            // quick-router extractors (clean_control_entity, web_search_request)
+            // already strip it; the recall prefix loop was the lone holdout.
+            let query = query.trim_end_matches(" please").trim_end();
             // A bare pronoun referent ("do you remember it/this") has no concrete
             // subject to search for — recalling the literal word returns noise.
             // Abstain so the LLM resolves the referent from context, mirroring the
             // sibling memory_forget_query, which already skips that/it/this.
-            return Some(query.to_string());
+            if !query.is_empty() && !matches!(query, "that" | "it" | "this") {
+                return Some(query.to_string());
+            }
         }
     }
 
@@ -1096,10 +1101,17 @@ fn shopping_list_add_request(text: &str) -> Option<String> {
     let rest = text
         .strip_prefix("add ")
         .or_else(|| text.strip_prefix("put "))?;
+    // The word before "shopping list" is optional and may be a possessive:
+    // "the shopping list", the article-less "shopping list", or the equally
+    // common "my shopping list". Without the "my" variants a natural "add milk
+    // to my shopping list" matched no suffix and fell through to memory_recall,
+    // searching memory for the command instead of adding the item.
     let items = rest
         .strip_suffix(" to the shopping list")
+        .or_else(|| rest.strip_suffix(" to my shopping list"))
         .or_else(|| rest.strip_suffix(" to shopping list"))
         .or_else(|| rest.strip_suffix(" on the shopping list"))
+        .or_else(|| rest.strip_suffix(" on my shopping list"))
         .or_else(|| rest.strip_suffix(" on shopping list"))?
         .trim();
     if items.is_empty() {
@@ -1120,11 +1132,13 @@ fn shopping_list_remove_request(text: &str) -> Option<String> {
         .strip_prefix("take ")
         .and_then(|rest| {
             rest.strip_suffix(" off the shopping list")
+                .or_else(|| rest.strip_suffix(" off my shopping list"))
                 .or_else(|| rest.strip_suffix(" off shopping list"))
         })
         .or_else(|| {
             text.strip_prefix("remove ").and_then(|rest| {
                 rest.strip_suffix(" from the shopping list")
+                    .or_else(|| rest.strip_suffix(" from my shopping list"))
                     .or_else(|| rest.strip_suffix(" from shopping list"))
             })
         })?
@@ -2615,6 +2629,7 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     // bare unit, so "half an hour" used to become "an hour" -> 3600s.
     let (seconds, unit_end_index) = fractional_duration(&tokens)
         .or_else(|| couple_duration(&tokens))
+        .or_else(|| dozen_duration(&tokens))
         .or_else(|| parse_duration(&tokens))?;
     // `fractional_duration` and `couple_duration` return as soon as they match
     // their idiom, unlike `parse_duration`'s own trailing-span sum, so "half an
@@ -3282,6 +3297,45 @@ fn couple_duration(tokens: &[&str]) -> Option<(u64, usize)> {
         }
         let multiplier = duration_unit_seconds(tokens.get(unit_index).copied())?;
         return Some((2_u64.saturating_mul(multiplier), unit_index));
+    }
+    None
+}
+
+/// Parse the spoken idiom "a dozen minutes" (12 of the unit), "two dozen hours"
+/// (24), etc. `parse_duration` does not treat "dozen" as a number, so these
+/// utterances used to abstain (#602). "half a dozen" (= 6) is a fractional
+/// idiom, so it is deliberately left to abstain rather than emit a wrong 12.
+fn dozen_duration(tokens: &[&str]) -> Option<(u64, usize)> {
+    for i in 0..tokens.len() {
+        if tokens[i] != "dozen" {
+            continue;
+        }
+        // "half a dozen" / "half dozen" / "quarter of a dozen" are fractions of
+        // a dozen — don't emit a confidently-wrong 12 for them.
+        if tokens[..i]
+            .iter()
+            .rev()
+            .take(2)
+            .any(|&t| t == "half" || t == "quarter")
+        {
+            return None;
+        }
+        // Count immediately before "dozen": "two dozen" -> 2; "a dozen" or a
+        // bare "dozen" -> 1.
+        let count = i
+            .checked_sub(1)
+            .and_then(|j| super::number_words::parse_spoken_number(&tokens[j..=j], 0))
+            .map(|(value, _)| value)
+            .unwrap_or(1);
+        let mut unit_index = i + 1;
+        if tokens.get(unit_index).copied() == Some("of") {
+            unit_index += 1;
+        }
+        let multiplier = duration_unit_seconds(tokens.get(unit_index).copied())?;
+        return Some((
+            count.saturating_mul(12).saturating_mul(multiplier),
+            unit_index,
+        ));
     }
     None
 }
@@ -4337,6 +4391,19 @@ mod tests {
         // The media "put on ..." path is unaffected.
         let call = route("Put on the morning news").unwrap();
         assert_eq!(call.name, "play_media");
+
+        // The possessive "my shopping list" is as common as "the shopping list";
+        // without it "add milk to my shopping list" fell through to memory_recall.
+        let call = route("Add milk to my shopping list").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "shopping");
+        assert_eq!(call.arguments["content"], "shopping list pending: milk");
+
+        let call = route("Put eggs and bread on my shopping list").unwrap();
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list pending: eggs, bread"
+        );
     }
 
     #[test]
@@ -4360,6 +4427,16 @@ mod tests {
         // The articled form still works.
         let call = route("Take milk off the shopping list").unwrap();
         assert_eq!(call.arguments["content"], "shopping list removed: milk");
+
+        // The possessive "my shopping list" mirrors the add path.
+        let call = route("Take milk off my shopping list").unwrap();
+        assert_eq!(call.arguments["content"], "shopping list removed: milk");
+
+        let call = route("Remove eggs and bread from my shopping list").unwrap();
+        assert_eq!(
+            call.arguments["content"],
+            "shopping list removed: eggs, bread"
+        );
     }
 
     #[test]
@@ -5548,6 +5625,12 @@ mod tests {
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "jared");
         assert_eq!(call.arguments["limit"], 3);
+
+        // A trailing "please" is politeness, not part of the recall query — it
+        // must be stripped like the sibling memory_forget path does.
+        let call = route("search memory for Jared please").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "jared");
     }
 
     #[test]
@@ -5793,6 +5876,34 @@ mod tests {
         let call = route("remind me in 5 minutes to feed the couple cats").unwrap();
         assert_eq!(call.arguments["seconds"], 300);
         assert_eq!(call.arguments["label"], "feed the couple cats");
+    }
+
+    #[test]
+    fn routes_dozen_duration_timer() {
+        // #602: "a dozen minutes" is 12 of the unit (12 x 60 = 720s).
+        let call = route("set a timer for a dozen minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 720);
+
+        // The reminder label is still recovered from the task clause.
+        let call = route("remind me in a dozen minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 720);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // A count before "dozen" multiplies; other units divide too.
+        let call = route("set a timer for two dozen minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 1440);
+        let call = route("set a timer for a dozen hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 43200);
+
+        // "half a dozen" (= 6) is a fraction of a dozen — deliberately abstain
+        // rather than emit a confidently-wrong 12.
+        assert!(route("set a timer for half a dozen minutes").is_none());
+
+        // "dozen" inside a later label is not mistaken for duration.
+        let call = route("remind me in 5 minutes to sort the dozen eggs").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "sort the dozen eggs");
     }
 
     #[test]

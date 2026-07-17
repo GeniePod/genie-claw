@@ -951,15 +951,25 @@ fn capabilities_for(domain: &str, attributes: &serde_json::Value) -> Vec<String>
     caps
 }
 
+/// Whether the operator explicitly opted this script in to voice activation.
+///
+/// The punctuated markers are matched against the lowercased raw text, not the
+/// `normalize`d text: `normalize` rewrites every non-alphanumeric byte to a
+/// space, so "[voice]", "(voice)", "voice_" and "genie_" can never occur in its
+/// output and those arms never fired. Matching them on the raw text keeps each
+/// marker's spelling exact — a bare "voice" anywhere in a name still does not
+/// opt a script in, so the gate stays closed for everything unmarked.
 fn is_voice_safe_script(entity: &Entity) -> bool {
+    let raw_name = entity.friendly_name().to_lowercase();
+    let raw_entity_id = entity.entity_id.to_lowercase();
     let name = normalize(entity.friendly_name());
     let entity_id = normalize(&entity.entity_id.replace('.', " "));
-    name.contains("[voice]")
-        || name.contains("(voice)")
+    raw_name.contains("[voice]")
+        || raw_name.contains("(voice)")
         || name.starts_with("voice ")
         || entity_id.contains(" voice ")
-        || entity_id.contains("voice_")
-        || entity_id.contains("genie_")
+        || raw_entity_id.contains("voice_")
+        || raw_entity_id.contains("genie_")
 }
 
 fn domain_synonyms(domain: &str) -> Vec<String> {
@@ -1504,6 +1514,50 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn voice_safe_script_markers_survive_normalization() {
+        // `normalize` maps every non-alphanumeric byte to a space, so a marker
+        // spelled with punctuation never survives to be matched: "[voice]",
+        // "(voice)", "voice_" and "genie_" could not appear in its output, and
+        // those four arms were unreachable. Only the two space-delimited forms
+        // ("Voice ..." / "script.voice_...", the latter via " voice ") ever fired,
+        // so a script the operator explicitly opted in with a "[Voice]" tag or a
+        // `genie_` id was reported as NOT voice-safe -- and since #773 that is a
+        // hard deny with no confirmation escape hatch, making the script
+        // unreachable by voice entirely.
+        let script = |id: &str, name: &str| Entity {
+            entity_id: id.into(),
+            state: "off".into(),
+            attributes: serde_json::json!({ "friendly_name": name }),
+        };
+
+        // Explicit opt-in markers are honored.
+        for (id, name) in [
+            ("script.goodnight", "Goodnight [Voice]"),
+            ("script.goodnight", "Goodnight (Voice)"),
+            ("script.genie_goodnight", "Goodnight"),
+            ("script.voice_goodnight", "Goodnight"),
+            ("script.goodnight", "Voice Goodnight"),
+        ] {
+            assert!(
+                is_voice_safe_script(&script(id, name)),
+                "expected voice-safe: {id} / {name:?}"
+            );
+        }
+
+        // An unmarked script stays non-voice-safe: the gate still fails closed
+        // for anything the operator did not opt in.
+        for (id, name) in [
+            ("script.disarm_alarm", "Disarm Alarm"),
+            ("script.open_garage", "Open Garage"),
+        ] {
+            assert!(
+                !is_voice_safe_script(&script(id, name)),
+                "expected NOT voice-safe: {id} / {name:?}"
+            );
+        }
     }
 
     #[test]
