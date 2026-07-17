@@ -1016,6 +1016,13 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
                 .trim_start_matches("the ")
                 .trim_start_matches("a ")
                 .trim_start_matches("an ")
+                // A trailing "please" is politeness, not part of the name. It has
+                // to come off *before* the " scene"/" routine" suffix trim below,
+                // or it defeats that trim and leaks straight into the entity:
+                // "activate the movie scene please" otherwise routes the garbled
+                // scene "movie scene please" instead of "movie".
+                .trim_end_matches(" please")
+                .trim_end()
                 .trim_end_matches(" scene")
                 .trim_end_matches(" routine")
                 .trim()
@@ -2617,6 +2624,7 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     // bare unit, so "half an hour" used to become "an hour" -> 3600s.
     let (seconds, unit_end_index) = fractional_duration(&tokens)
         .or_else(|| couple_duration(&tokens))
+        .or_else(|| dozen_duration(&tokens))
         .or_else(|| parse_duration(&tokens))?;
     // `fractional_duration` and `couple_duration` return as soon as they match
     // their idiom, unlike `parse_duration`'s own trailing-span sum, so "half an
@@ -3284,6 +3292,45 @@ fn couple_duration(tokens: &[&str]) -> Option<(u64, usize)> {
         }
         let multiplier = duration_unit_seconds(tokens.get(unit_index).copied())?;
         return Some((2_u64.saturating_mul(multiplier), unit_index));
+    }
+    None
+}
+
+/// Parse the spoken idiom "a dozen minutes" (12 of the unit), "two dozen hours"
+/// (24), etc. `parse_duration` does not treat "dozen" as a number, so these
+/// utterances used to abstain (#602). "half a dozen" (= 6) is a fractional
+/// idiom, so it is deliberately left to abstain rather than emit a wrong 12.
+fn dozen_duration(tokens: &[&str]) -> Option<(u64, usize)> {
+    for i in 0..tokens.len() {
+        if tokens[i] != "dozen" {
+            continue;
+        }
+        // "half a dozen" / "half dozen" / "quarter of a dozen" are fractions of
+        // a dozen — don't emit a confidently-wrong 12 for them.
+        if tokens[..i]
+            .iter()
+            .rev()
+            .take(2)
+            .any(|&t| t == "half" || t == "quarter")
+        {
+            return None;
+        }
+        // Count immediately before "dozen": "two dozen" -> 2; "a dozen" or a
+        // bare "dozen" -> 1.
+        let count = i
+            .checked_sub(1)
+            .and_then(|j| super::number_words::parse_spoken_number(&tokens[j..=j], 0))
+            .map(|(value, _)| value)
+            .unwrap_or(1);
+        let mut unit_index = i + 1;
+        if tokens.get(unit_index).copied() == Some("of") {
+            unit_index += 1;
+        }
+        let multiplier = duration_unit_seconds(tokens.get(unit_index).copied())?;
+        return Some((
+            count.saturating_mul(12).saturating_mul(multiplier),
+            unit_index,
+        ));
     }
     None
 }
@@ -4255,6 +4302,16 @@ mod tests {
         // Without an article the name is unchanged.
         let call = route("activate movie night scene").unwrap();
         assert_eq!(call.arguments["entity"], "movie night");
+
+        // A trailing "please" must be dropped before the " scene"/" routine"
+        // suffix trim, or it defeats that trim and leaks a garbled scene name.
+        let call = route("activate the movie scene please").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "movie");
+        assert_eq!(call.arguments["action"], "activate");
+
+        let call = route("run the away routine please").unwrap();
+        assert_eq!(call.arguments["entity"], "away");
     }
 
     #[test]
@@ -5773,6 +5830,34 @@ mod tests {
         let call = route("remind me in 5 minutes to feed the couple cats").unwrap();
         assert_eq!(call.arguments["seconds"], 300);
         assert_eq!(call.arguments["label"], "feed the couple cats");
+    }
+
+    #[test]
+    fn routes_dozen_duration_timer() {
+        // #602: "a dozen minutes" is 12 of the unit (12 x 60 = 720s).
+        let call = route("set a timer for a dozen minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 720);
+
+        // The reminder label is still recovered from the task clause.
+        let call = route("remind me in a dozen minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 720);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // A count before "dozen" multiplies; other units divide too.
+        let call = route("set a timer for two dozen minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 1440);
+        let call = route("set a timer for a dozen hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 43200);
+
+        // "half a dozen" (= 6) is a fraction of a dozen — deliberately abstain
+        // rather than emit a confidently-wrong 12.
+        assert!(route("set a timer for half a dozen minutes").is_none());
+
+        // "dozen" inside a later label is not mistaken for duration.
+        let call = route("remind me in 5 minutes to sort the dozen eggs").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "sort the dozen eggs");
     }
 
     #[test]
