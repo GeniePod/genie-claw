@@ -1943,7 +1943,16 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
         .or_else(|| text.strip_prefix("preheat "))
         && let Some((entity, value)) = parse_temperature_target(rest)
     {
-        return Some((entity, "set_temperature", Some(value)));
+        // A numeric setpoint on a light is brightness, not temperature: "set the
+        // living room lights to 50 percent" is a set_brightness{value:50}, not a
+        // set_temperature that would try to set a light's (nonexistent)
+        // temperature. Thermostats/ovens keep set_temperature.
+        let action = if is_light_entity(&entity) {
+            "set_brightness"
+        } else {
+            "set_temperature"
+        };
+        return Some((entity, action, Some(value)));
     }
 
     None
@@ -2024,6 +2033,12 @@ fn clean_control_entity(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Whether an entity name refers to a light, so a numeric setpoint is read as
+/// brightness rather than temperature.
+fn is_light_entity(entity: &str) -> bool {
+    contains_any(entity, &["light", "lights", "lamp", "lamps"])
 }
 
 fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
@@ -4522,6 +4537,33 @@ mod tests {
             );
             assert_eq!(call.arguments["content"], content, "{utterance:?}");
         }
+    }
+
+    #[test]
+    fn set_lights_to_a_percent_routes_to_brightness_not_temperature() {
+        // A numeric setpoint on a light is brightness, not temperature — routing
+        // it to set_temperature would try to set a light's temperature.
+        for (utterance, entity, value) in [
+            (
+                "set the living room lights to 50 percent",
+                "living room lights",
+                50.0,
+            ),
+            ("set the bedroom lamp to 30 percent", "bedroom lamp", 30.0),
+            ("set the kitchen lights to 80", "kitchen lights", 80.0),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["action"], "set_brightness", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["value"], value, "{utterance:?}");
+        }
+
+        // Thermostats and ovens still take set_temperature.
+        let call = route("set the thermostat to 72").unwrap();
+        assert_eq!(call.arguments["action"], "set_temperature");
+        let call = route("set the oven to 400 degrees").unwrap();
+        assert_eq!(call.arguments["action"], "set_temperature");
     }
 
     #[test]
