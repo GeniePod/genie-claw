@@ -751,19 +751,27 @@ async fn run_push_to_talk(
 /// on a LyraT-style setup).
 async fn detect_audio_output_device() -> Option<String> {
     const DETECT_SCRIPT: &str = "/opt/geniepod/bin/detect-audio-device.sh";
+    // Shell-out to the deploy helper must not hang boot/voice-loop start (#617).
+    const DETECT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
     if tokio::fs::metadata(DETECT_SCRIPT).await.is_ok() {
         // Pass --output so the script returns a sink-suitable device
         // (skipping LyraT/APE which our firmware leaves capture-only).
-        match Command::new(DETECT_SCRIPT).arg("--output").output().await {
-            Ok(out) if out.status.success() => {
+        let mut cmd = Command::new(DETECT_SCRIPT);
+        cmd.arg("--output").kill_on_drop(true);
+        match tokio::time::timeout(DETECT_SCRIPT_TIMEOUT, cmd.output()).await {
+            Ok(Ok(out)) if out.status.success() => {
                 let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !dev.is_empty() {
                     return Some(dev);
                 }
             }
-            Ok(_) => {}
-            Err(e) => tracing::debug!(error = %e, "detect-audio-device.sh --output failed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::debug!(error = %e, "detect-audio-device.sh --output failed"),
+            Err(_) => tracing::warn!(
+                timeout_secs = DETECT_SCRIPT_TIMEOUT.as_secs(),
+                "detect-audio-device.sh --output timed out"
+            ),
         }
     }
 
@@ -795,17 +803,26 @@ async fn detect_audio_output_device() -> Option<String> {
 /// `cargo run` without the deploy layout still detects USB devices.
 async fn detect_audio_device() -> Option<String> {
     const DETECT_SCRIPT: &str = "/opt/geniepod/bin/detect-audio-device.sh";
+    const DETECT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
     if tokio::fs::metadata(DETECT_SCRIPT).await.is_ok() {
-        match Command::new(DETECT_SCRIPT).output().await {
-            Ok(out) if out.status.success() => {
+        let mut cmd = Command::new(DETECT_SCRIPT);
+        cmd.kill_on_drop(true);
+        match tokio::time::timeout(DETECT_SCRIPT_TIMEOUT, cmd.output()).await {
+            Ok(Ok(out)) if out.status.success() => {
                 let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !dev.is_empty() {
                     return Some(dev);
                 }
             }
-            Ok(_) => {} // script exit non-zero — fall through to in-process scan
-            Err(e) => tracing::debug!(error = %e, "detect-audio-device.sh failed, falling back"),
+            Ok(Ok(_)) => {} // script exit non-zero — fall through to in-process scan
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "detect-audio-device.sh failed, falling back")
+            }
+            Err(_) => tracing::warn!(
+                timeout_secs = DETECT_SCRIPT_TIMEOUT.as_secs(),
+                "detect-audio-device.sh timed out — falling back"
+            ),
         }
     }
 
