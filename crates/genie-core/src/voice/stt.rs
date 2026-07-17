@@ -25,6 +25,44 @@ async fn whisper_cli_output(mut cmd: Command) -> Result<std::process::Output> {
     }
 }
 
+/// Deadlines for the remaining unbounded subprocess calls in this file
+/// (#617): the pre-CUDA page-cache drop, arecord capture/flush, and the
+/// sox/DeepFilterNet denoising chains.
+const DROP_CACHES_TIMEOUT: Duration = Duration::from_secs(5);
+const MIC_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Extra headroom beyond the requested capture duration before a hung
+/// `arecord` is killed.
+const ARECORD_TIMEOUT_MARGIN: Duration = Duration::from_secs(10);
+const SOX_TIMEOUT: Duration = Duration::from_secs(15);
+/// Neural denoising is slower than sox, especially on CPU fallback.
+const DEEP_FILTER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound `arecord` by the requested capture length plus generous margin —
+/// a fixed deadline would either kill long recordings early or leave short
+/// ones unbounded for too long.
+fn arecord_timeout_for_duration(duration_secs: u32) -> Duration {
+    Duration::from_secs(u64::from(duration_secs) + ARECORD_TIMEOUT_MARGIN.as_secs())
+}
+
+/// Run a `sox`/`deep-filter` step under a deadline, reaping the child on
+/// timeout via `kill_on_drop`. Returns the same `io::Result<Output>` shape
+/// `Command::output()` does so call sites' existing `matches!`/`if let Ok`
+/// handling is unaffected by adding a timeout.
+async fn denoise_step_output(
+    mut cmd: Command,
+    timeout: Duration,
+    label: &'static str,
+) -> std::io::Result<std::process::Output> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{label} timed out after {timeout:?}"),
+        )),
+    }
+}
+
 /// Monotonic per-process counter for unique temp-file suffixes. Pairs with
 /// the PID so two concurrent `transcribe_pcm` calls in the same process
 /// cannot collide on `/tmp/geniepod-stt-*.wav`.
@@ -402,14 +440,17 @@ impl SttEngine {
     async fn transcribe_via_cli(&self, wav_path: &str) -> Result<Transcript> {
         tracing::info!(cli = %self.cli_path, model = %self.model_path, file = wav_path, "running whisper-cli");
 
-        // Drop page cache before CUDA allocation — NvMap needs contiguous blocks.
-        let _ = Command::new("sh")
+        // Drop page cache before CUDA allocation — NvMap needs contiguous
+        // blocks. Best-effort and bounded (#617): a hung `sync` must not
+        // block transcription.
+        let mut drop_caches_cmd = Command::new("sh");
+        drop_caches_cmd
             .args([
                 "-c",
                 "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null",
             ])
-            .output()
-            .await;
+            .kill_on_drop(true);
+        let _ = tokio::time::timeout(DROP_CACHES_TIMEOUT, drop_caches_cmd.output()).await;
 
         let mut args = vec![
             "-m".to_string(),
@@ -574,7 +615,8 @@ pub async fn flush_mic_buffer(device: &str, sample_rate: u32) {
     // Tegra/LyraT plughw stack returns samples in half real time, so a 1 s
     // mono flush actually drains only ~0.5 s of pending audio. Stereo keeps
     // arecord properly throttled.
-    let _ = Command::new("arecord")
+    let mut flush_cmd = Command::new("arecord");
+    flush_cmd
         .args([
             "-D",
             device,
@@ -589,8 +631,10 @@ pub async fn flush_mic_buffer(device: &str, sample_rate: u32) {
             "1",
             &flush_path,
         ])
-        .output()
-        .await;
+        .kill_on_drop(true);
+    // Bounded (#617): a hung flush capture must not block the voice loop
+    // before it ever prompts the user.
+    let _ = tokio::time::timeout(MIC_FLUSH_TIMEOUT, flush_cmd.output()).await;
     let _ = tokio::fs::remove_file(&flush_path).await;
 }
 
@@ -662,7 +706,8 @@ pub async fn record_audio(
     // and the recorded audio is timing-distorted. Capturing native stereo
     // and downmixing to mono in the sox stage below gives clean 3-second
     // real-time captures with correct sample timing.
-    let output = Command::new("arecord")
+    let mut record_cmd = Command::new("arecord");
+    record_cmd
         .args([
             "-D",
             device,
@@ -676,8 +721,14 @@ pub async fn record_audio(
             &duration_secs.to_string(),
             &wav_path,
         ])
-        .output()
-        .await?;
+        .kill_on_drop(true);
+    // Bounded by the requested capture length + margin (#617): a hung
+    // arecord must not wedge the single per-device voice loop forever.
+    let record_timeout = arecord_timeout_for_duration(duration_secs);
+    let output = match tokio::time::timeout(record_timeout, record_cmd.output()).await {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!("arecord timed out after {record_timeout:?}"),
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -789,7 +840,9 @@ async fn run_sox_chain(
     sox_cmd.args(["compand", "0.02,0.20", "-50,-50,-25,-12,-5,-5", "-2"]);
     sox_cmd.args(["gain", "-n", "-3"]);
 
-    match sox_cmd.output().await {
+    // Bounded (#617): a hung sox process must not wedge the STT pipeline —
+    // fall back to the raw recording just like any other sox failure.
+    match denoise_step_output(sox_cmd, SOX_TIMEOUT, "sox normalization").await {
         Ok(out)
             if out.status.success()
                 && tokio::fs::metadata(normalized_path)
@@ -862,15 +915,17 @@ async fn run_deepfilternet_chain(
         return run_sox_chain(wav_path, normalized_path, None).await;
     }
 
-    // Stage 1: stereo → mono + bandpass.
-    let stage1 = Command::new("sox")
+    // Stage 1: stereo → mono + bandpass. Bounded (#617): a hung sox must not
+    // wedge the STT pipeline — falls back to the sox-only chain like any
+    // other stage-1 failure.
+    let mut stage1_cmd = Command::new("sox");
+    stage1_cmd
         .arg(wav_path)
         .arg(&mono_path)
         .args(["channels", "1"])
         .args(["highpass", "100"])
-        .args(["lowpass", "7000"])
-        .output()
-        .await;
+        .args(["lowpass", "7000"]);
+    let stage1 = denoise_step_output(stage1_cmd, SOX_TIMEOUT, "sox stage 1").await;
     let stage1_ok = matches!(stage1, Ok(ref o) if o.status.success())
         && tokio::fs::metadata(&mono_path)
             .await
@@ -895,12 +950,15 @@ async fn run_deepfilternet_chain(
     // not `--atten-lim` as the current main-branch enhance_wav.rs source
     // suggests.)
     let dfn_start = std::time::Instant::now();
-    let dfn_res = Command::new(binary_path)
+    let mut dfn_cmd = Command::new(binary_path);
+    dfn_cmd
         .arg(&mono_path)
         .args(["-o", &dfn_dir])
-        .args(["--atten-lim-db", &format!("{}", atten_lim_db)])
-        .output()
-        .await;
+        .args(["--atten-lim-db", &format!("{}", atten_lim_db)]);
+    // Bounded (#617): neural denoising is slower than sox (especially on
+    // CPU fallback), but a hung deep-filter must not wedge the STT
+    // pipeline — falls back to the sox-only chain like any other failure.
+    let dfn_res = denoise_step_output(dfn_cmd, DEEP_FILTER_TIMEOUT, "deep-filter").await;
     let dfn_ok = matches!(dfn_res, Ok(ref o) if o.status.success())
         && tokio::fs::metadata(&dfn_out)
             .await
@@ -924,13 +982,14 @@ async fn run_deepfilternet_chain(
     }
     let dfn_ms = dfn_start.elapsed().as_millis();
 
-    // Stage 3: peak-normalize cleaned audio.
-    let stage3 = Command::new("sox")
+    // Stage 3: peak-normalize cleaned audio. Bounded (#617), same fallback
+    // behavior as the other denoise stages.
+    let mut stage3_cmd = Command::new("sox");
+    stage3_cmd
         .arg(&dfn_out)
         .arg(normalized_path)
-        .args(["gain", "-n", "-3"])
-        .output()
-        .await;
+        .args(["gain", "-n", "-3"]);
+    let stage3 = denoise_step_output(stage3_cmd, SOX_TIMEOUT, "sox stage 3").await;
     let stage3_ok = matches!(stage3, Ok(ref o) if o.status.success())
         && tokio::fs::metadata(normalized_path)
             .await
@@ -1129,5 +1188,65 @@ mod tests {
             SttEngine::clean_hallucinations("what's the weather like"),
             "what's the weather like"
         );
+    }
+
+    /// #617: `arecord`'s deadline must scale with the requested capture
+    /// length (a fixed timeout would either kill long recordings early or
+    /// leave short ones unbounded for too long), plus a fixed margin for
+    /// device-open overhead.
+    #[test]
+    fn arecord_timeout_scales_with_requested_duration() {
+        assert_eq!(
+            arecord_timeout_for_duration(3),
+            Duration::from_secs(3 + ARECORD_TIMEOUT_MARGIN.as_secs())
+        );
+        assert_eq!(
+            arecord_timeout_for_duration(30),
+            Duration::from_secs(30 + ARECORD_TIMEOUT_MARGIN.as_secs())
+        );
+        assert!(arecord_timeout_for_duration(30) > arecord_timeout_for_duration(3));
+    }
+
+    /// Regression for #617: the sox/deep-filter/arecord/sh call sites in
+    /// this file wrap their command in `tokio::time::timeout` +
+    /// `kill_on_drop(true)`, mirroring `whisper_cli_output` (already merged
+    /// via #790). Those binaries aren't guaranteed to hang predictably in a
+    /// test sandbox, so this exercises the exact same wrap-and-kill idiom
+    /// directly against `sleep` (always present on the Linux targets this
+    /// project supports) to prove a hung child is bounded and does not
+    /// block the caller.
+    #[tokio::test]
+    async fn timeout_wrap_bounds_a_hung_child() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_millis(200), cmd.output()).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "200ms timeout must fire before `sleep 30` exits"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must fail fast on the timeout, not wait for the child: took {elapsed:?}"
+        );
+    }
+
+    /// The shared `denoise_step_output` helper must surface a timeout as
+    /// the same `io::Result<Output>` shape a normal `Command::output()`
+    /// call produces, so downstream `matches!`/`if let Ok` call sites need
+    /// no special-casing.
+    #[tokio::test]
+    async fn denoise_step_output_reports_timeout_as_io_error() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+
+        let result = denoise_step_output(cmd, Duration::from_millis(200), "test step").await;
+
+        let err = result.expect_err("a timed-out step must be an Err, not a hung future");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("test step"));
     }
 }
