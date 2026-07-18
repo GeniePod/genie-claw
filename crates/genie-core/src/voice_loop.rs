@@ -231,6 +231,7 @@ async fn run_with_wakeword(
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(c) => c,
@@ -252,9 +253,24 @@ async fn run_with_wakeword(
         let mut reader = BufReader::new(stdout);
         let mut writer = stdin;
 
-        // Wait for "LISTENING" signal.
+        // Wait for "LISTENING" signal — bound so a hung Python import cannot
+        // wedge voice-loop start forever (#617).
+        const WAKEWORD_READY_TIMEOUT: Duration = Duration::from_secs(30);
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        match tokio::time::timeout(WAKEWORD_READY_TIMEOUT, reader.read_line(&mut line)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill().await;
+                anyhow::bail!("wake word listener stdout error: {e}");
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                anyhow::bail!(
+                    "wake word listener timed out waiting for LISTENING after {}s",
+                    WAKEWORD_READY_TIMEOUT.as_secs()
+                );
+            }
+        }
         if !line.trim().starts_with("LISTENING") {
             eprintln!("[voice] Wake word listener failed: {}", line.trim());
             let _ = child.kill().await;
