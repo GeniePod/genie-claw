@@ -3113,21 +3113,30 @@ fn arithmetic_expression(text: &str) -> Option<String> {
     Some(expression.trim().to_string())
 }
 
-/// Convert standalone cardinal words to digits in a calculator expression, so
+/// Convert cardinal words to digits in a calculator expression, so
 /// "two plus two" -> "two + two" -> "2 + 2" (#532-adjacent: word-form arithmetic).
-/// Operator symbols and non-number words are left as-is; compound cardinals
-/// across multiple tokens are out of scope (rare in a calculation).
+/// A compound cardinal spans several tokens ("one hundred" -> 100, "ninety nine"
+/// -> 99); walk the tokens and let `parse_spoken_number` consume the whole span
+/// so it composes as one number rather than one digit per word ("one hundred /
+/// five" -> "100 / 5", not "1 100 / 5"). Operator symbols and non-number words
+/// parse as nothing and pass through unchanged; a bare digit token composes as
+/// itself, so digit expressions are untouched.
 fn words_to_digits(expression: &str) -> String {
-    expression
-        .split(' ')
-        .map(|token| {
-            super::number_words::parse_amount(token)
-                .filter(|value| value.fract() == 0.0)
-                .map(|value| (value as i64).to_string())
-                .unwrap_or_else(|| token.to_string())
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let tokens: Vec<&str> = expression.split(' ').collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if let Some((value, next)) = super::number_words::parse_spoken_number(&tokens, index)
+            && next > index
+        {
+            out.push(value.to_string());
+            index = next;
+        } else {
+            out.push(tokens[index].to_string());
+            index += 1;
+        }
+    }
+    out.join(" ")
 }
 
 fn parse_decimal_token(token: &str) -> Option<f64> {
@@ -5652,6 +5661,33 @@ mod tests {
         // Digit forms still work.
         let call = route("what is 3 times 4").unwrap();
         assert_eq!(call.arguments["expression"], "3 * 4");
+    }
+
+    #[test]
+    fn routes_compound_spoken_cardinals_to_calculate() {
+        // A compound spoken cardinal ("one hundred", "ninety nine") spans several
+        // tokens. words_to_digits converted each token on its own, so "one
+        // hundred / five" became "1 100 / 5" — a garbled expression — instead of
+        // "100 / 5". Compose the span with the same parser the timer/amount paths
+        // use.
+        for (utterance, expression) in [
+            ("what is one hundred divided by five", "100 / 5"),
+            ("what is two hundred minus fifty", "200 - 50"),
+            ("what is one thousand divided by four", "1000 / 4"),
+            ("what is ninety nine plus one", "99 + 1"),
+            ("what is one hundred twenty plus five", "120 + 5"),
+            ("what is five hundred divided by ten", "500 / 10"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "calculate", "{utterance:?}");
+            assert_eq!(call.arguments["expression"], expression, "{utterance:?}");
+        }
+
+        // Simple tens and digit forms are unchanged.
+        let call = route("what is twenty plus thirty").unwrap();
+        assert_eq!(call.arguments["expression"], "20 + 30");
+        let call = route("what is 100 divided by 5").unwrap();
+        assert_eq!(call.arguments["expression"], "100 / 5");
     }
 
     #[test]
