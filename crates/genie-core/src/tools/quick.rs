@@ -2655,6 +2655,14 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     let label = reminder_label(&tokens, unit_end_index, reminder_style)
         .filter(|label| !label.is_empty())
         .or_else(|| extract_named_timer_label(&tokens, unit_end_index))
+        // A trailing "please" is politeness, not part of the label. Both label
+        // extractors leak it ("... for the pasta please" -> "pasta please",
+        // "... to check the pasta please" -> "check the pasta please"), so strip
+        // it once here where every extracted label converges. Done before the
+        // fallback so a bare "... for please" collapses to empty and still takes
+        // the generic default rather than the literal label "please".
+        .map(|label| label.trim_end_matches(" please").trim_end().to_string())
+        .filter(|label| !label.is_empty() && label != "please")
         .unwrap_or_else(|| {
             if text.starts_with("remind ") {
                 "reminder".into()
@@ -5790,6 +5798,34 @@ mod tests {
 
         // No trailing label -> still the generic default (unchanged).
         let call = route("set a timer for 5 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn timer_label_drops_a_trailing_please() {
+        // A trailing "please" is politeness, not part of the label. Both label
+        // paths that reach the timer label leaked it: the "for <label>" form via
+        // clean_timer_label and the "to <task>" form via label_after_duration.
+        for (utterance, label) in [
+            ("set a timer for 10 minutes for the pasta please", "pasta"),
+            ("set a timer for 5 minutes for the eggs please", "eggs"),
+            ("set a 3 minute timer for the tea please", "tea"),
+            (
+                "set a timer for 10 minutes to check the pasta please",
+                "check the pasta",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "set_timer", "{utterance:?}");
+            assert_eq!(call.arguments["label"], label, "{utterance:?}");
+        }
+
+        // A label that merely ends in those letters is untouched (whole word).
+        let call = route("set a timer for 10 minutes for the pleasantries").unwrap();
+        assert_eq!(call.arguments["label"], "pleasantries");
+
+        // A bare "... please" with no real label still falls to the default.
+        let call = route("set a timer for 10 minutes for please").unwrap();
         assert_eq!(call.arguments["label"], "timer");
     }
 
