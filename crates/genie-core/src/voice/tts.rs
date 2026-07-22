@@ -334,15 +334,19 @@ impl TtsEngine {
             .kill_on_drop(true)
             .spawn()?;
 
-        if let Some(mut stdin) = piper.stdin.take() {
-            stdin.write_all(clean.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-        }
-
         // Bounded so a hung piper process can't wedge the single-per-device
-        // voice loop forever (#617).
-        let out = match tokio::time::timeout(PIPER_SYNTHESIS_TIMEOUT, piper.wait_with_output())
-            .await
+        // voice loop forever (#617). The stdin write is inside the same
+        // deadline as the wait: a piper that wedges before ever reading its
+        // input must not be able to stall the write with no timeout of its
+        // own.
+        let out = match tokio::time::timeout(PIPER_SYNTHESIS_TIMEOUT, async move {
+            if let Some(mut stdin) = piper.stdin.take() {
+                stdin.write_all(clean.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+            }
+            piper.wait_with_output().await
+        })
+        .await
         {
             Ok(result) => result?,
             Err(_) => anyhow::bail!("Piper synthesis timed out after {PIPER_SYNTHESIS_TIMEOUT:?}"),
@@ -424,20 +428,33 @@ impl TtsEngine {
             return Ok(());
         }
 
-        let clean = text.replace('\'', "'\\''");
+        let clean = text.replace('\n', " ");
 
-        let mut cmd = Command::new("sh");
-        cmd.args([
-            "-c",
-            &format!(
-                "echo '{}' | '{}' --model '{}' --output_file '{}'",
-                clean, self.piper_path, self.model_path, output_path,
-            ),
-        ])
-        .kill_on_drop(true);
+        // Spawned directly with piped stdin rather than through `sh -c
+        // "echo ... | piper ..."`: killing a shell on timeout doesn't
+        // reliably kill a piped grandchild, which can get reparented and
+        // keep running/writing to `output_path` past the deadline —
+        // defeating the point of bounding this call (#617).
+        let mut piper = Command::new(&self.piper_path)
+            .args(["--model", &self.model_path, "--output_file", output_path])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
 
-        // Bounded so a hung piper process can't wedge the caller forever (#617).
-        let output = match tokio::time::timeout(PIPER_SYNTHESIS_TIMEOUT, cmd.output()).await {
+        // Bounded so a hung piper process can't wedge the caller forever
+        // (#617). The stdin write shares the deadline with the wait, same
+        // as `synthesize_only`.
+        let output = match tokio::time::timeout(PIPER_SYNTHESIS_TIMEOUT, async move {
+            if let Some(mut stdin) = piper.stdin.take() {
+                stdin.write_all(clean.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+            }
+            piper.wait_with_output().await
+        })
+        .await
+        {
             Ok(result) => result?,
             Err(_) => {
                 anyhow::bail!("piper (file mode) timed out after {PIPER_SYNTHESIS_TIMEOUT:?}")
