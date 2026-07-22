@@ -1943,7 +1943,16 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
         .or_else(|| text.strip_prefix("preheat "))
         && let Some((entity, value)) = parse_temperature_target(rest)
     {
-        return Some((entity, "set_temperature", Some(value)));
+        // A numeric setpoint on a light is brightness, not temperature: "set the
+        // living room lights to 50 percent" is a set_brightness{value:50}, not a
+        // set_temperature that would try to set a light's (nonexistent)
+        // temperature. Thermostats/ovens keep set_temperature.
+        let action = if is_light_entity(&entity) {
+            "set_brightness"
+        } else {
+            "set_temperature"
+        };
+        return Some((entity, action, Some(value)));
     }
 
     None
@@ -2024,6 +2033,12 @@ fn clean_control_entity(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Whether an entity name refers to a light, so a numeric setpoint is read as
+/// brightness rather than temperature.
+fn is_light_entity(entity: &str) -> bool {
+    contains_any(entity, &["light", "lights", "lamp", "lamps"])
 }
 
 fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
@@ -2747,6 +2762,16 @@ fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> 
     if parse_duration(rest).is_some() {
         if let Some(for_pos) = rest.iter().position(|token| *token == "for") {
             let label_tokens = &rest[for_pos + 1..];
+            if !label_tokens.is_empty() && parse_duration(label_tokens).is_none() {
+                return clean_timer_label(label_tokens);
+            }
+            // Mirrored order: `"timer for the pasta for 5 minutes"` puts the
+            // label *before* the duration's own `for`. The check above only
+            // looked after it, so this equally natural phrasing dropped its
+            // label to the generic "timer". The duration guard keeps a plain
+            // `"timer for 5 minutes"` (label window would be the duration
+            // itself) on the generic default.
+            let label_tokens = &rest[..for_pos];
             if !label_tokens.is_empty() && parse_duration(label_tokens).is_none() {
                 return clean_timer_label(label_tokens);
             }
@@ -4540,6 +4565,33 @@ mod tests {
     }
 
     #[test]
+    fn set_lights_to_a_percent_routes_to_brightness_not_temperature() {
+        // A numeric setpoint on a light is brightness, not temperature — routing
+        // it to set_temperature would try to set a light's temperature.
+        for (utterance, entity, value) in [
+            (
+                "set the living room lights to 50 percent",
+                "living room lights",
+                50.0,
+            ),
+            ("set the bedroom lamp to 30 percent", "bedroom lamp", 30.0),
+            ("set the kitchen lights to 80", "kitchen lights", 80.0),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["action"], "set_brightness", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["value"], value, "{utterance:?}");
+        }
+
+        // Thermostats and ovens still take set_temperature.
+        let call = route("set the thermostat to 72").unwrap();
+        assert_eq!(call.arguments["action"], "set_temperature");
+        let call = route("set the oven to 400 degrees").unwrap();
+        assert_eq!(call.arguments["action"], "set_temperature");
+    }
+
+    #[test]
     fn routes_shopping_and_temperature_home_requests() {
         let call = route("Add milk and eggs to the shopping list").unwrap();
         assert_eq!(call.name, "memory_store");
@@ -5979,6 +6031,40 @@ mod tests {
 
         // No trailing label -> still the generic default (unchanged).
         let call = route("set a timer for 5 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn routes_named_timer_label_between_for_and_duration() {
+        // "timer for <label> for <duration>" — the label sits between the first
+        // "for" and the duration's own "for". Only the mirrored duration-first
+        // order recovered a label; this order dropped it to the generic "timer".
+        let call = route("set a timer for the pasta for 5 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "pasta");
+
+        let call = route("start a timer for the laundry for 45 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 2700);
+        assert_eq!(call.arguments["label"], "laundry");
+
+        // Article-less label and a spoken duration.
+        let call = route("set a timer for homework for twenty minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 1200);
+        assert_eq!(call.arguments["label"], "homework");
+
+        // A trailing "please" stays out of the duration-first label window.
+        let call = route("set a timer for the tea for 3 minutes please").unwrap();
+        assert_eq!(call.arguments["seconds"], 180);
+        assert_eq!(call.arguments["label"], "tea");
+
+        // The mirrored duration-first order is unchanged.
+        let call = route("set a timer for 5 minutes for the pasta").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "pasta");
+
+        // No label anywhere -> still the generic default (unchanged).
+        let call = route("set a timer for 10 minutes").unwrap();
         assert_eq!(call.arguments["label"], "timer");
     }
 
