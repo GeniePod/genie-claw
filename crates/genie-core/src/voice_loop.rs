@@ -1252,7 +1252,17 @@ pub struct ProcessTranscriptInputs<'a> {
 /// `"http:dana"`). An unresolved speaker collapses to `"voice:unknown"` so the
 /// shared-device turns still enroll as one bounded session.
 fn voice_session_key(speaker_name: Option<&str>) -> String {
-    format!("voice:{}", speaker_name.unwrap_or("unknown"))
+    // Normalize exactly like `channel::session_key`: trim, treat a blank name as
+    // unresolved, and lowercase. An enrolled voice profile keeps the name as the
+    // operator typed it ("Dana"), so without this the same speaker keys as
+    // `voice:Dana` here but `http:dana` on the HTTP path, and any case
+    // difference opens a second per-speaker session and history under one
+    // person.
+    let name = speaker_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown");
+    format!("voice:{}", name.to_ascii_lowercase())
 }
 
 fn voice_session_now_ms() -> i64 {
@@ -1657,6 +1667,19 @@ mod tests {
         assert_eq!(voice_session_key(Some("dana")), "voice:dana");
         // An unresolved speaker collapses to one shared-device session.
         assert_eq!(voice_session_key(None), "voice:unknown");
+    }
+
+    #[test]
+    fn voice_session_key_normalizes_like_the_channel_convention() {
+        // channel::session_key trims and lowercases the speaker name, and an
+        // enrolled profile stores the name as typed ("Dana"), so the voice key
+        // must normalize the same way or one speaker gets two per-speaker
+        // sessions and split conversation histories.
+        assert_eq!(voice_session_key(Some("Dana")), "voice:dana");
+        assert_eq!(voice_session_key(Some(" dana ")), "voice:dana");
+        assert_eq!(voice_session_key(Some("DANA")), "voice:dana");
+        // A blank name is not a resolved speaker; collapse to the shared key.
+        assert_eq!(voice_session_key(Some("   ")), "voice:unknown");
     }
 
     #[test]

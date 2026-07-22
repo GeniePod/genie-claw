@@ -1163,17 +1163,14 @@ fn household_rule_store_request(text: &str) -> Option<String> {
 
 fn health_log_store_request(text: &str) -> Option<(&'static str, String)> {
     if text.starts_with("log that i drank ") && text.contains("water") {
-        let amount = text
-            .trim_start_matches("log that i drank ")
-            .trim_end_matches(" of water")
-            .trim_end_matches(" water")
-            .trim();
-        let content = if amount.is_empty() {
-            "hydration log: drank water".into()
-        } else {
-            format!("hydration log: drank {amount} of water")
-        };
-        return Some(("health_tracker", content));
+        // Preserve the spoken drank-phrase verbatim. The previous code stripped
+        // a trailing "water"/" of water" and re-appended " of water", which
+        // mangled anything that was not exactly "<quantity> of water": a bare
+        // "water" became "water of water", and "<descriptor> water" (e.g. "cold
+        // water") became "cold of water". Echoing the phrase yields the same
+        // output for the "<quantity> of water" forms and fixes the rest.
+        let drank = text.trim_start_matches("log that i drank ").trim();
+        return Some(("health_tracker", format!("hydration log: drank {drank}")));
     }
     if text == "log my weight"
         || text == "log my weight today"
@@ -2516,23 +2513,27 @@ fn home_status_target(text: &str) -> Option<String> {
         );
     }
 
-    if contains_any(
-        &target,
-        &[
-            "cover",
-            "covers",
-            "blind",
-            "blinds",
-            "shade",
-            "shades",
-            "curtain",
-            "curtains",
-            "garage",
-            "garage door",
-            "gate",
-            "front gate",
-        ],
-    ) {
+    // Match the cover/gate tokens as whole words, not substrings: a bare
+    // `contains_any` fired on "investi[gate]" / "navi[gate]" and "[cover]age",
+    // so "what should we investigate" misrouted to home_status with a garbled
+    // "should we investigate" entity. Mirrors the ice/iron/cooktop whole-word
+    // fixes above. The multi-word "garage door" / "front gate" entries are
+    // redundant once "garage"/"gate" match as words, and are dropped.
+    if target.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "cover"
+                | "covers"
+                | "blind"
+                | "blinds"
+                | "shade"
+                | "shades"
+                | "curtain"
+                | "curtains"
+                | "garage"
+                | "gate"
+        )
+    }) {
         return Some(if target.split_whitespace().count() == 1 {
             "covers".into()
         } else {
@@ -4450,6 +4451,40 @@ mod tests {
     }
 
     #[test]
+    fn hydration_log_preserves_drank_phrase() {
+        // The strip-and-re-append logic turned a bare "water" into "water of
+        // water" and "<descriptor> water" into "<descriptor> of water".
+        for (utterance, content) in [
+            ("Log that I drank water", "hydration log: drank water"),
+            (
+                "Log that I drank cold water",
+                "hydration log: drank cold water",
+            ),
+            (
+                "Log that I drank sparkling water",
+                "hydration log: drank sparkling water",
+            ),
+            // Quantity forms are unchanged from before the fix.
+            (
+                "Log that I drank 2 glasses of water",
+                "hydration log: drank 2 glasses of water",
+            ),
+            (
+                "Log that I drank a bottle of water",
+                "hydration log: drank a bottle of water",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "memory_store", "{utterance:?}");
+            assert_eq!(
+                call.arguments["category"], "health_tracker",
+                "{utterance:?}"
+            );
+            assert_eq!(call.arguments["content"], content, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_shopping_and_temperature_home_requests() {
         let call = route("Add milk and eggs to the shopping list").unwrap();
         assert_eq!(call.name, "memory_store");
@@ -5337,6 +5372,36 @@ mod tests {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "home_status", "{utterance:?}");
             assert_eq!(call.arguments["entity"], "stove", "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn cover_and_gate_status_match_whole_words_not_substrings() {
+        // The cover/blinds branch matched its tokens with a substring
+        // `contains_any`, so "investi[gate]" / "navi[gate]" and "[cover]age"
+        // misrouted to home_status with a garbled multi-word entity (e.g.
+        // "should we investigate") instead of abstaining.
+        for utterance in [
+            "what should we investigate",
+            "what should we navigate to",
+            "what is the coverage like",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain, not resolve to a garbled cover/gate status entity"
+            );
+        }
+
+        // Genuine cover/gate/garage queries still resolve.
+        for (utterance, entity) in [
+            ("are the blinds closed", "covers"),
+            ("are the curtains open", "covers"),
+            ("is the front gate closed", "front gate"),
+            ("is the garage door open", "garage door"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
         }
     }
 
