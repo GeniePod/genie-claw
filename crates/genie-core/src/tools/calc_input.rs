@@ -78,14 +78,21 @@ fn match_decimal_fold_at(tokens: &[&str], start: usize) -> Option<(usize, String
 
     let point_idx = start + point_rel;
     let frac_token = tokens.get(point_idx + 1)?;
-    let frac_digit = parse_single_digit_word(frac_token).or_else(|| {
-        is_digits(frac_token)
-            .then(|| frac_token.parse::<u64>().ok())
-            .flatten()
-    })?;
+    // Keep the fractional part exactly as written so a leading zero survives:
+    // "3 point 05" must fold to "3.05", not "3.5". A spoken single-digit word
+    // ("five") becomes its digit; a digit run ("05", "25") is preserved verbatim.
+    // Round-tripping the token through a `u64` (as before) parsed "05" as 5 and
+    // silently dropped the leading zero.
+    let frac_str: String = if let Some(word) = parse_single_digit_word(frac_token) {
+        word.to_string()
+    } else if is_digits(frac_token) {
+        (*frac_token).to_string()
+    } else {
+        return None;
+    };
 
     let int_val = if point_idx == start + 1 && is_digits(tokens[start]) {
-        tokens[start].parse().ok()?
+        tokens[start].parse::<u64>().ok()?
     } else if let Some((value, end)) = super::number_words::parse_spoken_number(tokens, start)
         && end == point_idx
     {
@@ -95,7 +102,7 @@ fn match_decimal_fold_at(tokens: &[&str], start: usize) -> Option<(usize, String
     };
 
     let consumed = point_idx + 2 - start;
-    Some((consumed, format!("{int_val}.{frac_digit}")))
+    Some((consumed, format!("{int_val}.{frac_str}")))
 }
 
 fn parse_single_digit_word(token: &str) -> Option<u64> {
