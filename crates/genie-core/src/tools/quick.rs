@@ -2048,13 +2048,16 @@ fn is_light_entity(entity: &str) -> bool {
 /// <value>" is a set_temperature rather than an abstain. Matched at the word
 /// level so short tokens like "ac" don't substring-match unrelated names.
 fn is_temperature_entity(entity: &str) -> bool {
-    entity.split_whitespace().any(|word| {
+    let words: Vec<&str> = entity.split_whitespace().collect();
+    words.iter().any(|word| {
         matches!(
-            word,
+            *word,
             "thermostat"
                 | "thermostats"
                 | "temperature"
+                | "temperatures"
                 | "temp"
+                | "temps"
                 | "climate"
                 | "oven"
                 | "ovens"
@@ -2063,14 +2066,26 @@ fn is_temperature_entity(entity: &str) -> bool {
                 | "heaters"
                 | "heating"
                 | "furnace"
+                | "furnaces"
                 | "kettle"
+                | "kettles"
                 | "boiler"
+                | "boilers"
                 | "radiator"
+                | "radiators"
                 | "grill"
+                | "grills"
                 | "smoker"
+                | "smokers"
+                // Air conditioner: the "ac"/"acs" short form and the spelled-out
+                // "conditioner"/"conditioning" word (the "air" is a separate token).
                 | "ac"
+                | "acs"
+                | "conditioner"
+                | "conditioners"
+                | "conditioning"
         )
-    }) || contains_any(entity, &["air condition", "sous vide"])
+    }) || words.windows(2).any(|pair| pair == ["sous", "vide"])
 }
 
 fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
@@ -4635,10 +4650,9 @@ mod tests {
             "set the brightness to 75",
         ] {
             assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain (no deterministic set-to-N action), got {:?}",
                 route(utterance)
-                    .is_none_or(|c| c.arguments.get("action")
-                        != Some(&serde_json::json!("set_temperature"))),
-                "{utterance:?} must not emit set_temperature"
             );
         }
 
