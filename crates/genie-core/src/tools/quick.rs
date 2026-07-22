@@ -1943,7 +1943,16 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
         .or_else(|| text.strip_prefix("preheat "))
         && let Some((entity, value)) = parse_temperature_target(rest)
     {
-        return Some((entity, "set_temperature", Some(value)));
+        // A numeric setpoint on a light is brightness, not temperature: "set the
+        // living room lights to 50 percent" is a set_brightness{value:50}, not a
+        // set_temperature that would try to set a light's (nonexistent)
+        // temperature. Thermostats/ovens keep set_temperature.
+        let action = if is_light_entity(&entity) {
+            "set_brightness"
+        } else {
+            "set_temperature"
+        };
+        return Some((entity, action, Some(value)));
     }
 
     None
@@ -2024,6 +2033,12 @@ fn clean_control_entity(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Whether an entity name refers to a light, so a numeric setpoint is read as
+/// brightness rather than temperature.
+fn is_light_entity(entity: &str) -> bool {
+    contains_any(entity, &["light", "lights", "lamp", "lamps"])
 }
 
 fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
@@ -2450,7 +2465,22 @@ fn home_status_target(text: &str) -> Option<String> {
     // "env[iron]ment" and "[iron]ic", so "is the environment safe" misrouted to
     // home_status "iron" instead of abstaining. Mirrors the ice/icy whole-word
     // fix below.
-    if text.split_whitespace().any(|word| word == "iron") {
+    //
+    // "iron" is also a household *verb*, and this check runs before the
+    // status-query gate (it must: "did i leave the iron on" carries no gate
+    // prefix), so keying on the word alone hijacked every verb use —
+    // "remind me to iron my shirt", "did i iron my shirt", "what should i iron".
+    // Key on the *appliance noun phrase* instead: the device is "the iron" / "my
+    // iron", and a verb use never places a determiner immediately before the
+    // word ("to iron", "i iron", "tailor iron ..."). Still require a
+    // status-question shape (the standard gate, plus the "did ..." form the gate
+    // prefixes do not cover) so only questions about the appliance resolve here.
+    let names_the_iron_appliance = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| matches!(pair[0], "the" | "my") && pair[1] == "iron");
+    if names_the_iron_appliance && (looks_like_status_query(text) || text.starts_with("did ")) {
         return Some("iron".into());
     }
 
@@ -2732,6 +2762,16 @@ fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> 
     if parse_duration(rest).is_some() {
         if let Some(for_pos) = rest.iter().position(|token| *token == "for") {
             let label_tokens = &rest[for_pos + 1..];
+            if !label_tokens.is_empty() && parse_duration(label_tokens).is_none() {
+                return clean_timer_label(label_tokens);
+            }
+            // Mirrored order: `"timer for the pasta for 5 minutes"` puts the
+            // label *before* the duration's own `for`. The check above only
+            // looked after it, so this equally natural phrasing dropped its
+            // label to the generic "timer". The duration guard keeps a plain
+            // `"timer for 5 minutes"` (label window would be the duration
+            // itself) on the generic default.
+            let label_tokens = &rest[..for_pos];
             if !label_tokens.is_empty() && parse_duration(label_tokens).is_none() {
                 return clean_timer_label(label_tokens);
             }
@@ -4525,6 +4565,33 @@ mod tests {
     }
 
     #[test]
+    fn set_lights_to_a_percent_routes_to_brightness_not_temperature() {
+        // A numeric setpoint on a light is brightness, not temperature — routing
+        // it to set_temperature would try to set a light's temperature.
+        for (utterance, entity, value) in [
+            (
+                "set the living room lights to 50 percent",
+                "living room lights",
+                50.0,
+            ),
+            ("set the bedroom lamp to 30 percent", "bedroom lamp", 30.0),
+            ("set the kitchen lights to 80", "kitchen lights", 80.0),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["action"], "set_brightness", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["value"], value, "{utterance:?}");
+        }
+
+        // Thermostats and ovens still take set_temperature.
+        let call = route("set the thermostat to 72").unwrap();
+        assert_eq!(call.arguments["action"], "set_temperature");
+        let call = route("set the oven to 400 degrees").unwrap();
+        assert_eq!(call.arguments["action"], "set_temperature");
+    }
+
+    #[test]
     fn routes_shopping_and_temperature_home_requests() {
         let call = route("Add milk and eggs to the shopping list").unwrap();
         assert_eq!(call.name, "memory_store");
@@ -5395,6 +5462,44 @@ mod tests {
     }
 
     #[test]
+    fn iron_verb_uses_do_not_report_iron_status() {
+        // "iron" is also a household *verb*. The appliance check runs before the
+        // status-query gate, so keying on the bare word reported home_status
+        // "iron" for verb uses when nobody asked about the appliance — including
+        // the "did i iron ..." / "what should i iron" forms that still slip past
+        // a status-shape gate because they *are* question-shaped.
+        for utterance in [
+            "remind me to iron my shirt",
+            "i need to iron my pants for tomorrow",
+            "how do i iron a silk shirt",
+            "did i iron my shirt",
+            "did the tailor iron my shirt",
+            "what should i iron",
+        ] {
+            // Assert the router does not route to home_status at all (not merely
+            // to a non-"iron" entity), so the abstention requirement is enforced.
+            assert!(
+                route(utterance)
+                    .map(|c| c.name != "home_status")
+                    .unwrap_or(true),
+                "{utterance:?} must not route to home_status"
+            );
+        }
+
+        // Genuine status questions about the appliance still resolve, including
+        // the "did ..." form the standard gate prefixes do not cover.
+        for utterance in [
+            "is the iron on",
+            "did i leave the iron on",
+            "check the iron",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "iron", "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn cooktop_status_matches_whole_words_not_substrings() {
         // "stove"/"burner"/"oven" were matched as substrings, so "pr[oven]" and
         // "w[oven]" misrouted to home_status "stove" instead of abstaining.
@@ -5926,6 +6031,40 @@ mod tests {
 
         // No trailing label -> still the generic default (unchanged).
         let call = route("set a timer for 5 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn routes_named_timer_label_between_for_and_duration() {
+        // "timer for <label> for <duration>" — the label sits between the first
+        // "for" and the duration's own "for". Only the mirrored duration-first
+        // order recovered a label; this order dropped it to the generic "timer".
+        let call = route("set a timer for the pasta for 5 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "pasta");
+
+        let call = route("start a timer for the laundry for 45 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 2700);
+        assert_eq!(call.arguments["label"], "laundry");
+
+        // Article-less label and a spoken duration.
+        let call = route("set a timer for homework for twenty minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 1200);
+        assert_eq!(call.arguments["label"], "homework");
+
+        // A trailing "please" stays out of the duration-first label window.
+        let call = route("set a timer for the tea for 3 minutes please").unwrap();
+        assert_eq!(call.arguments["seconds"], 180);
+        assert_eq!(call.arguments["label"], "tea");
+
+        // The mirrored duration-first order is unchanged.
+        let call = route("set a timer for 5 minutes for the pasta").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "pasta");
+
+        // No label anywhere -> still the generic default (unchanged).
+        let call = route("set a timer for 10 minutes").unwrap();
         assert_eq!(call.arguments["label"], "timer");
     }
 
