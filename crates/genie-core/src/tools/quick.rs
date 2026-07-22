@@ -2452,15 +2452,20 @@ fn home_status_target(text: &str) -> Option<String> {
     // fix below.
     //
     // "iron" is also a household *verb*, and this check runs before the
-    // status-query gate (it must: "did i leave the iron on" has no gate
-    // prefix), so the whole-word test alone still hijacked verb uses —
-    // "remind me to iron my shirt" reported iron status instead of abstaining
-    // to the LLM. Require a status-question shape (the standard gate, plus the
-    // "did ..." form the gate prefixes do not cover) so only questions about
-    // the appliance resolve here.
-    if (looks_like_status_query(text) || text.starts_with("did "))
-        && text.split_whitespace().any(|word| word == "iron")
-    {
+    // status-query gate (it must: "did i leave the iron on" carries no gate
+    // prefix), so keying on the word alone hijacked every verb use —
+    // "remind me to iron my shirt", "did i iron my shirt", "what should i iron".
+    // Key on the *appliance noun phrase* instead: the device is "the iron" / "my
+    // iron", and a verb use never places a determiner immediately before the
+    // word ("to iron", "i iron", "tailor iron ..."). Still require a
+    // status-question shape (the standard gate, plus the "did ..." form the gate
+    // prefixes do not cover) so only questions about the appliance resolve here.
+    let names_the_iron_appliance = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| matches!(pair[0], "the" | "my") && pair[1] == "iron");
+    if names_the_iron_appliance && (looks_like_status_query(text) || text.starts_with("did ")) {
         return Some("iron".into());
     }
 
@@ -5407,19 +5412,25 @@ mod tests {
     #[test]
     fn iron_verb_uses_do_not_report_iron_status() {
         // "iron" is also a household *verb*. The appliance check runs before the
-        // status-query gate, so any utterance containing the word — including
-        // "to iron <garment>" verb uses — reported home_status "iron" when
-        // nobody asked about the appliance.
+        // status-query gate, so keying on the bare word reported home_status
+        // "iron" for verb uses when nobody asked about the appliance — including
+        // the "did i iron ..." / "what should i iron" forms that still slip past
+        // a status-shape gate because they *are* question-shaped.
         for utterance in [
             "remind me to iron my shirt",
             "i need to iron my pants for tomorrow",
             "how do i iron a silk shirt",
+            "did i iron my shirt",
+            "did the tailor iron my shirt",
+            "what should i iron",
         ] {
+            // Assert the router does not route to home_status at all (not merely
+            // to a non-"iron" entity), so the abstention requirement is enforced.
             assert!(
                 route(utterance)
-                    .map(|c| c.arguments.get("entity").and_then(|e| e.as_str()) != Some("iron"))
+                    .map(|c| c.name != "home_status")
                     .unwrap_or(true),
-                "{utterance:?} must not resolve to the iron status entity"
+                "{utterance:?} must not route to home_status"
             );
         }
 
