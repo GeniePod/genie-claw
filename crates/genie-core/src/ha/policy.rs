@@ -137,6 +137,11 @@ pub fn assess_home_action(action: &HomeAction) -> ActionPolicyDecision {
     let risk = match (domain, action.kind) {
         ("climate", HomeActionKind::SetTemperature) => ActionRisk::Medium,
         ("cover", HomeActionKind::Close) => ActionRisk::Medium,
+        // `cover.toggle` opens-or-closes the same physical barrier as
+        // `open`/`close`, so it must be at least as sensitive as a `close`
+        // (Medium); otherwise a toggle silently skips the confirmation both
+        // `open` (High, above) and `close` (Medium) require.
+        ("cover", HomeActionKind::Toggle) => ActionRisk::Medium,
         ("script", HomeActionKind::Activate) => ActionRisk::Medium,
         _ => ActionRisk::Low,
     };
@@ -288,6 +293,14 @@ mod tests {
             assess_home_action(&action("cover", HomeActionKind::Open, "Garage door", true));
         assert!(!decision.allowed);
         assert!(decision.requires_confirmation);
+    }
+
+    #[test]
+    fn cover_toggle_is_as_sensitive_as_cover_close() {
+        // A cover toggle opens-or-closes the same physical barrier, so it must
+        // require confirmation like open/close (Medium, matching close).
+        let toggle = action("cover", HomeActionKind::Toggle, "Garage door", true);
+        assert_eq!(assess_home_action(&toggle).risk, ActionRisk::Medium);
     }
 
     #[test]
