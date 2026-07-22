@@ -2449,7 +2449,11 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("stove".into());
     }
 
-    if text.contains("iron") {
+    // Match "iron" as a whole word, not a substring: a bare `contains` fired on
+    // "env[iron]ment" and "[iron]ic", so "is the environment safe" misrouted to
+    // home_status "iron" instead of abstaining. Mirrors the ice/icy whole-word
+    // fix below.
+    if text.split_whitespace().any(|word| word == "iron") {
         return Some("iron".into());
     }
 
@@ -2594,7 +2598,13 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("car".into());
     }
 
-    if target.contains("stove") || target.contains("burner") || target.contains("oven") {
+    // Match the cooktop tokens as whole words, not substrings: a bare `contains`
+    // fired on "pr[oven]" and "w[oven]", so "is the theory proven" misrouted to
+    // home_status "stove". Mirrors the ice/icy whole-word fix below.
+    if target
+        .split_whitespace()
+        .any(|word| matches!(word, "stove" | "burner" | "oven"))
+    {
         return Some("stove".into());
     }
 
@@ -5287,6 +5297,46 @@ mod tests {
                     .unwrap_or(true),
                 "{utterance:?} must not resolve to the {wrong_entity:?} status entity"
             );
+        }
+    }
+
+    #[test]
+    fn iron_status_matches_whole_words_not_substrings() {
+        // "iron" was matched as a substring, so "env[iron]ment" and "[iron]ic"
+        // misrouted to home_status "iron" instead of abstaining.
+        for utterance in ["is the environment safe", "that is ironic"] {
+            assert!(
+                route(utterance)
+                    .map(|c| c.arguments.get("entity").and_then(|e| e.as_str()) != Some("iron"))
+                    .unwrap_or(true),
+                "{utterance:?} must not resolve to the iron status entity"
+            );
+        }
+
+        // A genuine iron query still resolves.
+        let call = route("is the iron on").unwrap_or_else(|| panic!("no route for iron query"));
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "iron");
+    }
+
+    #[test]
+    fn cooktop_status_matches_whole_words_not_substrings() {
+        // "stove"/"burner"/"oven" were matched as substrings, so "pr[oven]" and
+        // "w[oven]" misrouted to home_status "stove" instead of abstaining.
+        for utterance in ["is the theory proven", "is the fabric woven"] {
+            assert!(
+                route(utterance)
+                    .map(|c| c.arguments.get("entity").and_then(|e| e.as_str()) != Some("stove"))
+                    .unwrap_or(true),
+                "{utterance:?} must not resolve to the stove status entity"
+            );
+        }
+
+        // Genuine cooktop queries still resolve.
+        for utterance in ["is the stove on", "is the back burner on"] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "stove", "{utterance:?}");
         }
     }
 

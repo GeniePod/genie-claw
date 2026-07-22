@@ -41,6 +41,34 @@ pub struct StoredMessage {
     pub speaker: Option<String>,
 }
 
+/// One message to persist inside [`ConversationStore::ensure_and_append_batch`].
+///
+/// Owned fields keep the batch movable across the `spawn_blocking` boundary
+/// without cloning into the closure after the call returns.
+#[derive(Debug, Clone)]
+pub struct BatchMessage {
+    pub role: String,
+    pub content: String,
+    pub tool_name: Option<String>,
+    pub speaker: Option<String>,
+}
+
+impl BatchMessage {
+    pub fn new(
+        role: impl Into<String>,
+        content: impl Into<String>,
+        tool_name: Option<&str>,
+        speaker: Option<&str>,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_name: tool_name.map(|s| s.to_string()),
+            speaker: speaker.map(|s| s.to_string()),
+        }
+    }
+}
+
 impl ConversationStore {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -209,12 +237,103 @@ impl ConversationStore {
         }
     }
 
+    /// Ensure a conversation exists and append `messages` in one SQLite transaction.
+    ///
+    /// Used by the quick-command path to collapse `ensure` + N `append` calls into a
+    /// single `spawn_blocking` hop and a single WAL commit — the dominant cost on
+    /// Jetson eMMC for deterministic no-LLM turns.
+    pub async fn ensure_and_append_batch(
+        &self,
+        conv_id: &str,
+        title: &str,
+        messages: Vec<BatchMessage>,
+    ) -> Result<()> {
+        let conv_id = conv_id.to_string();
+        let title = title.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let now = now_ms();
+            tx.execute(
+                "INSERT OR IGNORE INTO conversations (id, title, created_ms, updated_ms) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![conv_id, title, now, now],
+            )?;
+
+            let mut prior_user_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE conv_id = ?1 AND role = 'user'",
+                [&conv_id],
+                |row| row.get(0),
+            )?;
+            let mut title_from_first_user: Option<String> = None;
+
+            for message in &messages {
+                tx.execute(
+                    "INSERT INTO messages (conv_id, role, content, tool_name, ts_ms, speaker) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        conv_id,
+                        message.role,
+                        message.content,
+                        message.tool_name,
+                        now,
+                        message.speaker
+                    ],
+                )?;
+                if message.role == "user" {
+                    prior_user_count += 1;
+                    if prior_user_count == 1 {
+                        title_from_first_user = Some(if message.content.len() > 60 {
+                            format!("{}...", truncate_at_char_boundary(&message.content, 57))
+                        } else {
+                            message.content.clone()
+                        });
+                    }
+                }
+            }
+
+            if let Some(new_title) = title_from_first_user {
+                tx.execute(
+                    "UPDATE conversations SET title = ?1, updated_ms = ?2 WHERE id = ?3",
+                    rusqlite::params![new_title, now, conv_id],
+                )?;
+            } else if !messages.is_empty() {
+                tx.execute(
+                    "UPDATE conversations SET updated_ms = ?1 WHERE id = ?2",
+                    rusqlite::params![now, conv_id],
+                )?;
+            }
+
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Batch-append variant that logs persistence failures instead of failing the turn.
+    pub async fn ensure_and_append_batch_or_log(
+        &self,
+        conv_id: &str,
+        title: &str,
+        messages: Vec<BatchMessage>,
+    ) {
+        let message_count = messages.len();
+        if let Err(error) = self.ensure_and_append_batch(conv_id, title, messages).await {
+            tracing::error!(
+                conv_id,
+                message_count,
+                error = %error,
+                "conversation batch append failed"
+            );
+        }
+    }
+
     /// Get all messages in a conversation, including the tagged speaker (if any).
     pub async fn get_messages(&self, conv_id: &str) -> Result<Vec<StoredMessage>> {
         let conv_id = conv_id.to_string();
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT role, content, speaker FROM messages WHERE conv_id = ?1 ORDER BY ts_ms ASC",
+                "SELECT role, content, speaker FROM messages \
+                 WHERE conv_id = ?1 ORDER BY ts_ms ASC, id ASC",
             )?;
 
             let messages = stmt
@@ -660,6 +779,204 @@ mod tests {
         assert_eq!(convos.len(), 1);
         assert_eq!(convos[0].id, "telegram-123");
         assert_eq!(convos[0].title, "Telegram 123");
+    }
+
+    #[tokio::test]
+    async fn ensure_and_append_batch_persists_quick_turn_order_and_metadata() {
+        let store = temp_store();
+        let conv_id = "quick-batch-1";
+
+        store
+            .ensure_and_append_batch(
+                conv_id,
+                "New conversation",
+                vec![BatchMessage::new(
+                    "user",
+                    "what time is it?",
+                    None,
+                    Some("dana"),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let tool_json = r#"{"tool":"get_time","arguments":{}}"#;
+        store
+            .ensure_and_append_batch(
+                conv_id,
+                "New conversation",
+                vec![
+                    BatchMessage::new("assistant", tool_json, Some("get_time"), None),
+                    BatchMessage::new("system", "Tool result: 3:32 PM", None, None),
+                    BatchMessage::new("assistant", "3:32 PM", None, None),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let messages = store.get_messages(conv_id).await.unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "what time is it?");
+        assert_eq!(messages[0].speaker.as_deref(), Some("dana"));
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, tool_json);
+        assert_eq!(messages[2].role, "system");
+        assert_eq!(messages[3].role, "assistant");
+        assert_eq!(messages[3].content, "3:32 PM");
+
+        let tool_name: Option<String> = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT tool_name FROM messages WHERE conv_id = ?1 AND role = 'assistant' \
+                 ORDER BY id ASC LIMIT 1",
+                [conv_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(tool_name.as_deref(), Some("get_time"));
+
+        let convos = store.list().await.unwrap();
+        assert_eq!(convos.len(), 1);
+        assert_eq!(convos[0].title, "what time is it?");
+    }
+
+    #[tokio::test]
+    async fn ensure_and_append_batch_is_idempotent_for_conversation_row() {
+        let store = temp_store();
+        store
+            .ensure_and_append_batch(
+                "stable-id",
+                "First title",
+                vec![BatchMessage::new("user", "hello", None, None)],
+            )
+            .await
+            .unwrap();
+        store
+            .ensure_and_append_batch(
+                "stable-id",
+                "Second title ignored",
+                vec![BatchMessage::new("assistant", "hi", None, None)],
+            )
+            .await
+            .unwrap();
+
+        let convos = store.list().await.unwrap();
+        assert_eq!(convos.len(), 1);
+        assert_eq!(convos[0].id, "stable-id");
+        // First user message wins the title, not the ensure title on later batches.
+        assert_eq!(convos[0].title, "hello");
+        assert_eq!(convos[0].message_count, 2);
+    }
+
+    #[tokio::test]
+    async fn ensure_and_append_batch_rolls_back_on_failure() {
+        let store = temp_store();
+        let conv_id = "rollback-batch";
+
+        // Abort on the second message insert so the transaction must roll back
+        // both the conversation row and the first message.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_second_message AFTER INSERT ON messages
+                 WHEN (SELECT COUNT(*) FROM messages WHERE conv_id = 'rollback-batch') >= 2
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced batch failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let err = store
+            .ensure_and_append_batch(
+                conv_id,
+                "New conversation",
+                vec![
+                    BatchMessage::new("user", "should roll back", None, None),
+                    BatchMessage::new("assistant", "also roll back", None, None),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("forced batch failure"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            !conv_exists(&store, conv_id),
+            "failed batch must not leave a conversation row"
+        );
+        assert_eq!(msg_count(&store, conv_id), 0);
+    }
+
+    /// Same-millisecond batch inserts must read back in insert order via id.
+    #[tokio::test]
+    async fn get_messages_orders_same_timestamp_by_id() {
+        let store = temp_store();
+        let conv_id = "same-ts";
+        store
+            .ensure_and_append_batch(
+                conv_id,
+                "New conversation",
+                vec![
+                    BatchMessage::new("user", "one", None, None),
+                    BatchMessage::new("assistant", "two", None, None),
+                    BatchMessage::new("system", "three", None, None),
+                    BatchMessage::new("assistant", "four", None, None),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let messages = store.get_messages(conv_id).await.unwrap();
+        let contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["one", "two", "three", "four"]);
+    }
+
+    /// Batch writes must stay on spawn_blocking so concurrent tasks can interleave.
+    #[tokio::test]
+    async fn batch_appends_do_not_starve_a_concurrent_task() {
+        let store = Arc::new(temp_store());
+        let id = "batch-starvation";
+
+        let writer = {
+            let store = Arc::clone(&store);
+            let id = id.to_string();
+            tokio::spawn(async move {
+                for i in 0..100 {
+                    store
+                        .ensure_and_append_batch(
+                            &id,
+                            "New conversation",
+                            vec![BatchMessage::new(
+                                "user",
+                                format!("message number {i}"),
+                                None,
+                                None,
+                            )],
+                        )
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+
+        let interleaved = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for _ in 0..2000 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        writer.await.unwrap();
+        assert!(
+            interleaved.is_ok(),
+            "a concurrent task was starved while conversation batch writes were in flight — \
+             ConversationStore regressed to blocking the executor thread"
+        );
     }
 
     /// Direct helper coverage: the truncation must always land on a char

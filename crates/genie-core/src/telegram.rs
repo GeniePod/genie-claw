@@ -1,14 +1,17 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::process::Command;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 use zeroize::Zeroizing;
+
+use crate::channel::{Channel, ChannelKind, IncomingTurn, OutgoingResponse, serve_channel};
 
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
@@ -83,49 +86,6 @@ pub struct TelegramVoiceRuntimeConfig {
     pub max_parallel_voice: usize,
 }
 
-/// TTL after which an idle chat lock entry is eligible for eviction (issue #278).
-const CHAT_LOCK_TTL: Duration = Duration::from_secs(300);
-
-/// Per-chat serialization map with TTL-based eviction.
-///
-/// Issue #278: the original `HashMap<i64, Arc<AsyncMutex<()>>>` grew without
-/// bound for `allow_all_chats = true` deployments. Each access sweeps entries
-/// that have been idle for `CHAT_LOCK_TTL` seconds so the map stays bounded
-/// under real-world traffic patterns without requiring a background GC task.
-///
-/// The struct lives inside a `StdMutex` — all operations are synchronous (no
-/// `.await` across the lock), so a regular mutex is correct and avoids the
-/// async-mutex-inside-sync-mutex hazard.
-struct ChatLocks {
-    inner: HashMap<i64, (Arc<AsyncMutex<()>>, Instant)>,
-}
-
-impl ChatLocks {
-    fn new() -> Self {
-        Self {
-            inner: HashMap::new(),
-        }
-    }
-
-    /// Return (creating if absent) the per-chat mutex, updating last-access
-    /// time. Sweeps expired entries before inserting to keep the map bounded.
-    fn get(&mut self, chat_id: i64) -> Arc<AsyncMutex<()>> {
-        let now = Instant::now();
-        self.inner
-            .retain(|_, (_, last_seen)| now.duration_since(*last_seen) < CHAT_LOCK_TTL);
-        let (mutex, last_seen) = self
-            .inner
-            .entry(chat_id)
-            .or_insert_with(|| (Arc::new(AsyncMutex::new(())), now));
-        *last_seen = now;
-        mutex.clone()
-    }
-
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
 pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
     let client = Client::builder()
         .user_agent("GenieClaw/1.0")
@@ -144,29 +104,79 @@ pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
         }
     };
 
-    // Issue #77 / #278: spawn each update so a slow voice pipeline does not
-    // block unrelated chats. `TelegramApi` is `Send + Sync` behind `Arc`;
-    // per-chat ordering is preserved by a `chat_id` keyed mutex inside
-    // `handle_update`. Issue #278: acquire an update permit *before* spawning
-    // so total in-flight tasks are bounded — back-pressure is applied in the
-    // poll loop rather than inside the spawned task, which means we stop
-    // draining `getUpdates` until capacity is available.
+    // Issue #701: drive each chat through `serve_channel`. The poll loop is a
+    // dispatcher — it routes every message to that chat's `mpsc` inbox, spawning
+    // one `serve_channel` driver task per chat on first sight. A single driver
+    // per chat processes its turns sequentially (so replies keep Telegram's
+    // delivery order, issue #77), while different chats run on separate tasks in
+    // parallel. This replaces the per-chat `chat_id`-keyed mutex. Backpressure
+    // (#278) is applied per *turn* inside the handler (an `update_permits`
+    // permit is held only across `chat_core`, not pinned to a long-lived driver),
+    // and voice STT stays bounded by `voice_permits` inside `handle_voice_message`.
+    let mut drivers: HashMap<i64, mpsc::Sender<TelegramMessage>> = HashMap::new();
     loop {
         match api.get_updates(offset).await {
             Ok(updates) => {
                 for update in updates {
                     offset = offset.max(update.update_id.saturating_add(1));
-                    let permit = Arc::clone(&api.update_permits)
-                        .acquire_owned()
-                        .await
-                        .context("telegram update permit semaphore closed unexpectedly")?;
-                    let api2 = Arc::clone(&api);
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        if let Err(e) = api2.handle_update(update).await {
-                            tracing::warn!(error = %e, "telegram update handling failed");
+                    let Some(message) = update.message else {
+                        continue;
+                    };
+                    if message
+                        .from
+                        .as_ref()
+                        .and_then(|u| u.is_bot)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let chat_id = message.chat.id;
+                    if !api.chat_allowed(chat_id) {
+                        // Unauthorized chats ack immediately without spinning up a
+                        // driver, so a flood can't squat on a task slot.
+                        let _ = api
+                            .send_text(chat_id, "This chat is not authorized for GenieClaw.")
+                            .await;
+                        continue;
+                    }
+                    let sender = match drivers.get(&chat_id) {
+                        Some(tx) if !tx.is_closed() => tx.clone(),
+                        _ => {
+                            let (tx, rx) = mpsc::channel::<TelegramMessage>(64);
+                            let api2 = Arc::clone(&api);
+                            tokio::spawn(async move {
+                                let mut channel = TelegramChatChannel {
+                                    chat_id,
+                                    api: Arc::clone(&api2),
+                                    inbox: rx,
+                                };
+                                let result = serve_channel(&mut channel, |turn: IncomingTurn| {
+                                    let api3 = Arc::clone(&api2);
+                                    async move {
+                                        // Per-turn backpressure (#278): hold an update
+                                        // permit only across the core call.
+                                        let _permit =
+                                            api3.update_permits.acquire().await.context(
+                                                "telegram update permit semaphore closed",
+                                            )?;
+                                        let reply = api3.chat_core(chat_id, &turn.text).await?;
+                                        Ok(OutgoingResponse::new(reply, turn.session_id))
+                                    }
+                                })
+                                .await;
+                                if let Err(e) = result {
+                                    tracing::warn!(chat_id, error = %e, "telegram chat driver ended");
+                                }
+                            });
+                            drivers.insert(chat_id, tx.clone());
+                            tx
                         }
-                    });
+                    };
+                    if sender.send(message).await.is_err() {
+                        // The driver exited between the check and the send; drop the
+                        // stale sender so the next message spawns a fresh driver.
+                        drivers.remove(&chat_id);
+                    }
                 }
             }
             Err(e) => {
@@ -174,6 +184,66 @@ pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
+    }
+}
+
+/// A single Telegram chat as a [`Channel`] (#701). The poll-loop dispatcher owns
+/// the `getUpdates` stream and feeds this chat's messages in over `inbox`;
+/// `serve_channel` drives `recv -> handle -> send` for just this chat, so its
+/// turns are serialized (reply order matches delivery) while other chats run on
+/// their own driver tasks in parallel.
+struct TelegramChatChannel {
+    chat_id: i64,
+    api: Arc<TelegramApi>,
+    inbox: mpsc::Receiver<TelegramMessage>,
+}
+
+#[async_trait]
+impl Channel for TelegramChatChannel {
+    fn kind(&self) -> ChannelKind {
+        ChannelKind::Telegram
+    }
+
+    async fn recv(&mut self) -> Option<IncomingTurn> {
+        while let Some(message) = self.inbox.recv().await {
+            // Voice/audio is transport I/O owned by the channel: it is downloaded,
+            // transcribed (bounded by `voice_permits`), answered, and replied to
+            // fully here — sequentially per chat so ordering holds — then we wait
+            // for the next message. Only text becomes a `serve_channel` turn.
+            if let Some(voice) = message.voice.as_ref().or(message.audio.as_ref()) {
+                if let Err(e) = self.api.handle_voice_message(self.chat_id, voice).await {
+                    tracing::warn!(chat_id = self.chat_id, error = %e, "telegram voice handling failed");
+                }
+                continue;
+            }
+            let Some(text) = message
+                .text
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            else {
+                let _ = self
+                    .api
+                    .send_text(self.chat_id, "Telegram v1 supports text messages only.")
+                    .await;
+                continue;
+            };
+            let normalized = strip_bot_mention(text);
+            let normalized = normalized.trim();
+            if normalized.is_empty() {
+                continue;
+            }
+            return Some(IncomingTurn::new(
+                normalized.to_string(),
+                format!("telegram-{}", self.chat_id),
+                ChannelKind::Telegram,
+            ));
+        }
+        None
+    }
+
+    async fn send(&mut self, response: OutgoingResponse) -> Result<()> {
+        self.api.send_text(self.chat_id, &response.text).await
     }
 }
 
@@ -188,12 +258,6 @@ struct TelegramApi {
     /// least `voice_permits` count so the voice inner semaphore is never the
     /// tighter outer constraint.
     update_permits: Arc<Semaphore>,
-    /// Per-chat serialization (issue #77 / #278): a single chat_id processes
-    /// its updates one at a time so reply order matches Telegram's delivery
-    /// order, while different chat_ids run in parallel. Entries idle for
-    /// longer than `CHAT_LOCK_TTL` are evicted on the next access so the map
-    /// stays bounded for `allow_all_chats = true` deployments.
-    chat_locks: StdMutex<ChatLocks>,
 }
 
 impl TelegramApi {
@@ -208,17 +272,7 @@ impl TelegramApi {
             config,
             voice_permits: Arc::new(Semaphore::new(voice_slots)),
             update_permits: Arc::new(Semaphore::new(update_slots)),
-            chat_locks: StdMutex::new(ChatLocks::new()),
         }
-    }
-
-    /// Returns (creating if necessary) the per-chat serialization mutex,
-    /// updating the entry's last-access timestamp for TTL eviction.
-    /// Keeping the map under a `std::sync::Mutex` is correct because the
-    /// critical section is purely synchronous — no `.await` is held across it.
-    fn chat_lock(&self, chat_id: i64) -> Arc<AsyncMutex<()>> {
-        let mut locks = self.chat_locks.lock().unwrap_or_else(|e| e.into_inner());
-        locks.get(chat_id)
     }
 
     async fn bootstrap_offset(&self) -> Result<i64> {
@@ -284,66 +338,6 @@ impl TelegramApi {
         }
 
         Ok(resp.result.unwrap_or_default())
-    }
-
-    async fn handle_update(&self, update: TelegramUpdate) -> Result<()> {
-        let Some(message) = update.message else {
-            return Ok(());
-        };
-
-        if message
-            .from
-            .as_ref()
-            .and_then(|u| u.is_bot)
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        let chat_id = message.chat.id;
-        if !self.chat_allowed(chat_id) {
-            // Unauthorized chats ack immediately; skip the per-chat lock so
-            // a flood of unauthorized traffic doesn't squat on a lock slot
-            // and the rejection messages run in parallel.
-            let _ = self
-                .send_text(chat_id, "This chat is not authorized for GenieClaw.")
-                .await;
-            return Ok(());
-        }
-
-        // Issue #77: serialize within a chat so the user-perceived reply
-        // order matches Telegram's delivery order. Different chats hold
-        // different locks and run in parallel.
-        let chat_lock = self.chat_lock(chat_id);
-        let _chat_guard = chat_lock.lock().await;
-
-        // Voice or audio messages (issue #42): download → transcode → STT →
-        // /api/chat → reply. The text path falls through below.
-        if let Some(voice) = message.voice.as_ref().or(message.audio.as_ref()) {
-            return self.handle_voice_message(chat_id, voice).await;
-        }
-
-        let Some(text) = message
-            .text
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        else {
-            let _ = self
-                .send_text(chat_id, "Telegram v1 supports text messages only.")
-                .await;
-            return Ok(());
-        };
-
-        let normalized = strip_bot_mention(text);
-        let normalized = normalized.trim();
-        if normalized.is_empty() {
-            return Ok(());
-        }
-
-        let core_response = self.chat_core(chat_id, normalized).await?;
-        self.send_text(chat_id, &core_response).await?;
-        Ok(())
     }
 
     async fn handle_voice_message(&self, chat_id: i64, voice: &TelegramVoice) -> Result<()> {
@@ -1112,15 +1106,16 @@ struct CoreChatResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHAT_LOCK_TTL, TELEGRAM_MAX_MESSAGE_LEN, TelegramApi, TelegramRuntimeConfig,
-        TelegramVoiceRuntimeConfig, VoiceReplyGate, clean_transcript, configured_language,
-        next_temp_nonce, split_message, strip_bot_mention, voice_reply_gate,
+        TELEGRAM_MAX_MESSAGE_LEN, TelegramApi, TelegramRuntimeConfig, TelegramVoiceRuntimeConfig,
+        VoiceReplyGate, clean_transcript, configured_language, next_temp_nonce, split_message,
+        strip_bot_mention, voice_reply_gate,
     };
     use reqwest::Client;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use tokio::sync::mpsc;
 
     fn test_api(max_parallel_voice: usize, max_parallel_updates: usize) -> TelegramApi {
         TelegramApi::new(
@@ -1269,22 +1264,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn chat_lock_is_stable_per_chat_id() {
-        // Issue #77: per-chat serialization depends on the same chat_id
-        // mapping to the same mutex across calls. Different chats must
-        // hand out distinct mutexes so they can run in parallel.
-        let api = test_api(2, 8);
-        let a1 = api.chat_lock(42);
-        let a2 = api.chat_lock(42);
-        let b = api.chat_lock(43);
-        assert!(Arc::ptr_eq(&a1, &a2), "same chat_id must reuse its mutex");
-        assert!(
-            !Arc::ptr_eq(&a1, &b),
-            "different chat_ids must get distinct mutexes so they don't serialize"
-        );
-    }
-
     #[tokio::test]
     async fn voice_permits_enforce_max_parallel() {
         // Issue #77: max_parallel_voice = 1 means only one voice pipeline
@@ -1383,46 +1362,87 @@ mod tests {
         assert!(api.update_permits.available_permits() >= 1);
     }
 
-    #[test]
-    fn chat_locks_evict_expired_entries() {
-        use super::ChatLocks;
-        use std::time::Duration;
-
-        let mut locks = ChatLocks::new();
-
-        // Insert an entry and manually back-date its timestamp so it looks expired.
-        let _m = locks.get(1);
-        assert_eq!(locks.len(), 1);
-
-        // Reach into the inner map to age the entry past the TTL.
-        {
-            let entry = locks.inner.get_mut(&1).unwrap();
-            entry.1 = std::time::Instant::now()
-                .checked_sub(CHAT_LOCK_TTL + Duration::from_secs(1))
-                .unwrap_or(std::time::Instant::now());
+    fn text_message(chat_id: i64, text: &str) -> super::TelegramMessage {
+        super::TelegramMessage {
+            chat: super::TelegramChat { id: chat_id },
+            from: None,
+            text: Some(text.to_string()),
+            voice: None,
+            audio: None,
         }
+    }
 
-        // A lookup for a *different* chat triggers the sweep and removes chat 1.
-        let _m2 = locks.get(2);
-        assert_eq!(locks.len(), 1, "expired chat 1 entry must be evicted");
-        assert!(
-            locks.inner.contains_key(&2),
-            "the newly accessed chat 2 must remain"
+    // Issue #701/#77: after the serve_channel port, each chat is driven by its
+    // own per-chat channel fed from an mpsc inbox. A single chat's turns must be
+    // yielded in the order the dispatcher enqueued them — that ordering is what
+    // preserves per-chat serialization once one driver task owns each chat.
+    #[tokio::test]
+    async fn telegram_chat_channel_recv_yields_text_turns_in_order() {
+        use crate::channel::Channel;
+
+        let api = Arc::new(test_api(2, 8));
+        let (tx, rx) = mpsc::channel::<super::TelegramMessage>(8);
+        let mut channel = super::TelegramChatChannel {
+            chat_id: 7,
+            api,
+            inbox: rx,
+        };
+
+        tx.send(text_message(7, "first")).await.unwrap();
+        tx.send(text_message(7, "second")).await.unwrap();
+        tx.send(text_message(7, "third")).await.unwrap();
+        // Closing the inbox makes recv() drain the queue and then return None,
+        // which is how a driver task learns its chat has no more updates.
+        drop(tx);
+
+        let mut turns = Vec::new();
+        while let Some(turn) = channel.recv().await {
+            assert_eq!(turn.session_id, "telegram-7");
+            turns.push(turn.text);
+        }
+        assert_eq!(
+            turns,
+            vec!["first", "second", "third"],
+            "a chat's turns must arrive in the order they were enqueued"
         );
     }
 
-    #[test]
-    fn chat_locks_fresh_entry_not_evicted() {
-        use super::ChatLocks;
+    // Distinct chats own distinct inboxes, so their drivers make progress
+    // independently: draining chat B never depends on chat A being drained. This
+    // is the cross-chat parallelism the dispatcher provides by handing each chat
+    // its own serve_channel driver task.
+    #[tokio::test]
+    async fn distinct_chats_have_independent_inboxes() {
+        use crate::channel::Channel;
 
-        let mut locks = ChatLocks::new();
-        let _m1 = locks.get(10);
-        let _m2 = locks.get(20);
-        assert_eq!(
-            locks.len(),
-            2,
-            "recently accessed entries must not be evicted"
+        let api = Arc::new(test_api(2, 8));
+        let (tx_a, rx_a) = mpsc::channel::<super::TelegramMessage>(8);
+        let (tx_b, rx_b) = mpsc::channel::<super::TelegramMessage>(8);
+        let mut chat_a = super::TelegramChatChannel {
+            chat_id: 1,
+            api: Arc::clone(&api),
+            inbox: rx_a,
+        };
+        let mut chat_b = super::TelegramChatChannel {
+            chat_id: 2,
+            api,
+            inbox: rx_b,
+        };
+
+        // Feed only chat B, then close both. Chat A yields nothing immediately;
+        // chat B still drains its own turn regardless of A's empty inbox.
+        tx_b.send(text_message(2, "hello b")).await.unwrap();
+        drop(tx_a);
+        drop(tx_b);
+
+        assert!(
+            chat_a.recv().await.is_none(),
+            "chat A has no updates and must not block on chat B"
         );
+        let b_turn = chat_b.recv().await.expect("chat B has one queued turn");
+        assert_eq!(b_turn.session_id, "telegram-2");
+        assert_eq!(b_turn.text, "hello b");
+        assert!(chat_b.recv().await.is_none(), "chat B inbox now closed");
     }
 
     /// Regression for #617: the piper/ffmpeg/whisper-cli calls in this file
