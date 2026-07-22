@@ -5741,10 +5741,16 @@ mod tests {
         assert_eq!(call.arguments["entity"], "thermostat");
         assert_eq!(call.arguments["action"], "set_temperature");
 
-        // A room after "in [the]" is not a schedule — it still resolves.
+        // A room after "in [the]" is not a schedule — it still resolves and
+        // actuates the setpoint now (the guard only fires on a time expression).
+        // In this path the trailing "in the den" is not folded into the entity —
+        // parse_temperature_target extracts the numeric setpoint from the value
+        // clause, so the entity stays "thermostat" and the value is 68.
         let call = route("set the thermostat to 68 in the den").unwrap();
         assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "thermostat");
         assert_eq!(call.arguments["action"], "set_temperature");
+        assert_eq!(call.arguments["value"], 68);
     }
 
     #[test]
