@@ -22,12 +22,14 @@ home_runtime_boundary = "transitional_adapter"  # HA provider today; target is t
 [optional_ai_provider]
 enabled = false
 provider = "open_ai_compatible"   # "open_ai_compatible", "open_ai", "anthropic", "gemini", or "custom".
+                                  # Only open_ai_compatible / open_ai are wired (HTTP/HTTPS Chat Completions).
 auth_mode = "api_key"             # "api_key" or "oauth_bearer" (OAuth access token in oauth_token_env).
-base_url = ""
+base_url = ""                     # e.g. "https://api.openai.com/v1" or "http://127.0.0.1:11434/v1"
+model = ""                        # Required when enabled — sent as the request "model" field.
 api_key_env = "GENIEPOD_AI_PROVIDER_API_KEY"
 oauth_token_env = "GENIEPOD_AI_PROVIDER_OAUTH_TOKEN"
 context_window_tokens = 4096
-allow_remote_base_url = false
+allow_remote_base_url = false     # Required for non-loopback base_url. Credential is re-checked every request.
 
 [core]
 port = 3000

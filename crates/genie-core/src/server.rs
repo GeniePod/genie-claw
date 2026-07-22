@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::channel::{IncomingTurn, incoming_turn_from_chat_json};
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
-use crate::conversation::ConversationStore;
+use crate::conversation::{BatchMessage, ConversationStore};
 use crate::llm::{
     EscalationReason, LlmBackendClient, LlmClient, LlmRequestHints, Message, OptionalProviderPlan,
     PrivacyProxyBackend, Provider, ProviderReadiness, gated_provider_for_http, may_escalate,
@@ -1032,9 +1032,17 @@ async fn handle_chat_stream(
     let conv_id = resolve_chat_conv_id(session_registry, &parsed, &turn).await;
     let tool_ctx = turn.tool_execution_context(request_origin, false);
 
-    conversations.ensure(&conv_id, "New conversation").await?;
     conversations
-        .append(&conv_id, "user", &turn.text, None, turn.speaker_name())
+        .ensure_and_append_batch(
+            &conv_id,
+            "New conversation",
+            vec![BatchMessage::new(
+                "user",
+                turn.text.as_str(),
+                None,
+                turn.speaker_name(),
+            )],
+        )
         .await?;
 
     if let Some(call) = crate::tools::quick::route_for_available_tools(
@@ -1323,9 +1331,17 @@ pub async fn process_chat_turn(
     request_origin: RequestOrigin,
     privacy_proxy: Option<&PrivacyProxyConfig>,
 ) -> Result<ChatTurnResult> {
-    conversations.ensure(conv_id, "New conversation").await?;
     conversations
-        .append(conv_id, "user", &turn.text, None, turn.speaker_name())
+        .ensure_and_append_batch(
+            conv_id,
+            "New conversation",
+            vec![BatchMessage::new(
+                "user",
+                turn.text.as_str(),
+                None,
+                turn.speaker_name(),
+            )],
+        )
         .await?;
 
     let tool_ctx = turn.tool_execution_context(request_origin, false);
@@ -1545,24 +1561,6 @@ async fn finalize_direct_tool_turn(
         "arguments": call.arguments,
     })
     .to_string();
-    conversations
-        .append_or_log(
-            conv_id,
-            "assistant",
-            &tool_json,
-            Some(&tool_result.tool),
-            None,
-        )
-        .await;
-    conversations
-        .append_or_log(
-            conv_id,
-            "system",
-            &format!("Tool result: {}", tool_result.output),
-            None,
-            None,
-        )
-        .await;
 
     let response = if tool_result.success {
         tool_result.output.clone()
@@ -1571,7 +1569,20 @@ async fn finalize_direct_tool_turn(
     };
     let sanitized = crate::security::sandbox::sanitize_output(&response);
     conversations
-        .append_or_log(conv_id, "assistant", &sanitized, None, None)
+        .ensure_and_append_batch_or_log(
+            conv_id,
+            "New conversation",
+            vec![
+                BatchMessage::new("assistant", tool_json, Some(&tool_result.tool), None),
+                BatchMessage::new(
+                    "system",
+                    format!("Tool result: {}", tool_result.output),
+                    None,
+                    None,
+                ),
+                BatchMessage::new("assistant", sanitized.clone(), None, None),
+            ],
+        )
         .await;
     sanitized
 }

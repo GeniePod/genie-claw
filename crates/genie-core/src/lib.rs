@@ -80,7 +80,7 @@ pub use connectivity::{
     ConnectivityCapability, ConnectivityController, ConnectivityFrame, ConnectivityHealth,
     ConnectivityState, NullConnectivityController,
 };
-pub use conversation::ConversationStore;
+pub use conversation::{BatchMessage, ConversationStore};
 pub use ha::{HaClient, HomeAssistantProvider, HomeAutomationProvider};
 pub use llm::{LlmClient, Message};
 pub use memory::{Memory, SharedMemory};

@@ -167,7 +167,7 @@ fn classify_uart_path(path: &str) -> UartPathState {
         }
     }
 
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+    let Some(name) = resolved_device_name(path) else {
         return UartPathState::Invalid("the configured path is not a valid tty device path");
     };
 
@@ -178,9 +178,47 @@ fn classify_uart_path(path: &str) -> UartPathState {
     }
 }
 
+/// File name of the real device node behind `path`.
+///
+/// udev exposes stable aliases — `/dev/serial/by-id/...`, or a custom
+/// `SYMLINK+=` rule — as symlinks to the actual `ttyUSB*`/`ttyACM*`/`ttyTHS*`
+/// node, and they are the usual way to name a USB serial device because the
+/// `ttyUSB*` numbering is not stable across reboots. `fs::metadata` above
+/// already follows the link for the char-device check, so the name check has to
+/// resolve it too; judging the unresolved alias reported a real UART as "not a
+/// tty device". Falls back to the given path when it cannot be resolved.
+fn resolved_device_name(path: &Path) -> Option<String> {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    resolved
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|name| name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_device_name_follows_a_udev_style_symlink() {
+        // A udev alias is a symlink to the real ttyUSB*/ttyACM* node. Since the
+        // char-device check follows the link, the name check must too — judging
+        // the alias name reported a real UART as "not a tty device".
+        let dir = std::env::temp_dir().join(format!("genie-uart-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let real = dir.join("ttyUSB0");
+        std::fs::write(&real, b"").unwrap();
+        let alias = dir.join("usb-Espressif_USB_JTAG_serial_debug_unit-if00");
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        assert_eq!(resolved_device_name(&alias).as_deref(), Some("ttyUSB0"));
+        // A plain (non-symlink) path still reports its own name.
+        assert_eq!(resolved_device_name(&real).as_deref(), Some("ttyUSB0"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn disabled_config_reports_disabled_health() {

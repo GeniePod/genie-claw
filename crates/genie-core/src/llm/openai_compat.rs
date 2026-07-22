@@ -1212,7 +1212,25 @@ fn flatten_system_into_first_user(messages: &[Message]) -> Vec<Message> {
     flattened
 }
 
-fn backend_error_message(body: &str) -> String {
+/// Serialize a generic OpenAI-compatible chat body (no `nvext` / session fields).
+pub(crate) fn serialize_generic_chat_request(
+    model: &str,
+    messages: &[Message],
+    max_tokens: Option<u32>,
+    stream: bool,
+    response_format: Option<ResponseFormat>,
+) -> Result<String> {
+    RequestProfile::generic_with_model(model).serialize_body(
+        messages,
+        max_tokens,
+        stream,
+        response_format,
+        None,
+    )
+}
+
+/// Extract a human-readable message from an OpenAI-compatible error body.
+pub(crate) fn backend_error_message(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|json| {
@@ -1229,7 +1247,7 @@ fn backend_error_message(body: &str) -> String {
         .unwrap_or_else(|| truncate_body(body))
 }
 
-fn truncate_body(body: &str) -> String {
+pub(crate) fn truncate_body(body: &str) -> String {
     const MAX_LEN: usize = 240;
     let trimmed = body.trim();
     if trimmed.len() <= MAX_LEN {

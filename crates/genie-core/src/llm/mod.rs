@@ -170,14 +170,15 @@ impl LlmClient {
                 let provider = &config.optional_ai_provider;
                 match provider.provider {
                     OptionalAiProviderKind::OpenAiCompatible | OptionalAiProviderKind::OpenAi => {
-                        Ok(
-                            Self::from_openai_compatible_url_with_bearer_token_env_and_model(
-                                provider.base_url.trim(),
-                                provider.credential_env(),
-                                provider.model.trim(),
-                                timeouts,
-                            ),
-                        )
+                        let backend = OpenAiCompatibleBackend::try_new(
+                            provider.base_url.trim(),
+                            provider.model.trim(),
+                            provider.credential_env(),
+                            timeouts,
+                        )?;
+                        Ok(Self {
+                            backend: Box::new(backend),
+                        })
                     }
                     OptionalAiProviderKind::Anthropic
                     | OptionalAiProviderKind::Gemini
