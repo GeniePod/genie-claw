@@ -442,15 +442,13 @@ impl SttEngine {
 
         // Drop page cache before CUDA allocation — NvMap needs contiguous
         // blocks. Best-effort and bounded (#617): a hung `sync` must not
-        // block transcription.
-        let mut drop_caches_cmd = Command::new("sh");
-        drop_caches_cmd
-            .args([
-                "-c",
-                "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null",
-            ])
-            .kill_on_drop(true);
-        let _ = tokio::time::timeout(DROP_CACHES_TIMEOUT, drop_caches_cmd.output()).await;
+        // block transcription. Spawned directly (no `sh -c` pipeline) so
+        // kill_on_drop actually terminates the process doing the blocking
+        // I/O, rather than a shell whose child can outlive it.
+        let mut sync_cmd = Command::new("sync");
+        sync_cmd.kill_on_drop(true);
+        let _ = tokio::time::timeout(DROP_CACHES_TIMEOUT, sync_cmd.output()).await;
+        let _ = tokio::fs::write("/proc/sys/vm/drop_caches", "3").await;
 
         let mut args = vec![
             "-m".to_string(),
