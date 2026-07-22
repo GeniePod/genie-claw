@@ -1941,21 +1941,35 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
     if let Some(rest) = text
         .strip_prefix("set ")
         .or_else(|| text.strip_prefix("preheat "))
-        && let Some((entity, value)) = parse_temperature_target(rest)
     {
-        // The action for a numeric setpoint depends on the device. A light dims
-        // (set_brightness, #813); a thermostat/oven/heater sets temperature; a
-        // "preheat …" is always a temperature. Anything else — a volume, a fan
-        // speed — has no deterministic "set to N" action (there is no set_volume
-        // etc.), so abstain and let the LLM ground it rather than emit a wrong
-        // set_temperature that would try to set, e.g., a volume's temperature.
-        if is_light_entity(&entity) {
-            return Some((entity, "set_brightness", Some(value)));
+        // A trailing "in <duration>" is a schedule, not part of the setpoint:
+        // "set the thermostat to 68 in an hour" must be grounded by the LLM
+        // (which can arm the delay), not actuated now. parse_amount reads "68"
+        // straight out of "68 in an hour", so without this guard the setpoint
+        // fires immediately and the delay is silently dropped. Mirrors the same
+        // is_time_expression guard on the turn_on/turn_off path
+        // (simple_turn_request).
+        if let Some((_, tail)) = rest.rsplit_once(" in ") {
+            let tail = tail.trim().trim_start_matches("the ").trim();
+            if is_time_expression(tail) {
+                return None;
+            }
         }
-        if text.starts_with("preheat ") || is_temperature_entity(&entity) {
-            return Some((entity, "set_temperature", Some(value)));
+        if let Some((entity, value)) = parse_temperature_target(rest) {
+            // The action for a numeric setpoint depends on the device. A light
+            // dims (set_brightness, #813); a thermostat/oven/heater sets
+            // temperature; a "preheat …" is always a temperature. Anything else —
+            // a volume, a fan speed — has no deterministic "set to N" action
+            // (there is no set_volume etc.), so abstain and let the LLM ground it
+            // rather than emit a wrong set_temperature (#827).
+            if is_light_entity(&entity) {
+                return Some((entity, "set_brightness", Some(value)));
+            }
+            if text.starts_with("preheat ") || is_temperature_entity(&entity) {
+                return Some((entity, "set_temperature", Some(value)));
+            }
+            return None;
         }
-        return None;
     }
 
     None
@@ -5701,6 +5715,36 @@ mod tests {
             assert_eq!(call.name, "home_control", "{utterance:?}");
             assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
         }
+    }
+
+    #[test]
+    fn setpoint_with_scheduled_delay_abstains_instead_of_firing_now() {
+        // "set the thermostat to 68 in an hour" is a schedule. parse_amount reads
+        // "68" straight out of "68 in an hour", so the setpoint path actuated the
+        // thermostat immediately and dropped the delay. The turn_on/turn_off path
+        // already abstains on a trailing time schedule; the setpoint path must too
+        // so the LLM can arm it.
+        for utterance in [
+            "set the thermostat to 68 in an hour",
+            "set the thermostat to 72 in 30 minutes",
+            "set the bedroom thermostat to 70 in 15 minutes",
+            "preheat the oven to 400 in an hour",
+            // Longer calendar durations are schedules too.
+            "set the thermostat to 68 in a week",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // An immediate setpoint (no trailing time) still actuates now.
+        let call = route("set the thermostat to 68").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "thermostat");
+        assert_eq!(call.arguments["action"], "set_temperature");
+
+        // A room after "in [the]" is not a schedule — it still resolves.
+        let call = route("set the thermostat to 68 in the den").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["action"], "set_temperature");
     }
 
     #[test]
