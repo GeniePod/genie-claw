@@ -2735,6 +2735,16 @@ fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> 
             if !label_tokens.is_empty() && parse_duration(label_tokens).is_none() {
                 return clean_timer_label(label_tokens);
             }
+            // Mirrored order: `"timer for the pasta for 5 minutes"` puts the
+            // label *before* the duration's own `for`. The check above only
+            // looked after it, so this equally natural phrasing dropped its
+            // label to the generic "timer". The duration guard keeps a plain
+            // `"timer for 5 minutes"` (label window would be the duration
+            // itself) on the generic default.
+            let label_tokens = &rest[..for_pos];
+            if !label_tokens.is_empty() && parse_duration(label_tokens).is_none() {
+                return clean_timer_label(label_tokens);
+            }
         }
         return None;
     }
@@ -5926,6 +5936,40 @@ mod tests {
 
         // No trailing label -> still the generic default (unchanged).
         let call = route("set a timer for 5 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn routes_named_timer_label_between_for_and_duration() {
+        // "timer for <label> for <duration>" — the label sits between the first
+        // "for" and the duration's own "for". Only the mirrored duration-first
+        // order recovered a label; this order dropped it to the generic "timer".
+        let call = route("set a timer for the pasta for 5 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "pasta");
+
+        let call = route("start a timer for the laundry for 45 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 2700);
+        assert_eq!(call.arguments["label"], "laundry");
+
+        // Article-less label and a spoken duration.
+        let call = route("set a timer for homework for twenty minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 1200);
+        assert_eq!(call.arguments["label"], "homework");
+
+        // A trailing "please" stays out of the duration-first label window.
+        let call = route("set a timer for the tea for 3 minutes please").unwrap();
+        assert_eq!(call.arguments["seconds"], 180);
+        assert_eq!(call.arguments["label"], "tea");
+
+        // The mirrored duration-first order is unchanged.
+        let call = route("set a timer for 5 minutes for the pasta").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "pasta");
+
+        // No label anywhere -> still the generic default (unchanged).
+        let call = route("set a timer for 10 minutes").unwrap();
         assert_eq!(call.arguments["label"], "timer");
     }
 
