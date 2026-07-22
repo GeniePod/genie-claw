@@ -9,7 +9,27 @@
 //! but runs AFTER recording is complete (not in the critical path).
 
 use anyhow::Result;
+use std::time::Duration;
 use tokio::process::Command;
+
+/// Deadline for Silero VAD inference — covers torch.hub cold-load on first use
+/// but still reaps a hung Python child so the voice loop can recover (#617).
+const VAD_DETECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Probe for `import torch` should be near-instant; 5s is generous.
+const VAD_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn python_output_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    label: &'static str,
+) -> Result<std::process::Output> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => anyhow::bail!("{label} timed out after {}s", timeout.as_secs()),
+    }
+}
 
 /// Detect speech segments in a WAV file using Silero VAD.
 ///
@@ -17,11 +37,11 @@ use tokio::process::Command;
 /// and the timestamp (in ms) where speech ends.
 /// If speech_end_ms < total duration, the file can be trimmed.
 pub async fn detect_speech(wav_path: &str) -> Result<(bool, u64)> {
-    let output = Command::new("python3")
-        .args([
-            "-c",
-            &format!(
-                r#"
+    let mut cmd = Command::new("python3");
+    cmd.args([
+        "-c",
+        &format!(
+            r#"
 import sys, warnings
 warnings.filterwarnings("ignore")
 try:
@@ -40,11 +60,17 @@ except Exception as e:
     print(f"ERROR {{e}}", file=sys.stderr)
     print("SILENCE")
 "#,
-                wav_path
-            ),
-        ])
-        .output()
-        .await?;
+            wav_path
+        ),
+    ]);
+
+    let output = match python_output_with_timeout(cmd, VAD_DETECT_TIMEOUT, "silero-vad").await {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::warn!(error = %e, "VAD detect_speech failed — treating as silence");
+            return Ok((false, 0));
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.trim();
@@ -108,12 +134,10 @@ pub async fn trim_wav(wav_path: &str, end_ms: u64, sample_rate: u32) -> Result<(
 
 /// Check if Silero VAD is available (torch + silero-vad installed).
 pub async fn is_available() -> bool {
-    let output = Command::new("python3")
-        .args(["-c", "import torch; print('OK')"])
-        .output()
-        .await;
+    let mut cmd = Command::new("python3");
+    cmd.args(["-c", "import torch; print('OK')"]);
 
-    match output {
+    match python_output_with_timeout(cmd, VAD_AVAILABILITY_TIMEOUT, "vad-availability").await {
         Ok(o) => String::from_utf8_lossy(&o.stdout).contains("OK"),
         Err(_) => false,
     }

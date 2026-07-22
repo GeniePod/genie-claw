@@ -751,19 +751,27 @@ async fn run_push_to_talk(
 /// on a LyraT-style setup).
 async fn detect_audio_output_device() -> Option<String> {
     const DETECT_SCRIPT: &str = "/opt/geniepod/bin/detect-audio-device.sh";
+    // Shell-out to the deploy helper must not hang boot/voice-loop start (#617).
+    const DETECT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
     if tokio::fs::metadata(DETECT_SCRIPT).await.is_ok() {
         // Pass --output so the script returns a sink-suitable device
         // (skipping LyraT/APE which our firmware leaves capture-only).
-        match Command::new(DETECT_SCRIPT).arg("--output").output().await {
-            Ok(out) if out.status.success() => {
+        let mut cmd = Command::new(DETECT_SCRIPT);
+        cmd.arg("--output").kill_on_drop(true);
+        match tokio::time::timeout(DETECT_SCRIPT_TIMEOUT, cmd.output()).await {
+            Ok(Ok(out)) if out.status.success() => {
                 let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !dev.is_empty() {
                     return Some(dev);
                 }
             }
-            Ok(_) => {}
-            Err(e) => tracing::debug!(error = %e, "detect-audio-device.sh --output failed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::debug!(error = %e, "detect-audio-device.sh --output failed"),
+            Err(_) => tracing::warn!(
+                timeout_secs = DETECT_SCRIPT_TIMEOUT.as_secs(),
+                "detect-audio-device.sh --output timed out"
+            ),
         }
     }
 
@@ -795,17 +803,26 @@ async fn detect_audio_output_device() -> Option<String> {
 /// `cargo run` without the deploy layout still detects USB devices.
 async fn detect_audio_device() -> Option<String> {
     const DETECT_SCRIPT: &str = "/opt/geniepod/bin/detect-audio-device.sh";
+    const DETECT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
     if tokio::fs::metadata(DETECT_SCRIPT).await.is_ok() {
-        match Command::new(DETECT_SCRIPT).output().await {
-            Ok(out) if out.status.success() => {
+        let mut cmd = Command::new(DETECT_SCRIPT);
+        cmd.kill_on_drop(true);
+        match tokio::time::timeout(DETECT_SCRIPT_TIMEOUT, cmd.output()).await {
+            Ok(Ok(out)) if out.status.success() => {
                 let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !dev.is_empty() {
                     return Some(dev);
                 }
             }
-            Ok(_) => {} // script exit non-zero — fall through to in-process scan
-            Err(e) => tracing::debug!(error = %e, "detect-audio-device.sh failed, falling back"),
+            Ok(Ok(_)) => {} // script exit non-zero — fall through to in-process scan
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "detect-audio-device.sh failed, falling back")
+            }
+            Err(_) => tracing::warn!(
+                timeout_secs = DETECT_SCRIPT_TIMEOUT.as_secs(),
+                "detect-audio-device.sh timed out — falling back"
+            ),
         }
     }
 
@@ -1252,7 +1269,17 @@ pub struct ProcessTranscriptInputs<'a> {
 /// `"http:dana"`). An unresolved speaker collapses to `"voice:unknown"` so the
 /// shared-device turns still enroll as one bounded session.
 fn voice_session_key(speaker_name: Option<&str>) -> String {
-    format!("voice:{}", speaker_name.unwrap_or("unknown"))
+    // Normalize exactly like `channel::session_key`: trim, treat a blank name as
+    // unresolved, and lowercase. An enrolled voice profile keeps the name as the
+    // operator typed it ("Dana"), so without this the same speaker keys as
+    // `voice:Dana` here but `http:dana` on the HTTP path, and any case
+    // difference opens a second per-speaker session and history under one
+    // person.
+    let name = speaker_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown");
+    format!("voice:{}", name.to_ascii_lowercase())
 }
 
 fn voice_session_now_ms() -> i64 {
@@ -1657,6 +1684,19 @@ mod tests {
         assert_eq!(voice_session_key(Some("dana")), "voice:dana");
         // An unresolved speaker collapses to one shared-device session.
         assert_eq!(voice_session_key(None), "voice:unknown");
+    }
+
+    #[test]
+    fn voice_session_key_normalizes_like_the_channel_convention() {
+        // channel::session_key trims and lowercases the speaker name, and an
+        // enrolled profile stores the name as typed ("Dana"), so the voice key
+        // must normalize the same way or one speaker gets two per-speaker
+        // sessions and split conversation histories.
+        assert_eq!(voice_session_key(Some("Dana")), "voice:dana");
+        assert_eq!(voice_session_key(Some(" dana ")), "voice:dana");
+        assert_eq!(voice_session_key(Some("DANA")), "voice:dana");
+        // A blank name is not a resolved speaker; collapse to the shared key.
+        assert_eq!(voice_session_key(Some("   ")), "voice:unknown");
     }
 
     #[test]
