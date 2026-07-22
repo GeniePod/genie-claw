@@ -4222,7 +4222,7 @@ mod tests {
                 )
                 .await;
                 assert!(
-                    !export_with_tok.starts_with("HTTP/1.1 403"),
+                    export_with_tok.starts_with("HTTP/1.1 404"),
                     "{export_with_tok:?}"
                 );
 
