@@ -4181,7 +4181,53 @@ mod tests {
                     "{memories_with_tok:?}"
                 );
 
-                // Non-sensitive read routes stay open without a token.
+                // Conversation transcript reads leak full household/family
+                // content, so they are token-gated like `/api/memories`.
+                let history_no_tok = http_roundtrip(
+                    port,
+                    "GET /api/chat/history HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await;
+                assert!(
+                    history_no_tok.starts_with("HTTP/1.1 403"),
+                    "{history_no_tok:?}"
+                );
+
+                let history_with_tok = http_roundtrip(
+                    port,
+                    "GET /api/chat/history HTTP/1.1\r\nHost: localhost\r\nX-Genie-Token: s3cret\r\n\r\n",
+                )
+                .await;
+                assert!(
+                    history_with_tok.starts_with("HTTP/1.1 200"),
+                    "{history_with_tok:?}"
+                );
+
+                // Export is gated by path even though it carries an `?id=` query.
+                let export_no_tok = http_roundtrip(
+                    port,
+                    "GET /api/chat/export?id=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await;
+                assert!(
+                    export_no_tok.starts_with("HTTP/1.1 403"),
+                    "{export_no_tok:?}"
+                );
+
+                // With the token the gate lets the request reach the handler
+                // (404 for the missing conversation — i.e. not gated out).
+                let export_with_tok = http_roundtrip(
+                    port,
+                    "GET /api/chat/export?id=1 HTTP/1.1\r\nHost: localhost\r\nX-Genie-Token: s3cret\r\n\r\n",
+                )
+                .await;
+                assert!(
+                    !export_with_tok.starts_with("HTTP/1.1 403"),
+                    "{export_with_tok:?}"
+                );
+
+                // The conversation *list* (metadata only) stays open without a
+                // token — deliberate carve-out preserved from #757.
                 let read = http_roundtrip(
                     port,
                     "GET /api/conversations HTTP/1.1\r\nHost: localhost\r\n\r\n",
