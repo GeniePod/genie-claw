@@ -1163,17 +1163,14 @@ fn household_rule_store_request(text: &str) -> Option<String> {
 
 fn health_log_store_request(text: &str) -> Option<(&'static str, String)> {
     if text.starts_with("log that i drank ") && text.contains("water") {
-        let amount = text
-            .trim_start_matches("log that i drank ")
-            .trim_end_matches(" of water")
-            .trim_end_matches(" water")
-            .trim();
-        let content = if amount.is_empty() {
-            "hydration log: drank water".into()
-        } else {
-            format!("hydration log: drank {amount} of water")
-        };
-        return Some(("health_tracker", content));
+        // Preserve the spoken drank-phrase verbatim. The previous code stripped
+        // a trailing "water"/" of water" and re-appended " of water", which
+        // mangled anything that was not exactly "<quantity> of water": a bare
+        // "water" became "water of water", and "<descriptor> water" (e.g. "cold
+        // water") became "cold of water". Echoing the phrase yields the same
+        // output for the "<quantity> of water" forms and fixes the rest.
+        let drank = text.trim_start_matches("log that i drank ").trim();
+        return Some(("health_tracker", format!("hydration log: drank {drank}")));
     }
     if text == "log my weight"
         || text == "log my weight today"
@@ -2859,7 +2856,17 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
 
     let location = extract_location_after_marker(text, " in ")
         .or_else(|| extract_location_after_marker(text, " for "))?;
-    if location.is_empty() || location == "today" || location == "tomorrow" {
+    // "what's the weather in the morning" / "... in an hour" names a *time*, not a
+    // place — the marker after "in"/"for" is a time expression, so there is no
+    // city to look up and the query must fall back to the default local forecast
+    // (grounded by the LLM). The rain path already guards this with
+    // is_time_expression; the general weather/forecast path only rejected the
+    // bare "today"/"tomorrow" and otherwise emitted get_weather{location:"morning"}.
+    if location.is_empty()
+        || location == "today"
+        || location == "tomorrow"
+        || is_time_expression(&location)
+    {
         return None;
     }
 
@@ -4464,6 +4471,40 @@ mod tests {
             call.arguments["content"],
             "shopping list removed: eggs, bread"
         );
+    }
+
+    #[test]
+    fn hydration_log_preserves_drank_phrase() {
+        // The strip-and-re-append logic turned a bare "water" into "water of
+        // water" and "<descriptor> water" into "<descriptor> of water".
+        for (utterance, content) in [
+            ("Log that I drank water", "hydration log: drank water"),
+            (
+                "Log that I drank cold water",
+                "hydration log: drank cold water",
+            ),
+            (
+                "Log that I drank sparkling water",
+                "hydration log: drank sparkling water",
+            ),
+            // Quantity forms are unchanged from before the fix.
+            (
+                "Log that I drank 2 glasses of water",
+                "hydration log: drank 2 glasses of water",
+            ),
+            (
+                "Log that I drank a bottle of water",
+                "hydration log: drank a bottle of water",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "memory_store", "{utterance:?}");
+            assert_eq!(
+                call.arguments["category"], "health_tracker",
+                "{utterance:?}"
+            );
+            assert_eq!(call.arguments["content"], content, "{utterance:?}");
+        }
     }
 
     #[test]
@@ -6211,6 +6252,30 @@ mod tests {
         assert_eq!(call.name, "get_weather");
         assert_eq!(call.arguments["location"], "new york");
         assert_eq!(call.arguments["forecast"], true);
+    }
+
+    #[test]
+    fn weather_time_of_day_is_not_a_location() {
+        // "what's the weather in the morning" / "... in an hour" names a time,
+        // not a place — it must abstain (default local forecast via the LLM), not
+        // emit get_weather{location:"morning"}. The rain path already guarded
+        // this; the general weather/forecast path did not.
+        for utterance in [
+            "what's the weather in the morning",
+            "what's the weather in the evening",
+            "what's the weather in an hour",
+            "what's the weather in 3 days",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} should abstain, not route a time as a place"
+            );
+        }
+
+        // A real city with a trailing time qualifier still routes to that city.
+        let call = route("what's the weather in Denver tonight").unwrap();
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["location"], "denver");
     }
 
     #[test]
