@@ -5791,6 +5791,28 @@ mod tests {
     }
 
     #[test]
+    fn routes_digit_with_magnitude_word_to_calculate() {
+        // Mixed digit + magnitude word ("100 thousand", "5 hundred") is how STT
+        // commonly renders round numbers. parse_spoken_number's digit fast-path
+        // returned on the digit and left the magnitude word behind, so "100
+        // thousand / 4" became the garbled "100 1000 / 4" instead of "100000 / 4"
+        // — the same class as the all-word garble fixed above.
+        for (utterance, expression) in [
+            ("what is 100 thousand divided by 4", "100000 / 4"),
+            ("what is 20 thousand times 2", "20000 * 2"),
+            ("what is 5 hundred plus 10", "500 + 10"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "calculate", "{utterance:?}");
+            assert_eq!(call.arguments["expression"], expression, "{utterance:?}");
+        }
+
+        // A bare digit not followed by a magnitude word is unchanged.
+        let call = route("what is 1000 divided by 4").unwrap();
+        assert_eq!(call.arguments["expression"], "1000 / 4");
+    }
+
+    #[test]
     fn routes_weather_and_home_status_before_memory_recall() {
         let call = route("Jared: Is it raining for school pickup?").unwrap();
         assert_eq!(call.name, "get_weather");
