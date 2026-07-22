@@ -2516,23 +2516,27 @@ fn home_status_target(text: &str) -> Option<String> {
         );
     }
 
-    if contains_any(
-        &target,
-        &[
-            "cover",
-            "covers",
-            "blind",
-            "blinds",
-            "shade",
-            "shades",
-            "curtain",
-            "curtains",
-            "garage",
-            "garage door",
-            "gate",
-            "front gate",
-        ],
-    ) {
+    // Match the cover/gate tokens as whole words, not substrings: a bare
+    // `contains_any` fired on "investi[gate]" / "navi[gate]" and "[cover]age",
+    // so "what should we investigate" misrouted to home_status with a garbled
+    // "should we investigate" entity. Mirrors the ice/iron/cooktop whole-word
+    // fixes above. The multi-word "garage door" / "front gate" entries are
+    // redundant once "garage"/"gate" match as words, and are dropped.
+    if target.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "cover"
+                | "covers"
+                | "blind"
+                | "blinds"
+                | "shade"
+                | "shades"
+                | "curtain"
+                | "curtains"
+                | "garage"
+                | "gate"
+        )
+    }) {
         return Some(if target.split_whitespace().count() == 1 {
             "covers".into()
         } else {
@@ -5337,6 +5341,36 @@ mod tests {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "home_status", "{utterance:?}");
             assert_eq!(call.arguments["entity"], "stove", "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn cover_and_gate_status_match_whole_words_not_substrings() {
+        // The cover/blinds branch matched its tokens with a substring
+        // `contains_any`, so "investi[gate]" / "navi[gate]" and "[cover]age"
+        // misrouted to home_status with a garbled multi-word entity (e.g.
+        // "should we investigate") instead of abstaining.
+        for utterance in [
+            "what should we investigate",
+            "what should we navigate to",
+            "what is the coverage like",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain, not resolve to a garbled cover/gate status entity"
+            );
+        }
+
+        // Genuine cover/gate/garage queries still resolve.
+        for (utterance, entity) in [
+            ("are the blinds closed", "covers"),
+            ("are the curtains open", "covers"),
+            ("is the front gate closed", "front gate"),
+            ("is the garage door open", "garage door"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
         }
     }
 
