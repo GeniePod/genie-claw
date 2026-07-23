@@ -2575,10 +2575,19 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
-    if contains_any(
-        &target,
-        &["switch", "switches", "plug", "plugs", "outlet", "outlets"],
-    ) {
+    // Match the switch/plug/outlet tokens as whole words, not substrings: a bare
+    // `contains_any` fired on "[switch]board" / "[switch]gear", "un[plug]ged" /
+    // "ear[plug]s" and "[plug]in", so "what is the switchboard status" collapsed
+    // to the whole-house "switches" readout and "is the plugin enabled" / "are
+    // the earplugs in the drawer" misrouted to a garbled home_status entity
+    // instead of abstaining. Mirrors the ice/iron/cooktop/cover/car whole-word
+    // fixes elsewhere in this function.
+    if target.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "switch" | "switches" | "plug" | "plugs" | "outlet" | "outlets"
+        )
+    }) {
         return Some(if target.split_whitespace().count() == 1 {
             "switches".into()
         } else {
@@ -5732,6 +5741,41 @@ mod tests {
             ("is the door locked", "locks"),
             ("is the side door locked", "side door"),
             ("is the garage door closed", "garage door"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn switch_and_outlet_status_match_whole_words_not_substrings() {
+        // The switch/plug/outlet branch matched its tokens with a substring
+        // `contains_any`, so "[switch]board" / "[switch]gear", "un[plug]ged" /
+        // "ear[plug]s" and "[plug]in" all fired it. "what is the switchboard
+        // status" collapsed to the whole-house "switches" readout, and the
+        // multi-word cases misrouted to a garbled home_status entity.
+        for utterance in [
+            "what is the switchboard status",
+            "is the switchgear ok",
+            "is the plugin enabled",
+            "is the toaster unplugged",
+            "are the earplugs in the drawer",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain, not resolve to a switch/plug/outlet status entity"
+            );
+        }
+
+        // Genuine switch/plug/outlet queries still resolve exactly as before.
+        for (utterance, entity) in [
+            ("are the switches on", "switches"),
+            ("is the switch on", "switches"),
+            ("are the outlets on", "switches"),
+            ("check the outlet", "switches"),
+            ("is the kitchen plug on", "kitchen plug"),
+            ("are the kitchen plugs on", "kitchen plugs"),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "home_status", "{utterance:?}");
