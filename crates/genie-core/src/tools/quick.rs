@@ -5566,12 +5566,13 @@ mod tests {
             "is the clock on",
             "is the wall clock right",
             "is the block heater on",
+            // "out[door]" collided with the door token the same way — this
+            // misrouted to home_status "outdoor cameras" on the substring path.
+            "are the outdoor cameras on",
         ] {
             assert!(
-                route(utterance)
-                    .map(|c| c.arguments.get("entity").and_then(|e| e.as_str()) != Some("locks"))
-                    .unwrap_or(true),
-                "{utterance:?} must not resolve to the locks status entity"
+                route(utterance).is_none(),
+                "{utterance:?} must abstain from deterministic routing"
             );
         }
 
