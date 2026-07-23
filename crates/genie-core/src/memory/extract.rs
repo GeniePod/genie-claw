@@ -156,17 +156,22 @@ pub fn extract_and_store(memory: &Memory, user_text: &str) -> usize {
     let mut stored = 0;
 
     for fact in facts {
-        // Skip if similar memory already exists.
-        match memory.has_similar(&fact.content) {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    content = %fact.content,
-                    "auto-capture deduplication check failed; skipping fact"
-                );
-                continue;
+        // Skip if similar memory already exists. Single-valued facts are
+        // exempt: for those a similar stored value is the one being corrected,
+        // so they fall through to `store_resolved`, which supersedes it rather
+        // than dropping the correction as a duplicate.
+        if !super::is_single_valued_fact(&fact.category, &fact.content) {
+            match memory.has_similar(&fact.content) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        content = %fact.content,
+                        "auto-capture deduplication check failed; skipping fact"
+                    );
+                    continue;
+                }
             }
         }
 
@@ -554,5 +559,45 @@ fn capitalize(s: &str) -> String {
     match chars.next() {
         None => String::new(),
         Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_memory() -> Memory {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("geniepod-extract-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        Memory::open(&dir.join("memory.db")).unwrap()
+    }
+
+    #[test]
+    fn auto_capture_stores_a_name_correction_that_shortens_the_stored_name() {
+        let mem = temp_memory();
+        extract_and_store(&mem, "my name is Dana");
+
+        // The correction shares enough substrings with "Dana" that the
+        // similarity pre-check used to drop it before `store_resolved` ran.
+        extract_and_store(&mem, "my name is Dan");
+
+        let identities = mem.get_by_kind("identity", 10).unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].content, "User's name is Dan");
+    }
+
+    #[test]
+    fn auto_capture_still_skips_an_identical_restatement() {
+        let mem = temp_memory();
+        extract_and_store(&mem, "my name is Dana");
+        let stored = extract_and_store(&mem, "my name is Dana");
+
+        assert_eq!(stored, 0);
+        assert_eq!(mem.get_by_kind("identity", 10).unwrap().len(), 1);
     }
 }
