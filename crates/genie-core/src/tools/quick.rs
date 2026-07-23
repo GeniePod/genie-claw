@@ -3685,6 +3685,21 @@ fn asks_current_time(text: &str) -> bool {
     // apostrophe-less "whats the time" this list originally stored, so it fell
     // through to the LLM. Match the normalized `what s ...` forms (and add the
     // missing date counterpart for parity with the time phrasings).
+    //
+    // The list is an exact match, so any politeness or time qualifier the caller
+    // trails defeats it entirely and a plain "what time is it right now" /
+    // "what time is it please" falls through to the LLM. Both tails are pure
+    // noise for a clock reading — "now" is what the question already asks for —
+    // so strip them first, exactly as clean_status_target strips " please" and
+    // the " right now" / " now" STATUS_SUFFIXES off a home_status entity.
+    // Politeness comes off before the time qualifier so the two compose in the
+    // natural spoken order ("what time is it right now please").
+    let text = text.trim_end_matches(" please").trim_end();
+    let text = text
+        .strip_suffix(" right now")
+        .or_else(|| text.strip_suffix(" now"))
+        .map(str::trim_end)
+        .unwrap_or(text);
     matches!(
         text,
         "what time is it"
@@ -5995,6 +6010,42 @@ mod tests {
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "get_time", "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn time_question_survives_a_trailing_please_or_time_qualifier() {
+        // asks_current_time is an exact-match set, so any politeness or time
+        // qualifier the caller trails defeated it entirely and the question fell
+        // through to the LLM — including the very common "what time is it right
+        // now". Both tails are noise for a clock reading.
+        for utterance in [
+            "What time is it right now?",
+            "What time is it now?",
+            "What time is it, please?",
+            "What's the time please?",
+            "What's the time right now?",
+            "What is the time now?",
+            "What is the date, please?",
+            "Current time please",
+            "Tell me the time please",
+            "What day is it right now?",
+            // Politeness and the time qualifier compose, in spoken order.
+            "What time is it right now please?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_time", "{utterance:?}");
+        }
+
+        // A question that only *contains* those words is still not a clock
+        // reading — the set stays an exact match after the tails come off.
+        for utterance in ["what time does the store close", "what is the time zone"] {
+            assert!(
+                route(utterance)
+                    .map(|call| call.name != "get_time")
+                    .unwrap_or(true),
+                "{utterance:?} must not route to get_time"
+            );
         }
     }
 
