@@ -10,7 +10,7 @@ pub struct DomainArea<'a> {
 /// Query words that do not pin a request to a specific place.
 const BENIGN_QUERY_TOKENS: &[&str] = &[
     "all", "the", "a", "an", "every", "any", "my", "our", "this", "that", "please", "now", "here",
-    "turn", "switch", "set", "get", "status", "of", "to", "in",
+    "turn", "switch", "set", "get", "status", "of", "to", "in", "on", "off",
 ];
 
 /// Split a free-text query into lowercase alphanumeric tokens.
@@ -105,5 +105,17 @@ mod tests {
             &entities,
             "kitchen lights"
         ));
+    }
+
+    #[test]
+    fn allows_bare_domain_command_with_on_off_particles() {
+        // "on"/"off" are command particles that leak into the entity argument
+        // just like the already-allowed "turn"/"set"/"status" -- they name no
+        // room, so a whole-home "lights off" must stay trustworthy.
+        let e = kitchen_light_home();
+        assert!(whole_home_resolution_is_trustworthy(&e, "lights off"));
+        assert!(whole_home_resolution_is_trustworthy(&e, "all lights on"));
+        // A genuine foreign room is still rejected.
+        assert!(!whole_home_resolution_is_trustworthy(&e, "bedroom lights"));
     }
 }
