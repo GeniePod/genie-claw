@@ -2618,10 +2618,16 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
-    if contains_any(
-        &target,
-        &["lock", "locks", "door lock", "door locks", "door"],
-    ) {
+    // Match the lock/door tokens as whole words, not substrings: a bare
+    // `contains_any` fired on "c[lock]" / "b[lock]" and "out[door]", so "is the
+    // clock on" misrouted to home_status "locks" instead of abstaining. Mirrors
+    // the ice/iron/cooktop/cover whole-word fixes above. The multi-word "door
+    // lock" / "door locks" entries are redundant once "lock"/"door" match as
+    // words, and are dropped.
+    if target
+        .split_whitespace()
+        .any(|word| matches!(word, "lock" | "locks" | "door" | "doors"))
+    {
         return Some(if target.split_whitespace().count() == 1 {
             "locks".into()
         } else {
@@ -5621,6 +5627,40 @@ mod tests {
             ("are the curtains open", "covers"),
             ("is the front gate closed", "front gate"),
             ("is the garage door open", "garage door"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn lock_and_door_status_match_whole_words_not_substrings() {
+        // The lock/door branch matched its tokens with a substring `contains_any`,
+        // so "c[lock]" / "b[lock]" and "out[door]" misrouted to home_status
+        // "locks" (or a garbled multi-word entity) instead of abstaining. Mirrors
+        // the ice/iron/cooktop/cover whole-word fixes.
+        for utterance in [
+            "is the clock on",
+            "is the wall clock right",
+            "is the block heater on",
+            // "out[door]" collided with the door token the same way — this
+            // misrouted to home_status "outdoor cameras" on the substring path.
+            "are the outdoor cameras on",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain from deterministic routing"
+            );
+        }
+
+        // Genuine lock/door queries still resolve: a bare token collapses to
+        // "locks", a named device keeps its full entity.
+        for (utterance, entity) in [
+            ("are the doors locked", "locks"),
+            ("is the door locked", "locks"),
+            ("is the side door locked", "side door"),
+            ("is the garage door closed", "garage door"),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "home_status", "{utterance:?}");
