@@ -1434,6 +1434,9 @@ mod tests {
             ("switch_on", Some("turn_on")),
             ("toggle", Some("toggle")),
             ("activate", Some("activate")), // distinct action, must not remap
+            // Lower layers accept activate_scene; dispatch must canonicalize it.
+            ("activate_scene", Some("activate")),
+            ("Activate Scene", Some("activate")),
             ("frobnicate", None),
         ] {
             assert_eq!(canon_home_control_action(raw), want, "action {raw:?}");
@@ -1445,6 +1448,14 @@ mod tests {
             parse_home_control_args(&args).expect("'turn off' should canonicalize and parse");
         assert_eq!(entity, "kitchen lights");
         assert_eq!(action, "turn_off");
+
+        // Regression: model-emitted activate_scene used to fail at the dispatch
+        // boundary even though home_action_kind already mapped it to Activate.
+        let args = serde_json::json!({"entity": "movie night", "action": "activate_scene"});
+        let (entity, action, _) = parse_home_control_args(&args)
+            .expect("'activate_scene' should canonicalize to activate");
+        assert_eq!(entity, "movie night");
+        assert_eq!(action, "activate");
     }
 
     #[test]
