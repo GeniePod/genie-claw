@@ -3685,6 +3685,15 @@ fn asks_current_time(text: &str) -> bool {
     // apostrophe-less "whats the time" this list originally stored, so it fell
     // through to the LLM. Match the normalized `what s ...` forms (and add the
     // missing date counterpart for parity with the time phrasings).
+    //
+    // Trailing "right now" / "now" / "please" are time/politeness qualifiers, not
+    // a different question — strip them so "what time is it right now" still
+    // routes to get_time (#847).
+    let text = text
+        .trim_end_matches(" please")
+        .trim_end_matches(" right now")
+        .trim_end_matches(" now")
+        .trim_end();
     matches!(
         text,
         "what time is it"
@@ -3718,6 +3727,22 @@ fn clean_quick_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routes_time_with_trailing_qualifier_to_get_time() {
+        for prompt in [
+            "what time is it right now",
+            "what time is it now",
+            "what time is it please",
+            "what s the time please",
+            "what is the time now",
+            "current time please",
+            "what day is it right now",
+        ] {
+            let call = route(prompt).expect(prompt);
+            assert_eq!(call.name, "get_time", "prompt={prompt:?}");
+        }
+    }
 
     #[test]
     fn routes_home_assistant_status_to_system_info() {
