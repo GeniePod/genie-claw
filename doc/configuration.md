@@ -19,6 +19,7 @@ Runtime load path:
 | --- | --- |
 | `data_dir` | Root directory for runtime databases and profile data |
 | `[optional_ai_provider]` | Disabled-by-default API provider planning, including API-key or OAuth bearer auth mode |
+| `[privacy_proxy]` | Disabled-by-default on-device anonymizing gateway for cloud escalation |
 | `[core]` | `genie-core` runtime behavior |
 | `[governor]` | governor polling and day/night behavior |
 | `[governor.pressure]` | memory-pressure thresholds |
@@ -92,6 +93,38 @@ Do not enable this path for household production by default. If a provider is
 used for validation, keep `context_window_tokens` at or below
 `[agent].context_window_tokens` and avoid sending household memory unless the
 operator has explicitly accepted that privacy tradeoff.
+
+`[optional_ai_provider]` and `[privacy_proxy]` (below) cannot both be enabled
+at once — `genie-core` refuses to start if they are. See that section for why.
+
+## `[privacy_proxy]`
+
+Disabled by default. An on-device anonymizing gateway (`genie-core → PrivacyProxy
+(localhost) → cloud LLM`) that lets a chat turn escalate to a cloud model on
+context overflow or a local-model error, without forwarding raw household
+identifiers: `genie-core` seeds only `Anonymized`-policy memory terms to the
+proxy for masking; `Private`/`Restricted` facts are never forwarded.
+
+| Key | Purpose |
+| --- | --- |
+| `enabled` | Turn on cloud escalation via PrivacyProxy |
+| `base_url` | PrivacyProxy endpoint — must resolve to localhost |
+| `trigger` | Condition that triggers escalation |
+| `vocab_path` | Path on the PrivacyProxy server used to seed masking vocabulary |
+
+**Cannot be combined with `[optional_ai_provider].enabled = true`.** When the
+optional provider is active, every chat turn's primary LLM call already goes
+directly to `[optional_ai_provider].base_url`, unmasked — `LlmClient::from_config`
+routes the shared client there regardless of PrivacyProxy. PrivacyProxy's
+escalation only ever fires as a *fallback* (context overflow or a provider
+error), so it could never anonymize that primary traffic — only a fallback
+that is itself already remote. `genie-core` fails loud at config load if both
+are enabled, rather than leave an operator silently unprotected after
+configuring `[privacy_proxy]` expecting it to guard all cloud escalation.
+
+Also note: escalation is currently only reachable from the non-streaming
+`POST /api/chat` route. Streaming chat (`/api/chat/stream`) and the voice
+loop never call into PrivacyProxy under any configuration.
 
 ## `[core]`
 

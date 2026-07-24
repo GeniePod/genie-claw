@@ -1163,17 +1163,14 @@ fn household_rule_store_request(text: &str) -> Option<String> {
 
 fn health_log_store_request(text: &str) -> Option<(&'static str, String)> {
     if text.starts_with("log that i drank ") && text.contains("water") {
-        let amount = text
-            .trim_start_matches("log that i drank ")
-            .trim_end_matches(" of water")
-            .trim_end_matches(" water")
-            .trim();
-        let content = if amount.is_empty() {
-            "hydration log: drank water".into()
-        } else {
-            format!("hydration log: drank {amount} of water")
-        };
-        return Some(("health_tracker", content));
+        // Preserve the spoken drank-phrase verbatim. The previous code stripped
+        // a trailing "water"/" of water" and re-appended " of water", which
+        // mangled anything that was not exactly "<quantity> of water": a bare
+        // "water" became "water of water", and "<descriptor> water" (e.g. "cold
+        // water") became "cold of water". Echoing the phrase yields the same
+        // output for the "<quantity> of water" forms and fixes the rest.
+        let drank = text.trim_start_matches("log that i drank ").trim();
+        return Some(("health_tracker", format!("hydration log: drank {drank}")));
     }
     if text == "log my weight"
         || text == "log my weight today"
@@ -1946,7 +1943,19 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
         .or_else(|| text.strip_prefix("preheat "))
         && let Some((entity, value)) = parse_temperature_target(rest)
     {
-        return Some((entity, "set_temperature", Some(value)));
+        // The action for a numeric setpoint depends on the device. A light dims
+        // (set_brightness, #813); a thermostat/oven/heater sets temperature; a
+        // "preheat …" is always a temperature. Anything else — a volume, a fan
+        // speed — has no deterministic "set to N" action (there is no set_volume
+        // etc.), so abstain and let the LLM ground it rather than emit a wrong
+        // set_temperature that would try to set, e.g., a volume's temperature.
+        if is_light_entity(&entity) {
+            return Some((entity, "set_brightness", Some(value)));
+        }
+        if text.starts_with("preheat ") || is_temperature_entity(&entity) {
+            return Some((entity, "set_temperature", Some(value)));
+        }
+        return None;
     }
 
     None
@@ -2027,6 +2036,56 @@ fn clean_control_entity(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Whether an entity name refers to a light, so a numeric setpoint is read as
+/// brightness rather than temperature.
+fn is_light_entity(entity: &str) -> bool {
+    contains_any(entity, &["light", "lights", "lamp", "lamps"])
+}
+
+/// Whether an entity name refers to a temperature device, so "set <entity> to
+/// <value>" is a set_temperature rather than an abstain. Matched at the word
+/// level so short tokens like "ac" don't substring-match unrelated names.
+fn is_temperature_entity(entity: &str) -> bool {
+    let words: Vec<&str> = entity.split_whitespace().collect();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "thermostat"
+                | "thermostats"
+                | "temperature"
+                | "temperatures"
+                | "temp"
+                | "temps"
+                | "climate"
+                | "oven"
+                | "ovens"
+                | "heat"
+                | "heater"
+                | "heaters"
+                | "heating"
+                | "furnace"
+                | "furnaces"
+                | "kettle"
+                | "kettles"
+                | "boiler"
+                | "boilers"
+                | "radiator"
+                | "radiators"
+                | "grill"
+                | "grills"
+                | "smoker"
+                | "smokers"
+                // Air conditioner: the "ac"/"acs" short form and the spelled-out
+                // "conditioner"/"conditioning" word (the "air" is a separate token).
+                | "ac"
+                | "acs"
+                | "conditioner"
+                | "conditioners"
+                | "conditioning"
+        )
+    }) || words.windows(2).any(|pair| pair == ["sous", "vide"])
 }
 
 fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
@@ -2453,7 +2512,22 @@ fn home_status_target(text: &str) -> Option<String> {
     // "env[iron]ment" and "[iron]ic", so "is the environment safe" misrouted to
     // home_status "iron" instead of abstaining. Mirrors the ice/icy whole-word
     // fix below.
-    if text.split_whitespace().any(|word| word == "iron") {
+    //
+    // "iron" is also a household *verb*, and this check runs before the
+    // status-query gate (it must: "did i leave the iron on" carries no gate
+    // prefix), so keying on the word alone hijacked every verb use —
+    // "remind me to iron my shirt", "did i iron my shirt", "what should i iron".
+    // Key on the *appliance noun phrase* instead: the device is "the iron" / "my
+    // iron", and a verb use never places a determiner immediately before the
+    // word ("to iron", "i iron", "tailor iron ..."). Still require a
+    // status-question shape (the standard gate, plus the "did ..." form the gate
+    // prefixes do not cover) so only questions about the appliance resolve here.
+    let names_the_iron_appliance = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| matches!(pair[0], "the" | "my") && pair[1] == "iron");
+    if names_the_iron_appliance && (looks_like_status_query(text) || text.starts_with("did ")) {
         return Some("iron".into());
     }
 
@@ -2516,23 +2590,27 @@ fn home_status_target(text: &str) -> Option<String> {
         );
     }
 
-    if contains_any(
-        &target,
-        &[
-            "cover",
-            "covers",
-            "blind",
-            "blinds",
-            "shade",
-            "shades",
-            "curtain",
-            "curtains",
-            "garage",
-            "garage door",
-            "gate",
-            "front gate",
-        ],
-    ) {
+    // Match the cover/gate tokens as whole words, not substrings: a bare
+    // `contains_any` fired on "investi[gate]" / "navi[gate]" and "[cover]age",
+    // so "what should we investigate" misrouted to home_status with a garbled
+    // "should we investigate" entity. Mirrors the ice/iron/cooktop whole-word
+    // fixes above. The multi-word "garage door" / "front gate" entries are
+    // redundant once "garage"/"gate" match as words, and are dropped.
+    if target.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "cover"
+                | "covers"
+                | "blind"
+                | "blinds"
+                | "shade"
+                | "shades"
+                | "curtain"
+                | "curtains"
+                | "garage"
+                | "gate"
+        )
+    }) {
         return Some(if target.split_whitespace().count() == 1 {
             "covers".into()
         } else {
@@ -2540,10 +2618,16 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
-    if contains_any(
-        &target,
-        &["lock", "locks", "door lock", "door locks", "door"],
-    ) {
+    // Match the lock/door tokens as whole words, not substrings: a bare
+    // `contains_any` fired on "c[lock]" / "b[lock]" and "out[door]", so "is the
+    // clock on" misrouted to home_status "locks" instead of abstaining. Mirrors
+    // the ice/iron/cooktop/cover whole-word fixes above. The multi-word "door
+    // lock" / "door locks" entries are redundant once "lock"/"door" match as
+    // words, and are dropped.
+    if target
+        .split_whitespace()
+        .any(|word| matches!(word, "lock" | "locks" | "door" | "doors"))
+    {
         return Some(if target.split_whitespace().count() == 1 {
             "locks".into()
         } else {
@@ -2655,6 +2739,14 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     let label = reminder_label(&tokens, unit_end_index, reminder_style)
         .filter(|label| !label.is_empty())
         .or_else(|| extract_named_timer_label(&tokens, unit_end_index))
+        // A trailing "please" is politeness, not part of the label. Both label
+        // extractors leak it ("... for the pasta please" -> "pasta please",
+        // "... to check the pasta please" -> "check the pasta please"), so strip
+        // it once here where every extracted label converges. Done before the
+        // fallback so a bare "... for please" collapses to empty and still takes
+        // the generic default rather than the literal label "please".
+        .map(|label| label.trim_end_matches(" please").trim_end().to_string())
+        .filter(|label| !label.is_empty() && label != "please")
         .unwrap_or_else(|| {
             if text.starts_with("remind ") {
                 "reminder".into()
@@ -2723,6 +2815,16 @@ fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> 
     if parse_duration(rest).is_some() {
         if let Some(for_pos) = rest.iter().position(|token| *token == "for") {
             let label_tokens = &rest[for_pos + 1..];
+            if !label_tokens.is_empty() && parse_duration(label_tokens).is_none() {
+                return clean_timer_label(label_tokens);
+            }
+            // Mirrored order: `"timer for the pasta for 5 minutes"` puts the
+            // label *before* the duration's own `for`. The check above only
+            // looked after it, so this equally natural phrasing dropped its
+            // label to the generic "timer". The duration guard keeps a plain
+            // `"timer for 5 minutes"` (label window would be the duration
+            // itself) on the generic default.
+            let label_tokens = &rest[..for_pos];
             if !label_tokens.is_empty() && parse_duration(label_tokens).is_none() {
                 return clean_timer_label(label_tokens);
             }
@@ -2805,10 +2907,23 @@ fn is_time_expression(location: &str) -> bool {
         return true;
     }
     // Numeric / vague durations ending in a time unit: "20 minutes", "an hour",
-    // "a few hours", "a couple days", "the next hour".
+    // "a few hours", "a couple days", "the next hour", "a month", "the weekend".
+    // The longer calendar units (month/year/weekend) belong here too: without
+    // them "in a month" / "on the weekend" read as a place or a room, so a rain
+    // query ("will it rain in a month") and a scheduled control ("turn on the
+    // lights in a month") both mishandled them — the same class the shorter
+    // day/week units already cover.
     matches!(
         location.split_whitespace().next_back(),
-        Some(last) if is_time_unit(last) || matches!(last, "day" | "days" | "week" | "weeks")
+        Some(last) if is_time_unit(last)
+            || matches!(
+                last,
+                "day" | "days"
+                    | "week" | "weeks"
+                    | "month" | "months"
+                    | "year" | "years"
+                    | "weekend" | "weekends"
+            )
     )
 }
 
@@ -2842,7 +2957,17 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
 
     let location = extract_location_after_marker(text, " in ")
         .or_else(|| extract_location_after_marker(text, " for "))?;
-    if location.is_empty() || location == "today" || location == "tomorrow" {
+    // "what's the weather in the morning" / "... in an hour" names a *time*, not a
+    // place — the marker after "in"/"for" is a time expression, so there is no
+    // city to look up and the query must fall back to the default local forecast
+    // (grounded by the LLM). The rain path already guards this with
+    // is_time_expression; the general weather/forecast path only rejected the
+    // bare "today"/"tomorrow" and otherwise emitted get_weather{location:"morning"}.
+    if location.is_empty()
+        || location == "today"
+        || location == "tomorrow"
+        || is_time_expression(&location)
+    {
         return None;
     }
 
@@ -3113,21 +3238,30 @@ fn arithmetic_expression(text: &str) -> Option<String> {
     Some(expression.trim().to_string())
 }
 
-/// Convert standalone cardinal words to digits in a calculator expression, so
+/// Convert cardinal words to digits in a calculator expression, so
 /// "two plus two" -> "two + two" -> "2 + 2" (#532-adjacent: word-form arithmetic).
-/// Operator symbols and non-number words are left as-is; compound cardinals
-/// across multiple tokens are out of scope (rare in a calculation).
+/// A compound cardinal spans several tokens ("one hundred" -> 100, "ninety nine"
+/// -> 99); walk the tokens and let `parse_spoken_number` consume the whole span
+/// so it composes as one number rather than one digit per word ("one hundred /
+/// five" -> "100 / 5", not "1 100 / 5"). Operator symbols and non-number words
+/// parse as nothing and pass through unchanged; a bare digit token composes as
+/// itself, so digit expressions are untouched.
 fn words_to_digits(expression: &str) -> String {
-    expression
-        .split(' ')
-        .map(|token| {
-            super::number_words::parse_amount(token)
-                .filter(|value| value.fract() == 0.0)
-                .map(|value| (value as i64).to_string())
-                .unwrap_or_else(|| token.to_string())
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let tokens: Vec<&str> = expression.split(' ').collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if let Some((value, next)) = super::number_words::parse_spoken_number(&tokens, index)
+            && next > index
+        {
+            out.push(value.to_string());
+            index = next;
+        } else {
+            out.push(tokens[index].to_string());
+            index += 1;
+        }
+    }
+    out.join(" ")
 }
 
 fn parse_decimal_token(token: &str) -> Option<f64> {
@@ -4450,6 +4584,98 @@ mod tests {
     }
 
     #[test]
+    fn hydration_log_preserves_drank_phrase() {
+        // The strip-and-re-append logic turned a bare "water" into "water of
+        // water" and "<descriptor> water" into "<descriptor> of water".
+        for (utterance, content) in [
+            ("Log that I drank water", "hydration log: drank water"),
+            (
+                "Log that I drank cold water",
+                "hydration log: drank cold water",
+            ),
+            (
+                "Log that I drank sparkling water",
+                "hydration log: drank sparkling water",
+            ),
+            // Quantity forms are unchanged from before the fix.
+            (
+                "Log that I drank 2 glasses of water",
+                "hydration log: drank 2 glasses of water",
+            ),
+            (
+                "Log that I drank a bottle of water",
+                "hydration log: drank a bottle of water",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "memory_store", "{utterance:?}");
+            assert_eq!(
+                call.arguments["category"], "health_tracker",
+                "{utterance:?}"
+            );
+            assert_eq!(call.arguments["content"], content, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn set_lights_to_a_percent_routes_to_brightness_not_temperature() {
+        // A numeric setpoint on a light is brightness, not temperature — routing
+        // it to set_temperature would try to set a light's temperature.
+        for (utterance, entity, value) in [
+            (
+                "set the living room lights to 50 percent",
+                "living room lights",
+                50.0,
+            ),
+            ("set the bedroom lamp to 30 percent", "bedroom lamp", 30.0),
+            ("set the kitchen lights to 80", "kitchen lights", 80.0),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["action"], "set_brightness", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["value"], value, "{utterance:?}");
+        }
+
+        // Thermostats and ovens still take set_temperature.
+        let call = route("set the thermostat to 72").unwrap();
+        assert_eq!(call.arguments["action"], "set_temperature");
+        let call = route("set the oven to 400 degrees").unwrap();
+        assert_eq!(call.arguments["action"], "set_temperature");
+    }
+
+    #[test]
+    fn set_to_value_abstains_when_the_device_is_not_temperature_or_a_light() {
+        // "set <entity> to <value>" used to emit set_temperature for *any* entity,
+        // so a volume/fan-speed/bare-brightness got a nonsensical
+        // set_temperature. There is no set_volume/set_fan_speed action, so the
+        // router abstains and lets the LLM ground it instead of actuating wrong.
+        for utterance in [
+            "set the volume to 50 percent",
+            "set the fan speed to 3",
+            "set the brightness to 75",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain (no deterministic set-to-N action), got {:?}",
+                route(utterance)
+            );
+        }
+
+        // Temperature devices (including AC/heater/preheat) still set_temperature.
+        for utterance in [
+            "set the ac to 68",
+            "set the heater to 68",
+            "set the bedroom temperature to 70",
+            "preheat the oven to 350",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["action"], "set_temperature", "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_shopping_and_temperature_home_requests() {
         let call = route("Add milk and eggs to the shopping list").unwrap();
         assert_eq!(call.name, "memory_store");
@@ -5320,6 +5546,44 @@ mod tests {
     }
 
     #[test]
+    fn iron_verb_uses_do_not_report_iron_status() {
+        // "iron" is also a household *verb*. The appliance check runs before the
+        // status-query gate, so keying on the bare word reported home_status
+        // "iron" for verb uses when nobody asked about the appliance — including
+        // the "did i iron ..." / "what should i iron" forms that still slip past
+        // a status-shape gate because they *are* question-shaped.
+        for utterance in [
+            "remind me to iron my shirt",
+            "i need to iron my pants for tomorrow",
+            "how do i iron a silk shirt",
+            "did i iron my shirt",
+            "did the tailor iron my shirt",
+            "what should i iron",
+        ] {
+            // Assert the router does not route to home_status at all (not merely
+            // to a non-"iron" entity), so the abstention requirement is enforced.
+            assert!(
+                route(utterance)
+                    .map(|c| c.name != "home_status")
+                    .unwrap_or(true),
+                "{utterance:?} must not route to home_status"
+            );
+        }
+
+        // Genuine status questions about the appliance still resolve, including
+        // the "did ..." form the standard gate prefixes do not cover.
+        for utterance in [
+            "is the iron on",
+            "did i leave the iron on",
+            "check the iron",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "iron", "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn cooktop_status_matches_whole_words_not_substrings() {
         // "stove"/"burner"/"oven" were matched as substrings, so "pr[oven]" and
         // "w[oven]" misrouted to home_status "stove" instead of abstaining.
@@ -5337,6 +5601,70 @@ mod tests {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "home_status", "{utterance:?}");
             assert_eq!(call.arguments["entity"], "stove", "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn cover_and_gate_status_match_whole_words_not_substrings() {
+        // The cover/blinds branch matched its tokens with a substring
+        // `contains_any`, so "investi[gate]" / "navi[gate]" and "[cover]age"
+        // misrouted to home_status with a garbled multi-word entity (e.g.
+        // "should we investigate") instead of abstaining.
+        for utterance in [
+            "what should we investigate",
+            "what should we navigate to",
+            "what is the coverage like",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain, not resolve to a garbled cover/gate status entity"
+            );
+        }
+
+        // Genuine cover/gate/garage queries still resolve.
+        for (utterance, entity) in [
+            ("are the blinds closed", "covers"),
+            ("are the curtains open", "covers"),
+            ("is the front gate closed", "front gate"),
+            ("is the garage door open", "garage door"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn lock_and_door_status_match_whole_words_not_substrings() {
+        // The lock/door branch matched its tokens with a substring `contains_any`,
+        // so "c[lock]" / "b[lock]" and "out[door]" misrouted to home_status
+        // "locks" (or a garbled multi-word entity) instead of abstaining. Mirrors
+        // the ice/iron/cooktop/cover whole-word fixes.
+        for utterance in [
+            "is the clock on",
+            "is the wall clock right",
+            "is the block heater on",
+            // "out[door]" collided with the door token the same way — this
+            // misrouted to home_status "outdoor cameras" on the substring path.
+            "are the outdoor cameras on",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain from deterministic routing"
+            );
+        }
+
+        // Genuine lock/door queries still resolve: a bare token collapses to
+        // "locks", a named device keeps its full entity.
+        for (utterance, entity) in [
+            ("are the doors locked", "locks"),
+            ("is the door locked", "locks"),
+            ("is the side door locked", "side door"),
+            ("is the garage door closed", "garage door"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
         }
     }
 
@@ -5396,6 +5724,10 @@ mod tests {
             "turn off the fan in an hour",
             "turn on the lights in the evening",
             "turn on the bedroom lights in 10 minutes",
+            // Longer calendar durations are schedules too — is_time_expression
+            // now recognizes month/year/weekend, not just minutes/hours/days/weeks.
+            "turn on the lights in a month",
+            "turn off the fan in a year",
         ] {
             assert!(route(utterance).is_none(), "{utterance:?}");
         }
@@ -5655,6 +5987,33 @@ mod tests {
     }
 
     #[test]
+    fn routes_compound_spoken_cardinals_to_calculate() {
+        // A compound spoken cardinal ("one hundred", "ninety nine") spans several
+        // tokens. words_to_digits converted each token on its own, so "one
+        // hundred / five" became "1 100 / 5" — a garbled expression — instead of
+        // "100 / 5". Compose the span with the same parser the timer/amount paths
+        // use.
+        for (utterance, expression) in [
+            ("what is one hundred divided by five", "100 / 5"),
+            ("what is two hundred minus fifty", "200 - 50"),
+            ("what is one thousand divided by four", "1000 / 4"),
+            ("what is ninety nine plus one", "99 + 1"),
+            ("what is one hundred twenty plus five", "120 + 5"),
+            ("what is five hundred divided by ten", "500 / 10"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "calculate", "{utterance:?}");
+            assert_eq!(call.arguments["expression"], expression, "{utterance:?}");
+        }
+
+        // Simple tens and digit forms are unchanged.
+        let call = route("what is twenty plus thirty").unwrap();
+        assert_eq!(call.arguments["expression"], "20 + 30");
+        let call = route("what is 100 divided by 5").unwrap();
+        assert_eq!(call.arguments["expression"], "100 / 5");
+    }
+
+    #[test]
     fn routes_weather_and_home_status_before_memory_recall() {
         let call = route("Jared: Is it raining for school pickup?").unwrap();
         assert_eq!(call.name, "get_weather");
@@ -5790,6 +6149,68 @@ mod tests {
 
         // No trailing label -> still the generic default (unchanged).
         let call = route("set a timer for 5 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn routes_named_timer_label_between_for_and_duration() {
+        // "timer for <label> for <duration>" — the label sits between the first
+        // "for" and the duration's own "for". Only the mirrored duration-first
+        // order recovered a label; this order dropped it to the generic "timer".
+        let call = route("set a timer for the pasta for 5 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "pasta");
+
+        let call = route("start a timer for the laundry for 45 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 2700);
+        assert_eq!(call.arguments["label"], "laundry");
+
+        // Article-less label and a spoken duration.
+        let call = route("set a timer for homework for twenty minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 1200);
+        assert_eq!(call.arguments["label"], "homework");
+
+        // A trailing "please" stays out of the duration-first label window.
+        let call = route("set a timer for the tea for 3 minutes please").unwrap();
+        assert_eq!(call.arguments["seconds"], 180);
+        assert_eq!(call.arguments["label"], "tea");
+
+        // The mirrored duration-first order is unchanged.
+        let call = route("set a timer for 5 minutes for the pasta").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "pasta");
+
+        // No label anywhere -> still the generic default (unchanged).
+        let call = route("set a timer for 10 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn timer_label_drops_a_trailing_please() {
+        // A trailing "please" is politeness, not part of the label. Both label
+        // paths that reach the timer label leaked it: the "for <label>" form via
+        // clean_timer_label and the "to <task>" form via label_after_duration.
+        for (utterance, label) in [
+            ("set a timer for 10 minutes for the pasta please", "pasta"),
+            ("set a timer for 5 minutes for the eggs please", "eggs"),
+            ("set a 3 minute timer for the tea please", "tea"),
+            (
+                "set a timer for 10 minutes to check the pasta please",
+                "check the pasta",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "set_timer", "{utterance:?}");
+            assert_eq!(call.arguments["label"], label, "{utterance:?}");
+        }
+
+        // A label that merely ends in those letters is untouched (whole word).
+        let call = route("set a timer for 10 minutes for the pleasantries").unwrap();
+        assert_eq!(call.arguments["label"], "pleasantries");
+
+        // A bare "... please" with no real label still falls to the default.
+        let call = route("set a timer for 10 minutes for please").unwrap();
         assert_eq!(call.arguments["label"], "timer");
     }
 
@@ -6163,6 +6584,30 @@ mod tests {
     }
 
     #[test]
+    fn weather_time_of_day_is_not_a_location() {
+        // "what's the weather in the morning" / "... in an hour" names a time,
+        // not a place — it must abstain (default local forecast via the LLM), not
+        // emit get_weather{location:"morning"}. The rain path already guarded
+        // this; the general weather/forecast path did not.
+        for utterance in [
+            "what's the weather in the morning",
+            "what's the weather in the evening",
+            "what's the weather in an hour",
+            "what's the weather in 3 days",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} should abstain, not route a time as a place"
+            );
+        }
+
+        // A real city with a trailing time qualifier still routes to that city.
+        let call = route("what's the weather in Denver tonight").unwrap();
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["location"], "denver");
+    }
+
+    #[test]
     fn weather_location_drops_trailing_please() {
         // A trailing "please" is politeness, not part of the city: the location
         // argument must be just the city, not "paris please". Mirrors the other
@@ -6229,6 +6674,9 @@ mod tests {
             "will it rain in an hour",
             "will it rain in 20 minutes",
             "will it rain in a bit",
+            // Longer calendar durations are time expressions too.
+            "will it rain in a month",
+            "will it rain in a year",
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "get_weather", "{utterance:?}");

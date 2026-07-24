@@ -1545,6 +1545,24 @@ impl Config {
             anyhow::bail!("[core].llm_model_path must be set");
         }
 
+        // #816: every chat turn's primary LLM call already goes straight to
+        // [optional_ai_provider].base_url, unmasked, whenever it's enabled —
+        // LlmClient::from_config routes the shared client there directly,
+        // independent of PrivacyProxy. [privacy_proxy]'s anonymizing
+        // escalation only ever fires as a *fallback* (context overflow or a
+        // provider error), so with both enabled it can never protect the
+        // primary traffic an operator configuring it would reasonably
+        // expect it to guard — only a fallback that is itself already
+        // remote. Fail loud rather than leave that silently unprotected.
+        if self.optional_ai_provider.enabled && self.privacy_proxy.enabled {
+            anyhow::bail!(
+                "[optional_ai_provider].enabled and [privacy_proxy].enabled cannot both be \
+                 true: the primary LLM call already goes directly to \
+                 [optional_ai_provider].base_url unmasked, so [privacy_proxy]'s anonymizing \
+                 escalation would never apply to it. Disable one of the two."
+            );
+        }
+
         match self.active_llm_provider_kind() {
             ActiveLlmProviderKind::Local => self.validate_local_llm_provider(),
             ActiveLlmProviderKind::OptionalApi => self.validate_optional_llm_provider(),
@@ -2181,6 +2199,29 @@ home_runtime_boundary = "external_runtime"
         config.services.llm.url.clear();
         let err = config.validate_llm_provider().unwrap_err().to_string();
         assert!(err.contains("[services.llm].url must be set"));
+    }
+
+    #[test]
+    fn validate_llm_provider_rejects_optional_provider_and_privacy_proxy_both_enabled() {
+        // #816: with both on, the primary LLM call already goes directly to
+        // [optional_ai_provider].base_url unmasked — [privacy_proxy]'s
+        // anonymizing escalation would never protect it, only a fallback
+        // that is itself already remote.
+        let mut config = test_config();
+        config.optional_ai_provider.enabled = true;
+        config.optional_ai_provider.base_url = "http://127.0.0.1:11434/v1".into();
+        config.optional_ai_provider.api_key_env = "GENIEPOD_TEST_API_KEY".into();
+        config.privacy_proxy.enabled = true;
+
+        let err = config.validate_llm_provider().unwrap_err().to_string();
+        assert!(err.contains("cannot both be true"));
+    }
+
+    #[test]
+    fn validate_llm_provider_accepts_privacy_proxy_alone() {
+        let mut config = test_config();
+        config.privacy_proxy.enabled = true;
+        config.validate_llm_provider().unwrap();
     }
 
     #[test]

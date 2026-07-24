@@ -153,3 +153,16 @@ fn percent_symbol_routes_like_the_spelled_out_word() {
     // Apostrophe prefix ("what's") must not block the percent-symbol path.
     assert_eq!(expression("what's 50% of 80"), "80 * 50 / 100");
 }
+
+#[test]
+fn spoken_decimal_preserves_leading_zero() {
+    // The fractional part was round-tripped through an integer, so a leading
+    // zero was dropped: "3 point 05" folded to "3.5" instead of "3.05".
+    assert_eq!(expression("what is 3 point 05 plus 1"), "3.05 + 1");
+    assert_eq!(expression("what is 7 point 09 plus 2"), "7.09 + 2");
+    assert_eq!(expression("what is 10 point 025 times 2"), "10.025 * 2");
+    // Non-leading-zero fractions are unchanged.
+    assert_eq!(expression("what is 3 point 5 plus 1"), "3.5 + 1");
+    assert_eq!(expression("what is 3 point 25 plus 1"), "3.25 + 1");
+    assert_eq!(expression("what is three point five plus 1"), "3.5 + 1");
+}
