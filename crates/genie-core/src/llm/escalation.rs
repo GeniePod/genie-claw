@@ -57,7 +57,7 @@ pub struct EscalationPayloadSummary {
 pub fn summarize_messages(messages: &[Message]) -> EscalationPayloadSummary {
     EscalationPayloadSummary {
         message_count: messages.len(),
-        payload_chars: messages.iter().map(|m| m.content.len()).sum(),
+        payload_chars: messages.iter().map(|m| m.content.chars().count()).sum(),
     }
 }
 
@@ -115,5 +115,16 @@ mod tests {
         let summary = summarize_messages(&messages);
         assert_eq!(summary.message_count, 2);
         assert_eq!(summary.payload_chars, 6);
+    }
+
+    #[test]
+    fn summarize_counts_unicode_chars_not_bytes() {
+        // payload_chars feeds the escalation audit trail, so a multi-byte
+        // character (café is 4 chars, 5 bytes) must count as one char.
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "café".into(),
+        }];
+        assert_eq!(summarize_messages(&messages).payload_chars, 4);
     }
 }
