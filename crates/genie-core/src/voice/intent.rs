@@ -124,10 +124,15 @@ fn looks_like_ambient_narration(text: &str, words: usize) -> bool {
                 "can you",
                 "could you",
                 "would you",
-                "turn",
-                "set",
-                "play",
-                "search",
+                // Space-prefixed so an embedded substring in ordinary narration
+                // ("sunset"/"returned"/"display"/"research") doesn't defeat the
+                // ambient filter; a real command word is always mid-sentence
+                // here (the text already starts with an article/pronoun), so it
+                // keeps a leading space. Mirrors looks_like_direct_request.
+                " turn",
+                " set",
+                " play",
+                " search",
                 "remember",
                 "forget",
                 "weather",
@@ -231,6 +236,20 @@ mod tests {
     fn rejects_ambient_narration() {
         assert_eq!(
             assess_transcript("the old house stood alone at the end of the road"),
+            VoiceIntentDecision::Reject("ambient narration")
+        );
+    }
+
+    #[test]
+    fn rejects_ambient_narration_with_embedded_command_substrings() {
+        // "sunset" embeds "set", "returned" embeds "turn"; the old bare-substring
+        // needles let this narration escape the ambient filter to the LLM path.
+        assert_eq!(
+            assess_transcript("the sunset over the hills painted the sky in gold tonight"),
+            VoiceIntentDecision::Reject("ambient narration")
+        );
+        assert_eq!(
+            assess_transcript("the soldiers returned from the long campaign weary and changed"),
             VoiceIntentDecision::Reject("ambient narration")
         );
     }
