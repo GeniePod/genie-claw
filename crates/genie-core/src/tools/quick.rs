@@ -2647,6 +2647,17 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
+    // "ice maker" names an appliance, not the driveway: the whole-word "ice"
+    // test below swept "is the ice maker on" into the driveway-ice collapse,
+    // so a question about the appliance was answered with the driveway
+    // ice-risk report. Match the two-word appliance name (and the fused
+    // "icemaker") first and keep the appliance as the entity, the same way
+    // the iron/car appliance-noun handling above keeps its device distinct.
+    let words: Vec<&str> = target.split_whitespace().collect();
+    if words.windows(2).any(|pair| pair == ["ice", "maker"]) || words.contains(&"icemaker") {
+        return Some("ice maker".into());
+    }
+
     // Match "ice"/"icy" as whole words, not as substrings: a bare `contains`
     // fired on "pr[ice]" and "sp[icy]", so "what's the price of bitcoin" and
     // "is the food spicy" misrouted to home_status "driveway ice". "driveway"
@@ -5594,6 +5605,30 @@ mod tests {
                     .unwrap_or(true),
                 "{utterance:?} must not resolve to the {wrong_entity:?} status entity"
             );
+        }
+    }
+
+    #[test]
+    fn ice_maker_status_reports_the_appliance_not_driveway_ice() {
+        // The whole-word "ice" match swept the ice-maker appliance into the
+        // driveway-ice collapse: "Is the ice maker on?" was answered with the
+        // driveway ice-risk report on `main`.
+        for utterance in [
+            "Is the ice maker working?",
+            "Is the ice maker on?",
+            "Check the ice maker",
+            "Is the icemaker on?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "ice maker", "{utterance:?}");
+        }
+
+        // Genuine driveway-ice queries still collapse to the driveway entity.
+        for utterance in ["Is the driveway icy?", "Is there ice on the driveway?"] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "driveway ice", "{utterance:?}");
         }
     }
 
