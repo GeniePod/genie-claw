@@ -796,7 +796,18 @@ impl Memory {
     /// favorite color. Free-form facts and broad preferences are still append-only.
     pub fn store_resolved(&self, kind: &str, content: &str) -> Result<StoreOutcome> {
         let content = normalize_memory_content(content);
-        if self.has_similar(&content)? {
+        let slot = memory_slot(kind, &content);
+
+        // Append-only facts dedup on similarity. Single-valued facts must not:
+        // a stored value that merely *looks* similar to the new one — "Dana"
+        // against "Dan", "New York" against "York" — is the value being
+        // corrected, and the slot replacement below is what supersedes it.
+        // For those, only an identical restatement is a duplicate.
+        let duplicate = match slot {
+            Some(_) => self.has_exact(&content)?,
+            None => self.has_similar(&content)?,
+        };
+        if duplicate {
             return Ok(StoreOutcome {
                 id: None,
                 replaced: 0,
@@ -805,7 +816,7 @@ impl Memory {
         }
 
         let mut replaced = 0;
-        if let Some(slot) = memory_slot(kind, &content) {
+        if let Some(slot) = slot {
             for existing in self.get_by_kind(kind, 100)? {
                 if existing.content != content
                     && memory_slot(&existing.kind, &existing.content).as_deref() == Some(&slot)
@@ -2426,11 +2437,31 @@ impl Memory {
         Ok(deleted)
     }
 
+    /// Check if this exact memory is already stored, ignoring case.
+    ///
+    /// This is the deduplication rule for single-valued facts, where
+    /// [`Self::has_similar`]'s substring matching would read a correction as a
+    /// duplicate of the value it corrects. Only a restatement of the same
+    /// value is a duplicate; a different value supersedes the stored one.
+    pub fn has_exact(&self, content: &str) -> Result<bool> {
+        let clean = strip_source_tag(content);
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE LOWER(content) = LOWER(?1)",
+            [clean.trim()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Check if a similar memory already exists (for deduplication).
     ///
     /// Uses SQL LIKE with key words from the content. More reliable than
     /// FTS5 for deduplication since FTS5 has issues with apostrophes and
     /// short queries.
+    ///
+    /// Substring-based, so it treats a shorter value as similar to a longer
+    /// one that contains it. Callers storing single-valued facts want
+    /// [`Self::has_exact`] instead — see [`Self::store_resolved`].
     pub fn has_similar(&self, content: &str) -> Result<bool> {
         let clean = strip_source_tag(content);
 
@@ -9143,6 +9174,16 @@ fn normalize_memory_content(content: &str) -> String {
     content.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// True when this fact should have exactly one current answer.
+///
+/// Single-valued facts — the user's name, age, location, workplace,
+/// occupation, or a favorite — are superseded by a newer statement rather than
+/// accumulated. Callers use this to keep substring-based deduplication from
+/// mistaking a correction for a duplicate of the value it corrects.
+pub(crate) fn is_single_valued_fact(kind: &str, content: &str) -> bool {
+    memory_slot(kind, &normalize_memory_content(content)).is_some()
+}
+
 fn memory_slot(kind: &str, content: &str) -> Option<String> {
     let kind = kind.trim().to_lowercase();
     let lower = content.trim().to_lowercase();
@@ -9753,6 +9794,81 @@ mod tests {
 
         mem.search("noodle soup", 10).unwrap();
         assert_eq!(mem.query_diversity(id).unwrap(), 2);
+    }
+
+    #[test]
+    fn store_resolved_corrects_name_that_is_a_substring_of_the_stored_one() {
+        let mem = temp_memory();
+        mem.store_resolved("identity", "User's name is Dana")
+            .unwrap();
+
+        // "dan" is a substring of "dana", so similarity dedup used to read this
+        // correction as a duplicate and drop it.
+        let outcome = mem
+            .store_resolved("identity", "User's name is Dan")
+            .unwrap();
+
+        assert!(!outcome.duplicate);
+        assert_eq!(outcome.replaced, 1);
+        let identities = mem.get_by_kind("identity", 10).unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].content, "User's name is Dan");
+    }
+
+    #[test]
+    fn store_resolved_corrects_location_that_is_a_substring_of_the_stored_one() {
+        let mem = temp_memory();
+        mem.store_resolved("identity", "User lives in New York")
+            .unwrap();
+
+        let outcome = mem
+            .store_resolved("identity", "User lives in York")
+            .unwrap();
+
+        assert!(!outcome.duplicate);
+        assert_eq!(outcome.replaced, 1);
+        let identities = mem.get_by_kind("identity", 10).unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].content, "User lives in York");
+    }
+
+    #[test]
+    fn store_resolved_still_reports_an_identical_single_value_fact_as_duplicate() {
+        let mem = temp_memory();
+        mem.store_resolved("identity", "User's name is Dana")
+            .unwrap();
+
+        let outcome = mem
+            .store_resolved("identity", "User's name is Dana")
+            .unwrap();
+
+        assert!(outcome.duplicate);
+        assert_eq!(outcome.replaced, 0);
+        assert_eq!(mem.get_by_kind("identity", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn store_resolved_keeps_similarity_dedup_for_append_only_facts() {
+        let mem = temp_memory();
+        mem.store_resolved("fact", "User adopted a rescue dog last spring")
+            .unwrap();
+
+        // Not slot-managed, so similarity dedup still applies unchanged.
+        let outcome = mem
+            .store_resolved("fact", "User adopted a rescue dog")
+            .unwrap();
+
+        assert!(outcome.duplicate);
+        assert_eq!(mem.get_by_kind("fact", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn has_exact_ignores_case_but_not_a_different_value() {
+        let mem = temp_memory();
+        mem.store("identity", "User's name is Dana").unwrap();
+
+        assert!(mem.has_exact("user's name is dana").unwrap());
+        assert!(!mem.has_exact("User's name is Dan").unwrap());
     }
 
     #[test]
