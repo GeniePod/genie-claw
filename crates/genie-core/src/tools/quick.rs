@@ -1098,6 +1098,14 @@ fn shopping_list_add_request(text: &str) -> Option<String> {
     // A trailing "please" sits after the list suffix ("... shopping list please")
     // and defeated the suffix match, so a polite request added nothing.
     let text = text.trim_end_matches(" please").trim_end();
+    // "please" also leads, and the command words below are anchored at the start
+    // of the utterance, so "please add milk to the shopping list" matched neither
+    // "add " nor "put " and fell through to memory_recall — the router then
+    // *searched memory for the command* instead of adding the item, so the user
+    // is told nothing was found and the milk never reaches the list.
+    // play_media_request already carries a "please play " prefix for exactly this
+    // reason; the list commands were the gap.
+    let text = text.strip_prefix("please ").unwrap_or(text);
     let rest = text
         .strip_prefix("add ")
         .or_else(|| text.strip_prefix("put "))?;
@@ -1125,6 +1133,10 @@ fn shopping_list_remove_request(text: &str) -> Option<String> {
     // Drop a trailing "please" so a polite "... off the shopping list please"
     // still matches the list suffix, mirroring shopping_list_add_request.
     let text = text.trim_end_matches(" please").trim_end();
+    // ... and a leading one, for the same reason as the add path: "take "/"remove "
+    // are anchored at the start, so "please take the milk off the shopping list"
+    // fell through to memory_recall and removed nothing.
+    let text = text.strip_prefix("please ").unwrap_or(text);
     // The article before "shopping list" is optional, exactly as on the add
     // path (" off shopping list" / " from shopping list"): without the
     // article-less variants the removal fell through to memory_recall.
@@ -4581,6 +4593,50 @@ mod tests {
             call.arguments["content"],
             "shopping list removed: eggs, bread"
         );
+    }
+
+    #[test]
+    fn shopping_list_commands_accept_a_leading_please() {
+        // The command words are anchored at the start of the utterance, so a
+        // leading "please" matched no prefix and the request fell through to
+        // memory_recall — the router searched memory for the command text
+        // instead of touching the list, so nothing was added or removed.
+        for (utterance, content) in [
+            (
+                "Please add milk to the shopping list",
+                "shopping list pending: milk",
+            ),
+            (
+                "Please put eggs and bread on the shopping list",
+                "shopping list pending: eggs, bread",
+            ),
+            (
+                "Please add milk to my shopping list",
+                "shopping list pending: milk",
+            ),
+            (
+                "Please remove milk from the shopping list",
+                "shopping list removed: milk",
+            ),
+            (
+                "Please take milk off the shopping list",
+                "shopping list removed: milk",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "memory_store", "{utterance:?}");
+            assert_eq!(call.arguments["category"], "shopping", "{utterance:?}");
+            assert_eq!(call.arguments["content"], content, "{utterance:?}");
+        }
+
+        // Leading and trailing politeness compose.
+        let call = route("Please add milk to the shopping list please").unwrap();
+        assert_eq!(call.arguments["content"], "shopping list pending: milk");
+
+        // An item that merely starts with those letters is untouched: the strip
+        // needs the whole word plus its trailing space.
+        let call = route("Add pleats to the shopping list").unwrap();
+        assert_eq!(call.arguments["content"], "shopping list pending: pleats");
     }
 
     #[test]
