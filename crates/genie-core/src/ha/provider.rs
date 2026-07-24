@@ -20,6 +20,14 @@ const AREA_TEMPLATE: &str = r#"
 
 const GRAPH_CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// Confidence for a fidelity-cleared whole-home domain group (`lights`, etc.).
+///
+/// Must clear default `min_target_confidence` (0.78) and the unconfirmed
+/// Voice / Telegram / Api floors (0.88 / 0.90 / 0.84) in
+/// `assess_runtime_home_action`. The previous hardcode of `0.72` sat below
+/// every floor, so a correct whole-home resolve never passed the runtime gate.
+const WHOLE_HOME_DOMAIN_CONFIDENCE: f32 = 0.90;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrationHealth {
     pub connected: bool,
@@ -503,7 +511,12 @@ impl HomeAssistantProvider {
             entity_ids,
             domain: Some(domain.to_string()),
             area: None,
-            confidence: 0.72,
+            // Fidelity already refused untrustworthy whole-home fallbacks.
+            // Confidence must clear default `min_target_confidence` (0.78) and
+            // the unconfirmed Voice/Telegram/Api floors (0.88/0.90/0.84), or a
+            // valid "turn on the lights" resolves then dies at the runtime gate.
+            // 0.72 was below every floor and made whole-home control unreachable.
+            confidence: WHOLE_HOME_DOMAIN_CONFIDENCE,
             voice_safe: domain != "lock",
         })
     }
@@ -1916,6 +1929,82 @@ mod tests {
         assert_eq!(target.display_name, "All lights");
         assert_eq!(target.domain.as_deref(), Some("light"));
         assert_eq!(target.entity_ids, vec!["light.living_room_lamp"]);
+        assert!(
+            (target.confidence - WHOLE_HOME_DOMAIN_CONFIDENCE).abs() < f32::EPSILON,
+            "whole-home confidence must clear the runtime actuation floors"
+        );
+    }
+
+    /// Regression: whole-home domain targets used confidence 0.72, below the
+    /// default `min_target_confidence` (0.78) and every unconfirmed channel
+    /// floor. Status still answered; control always died at the runtime gate.
+    #[test]
+    fn whole_home_domain_target_clears_runtime_confidence_gate() {
+        use crate::ha::{
+            ActionRisk, HomeAction, HomeActionKind, HomeState, assess_home_action,
+            assess_runtime_home_action,
+        };
+        use crate::tools::actuation::RequestOrigin;
+        use genie_common::config::ActuationSafetyConfig;
+
+        let graph = sample_graph();
+        let target = HomeAssistantProvider::resolve_target_in_graph(
+            &graph,
+            "lights",
+            Some(HomeActionKind::TurnOn),
+        )
+        .expect("bare 'lights' should resolve to the whole-home group");
+        assert!(
+            target.confidence + f32::EPSILON >= 0.78,
+            "confidence {:.2} is below default min_target_confidence 0.78",
+            target.confidence
+        );
+
+        let action = HomeAction {
+            kind: HomeActionKind::TurnOn,
+            target: target.clone(),
+            value: None,
+        };
+        let policy = assess_home_action(&action);
+        assert!(policy.allowed);
+        assert_eq!(policy.risk, ActionRisk::Low);
+
+        let health = IntegrationHealth {
+            connected: true,
+            cached_graph: false,
+            message: "ok".into(),
+        };
+        let state = HomeState {
+            target_name: target.display_name.clone(),
+            domain: target.domain.clone(),
+            area: None,
+            entities: Vec::new(),
+            available: true,
+            spoken_summary: "ok".into(),
+        };
+        let safety = ActuationSafetyConfig::default();
+
+        for origin in [
+            RequestOrigin::Dashboard,
+            RequestOrigin::Api,
+            RequestOrigin::Voice,
+            RequestOrigin::Telegram,
+        ] {
+            let decision = assess_runtime_home_action(
+                &action,
+                &policy,
+                &health,
+                Some(&state),
+                &safety,
+                origin,
+                false,
+            );
+            assert!(
+                decision.allowed,
+                "whole-home lights turn_on must clear the runtime gate for {origin:?}: {}",
+                decision.reason
+            );
+        }
     }
 
     #[test]
