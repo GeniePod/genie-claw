@@ -45,12 +45,23 @@ pub enum RoutePolicySurface {
 /// one is configured. This is centralized here so `genie-core` and `genie-api`
 /// cannot silently drift on sensitive route classification.
 pub fn route_requires_local_token(surface: RoutePolicySurface, method: &str, path: &str) -> bool {
+    // The query string is not part of a route's identity, so strip it before
+    // matching. This keeps a parametrized read (e.g. `/api/chat/export?id=X`)
+    // classified by its path and hardens the gate against a query suffix being
+    // used to slip past an exact-path match.
+    let path = path.split('?').next().unwrap_or(path);
     match (method, path) {
         // Sensitive actuation routes.
         ("POST", "/api/actuation/confirm")
         | ("GET", "/api/actuation/pending")
         | ("GET", "/api/actuation/actions") => true,
         ("GET", "/api/actuation/audit") => matches!(surface, RoutePolicySurface::GenieApi),
+
+        // Sensitive conversation reads: these return full transcript content
+        // (household and family context), the same disclosure class the
+        // `/api/memories` read is gated for. The `/api/conversations` *list*
+        // (ids + titles only) stays open, matching the carve-out in #757.
+        ("GET", "/api/chat/history") | ("GET", "/api/chat/export") => true,
 
         // Sensitive memory routes (list exposes full household memory content).
         ("GET", "/api/memories")
@@ -1197,6 +1208,37 @@ mod tests {
                 surface,
                 "POST",
                 "/api/memories/update"
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_route_token_policy_covers_conversation_transcript_reads() {
+        for surface in [RoutePolicySurface::GenieCore, RoutePolicySurface::GenieApi] {
+            assert!(route_requires_local_token(
+                surface,
+                "GET",
+                "/api/chat/history"
+            ));
+            // The export route carries the conversation id as a query param, so
+            // the gate must classify it by path, not by the full request target.
+            assert!(route_requires_local_token(
+                surface,
+                "GET",
+                "/api/chat/export"
+            ));
+            assert!(route_requires_local_token(
+                surface,
+                "GET",
+                "/api/chat/export?id=42"
+            ));
+
+            // The conversation *list* (ids + titles, no message bodies) stays
+            // open without a token, matching the deliberate carve-out in #757.
+            assert!(!route_requires_local_token(
+                surface,
+                "GET",
+                "/api/conversations"
             ));
         }
     }
