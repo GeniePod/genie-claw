@@ -1097,7 +1097,12 @@ fn shopping_list_add_request(text: &str) -> Option<String> {
     // to memory_recall, searching memory for the command instead of adding.
     // A trailing "please" sits after the list suffix ("... shopping list please")
     // and defeated the suffix match, so a polite request added nothing.
-    let text = text.trim_end_matches(" please").trim_end();
+    // A leading "please" likewise defeated the command-prefix strip (#843).
+    let text = text
+        .strip_prefix("please ")
+        .unwrap_or(text)
+        .trim_end_matches(" please")
+        .trim_end();
     let rest = text
         .strip_prefix("add ")
         .or_else(|| text.strip_prefix("put "))?;
@@ -1122,9 +1127,13 @@ fn shopping_list_add_request(text: &str) -> Option<String> {
 }
 
 fn shopping_list_remove_request(text: &str) -> Option<String> {
-    // Drop a trailing "please" so a polite "... off the shopping list please"
-    // still matches the list suffix, mirroring shopping_list_add_request.
-    let text = text.trim_end_matches(" please").trim_end();
+    // Drop leading/trailing "please" so polite forms still match the command
+    // prefix and list suffix, mirroring shopping_list_add_request (#843).
+    let text = text
+        .strip_prefix("please ")
+        .unwrap_or(text)
+        .trim_end_matches(" please")
+        .trim_end();
     // The article before "shopping list" is optional, exactly as on the add
     // path (" off shopping list" / " from shopping list"): without the
     // article-less variants the removal fell through to memory_recall.
@@ -4495,6 +4504,18 @@ mod tests {
             call.arguments["content"],
             "shopping list pending: eggs, bread"
         );
+    }
+
+    #[test]
+    fn shopping_list_commands_accept_leading_please() {
+        let add = route("please add milk to the shopping list").expect("add");
+        assert_eq!(add.name, "memory_store");
+        let rem = route("please remove milk from the shopping list").expect("remove");
+        assert_eq!(rem.name, "memory_store");
+        let take = route("please take eggs off the shopping list").expect("take");
+        assert_eq!(take.name, "memory_store");
+        let put = route("please put bread on the shopping list").expect("put");
+        assert_eq!(put.name, "memory_store");
     }
 
     #[test]
