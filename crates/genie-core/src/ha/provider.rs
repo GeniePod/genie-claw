@@ -379,12 +379,24 @@ impl HomeAssistantProvider {
             return Some(target);
         }
 
+        // A status query with no inferable domain ("is the kitchen coffee maker
+        // on?") still matches an area, and lights are the sensible default for a
+        // bare room phrase. But an extra token names one device, which may be in
+        // a domain `infer_domain` does not know (switch, media_player,
+        // binary_sensor), so resolve by name before assuming the room's lights.
         if action_hint.is_none()
             && let Some((area_name, area_score)) = area_match
-            && let Some(target) =
-                Self::resolve_group_target(graph, query, "light", &area_name, area_score * 0.8)
         {
-            return Some(target);
+            if !query_is_bare_area(&query_lower, &area_name)
+                && let Some(target) = Self::resolve_named_entity(graph, query, action_hint)
+            {
+                return Some(target);
+            }
+            if let Some(target) =
+                Self::resolve_group_target(graph, query, "light", &area_name, area_score * 0.8)
+            {
+                return Some(target);
+            }
         }
 
         Self::resolve_named_entity(graph, query, action_hint)
@@ -1140,6 +1152,24 @@ fn query_is_bare_area_domain(query_lower: &str, area_name: &str, domain: &str) -
     })
 }
 
+/// Whether `query_lower` is a bare area phrase — every token is accounted for
+/// by the matched area's name. "kitchen" is bare, so a status query about it
+/// falls back to that room's lights; "kitchen coffee maker" carries the extra
+/// tokens "coffee" and "maker", which name one device in the room and must not
+/// collapse to every light in it.
+///
+/// The sibling of [`query_is_bare_area_domain`] for queries where no domain was
+/// inferred at all.
+fn query_is_bare_area(query_lower: &str, area_name: &str) -> bool {
+    let area_tokens: HashSet<String> = normalize(area_name)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    query_lower
+        .split_whitespace()
+        .all(|token| area_tokens.contains(token))
+}
+
 fn best_area_match(areas: &[AreaRef], query: &str) -> Option<(String, f32)> {
     let query_words: Vec<&str> = query.split_whitespace().collect();
     let mut best: Option<(String, f32)> = None;
@@ -1699,6 +1729,117 @@ mod tests {
         );
         // A uniquely-identifying query reports no ambiguity.
         assert!(ambiguous_named_entity_candidates(&graph, "sofa lamp").is_none());
+    }
+
+    /// A kitchen with two lights plus devices in domains `infer_domain` does
+    /// not know (`switch`, `media_player`). `sample_graph` has only one light
+    /// per room and no such devices, which is what hid this.
+    fn mixed_domain_graph() -> HomeGraph {
+        let states = vec![
+            Entity {
+                entity_id: "light.kitchen_ceiling".into(),
+                state: "on".into(),
+                attributes: serde_json::json!({ "friendly_name": "Ceiling Light" }),
+            },
+            Entity {
+                entity_id: "light.kitchen_under_cabinet".into(),
+                state: "off".into(),
+                attributes: serde_json::json!({ "friendly_name": "Under Cabinet" }),
+            },
+            Entity {
+                entity_id: "switch.kitchen_coffee_maker".into(),
+                state: "off".into(),
+                attributes: serde_json::json!({ "friendly_name": "Coffee Maker" }),
+            },
+            Entity {
+                entity_id: "media_player.kitchen_speaker".into(),
+                state: "playing".into(),
+                attributes: serde_json::json!({ "friendly_name": "Speaker" }),
+            },
+        ];
+        let areas = vec![AreaTemplateEntry {
+            id: "kitchen".into(),
+            name: "Kitchen".into(),
+            entities: vec![
+                "light.kitchen_ceiling".into(),
+                "light.kitchen_under_cabinet".into(),
+                "switch.kitchen_coffee_maker".into(),
+                "media_player.kitchen_speaker".into(),
+            ],
+        }];
+        HomeAssistantProvider::build_graph(&states, &areas)
+    }
+
+    #[test]
+    fn status_resolves_a_named_non_light_device_in_an_area() {
+        // Regression: "is the kitchen coffee maker on?" reports no action hint,
+        // and `infer_domain` has no entry for "coffee"/"maker", so resolution
+        // used to hard-code the domain to "light" and answer about the room's
+        // light group — a confident answer about entirely different devices.
+        let graph = mixed_domain_graph();
+
+        let target =
+            HomeAssistantProvider::resolve_target_in_graph(&graph, "kitchen coffee maker", None)
+                .expect("the named coffee maker should resolve");
+
+        assert_eq!(target.kind, HomeTargetKind::Entity);
+        assert_eq!(target.entity_ids, vec!["switch.kitchen_coffee_maker"]);
+    }
+
+    #[test]
+    fn status_resolves_a_named_media_player_in_an_area() {
+        // `media_player` is voice-relevant but absent from `infer_domain`, so it
+        // took the same implicit-lights path.
+        let graph = mixed_domain_graph();
+
+        let target =
+            HomeAssistantProvider::resolve_target_in_graph(&graph, "kitchen speaker", None)
+                .expect("the named speaker should resolve");
+
+        assert_eq!(target.kind, HomeTargetKind::Entity);
+        assert_eq!(target.entity_ids, vec!["media_player.kitchen_speaker"]);
+    }
+
+    #[test]
+    fn status_on_a_bare_area_still_reports_the_room_lights() {
+        // The implicit-lights fallback is the point of this branch; a bare room
+        // phrase must keep resolving to that room's light group.
+        let graph = mixed_domain_graph();
+
+        let target = HomeAssistantProvider::resolve_target_in_graph(&graph, "kitchen", None)
+            .expect("a bare area should resolve to the room lights");
+
+        assert_eq!(target.kind, HomeTargetKind::Group);
+        assert_eq!(target.domain.as_deref(), Some("light"));
+        assert_eq!(
+            target.entity_ids,
+            vec!["light.kitchen_ceiling", "light.kitchen_under_cabinet"]
+        );
+    }
+
+    #[test]
+    fn status_falls_back_to_room_lights_when_nothing_named_matches() {
+        // Behavior preservation: extra tokens that name no device in the room
+        // still fall through to the implicit-lights group rather than failing.
+        let graph = mixed_domain_graph();
+
+        let target = HomeAssistantProvider::resolve_target_in_graph(
+            &graph,
+            "kitchen zzzz nonexistent",
+            None,
+        )
+        .expect("an unmatched descriptor should still fall back to the group");
+
+        assert_eq!(target.kind, HomeTargetKind::Group);
+        assert_eq!(target.domain.as_deref(), Some("light"));
+    }
+
+    #[test]
+    fn query_is_bare_area_distinguishes_a_room_from_a_device_in_it() {
+        assert!(query_is_bare_area("kitchen", "Kitchen"));
+        assert!(query_is_bare_area("living room", "Living Room"));
+        assert!(!query_is_bare_area("kitchen coffee maker", "Kitchen"));
+        assert!(!query_is_bare_area("living room tv", "Living Room"));
     }
 
     #[test]
