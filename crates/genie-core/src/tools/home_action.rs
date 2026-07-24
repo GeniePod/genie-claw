@@ -70,12 +70,15 @@ fn is_canonical_shape(raw: &str) -> bool {
     !raw.is_empty() && raw.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
 }
 
-/// Map the unambiguous off/on synonyms onto their canonical verb, then accept
-/// the result only if it is a real [`HOME_CONTROL_ACTIONS`] entry.
+/// Map unambiguous synonyms onto their canonical verb, then accept the result
+/// only if it is a real [`HOME_CONTROL_ACTIONS`] entry.
 fn map_synonym(action: &str) -> Option<&'static str> {
     let mapped: &str = match action {
         "deactivate" | "disable" | "switch_off" | "power_off" | "shut_off" => "turn_off",
         "enable" | "switch_on" | "power_on" => "turn_on",
+        // `home_action_kind` / `parse_action` already accept `activate_scene`;
+        // without this map, dispatch rejects it as an invalid home_control action.
+        "activate_scene" => "activate",
         other => other,
     };
     HOME_CONTROL_ACTIONS.iter().copied().find(|&a| a == mapped)

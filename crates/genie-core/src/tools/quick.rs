@@ -1098,6 +1098,14 @@ fn shopping_list_add_request(text: &str) -> Option<String> {
     // A trailing "please" sits after the list suffix ("... shopping list please")
     // and defeated the suffix match, so a polite request added nothing.
     let text = text.trim_end_matches(" please").trim_end();
+    // "please" also leads, and the command words below are anchored at the start
+    // of the utterance, so "please add milk to the shopping list" matched neither
+    // "add " nor "put " and fell through to memory_recall — the router then
+    // *searched memory for the command* instead of adding the item, so the user
+    // is told nothing was found and the milk never reaches the list.
+    // play_media_request already carries a "please play " prefix for exactly this
+    // reason; the list commands were the gap.
+    let text = text.strip_prefix("please ").unwrap_or(text);
     let rest = text
         .strip_prefix("add ")
         .or_else(|| text.strip_prefix("put "))?;
@@ -1125,6 +1133,10 @@ fn shopping_list_remove_request(text: &str) -> Option<String> {
     // Drop a trailing "please" so a polite "... off the shopping list please"
     // still matches the list suffix, mirroring shopping_list_add_request.
     let text = text.trim_end_matches(" please").trim_end();
+    // ... and a leading one, for the same reason as the add path: "take "/"remove "
+    // are anchored at the start, so "please take the milk off the shopping list"
+    // fell through to memory_recall and removed nothing.
+    let text = text.strip_prefix("please ").unwrap_or(text);
     // The article before "shopping list" is optional, exactly as on the add
     // path (" off shopping list" / " from shopping list"): without the
     // article-less variants the removal fell through to memory_recall.
@@ -1943,16 +1955,19 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
         .or_else(|| text.strip_prefix("preheat "))
         && let Some((entity, value)) = parse_temperature_target(rest)
     {
-        // A numeric setpoint on a light is brightness, not temperature: "set the
-        // living room lights to 50 percent" is a set_brightness{value:50}, not a
-        // set_temperature that would try to set a light's (nonexistent)
-        // temperature. Thermostats/ovens keep set_temperature.
-        let action = if is_light_entity(&entity) {
-            "set_brightness"
-        } else {
-            "set_temperature"
-        };
-        return Some((entity, action, Some(value)));
+        // The action for a numeric setpoint depends on the device. A light dims
+        // (set_brightness, #813); a thermostat/oven/heater sets temperature; a
+        // "preheat …" is always a temperature. Anything else — a volume, a fan
+        // speed — has no deterministic "set to N" action (there is no set_volume
+        // etc.), so abstain and let the LLM ground it rather than emit a wrong
+        // set_temperature that would try to set, e.g., a volume's temperature.
+        if is_light_entity(&entity) {
+            return Some((entity, "set_brightness", Some(value)));
+        }
+        if text.starts_with("preheat ") || is_temperature_entity(&entity) {
+            return Some((entity, "set_temperature", Some(value)));
+        }
+        return None;
     }
 
     None
@@ -2039,6 +2054,50 @@ fn clean_control_entity(text: &str) -> String {
 /// brightness rather than temperature.
 fn is_light_entity(entity: &str) -> bool {
     contains_any(entity, &["light", "lights", "lamp", "lamps"])
+}
+
+/// Whether an entity name refers to a temperature device, so "set <entity> to
+/// <value>" is a set_temperature rather than an abstain. Matched at the word
+/// level so short tokens like "ac" don't substring-match unrelated names.
+fn is_temperature_entity(entity: &str) -> bool {
+    let words: Vec<&str> = entity.split_whitespace().collect();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "thermostat"
+                | "thermostats"
+                | "temperature"
+                | "temperatures"
+                | "temp"
+                | "temps"
+                | "climate"
+                | "oven"
+                | "ovens"
+                | "heat"
+                | "heater"
+                | "heaters"
+                | "heating"
+                | "furnace"
+                | "furnaces"
+                | "kettle"
+                | "kettles"
+                | "boiler"
+                | "boilers"
+                | "radiator"
+                | "radiators"
+                | "grill"
+                | "grills"
+                | "smoker"
+                | "smokers"
+                // Air conditioner: the "ac"/"acs" short form and the spelled-out
+                // "conditioner"/"conditioning" word (the "air" is a separate token).
+                | "ac"
+                | "acs"
+                | "conditioner"
+                | "conditioners"
+                | "conditioning"
+        )
+    }) || words.windows(2).any(|pair| pair == ["sous", "vide"])
 }
 
 fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
@@ -2571,10 +2630,16 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
-    if contains_any(
-        &target,
-        &["lock", "locks", "door lock", "door locks", "door"],
-    ) {
+    // Match the lock/door tokens as whole words, not substrings: a bare
+    // `contains_any` fired on "c[lock]" / "b[lock]" and "out[door]", so "is the
+    // clock on" misrouted to home_status "locks" instead of abstaining. Mirrors
+    // the ice/iron/cooktop/cover whole-word fixes above. The multi-word "door
+    // lock" / "door locks" entries are redundant once "lock"/"door" match as
+    // words, and are dropped.
+    if target
+        .split_whitespace()
+        .any(|word| matches!(word, "lock" | "locks" | "door" | "doors"))
+    {
         return Some(if target.split_whitespace().count() == 1 {
             "locks".into()
         } else {
@@ -3685,6 +3750,21 @@ fn asks_current_time(text: &str) -> bool {
     // apostrophe-less "whats the time" this list originally stored, so it fell
     // through to the LLM. Match the normalized `what s ...` forms (and add the
     // missing date counterpart for parity with the time phrasings).
+    //
+    // The list is an exact match, so any politeness or time qualifier the caller
+    // trails defeats it entirely and a plain "what time is it right now" /
+    // "what time is it please" falls through to the LLM. Both tails are pure
+    // noise for a clock reading — "now" is what the question already asks for —
+    // so strip them first, exactly as clean_status_target strips " please" and
+    // the " right now" / " now" STATUS_SUFFIXES off a home_status entity.
+    // Politeness comes off before the time qualifier so the two compose in the
+    // natural spoken order ("what time is it right now please").
+    let text = text.trim_end_matches(" please").trim_end();
+    let text = text
+        .strip_suffix(" right now")
+        .or_else(|| text.strip_suffix(" now"))
+        .map(str::trim_end)
+        .unwrap_or(text);
     matches!(
         text,
         "what time is it"
@@ -4531,6 +4611,50 @@ mod tests {
     }
 
     #[test]
+    fn shopping_list_commands_accept_a_leading_please() {
+        // The command words are anchored at the start of the utterance, so a
+        // leading "please" matched no prefix and the request fell through to
+        // memory_recall — the router searched memory for the command text
+        // instead of touching the list, so nothing was added or removed.
+        for (utterance, content) in [
+            (
+                "Please add milk to the shopping list",
+                "shopping list pending: milk",
+            ),
+            (
+                "Please put eggs and bread on the shopping list",
+                "shopping list pending: eggs, bread",
+            ),
+            (
+                "Please add milk to my shopping list",
+                "shopping list pending: milk",
+            ),
+            (
+                "Please remove milk from the shopping list",
+                "shopping list removed: milk",
+            ),
+            (
+                "Please take milk off the shopping list",
+                "shopping list removed: milk",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "memory_store", "{utterance:?}");
+            assert_eq!(call.arguments["category"], "shopping", "{utterance:?}");
+            assert_eq!(call.arguments["content"], content, "{utterance:?}");
+        }
+
+        // Leading and trailing politeness compose.
+        let call = route("Please add milk to the shopping list please").unwrap();
+        assert_eq!(call.arguments["content"], "shopping list pending: milk");
+
+        // An item that merely starts with those letters is untouched: the strip
+        // needs the whole word plus its trailing space.
+        let call = route("Add pleats to the shopping list").unwrap();
+        assert_eq!(call.arguments["content"], "shopping list pending: pleats");
+    }
+
+    #[test]
     fn hydration_log_preserves_drank_phrase() {
         // The strip-and-re-append logic turned a bare "water" into "water of
         // water" and "<descriptor> water" into "<descriptor> of water".
@@ -4589,6 +4713,37 @@ mod tests {
         assert_eq!(call.arguments["action"], "set_temperature");
         let call = route("set the oven to 400 degrees").unwrap();
         assert_eq!(call.arguments["action"], "set_temperature");
+    }
+
+    #[test]
+    fn set_to_value_abstains_when_the_device_is_not_temperature_or_a_light() {
+        // "set <entity> to <value>" used to emit set_temperature for *any* entity,
+        // so a volume/fan-speed/bare-brightness got a nonsensical
+        // set_temperature. There is no set_volume/set_fan_speed action, so the
+        // router abstains and lets the LLM ground it instead of actuating wrong.
+        for utterance in [
+            "set the volume to 50 percent",
+            "set the fan speed to 3",
+            "set the brightness to 75",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain (no deterministic set-to-N action), got {:?}",
+                route(utterance)
+            );
+        }
+
+        // Temperature devices (including AC/heater/preheat) still set_temperature.
+        for utterance in [
+            "set the ac to 68",
+            "set the heater to 68",
+            "set the bedroom temperature to 70",
+            "preheat the oven to 350",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["action"], "set_temperature", "{utterance:?}");
+        }
     }
 
     #[test]
@@ -5551,6 +5706,40 @@ mod tests {
     }
 
     #[test]
+    fn lock_and_door_status_match_whole_words_not_substrings() {
+        // The lock/door branch matched its tokens with a substring `contains_any`,
+        // so "c[lock]" / "b[lock]" and "out[door]" misrouted to home_status
+        // "locks" (or a garbled multi-word entity) instead of abstaining. Mirrors
+        // the ice/iron/cooktop/cover whole-word fixes.
+        for utterance in [
+            "is the clock on",
+            "is the wall clock right",
+            "is the block heater on",
+            // "out[door]" collided with the door token the same way — this
+            // misrouted to home_status "outdoor cameras" on the substring path.
+            "are the outdoor cameras on",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain from deterministic routing"
+            );
+        }
+
+        // Genuine lock/door queries still resolve: a bare token collapses to
+        // "locks", a named device keeps its full entity.
+        for (utterance, entity) in [
+            ("are the doors locked", "locks"),
+            ("is the door locked", "locks"),
+            ("is the side door locked", "side door"),
+            ("is the garage door closed", "garage door"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn control_entity_drops_leading_indefinite_article() {
         // clean_control_entity stripped a leading "the " but left "a"/"an", so
         // "turn on a fan" produced entity "a fan". The sibling
@@ -5995,6 +6184,42 @@ mod tests {
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "get_time", "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn time_question_survives_a_trailing_please_or_time_qualifier() {
+        // asks_current_time is an exact-match set, so any politeness or time
+        // qualifier the caller trails defeated it entirely and the question fell
+        // through to the LLM — including the very common "what time is it right
+        // now". Both tails are noise for a clock reading.
+        for utterance in [
+            "What time is it right now?",
+            "What time is it now?",
+            "What time is it, please?",
+            "What's the time please?",
+            "What's the time right now?",
+            "What is the time now?",
+            "What is the date, please?",
+            "Current time please",
+            "Tell me the time please",
+            "What day is it right now?",
+            // Politeness and the time qualifier compose, in spoken order.
+            "What time is it right now please?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_time", "{utterance:?}");
+        }
+
+        // A question that only *contains* those words is still not a clock
+        // reading — the set stays an exact match after the tails come off.
+        for utterance in ["what time does the store close", "what is the time zone"] {
+            assert!(
+                route(utterance)
+                    .map(|call| call.name != "get_time")
+                    .unwrap_or(true),
+                "{utterance:?} must not route to get_time"
+            );
         }
     }
 
