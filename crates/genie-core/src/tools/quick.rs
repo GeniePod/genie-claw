@@ -1943,16 +1943,19 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
         .or_else(|| text.strip_prefix("preheat "))
         && let Some((entity, value)) = parse_temperature_target(rest)
     {
-        // A numeric setpoint on a light is brightness, not temperature: "set the
-        // living room lights to 50 percent" is a set_brightness{value:50}, not a
-        // set_temperature that would try to set a light's (nonexistent)
-        // temperature. Thermostats/ovens keep set_temperature.
-        let action = if is_light_entity(&entity) {
-            "set_brightness"
-        } else {
-            "set_temperature"
-        };
-        return Some((entity, action, Some(value)));
+        // The action for a numeric setpoint depends on the device. A light dims
+        // (set_brightness, #813); a thermostat/oven/heater sets temperature; a
+        // "preheat …" is always a temperature. Anything else — a volume, a fan
+        // speed — has no deterministic "set to N" action (there is no set_volume
+        // etc.), so abstain and let the LLM ground it rather than emit a wrong
+        // set_temperature that would try to set, e.g., a volume's temperature.
+        if is_light_entity(&entity) {
+            return Some((entity, "set_brightness", Some(value)));
+        }
+        if text.starts_with("preheat ") || is_temperature_entity(&entity) {
+            return Some((entity, "set_temperature", Some(value)));
+        }
+        return None;
     }
 
     None
@@ -2039,6 +2042,50 @@ fn clean_control_entity(text: &str) -> String {
 /// brightness rather than temperature.
 fn is_light_entity(entity: &str) -> bool {
     contains_any(entity, &["light", "lights", "lamp", "lamps"])
+}
+
+/// Whether an entity name refers to a temperature device, so "set <entity> to
+/// <value>" is a set_temperature rather than an abstain. Matched at the word
+/// level so short tokens like "ac" don't substring-match unrelated names.
+fn is_temperature_entity(entity: &str) -> bool {
+    let words: Vec<&str> = entity.split_whitespace().collect();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "thermostat"
+                | "thermostats"
+                | "temperature"
+                | "temperatures"
+                | "temp"
+                | "temps"
+                | "climate"
+                | "oven"
+                | "ovens"
+                | "heat"
+                | "heater"
+                | "heaters"
+                | "heating"
+                | "furnace"
+                | "furnaces"
+                | "kettle"
+                | "kettles"
+                | "boiler"
+                | "boilers"
+                | "radiator"
+                | "radiators"
+                | "grill"
+                | "grills"
+                | "smoker"
+                | "smokers"
+                // Air conditioner: the "ac"/"acs" short form and the spelled-out
+                // "conditioner"/"conditioning" word (the "air" is a separate token).
+                | "ac"
+                | "acs"
+                | "conditioner"
+                | "conditioners"
+                | "conditioning"
+        )
+    }) || words.windows(2).any(|pair| pair == ["sous", "vide"])
 }
 
 fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
@@ -4589,6 +4636,37 @@ mod tests {
         assert_eq!(call.arguments["action"], "set_temperature");
         let call = route("set the oven to 400 degrees").unwrap();
         assert_eq!(call.arguments["action"], "set_temperature");
+    }
+
+    #[test]
+    fn set_to_value_abstains_when_the_device_is_not_temperature_or_a_light() {
+        // "set <entity> to <value>" used to emit set_temperature for *any* entity,
+        // so a volume/fan-speed/bare-brightness got a nonsensical
+        // set_temperature. There is no set_volume/set_fan_speed action, so the
+        // router abstains and lets the LLM ground it instead of actuating wrong.
+        for utterance in [
+            "set the volume to 50 percent",
+            "set the fan speed to 3",
+            "set the brightness to 75",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain (no deterministic set-to-N action), got {:?}",
+                route(utterance)
+            );
+        }
+
+        // Temperature devices (including AC/heater/preheat) still set_temperature.
+        for utterance in [
+            "set the ac to 68",
+            "set the heater to 68",
+            "set the bedroom temperature to 70",
+            "preheat the oven to 350",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["action"], "set_temperature", "{utterance:?}");
+        }
     }
 
     #[test]
