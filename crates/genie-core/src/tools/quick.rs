@@ -1953,21 +1953,35 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
     if let Some(rest) = text
         .strip_prefix("set ")
         .or_else(|| text.strip_prefix("preheat "))
-        && let Some((entity, value)) = parse_temperature_target(rest)
     {
-        // The action for a numeric setpoint depends on the device. A light dims
-        // (set_brightness, #813); a thermostat/oven/heater sets temperature; a
-        // "preheat …" is always a temperature. Anything else — a volume, a fan
-        // speed — has no deterministic "set to N" action (there is no set_volume
-        // etc.), so abstain and let the LLM ground it rather than emit a wrong
-        // set_temperature that would try to set, e.g., a volume's temperature.
-        if is_light_entity(&entity) {
-            return Some((entity, "set_brightness", Some(value)));
+        // A trailing "in <duration>" is a schedule, not part of the setpoint:
+        // "set the thermostat to 68 in an hour" must be grounded by the LLM
+        // (which can arm the delay), not actuated now. parse_amount reads "68"
+        // straight out of "68 in an hour", so without this guard the setpoint
+        // fires immediately and the delay is silently dropped. Mirrors the same
+        // is_time_expression guard on the turn_on/turn_off path
+        // (simple_turn_request).
+        if let Some((_, tail)) = rest.rsplit_once(" in ") {
+            let tail = tail.trim().trim_start_matches("the ").trim();
+            if is_time_expression(tail) {
+                return None;
+            }
         }
-        if text.starts_with("preheat ") || is_temperature_entity(&entity) {
-            return Some((entity, "set_temperature", Some(value)));
+        if let Some((entity, value)) = parse_temperature_target(rest) {
+            // The action for a numeric setpoint depends on the device. A light
+            // dims (set_brightness, #813); a thermostat/oven/heater sets
+            // temperature; a "preheat …" is always a temperature. Anything else —
+            // a volume, a fan speed — has no deterministic "set to N" action
+            // (there is no set_volume etc.), so abstain and let the LLM ground it
+            // rather than emit a wrong set_temperature (#827).
+            if is_light_entity(&entity) {
+                return Some((entity, "set_brightness", Some(value)));
+            }
+            if text.starts_with("preheat ") || is_temperature_entity(&entity) {
+                return Some((entity, "set_temperature", Some(value)));
+            }
+            return None;
         }
-        return None;
     }
 
     None
@@ -2575,10 +2589,19 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
-    if contains_any(
-        &target,
-        &["switch", "switches", "plug", "plugs", "outlet", "outlets"],
-    ) {
+    // Match the switch/plug/outlet tokens as whole words, not substrings: a bare
+    // `contains_any` fired on "[switch]board" / "[switch]gear", "un[plug]ged" /
+    // "ear[plug]s" and "[plug]in", so "what is the switchboard status" collapsed
+    // to the whole-house "switches" readout and "is the plugin enabled" / "are
+    // the earplugs in the drawer" misrouted to a garbled home_status entity
+    // instead of abstaining. Mirrors the ice/iron/cooktop/cover/car whole-word
+    // fixes elsewhere in this function.
+    if target.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "switch" | "switches" | "plug" | "plugs" | "outlet" | "outlets"
+        )
+    }) {
         return Some(if target.split_whitespace().count() == 1 {
             "switches".into()
         } else {
@@ -2590,6 +2613,14 @@ fn home_status_target(text: &str) -> Option<String> {
         &target,
         &["thermostat", "thermostats", "temperature", "climate"],
     ) {
+        // "temperature outside" / "outdoor temperature" is a weather question,
+        // not an indoor thermostat reading — there is no "temperature outside"
+        // device, so emitting home_status{entity:"temperature outside"} is a
+        // garbled misroute. Abstain so the LLM grounds it as weather. The attic
+        // arm below already shows this branch is scoped to indoor climate.
+        if contains_any(&target, &["outside", "outdoor"]) {
+            return None;
+        }
         if target.contains("attic") {
             return Some("attic temperature".into());
         }
@@ -2647,6 +2678,17 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
+    // "ice maker" names an appliance, not the driveway: the whole-word "ice"
+    // test below swept "is the ice maker on" into the driveway-ice collapse,
+    // so a question about the appliance was answered with the driveway
+    // ice-risk report. Match the two-word appliance name (and the fused
+    // "icemaker") first and keep the appliance as the entity, the same way
+    // the iron/car appliance-noun handling above keeps its device distinct.
+    let words: Vec<&str> = target.split_whitespace().collect();
+    if words.windows(2).any(|pair| pair == ["ice", "maker"]) || words.contains(&"icemaker") {
+        return Some("ice maker".into());
+    }
+
     // Match "ice"/"icy" as whole words, not as substrings: a bare `contains`
     // fired on "pr[ice]" and "sp[icy]", so "what's the price of bitcoin" and
     // "is the food spicy" misrouted to home_status "driveway ice". "driveway"
@@ -2668,7 +2710,30 @@ fn home_status_target(text: &str) -> Option<String> {
     }
 
     if contains_any(&target, &["dryer", "drying machine"]) {
-        return Some("dryer".into());
+        // Keep a qualifier the caller named, like every sibling branch here
+        // (switches, thermostat, covers, locks, lights, freezer) already does:
+        // this one canonicalized *unconditionally*, so "is the hair dryer on"
+        // and "is the basement dryer on" both reported the laundry dryer — a
+        // different appliance in a different room from the one asked about.
+        //
+        // A plain word-count test (the sibling shape) would not work here,
+        // because " done" is not one of the STATUS_SUFFIXES: it would turn the
+        // common "is the dryer done" into the garbled entity "dryer done".
+        // Key on the device word's *position* instead — a qualifier precedes the
+        // device ("hair dryer"), while a leftover state word trails it ("dryer
+        // done") — so only a genuinely qualified target is preserved. The
+        // "drying machine" synonym still canonicalizes, since it does not end in
+        // the device word.
+        let names_a_qualified_dryer = target.split_whitespace().count() > 1
+            && matches!(
+                target.split_whitespace().next_back(),
+                Some("dryer" | "dryers")
+            );
+        return Some(if names_a_qualified_dryer {
+            target
+        } else {
+            "dryer".into()
+        });
     }
 
     if target.contains("humidity") {
@@ -5598,6 +5663,38 @@ mod tests {
     }
 
     #[test]
+    fn dryer_status_keeps_a_named_qualifier() {
+        // The dryer branch canonicalized every match to the bare laundry
+        // "dryer", so a qualified device reported a different appliance in a
+        // different room than the one asked about. Every sibling branch
+        // (switches, thermostat, covers, locks, lights, freezer) already keeps
+        // the qualifier the caller named.
+        for (utterance, entity) in [
+            ("is the hair dryer on", "hair dryer"),
+            ("is the hand dryer on", "hand dryer"),
+            ("is the basement dryer on", "basement dryer"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+
+        // The bare device, its synonym, and a target whose extra word is a
+        // leftover state word (" done" is not a STATUS_SUFFIXES entry) all still
+        // canonicalize to "dryer".
+        for utterance in [
+            "is the dryer on",
+            "check the dryer",
+            "is the drying machine on",
+            "is the dryer done",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "dryer", "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn car_and_light_status_match_whole_words_not_substrings() {
         // "car" and "light" were matched as substrings, so "[car]bon monoxide
         // alarm" reported on the car and "night[light]" collapsed to a
@@ -5616,6 +5713,30 @@ mod tests {
                     .unwrap_or(true),
                 "{utterance:?} must not resolve to the {wrong_entity:?} status entity"
             );
+        }
+    }
+
+    #[test]
+    fn ice_maker_status_reports_the_appliance_not_driveway_ice() {
+        // The whole-word "ice" match swept the ice-maker appliance into the
+        // driveway-ice collapse: "Is the ice maker on?" was answered with the
+        // driveway ice-risk report on `main`.
+        for utterance in [
+            "Is the ice maker working?",
+            "Is the ice maker on?",
+            "Check the ice maker",
+            "Is the icemaker on?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "ice maker", "{utterance:?}");
+        }
+
+        // Genuine driveway-ice queries still collapse to the driveway entity.
+        for utterance in ["Is the driveway icy?", "Is there ice on the driveway?"] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "driveway ice", "{utterance:?}");
         }
     }
 
@@ -5762,6 +5883,41 @@ mod tests {
     }
 
     #[test]
+    fn switch_and_outlet_status_match_whole_words_not_substrings() {
+        // The switch/plug/outlet branch matched its tokens with a substring
+        // `contains_any`, so "[switch]board" / "[switch]gear", "un[plug]ged" /
+        // "ear[plug]s" and "[plug]in" all fired it. "what is the switchboard
+        // status" collapsed to the whole-house "switches" readout, and the
+        // multi-word cases misrouted to a garbled home_status entity.
+        for utterance in [
+            "what is the switchboard status",
+            "is the switchgear ok",
+            "is the plugin enabled",
+            "is the toaster unplugged",
+            "are the earplugs in the drawer",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain, not resolve to a switch/plug/outlet status entity"
+            );
+        }
+
+        // Genuine switch/plug/outlet queries still resolve exactly as before.
+        for (utterance, entity) in [
+            ("are the switches on", "switches"),
+            ("is the switch on", "switches"),
+            ("are the outlets on", "switches"),
+            ("check the outlet", "switches"),
+            ("is the kitchen plug on", "kitchen plug"),
+            ("are the kitchen plugs on", "kitchen plugs"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn control_entity_drops_leading_indefinite_article() {
         // clean_control_entity stripped a leading "the " but left "a"/"an", so
         // "turn on a fan" produced entity "a fan". The sibling
@@ -5837,6 +5993,42 @@ mod tests {
     }
 
     #[test]
+    fn setpoint_with_scheduled_delay_abstains_instead_of_firing_now() {
+        // "set the thermostat to 68 in an hour" is a schedule. parse_amount reads
+        // "68" straight out of "68 in an hour", so the setpoint path actuated the
+        // thermostat immediately and dropped the delay. The turn_on/turn_off path
+        // already abstains on a trailing time schedule; the setpoint path must too
+        // so the LLM can arm it.
+        for utterance in [
+            "set the thermostat to 68 in an hour",
+            "set the thermostat to 72 in 30 minutes",
+            "set the bedroom thermostat to 70 in 15 minutes",
+            "preheat the oven to 400 in an hour",
+            // Longer calendar durations are schedules too.
+            "set the thermostat to 68 in a week",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // An immediate setpoint (no trailing time) still actuates now.
+        let call = route("set the thermostat to 68").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "thermostat");
+        assert_eq!(call.arguments["action"], "set_temperature");
+
+        // A room after "in [the]" is not a schedule — it still resolves and
+        // actuates the setpoint now (the guard only fires on a time expression).
+        // In this path the trailing "in the den" is not folded into the entity —
+        // parse_temperature_target extracts the numeric setpoint from the value
+        // clause, so the entity stays "thermostat" and the value is 68.
+        let call = route("set the thermostat to 68 in the den").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "thermostat");
+        assert_eq!(call.arguments["action"], "set_temperature");
+        assert_eq!(call.arguments["value"], 68);
+    }
+
+    #[test]
     fn whats_contraction_matches_spelled_out_status_prefix() {
         // `normalize` folds "what's" -> "what s", so the status prefix strip left
         // a dangling "s" ("what's the temperature in the bedroom" -> entity
@@ -5857,6 +6049,35 @@ mod tests {
         let contracted = route("what's the temperature in the bedroom").unwrap();
         let spelled = route("what is the temperature in the bedroom").unwrap();
         assert_eq!(contracted.arguments["entity"], spelled.arguments["entity"]);
+    }
+
+    #[test]
+    fn outdoor_temperature_query_abstains_instead_of_thermostat_status() {
+        // "what's the temperature outside" is a weather question, not an indoor
+        // thermostat reading — there is no "temperature outside" device, so the
+        // router emitted a garbled home_status{entity:"temperature outside"}. An
+        // outdoor-qualified temperature/climate query must abstain so the LLM
+        // grounds it (as weather).
+        for utterance in [
+            "what's the temperature outside",
+            "what is the temperature outdoors",
+            "what's the outdoor temperature",
+            "how's the climate outside",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain, not report a thermostat status"
+            );
+        }
+
+        // Indoor thermostat/climate queries still resolve.
+        let call = route("what's the temperature").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "thermostat");
+
+        let call = route("is the climate control on").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "climate control");
     }
 
     #[test]
