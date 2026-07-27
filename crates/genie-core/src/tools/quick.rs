@@ -3248,14 +3248,36 @@ fn temperature_conversion_expression(text: &str) -> Option<String> {
     // Both directions: "72 degrees to celsius" -> (72 - 32) * 5 / 9 and the
     // previously-unhandled "100 celsius to fahrenheit" -> 100 * 9 / 5 + 32, which
     // used to fall through to the LLM.
-    let to_celsius = text.contains("to celsius") || text.contains("to celcius");
-    let to_fahrenheit = text.contains("to fahrenheit") || text.contains("to farenheit");
+    // Accept the "in <unit>" phrasing ("72 degrees in celsius", "what is 37 c in
+    // fahrenheit") alongside the "to <unit>" form. "in" is at least as common as
+    // "to" for spoken temperature conversions; without it the query fell through
+    // to the LLM.
+    let to_celsius = text.contains("to celsius")
+        || text.contains("to celcius")
+        || text.contains("in celsius")
+        || text.contains("in celcius");
+    let to_fahrenheit = text.contains("to fahrenheit")
+        || text.contains("to farenheit")
+        || text.contains("in fahrenheit")
+        || text.contains("in farenheit");
     if !to_celsius && !to_fahrenheit {
         return None;
     }
     let tokens = text.split_whitespace().collect::<Vec<_>>();
-    let to_idx = tokens.iter().position(|token| *token == "to")?;
-    let value = calc_number_before_to(&tokens, to_idx)?;
+    // The conversion marker ("to"/"in") sits immediately before the *target* unit
+    // word. Anchoring on the target unit — not the first "to"/"in" token — keeps
+    // the source-unit form ("100 celsius to fahrenheit") and a stray earlier "to"
+    // ("i want to convert 72 degrees in celsius") reading the right number.
+    let target_units: &[&str] = if to_celsius {
+        &["celsius", "celcius"]
+    } else {
+        &["fahrenheit", "farenheit"]
+    };
+    let marker_idx = tokens.iter().enumerate().find_map(|(i, token)| {
+        (i > 0 && target_units.contains(token) && matches!(tokens[i - 1], "to" | "in"))
+            .then(|| i - 1)
+    })?;
+    let value = calc_number_before_to(&tokens, marker_idx)?;
     Some(if to_celsius {
         format!("({value} - 32) * 5 / 9")
     } else {
@@ -7207,5 +7229,28 @@ mod tests {
 
         let call = route_for_available_tools("what is 15 percent of 200", false, false).unwrap();
         assert_eq!(call.name, "calculate");
+    }
+
+    #[test]
+    fn temperature_conversion_accepts_the_in_phrasing() {
+        // "in <unit>" is at least as common as "to <unit>" for a spoken temperature
+        // conversion; it used to fall through to the LLM. Value-reading is anchored
+        // on the *target* unit, so the source-unit order and a stray earlier "to"
+        // still read the right number.
+        for (utterance, expression) in [
+            ("what is 72 degrees in celsius", "(72 - 32) * 5 / 9"),
+            ("Convert 72 degrees in Celsius", "(72 - 32) * 5 / 9"),
+            ("72 fahrenheit in celsius", "(72 - 32) * 5 / 9"),
+            ("convert 100 celsius in fahrenheit", "100 * 9 / 5 + 32"),
+            ("what is 37 c in fahrenheit", "37 * 9 / 5 + 32"),
+            (
+                "I want to convert 72 degrees in celsius",
+                "(72 - 32) * 5 / 9",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "calculate", "{utterance:?}");
+            assert_eq!(call.arguments["expression"], expression, "{utterance:?}");
+        }
     }
 }
