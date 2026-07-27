@@ -1953,21 +1953,35 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
     if let Some(rest) = text
         .strip_prefix("set ")
         .or_else(|| text.strip_prefix("preheat "))
-        && let Some((entity, value)) = parse_temperature_target(rest)
     {
-        // The action for a numeric setpoint depends on the device. A light dims
-        // (set_brightness, #813); a thermostat/oven/heater sets temperature; a
-        // "preheat …" is always a temperature. Anything else — a volume, a fan
-        // speed — has no deterministic "set to N" action (there is no set_volume
-        // etc.), so abstain and let the LLM ground it rather than emit a wrong
-        // set_temperature that would try to set, e.g., a volume's temperature.
-        if is_light_entity(&entity) {
-            return Some((entity, "set_brightness", Some(value)));
+        // A trailing "in <duration>" is a schedule, not part of the setpoint:
+        // "set the thermostat to 68 in an hour" must be grounded by the LLM
+        // (which can arm the delay), not actuated now. parse_amount reads "68"
+        // straight out of "68 in an hour", so without this guard the setpoint
+        // fires immediately and the delay is silently dropped. Mirrors the same
+        // is_time_expression guard on the turn_on/turn_off path
+        // (simple_turn_request).
+        if let Some((_, tail)) = rest.rsplit_once(" in ") {
+            let tail = tail.trim().trim_start_matches("the ").trim();
+            if is_time_expression(tail) {
+                return None;
+            }
         }
-        if text.starts_with("preheat ") || is_temperature_entity(&entity) {
-            return Some((entity, "set_temperature", Some(value)));
+        if let Some((entity, value)) = parse_temperature_target(rest) {
+            // The action for a numeric setpoint depends on the device. A light
+            // dims (set_brightness, #813); a thermostat/oven/heater sets
+            // temperature; a "preheat …" is always a temperature. Anything else —
+            // a volume, a fan speed — has no deterministic "set to N" action
+            // (there is no set_volume etc.), so abstain and let the LLM ground it
+            // rather than emit a wrong set_temperature (#827).
+            if is_light_entity(&entity) {
+                return Some((entity, "set_brightness", Some(value)));
+            }
+            if text.starts_with("preheat ") || is_temperature_entity(&entity) {
+                return Some((entity, "set_temperature", Some(value)));
+            }
+            return None;
         }
-        return None;
     }
 
     None
@@ -2575,10 +2589,19 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
-    if contains_any(
-        &target,
-        &["switch", "switches", "plug", "plugs", "outlet", "outlets"],
-    ) {
+    // Match the switch/plug/outlet tokens as whole words, not substrings: a bare
+    // `contains_any` fired on "[switch]board" / "[switch]gear", "un[plug]ged" /
+    // "ear[plug]s" and "[plug]in", so "what is the switchboard status" collapsed
+    // to the whole-house "switches" readout and "is the plugin enabled" / "are
+    // the earplugs in the drawer" misrouted to a garbled home_status entity
+    // instead of abstaining. Mirrors the ice/iron/cooktop/cover/car whole-word
+    // fixes elsewhere in this function.
+    if target.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "switch" | "switches" | "plug" | "plugs" | "outlet" | "outlets"
+        )
+    }) {
         return Some(if target.split_whitespace().count() == 1 {
             "switches".into()
         } else {
@@ -5795,6 +5818,41 @@ mod tests {
     }
 
     #[test]
+    fn switch_and_outlet_status_match_whole_words_not_substrings() {
+        // The switch/plug/outlet branch matched its tokens with a substring
+        // `contains_any`, so "[switch]board" / "[switch]gear", "un[plug]ged" /
+        // "ear[plug]s" and "[plug]in" all fired it. "what is the switchboard
+        // status" collapsed to the whole-house "switches" readout, and the
+        // multi-word cases misrouted to a garbled home_status entity.
+        for utterance in [
+            "what is the switchboard status",
+            "is the switchgear ok",
+            "is the plugin enabled",
+            "is the toaster unplugged",
+            "are the earplugs in the drawer",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain, not resolve to a switch/plug/outlet status entity"
+            );
+        }
+
+        // Genuine switch/plug/outlet queries still resolve exactly as before.
+        for (utterance, entity) in [
+            ("are the switches on", "switches"),
+            ("is the switch on", "switches"),
+            ("are the outlets on", "switches"),
+            ("check the outlet", "switches"),
+            ("is the kitchen plug on", "kitchen plug"),
+            ("are the kitchen plugs on", "kitchen plugs"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn control_entity_drops_leading_indefinite_article() {
         // clean_control_entity stripped a leading "the " but left "a"/"an", so
         // "turn on a fan" produced entity "a fan". The sibling
@@ -5867,6 +5925,42 @@ mod tests {
             assert_eq!(call.name, "home_control", "{utterance:?}");
             assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
         }
+    }
+
+    #[test]
+    fn setpoint_with_scheduled_delay_abstains_instead_of_firing_now() {
+        // "set the thermostat to 68 in an hour" is a schedule. parse_amount reads
+        // "68" straight out of "68 in an hour", so the setpoint path actuated the
+        // thermostat immediately and dropped the delay. The turn_on/turn_off path
+        // already abstains on a trailing time schedule; the setpoint path must too
+        // so the LLM can arm it.
+        for utterance in [
+            "set the thermostat to 68 in an hour",
+            "set the thermostat to 72 in 30 minutes",
+            "set the bedroom thermostat to 70 in 15 minutes",
+            "preheat the oven to 400 in an hour",
+            // Longer calendar durations are schedules too.
+            "set the thermostat to 68 in a week",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // An immediate setpoint (no trailing time) still actuates now.
+        let call = route("set the thermostat to 68").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "thermostat");
+        assert_eq!(call.arguments["action"], "set_temperature");
+
+        // A room after "in [the]" is not a schedule — it still resolves and
+        // actuates the setpoint now (the guard only fires on a time expression).
+        // In this path the trailing "in the den" is not folded into the entity —
+        // parse_temperature_target extracts the numeric setpoint from the value
+        // clause, so the entity stays "thermostat" and the value is 68.
+        let call = route("set the thermostat to 68 in the den").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "thermostat");
+        assert_eq!(call.arguments["action"], "set_temperature");
+        assert_eq!(call.arguments["value"], 68);
     }
 
     #[test]
