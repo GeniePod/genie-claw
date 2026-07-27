@@ -26,8 +26,7 @@ pub fn extract_facts(text: &str) -> Vec<ExtractedFact> {
     let trimmed = text.trim();
 
     if !needs_extract_facts_lower(text) {
-        if trimmed.len() >= 8
-            && trimmed[..8].eq_ignore_ascii_case("remember")
+        if starts_with_ascii_ci(trimmed, "remember")
             && let Some(content) = extract_remember(trimmed)
         {
             facts.push(ExtractedFact {
@@ -135,8 +134,7 @@ pub fn extract_facts(text: &str) -> Vec<ExtractedFact> {
     }
 
     // Explicit "remember" requests.
-    if trimmed.len() >= 8
-        && trimmed[..8].eq_ignore_ascii_case("remember")
+    if starts_with_ascii_ci(trimmed, "remember")
         && let Some(content) = extract_remember(trimmed)
         && facts.is_empty()
     {
@@ -223,6 +221,25 @@ fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
             .zip(needle.bytes())
             .all(|(left, right)| left.eq_ignore_ascii_case(&right))
     })
+}
+
+/// ASCII case-insensitive prefix check that is UTF-8-safe (#634).
+///
+/// `&haystack[..needle.len()]` panics when `needle.len()` lands inside a
+/// multi-byte codepoint (e.g. an emoji or accented char whose 8th byte is not
+/// a char boundary). Comparing the leading bytes never slices a `str`, so a
+/// non-ASCII utterance is simply "no match" instead of a crash. `needle` is
+/// an ASCII literal at every call site.
+fn starts_with_ascii_ci(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let n = needle.len();
+    if bytes.len() < n {
+        return false;
+    }
+    bytes[..n]
+        .iter()
+        .zip(needle.bytes())
+        .all(|(left, right)| left.eq_ignore_ascii_case(&right))
 }
 
 /// True when any Tier-1 extractor needs the allocating lowercase view.
@@ -542,7 +559,7 @@ fn extract_relationships(text: &str) -> Vec<(String, String)> {
 
 fn extract_remember(text: &str) -> Option<String> {
     const PREFIX: &str = "remember";
-    if text.len() < PREFIX.len() || !text[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+    if !starts_with_ascii_ci(text, PREFIX) {
         return None;
     }
     let rest = text[PREFIX.len()..].trim();
@@ -599,5 +616,35 @@ mod tests {
 
         assert_eq!(stored, 0);
         assert_eq!(mem.get_by_kind("identity", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn starts_with_ascii_ci_is_utf8_safe_and_case_insensitive() {
+        // The pre-fix `trimmed[..8]` sliced 8 bytes behind only a length
+        // check, so an utterance whose 8th byte fell inside a multi-byte char
+        // ("i love ✨…", byte 8 splits the sparkle) panicked. Byte comparison
+        // never slices a str, so these are a clean "no match" instead.
+        assert!(!starts_with_ascii_ci("i love ✨ sparkles", "remember"));
+        assert!(!starts_with_ascii_ci("abcdef😀 note", "remember"));
+        assert!(!starts_with_ascii_ci("hi", "remember"));
+        // Genuine prefixes still match, case-insensitively.
+        assert!(starts_with_ascii_ci("remember the code", "remember"));
+        assert!(starts_with_ascii_ci("Remember to buy milk", "remember"));
+    }
+
+    #[test]
+    fn extract_facts_does_not_panic_on_multibyte_input() {
+        // Regression for #634: the "remember" fast-path must not panic on
+        // non-ASCII input. Byte 8 lands inside a multi-byte codepoint in each.
+        let _ = extract_facts("i love ✨ sparkles everywhere");
+        let _ = extract_facts("abcdef😀 is my favorite emoji today");
+        let _ = extract_facts("日本語のテキストをここに入力します");
+        // A real "remember" request still extracts its content.
+        let facts = extract_facts("remember the garage code is 1234");
+        assert!(
+            facts.iter().any(|f| f.content.contains("garage code")),
+            "got: {:?}",
+            facts.iter().map(|f| &f.content).collect::<Vec<_>>()
+        );
     }
 }
