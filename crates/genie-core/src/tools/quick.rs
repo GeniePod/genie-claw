@@ -2990,12 +2990,24 @@ fn is_time_expression(location: &str) -> bool {
     // query ("will it rain in a month") and a scheduled control ("turn on the
     // lights in a month") both mishandled them — the same class the shorter
     // day/week units already cover.
+    //
+    // A trailing time-of-day word is a time, not a place, even with a qualifier
+    // in front of it: "tonight", "this morning", "tomorrow night". A bare
+    // "morning"/"evening"/"night" is already caught by TIME_PHRASES above, but
+    // "weather for tonight" and "weather for this morning" reached here with a
+    // non-matching last token and used to route to get_weather{location:"tonight"}.
+    // "tonight" is the sibling of the today/tomorrow the weather/rain paths
+    // already special-case.
     matches!(
         location.split_whitespace().next_back(),
         Some(last) if is_time_unit(last)
             || matches!(
                 last,
-                "day" | "days"
+                "morning" | "afternoon"
+                    | "evening" | "night"
+                    | "tonight" | "midday"
+                    | "noon" | "midnight"
+                    | "day" | "days"
                     | "week" | "weeks"
                     | "month" | "months"
                     | "year" | "years"
@@ -6955,6 +6967,26 @@ mod tests {
         let call = route("what's the weather in Denver tonight").unwrap();
         assert_eq!(call.name, "get_weather");
         assert_eq!(call.arguments["location"], "denver");
+    }
+
+    #[test]
+    fn weather_for_a_bare_time_of_day_abstains() {
+        // A bare time-of-day word after "for"/"in" names a *time*, not a place:
+        // "weather for tonight" must fall back to the local forecast (abstain),
+        // not look up a city called "tonight". "tonight" and the "this <part of
+        // day>" forms were the siblings of the today/tomorrow/morning the path
+        // already handled; they used to emit get_weather{location:"tonight"}.
+        for utterance in [
+            "what's the weather for tonight",
+            "what's the weather for this morning",
+            "what's the weather for this evening",
+            "what's the weather in the evening",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} should abstain (local forecast), not route a time as a place"
+            );
+        }
     }
 
     #[test]
