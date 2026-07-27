@@ -2613,6 +2613,14 @@ fn home_status_target(text: &str) -> Option<String> {
         &target,
         &["thermostat", "thermostats", "temperature", "climate"],
     ) {
+        // "temperature outside" / "outdoor temperature" is a weather question,
+        // not an indoor thermostat reading — there is no "temperature outside"
+        // device, so emitting home_status{entity:"temperature outside"} is a
+        // garbled misroute. Abstain so the LLM grounds it as weather. The attic
+        // arm below already shows this branch is scoped to indoor climate.
+        if contains_any(&target, &["outside", "outdoor"]) {
+            return None;
+        }
         if target.contains("attic") {
             return Some("attic temperature".into());
         }
@@ -5984,6 +5992,35 @@ mod tests {
         let contracted = route("what's the temperature in the bedroom").unwrap();
         let spelled = route("what is the temperature in the bedroom").unwrap();
         assert_eq!(contracted.arguments["entity"], spelled.arguments["entity"]);
+    }
+
+    #[test]
+    fn outdoor_temperature_query_abstains_instead_of_thermostat_status() {
+        // "what's the temperature outside" is a weather question, not an indoor
+        // thermostat reading — there is no "temperature outside" device, so the
+        // router emitted a garbled home_status{entity:"temperature outside"}. An
+        // outdoor-qualified temperature/climate query must abstain so the LLM
+        // grounds it (as weather).
+        for utterance in [
+            "what's the temperature outside",
+            "what is the temperature outdoors",
+            "what's the outdoor temperature",
+            "how's the climate outside",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain, not report a thermostat status"
+            );
+        }
+
+        // Indoor thermostat/climate queries still resolve.
+        let call = route("what's the temperature").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "thermostat");
+
+        let call = route("is the climate control on").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "climate control");
     }
 
     #[test]
