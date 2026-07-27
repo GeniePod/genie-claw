@@ -90,7 +90,7 @@ pub fn dream_cycle(
                 id = candidate.entry.id,
                 score = format!("{:.3}", candidate.score),
                 recalls = candidate.entry.recall_count,
-                content = &candidate.entry.content[..candidate.entry.content.len().min(60)],
+                content = log_preview(&candidate.entry.content),
                 "memory promoted to permanent"
             );
         }
@@ -320,6 +320,19 @@ fn diversity_from_unique_queries(unique_queries: usize) -> f64 {
     (unique_queries as f64 / 4.0).min(1.0)
 }
 
+/// Char-boundary-safe preview of a memory's content for the promotion log.
+///
+/// The previous `&content[..content.len().min(60)]` is a byte slice: when byte
+/// 60 falls inside a multi-byte UTF-8 codepoint — an emoji or an accented
+/// household name in the stored memory — it panics with "byte index 60 is not
+/// a char boundary". With `panic = "abort"` in the release profile that aborts
+/// the dreaming cycle mid-promotion. Truncating by character count never splits
+/// a codepoint. Same bug class as the conversation-title fix (#168 / #169) and
+/// the error-body fix (#150).
+fn log_preview(content: &str) -> String {
+    content.chars().take(60).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +436,29 @@ mod tests {
         assert_eq!(diversity_from_unique_queries(2), 0.5);
         assert_eq!(diversity_from_unique_queries(4), 1.0);
         assert_eq!(diversity_from_unique_queries(10), 1.0);
+    }
+
+    #[test]
+    fn log_preview_never_splits_a_multibyte_char() {
+        // The pre-fix `&content[..content.len().min(60)]` panicked when byte 60
+        // fell inside a multi-byte codepoint. Memory content is full of emoji /
+        // accented names / CJK, and with panic = "abort" a panic here aborts
+        // the dreaming cycle, so the promotion log must never slice mid-char.
+
+        // Byte 60 splits the first 'é' (59 ASCII bytes + 2-byte chars).
+        let straddling = format!("{}{}", "x".repeat(59), "é".repeat(4));
+        let preview = log_preview(&straddling);
+        assert!(straddling.starts_with(&preview), "preview must be a prefix");
+        assert_eq!(preview.chars().count(), 60, "capped at 60 chars");
+
+        // Emoji content far over 60 bytes stays safe and a valid prefix.
+        let emoji = "🎉".repeat(40); // 160 bytes, 40 chars
+        let short = log_preview(&emoji);
+        assert_eq!(short.chars().count(), 40);
+        assert!(emoji.starts_with(&short));
+
+        // Short ASCII content is returned unchanged.
+        assert_eq!(log_preview("hello"), "hello");
     }
 
     #[test]
