@@ -2589,10 +2589,19 @@ fn home_status_target(text: &str) -> Option<String> {
         });
     }
 
-    if contains_any(
-        &target,
-        &["switch", "switches", "plug", "plugs", "outlet", "outlets"],
-    ) {
+    // Match the switch/plug/outlet tokens as whole words, not substrings: a bare
+    // `contains_any` fired on "[switch]board" / "[switch]gear", "un[plug]ged" /
+    // "ear[plug]s" and "[plug]in", so "what is the switchboard status" collapsed
+    // to the whole-house "switches" readout and "is the plugin enabled" / "are
+    // the earplugs in the drawer" misrouted to a garbled home_status entity
+    // instead of abstaining. Mirrors the ice/iron/cooktop/cover/car whole-word
+    // fixes elsewhere in this function.
+    if target.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "switch" | "switches" | "plug" | "plugs" | "outlet" | "outlets"
+        )
+    }) {
         return Some(if target.split_whitespace().count() == 1 {
             "switches".into()
         } else {
@@ -2690,7 +2699,30 @@ fn home_status_target(text: &str) -> Option<String> {
     }
 
     if contains_any(&target, &["dryer", "drying machine"]) {
-        return Some("dryer".into());
+        // Keep a qualifier the caller named, like every sibling branch here
+        // (switches, thermostat, covers, locks, lights, freezer) already does:
+        // this one canonicalized *unconditionally*, so "is the hair dryer on"
+        // and "is the basement dryer on" both reported the laundry dryer — a
+        // different appliance in a different room from the one asked about.
+        //
+        // A plain word-count test (the sibling shape) would not work here,
+        // because " done" is not one of the STATUS_SUFFIXES: it would turn the
+        // common "is the dryer done" into the garbled entity "dryer done".
+        // Key on the device word's *position* instead — a qualifier precedes the
+        // device ("hair dryer"), while a leftover state word trails it ("dryer
+        // done") — so only a genuinely qualified target is preserved. The
+        // "drying machine" synonym still canonicalizes, since it does not end in
+        // the device word.
+        let names_a_qualified_dryer = target.split_whitespace().count() > 1
+            && matches!(
+                target.split_whitespace().next_back(),
+                Some("dryer" | "dryers")
+            );
+        return Some(if names_a_qualified_dryer {
+            target
+        } else {
+            "dryer".into()
+        });
     }
 
     if target.contains("humidity") {
@@ -5598,6 +5630,38 @@ mod tests {
     }
 
     #[test]
+    fn dryer_status_keeps_a_named_qualifier() {
+        // The dryer branch canonicalized every match to the bare laundry
+        // "dryer", so a qualified device reported a different appliance in a
+        // different room than the one asked about. Every sibling branch
+        // (switches, thermostat, covers, locks, lights, freezer) already keeps
+        // the qualifier the caller named.
+        for (utterance, entity) in [
+            ("is the hair dryer on", "hair dryer"),
+            ("is the hand dryer on", "hand dryer"),
+            ("is the basement dryer on", "basement dryer"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+
+        // The bare device, its synonym, and a target whose extra word is a
+        // leftover state word (" done" is not a STATUS_SUFFIXES entry) all still
+        // canonicalize to "dryer".
+        for utterance in [
+            "is the dryer on",
+            "check the dryer",
+            "is the drying machine on",
+            "is the dryer done",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "dryer", "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn car_and_light_status_match_whole_words_not_substrings() {
         // "car" and "light" were matched as substrings, so "[car]bon monoxide
         // alarm" reported on the car and "night[light]" collapsed to a
@@ -5754,6 +5818,41 @@ mod tests {
             ("is the door locked", "locks"),
             ("is the side door locked", "side door"),
             ("is the garage door closed", "garage door"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn switch_and_outlet_status_match_whole_words_not_substrings() {
+        // The switch/plug/outlet branch matched its tokens with a substring
+        // `contains_any`, so "[switch]board" / "[switch]gear", "un[plug]ged" /
+        // "ear[plug]s" and "[plug]in" all fired it. "what is the switchboard
+        // status" collapsed to the whole-house "switches" readout, and the
+        // multi-word cases misrouted to a garbled home_status entity.
+        for utterance in [
+            "what is the switchboard status",
+            "is the switchgear ok",
+            "is the plugin enabled",
+            "is the toaster unplugged",
+            "are the earplugs in the drawer",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain, not resolve to a switch/plug/outlet status entity"
+            );
+        }
+
+        // Genuine switch/plug/outlet queries still resolve exactly as before.
+        for (utterance, entity) in [
+            ("are the switches on", "switches"),
+            ("is the switch on", "switches"),
+            ("are the outlets on", "switches"),
+            ("check the outlet", "switches"),
+            ("is the kitchen plug on", "kitchen plug"),
+            ("are the kitchen plugs on", "kitchen plugs"),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "home_status", "{utterance:?}");
