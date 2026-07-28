@@ -5788,11 +5788,13 @@ mod tests {
             "Did Sarah check her gmail?",
             "Did the mailing list go out?",
         ] {
+            // Assert the router abstains outright, not merely that it picked
+            // some other entity: every `Some(call)` is executed, so only `None`
+            // proves the utterance reaches the LLM. Same bar as
+            // `iron_verb_uses_do_not_report_iron_status`.
             assert!(
-                route(utterance)
-                    .map(|call| call.name != "home_status")
-                    .unwrap_or(true),
-                "{utterance:?} must not resolve to a home_status reading"
+                route(utterance).is_none(),
+                "{utterance:?} must abstain and reach the LLM"
             );
         }
 
