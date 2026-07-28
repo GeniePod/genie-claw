@@ -2461,7 +2461,31 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("self-cleaning oven".into());
     }
 
-    if (text.contains("oven on") || text.contains("leave the oven"))
+    // The oven branch keyed on the bare phrase with no question-shape gate and
+    // no word boundary, which broke it two ways:
+    //
+    //   * A *command* was answered with a status read. "turn the oven on" and
+    //     "remind me to turn the oven on at six" both contain "oven on", so the
+    //     router returned home_status{entity:"oven"} and the oven never
+    //     actuated. Every other device already abstains here and lets the LLM
+    //     ground the write — "turn the lights on" and "turn the fan on" both
+    //     fall through — so the oven was the one appliance a trailing-particle
+    //     command silently failed on.
+    //   * "oven" matched inside "pr[oven]" / "w[oven]", so "is that theory
+    //     proven on the test bench" reported the oven.
+    //
+    // Require the status-question shape the iron block below uses (the standard
+    // gate plus the "did ..." form the gate prefixes do not cover) and match
+    // "oven" as a whole word, the same treatment the bare "oven" token gets in
+    // the cooktop branch further down.
+    let asks_about_the_oven = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| pair == ["oven", "on"])
+        || text.contains("leave the oven");
+    if asks_about_the_oven
+        && (looks_like_status_query(text) || text.starts_with("did "))
         && !text.contains("self cleaning")
         && !text.contains("self clean")
     {
@@ -5816,6 +5840,59 @@ mod tests {
             assert_eq!(call.name, "home_status", "{utterance:?}");
             assert_eq!(call.arguments["entity"], "stove", "{utterance:?}");
         }
+    }
+
+    #[test]
+    fn turning_the_oven_on_is_a_command_not_a_status_read() {
+        // The "oven on" branch had no question-shape gate, so a command that
+        // merely contained the phrase was answered with a status report and the
+        // oven never actuated. Every other device already abstains on this word
+        // order (asserted below), which is what made the oven the odd one out.
+        for utterance in [
+            "Turn the oven on",
+            "Switch the oven on",
+            "Please turn the oven on",
+            "Can you turn the oven on?",
+            "Remind me to turn the oven on at six",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain so the LLM can actuate the oven"
+            );
+        }
+
+        // The reference behavior the oven was diverging from.
+        for utterance in ["Turn the lights on", "Turn the fan on"] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // "oven" as a substring of "pr[oven]" / "w[oven]" must not report the
+        // oven either, even though both utterances are status-shaped.
+        for utterance in [
+            "Is that theory proven on the test bench?",
+            "Is the basket woven on a loom?",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain and reach the LLM"
+            );
+        }
+
+        // Genuine oven status questions still resolve, including the "did ..."
+        // form the standard gate prefixes do not cover.
+        for utterance in ["Is the oven on?", "Did I leave the oven on?"] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "oven", "{utterance:?}");
+        }
+
+        // The self-cleaning cycle keeps its own entity, and a setpoint keeps
+        // actuating through home_control.
+        let call = route("Is the self-cleaning oven on?").expect("self-cleaning oven route");
+        assert_eq!(call.arguments["entity"], "self-cleaning oven");
+        let call = route("Set the oven to 400 degrees").expect("oven setpoint route");
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["action"], "set_temperature");
     }
 
     #[test]
