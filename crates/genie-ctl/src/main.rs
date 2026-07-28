@@ -11,6 +11,9 @@
 //!   genie-ctl bfcl-score --cases CASES.jsonl --predictions PREDS.jsonl [--json] [--min-strict PCT]
 //!                              Score tool-call accuracy from JSONL fixtures
 //!                              (--min-strict fails when strict accuracy < PCT)
+//!   genie-ctl bfcl-analyze --cases CASES.jsonl --predictions PREDS.jsonl [--json] [--examples N]
+//!                              Classify scored cases into a failure taxonomy and
+//!                              explain the raw vs grounded argument-accuracy gap
 //!   genie-ctl bfcl-predict-quick --cases CASES.jsonl --out PREDS.jsonl
 //!                              Generate deterministic quick-router predictions
 //!   genie-ctl bfcl-predict-llm --cases CASES.jsonl --out PREDS.jsonl
@@ -147,6 +150,10 @@ async fn main() -> Result<()> {
         "bfcl-score" | "eval-bfcl" => {
             let score_args = parse_bfcl_score_args(&args[2..])?;
             cmd_bfcl_score(&score_args)?;
+        }
+        "bfcl-analyze" | "bfcl-taxonomy" => {
+            let analyze_args = parse_bfcl_analyze_args(&args[2..])?;
+            cmd_bfcl_analyze(&analyze_args)?;
         }
         "bfcl-score-llm" | "bfcl-score-local-llm" | "eval-bfcl-llm" => {
             let score_args = parse_bfcl_score_llm_args(&args[2..])?;
@@ -999,6 +1006,15 @@ struct BfclScoreArgs {
     min_strict: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BfclAnalyzeArgs {
+    cases: PathBuf,
+    predictions: PathBuf,
+    json: bool,
+    /// How many example case ids to print under each taxonomy bucket.
+    examples: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct BfclScoreLlmArgs {
     cases: PathBuf,
@@ -1083,6 +1099,87 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs> {
         limit,
         query: query_parts.join(" "),
     })
+}
+
+/// Default number of example case ids printed per taxonomy bucket. Small enough
+/// to keep the report readable on a terminal, large enough to show the shape of
+/// a bucket at a glance; `--examples` overrides it (0 prints counts only).
+const BFCL_ANALYZE_DEFAULT_EXAMPLES: usize = 3;
+
+fn parse_bfcl_analyze_args(args: &[String]) -> Result<BfclAnalyzeArgs> {
+    let mut cases = None;
+    let mut predictions = None;
+    let mut json = false;
+    let mut examples = BFCL_ANALYZE_DEFAULT_EXAMPLES;
+    let mut idx = 0;
+
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--cases" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--cases requires a JSONL path");
+                };
+                cases = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--predictions" | "--preds" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--predictions requires a JSONL path");
+                };
+                predictions = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--json" => {
+                json = true;
+                idx += 1;
+            }
+            "--examples" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--examples requires a count");
+                };
+                examples = parse_example_count(value)?;
+                idx += 2;
+            }
+            _ if arg.starts_with("--cases=") => {
+                cases = Some(PathBuf::from(arg.trim_start_matches("--cases=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--predictions=") => {
+                predictions = Some(PathBuf::from(arg.trim_start_matches("--predictions=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--preds=") => {
+                predictions = Some(PathBuf::from(arg.trim_start_matches("--preds=")));
+                idx += 1;
+            }
+            _ if arg.starts_with("--examples=") => {
+                examples = parse_example_count(arg.trim_start_matches("--examples="))?;
+                idx += 1;
+            }
+            other => anyhow::bail!("unknown bfcl-analyze option: {}", other),
+        }
+    }
+
+    let (Some(cases), Some(predictions)) = (cases, predictions) else {
+        anyhow::bail!(
+            "Usage: genie-ctl bfcl-analyze --cases CASES.jsonl --predictions PREDICTIONS.jsonl [--json] [--examples N]"
+        );
+    };
+
+    Ok(BfclAnalyzeArgs {
+        cases,
+        predictions,
+        json,
+        examples,
+    })
+}
+
+fn parse_example_count(value: &str) -> Result<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("--examples expects a non-negative count, got '{value}'"))
 }
 
 fn parse_bfcl_score_args(args: &[String]) -> Result<BfclScoreArgs> {
@@ -1514,6 +1611,88 @@ fn cmd_bfcl_score(args: &BfclScoreArgs) -> Result<()> {
     enforce_min_strict(args.min_strict, &report)?;
 
     Ok(())
+}
+
+/// Classify a scored run into the failure taxonomy and print it.
+///
+/// This never re-scores: it loads the same fixtures `bfcl-score` does, runs the
+/// scorer once, and groups the resulting case scores, so the headline metrics it
+/// echoes are the scorer's own.
+fn cmd_bfcl_analyze(args: &BfclAnalyzeArgs) -> Result<()> {
+    let cases = genie_core::eval::bfcl::load_cases_jsonl(&args.cases)?;
+    let predictions = genie_core::eval::bfcl::load_predictions_jsonl(&args.predictions)?;
+    let report = genie_core::eval::bfcl::score_cases(&cases, &predictions);
+    let analysis = genie_core::eval::analyze::analyze_report(&report);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&analysis)?);
+    } else {
+        print_bfcl_analysis(&analysis, args.examples);
+    }
+
+    Ok(())
+}
+
+fn print_bfcl_analysis(analysis: &genie_core::eval::analyze::AnalysisReport, examples: usize) {
+    use genie_core::eval::analyze::FailureClass;
+
+    println!("BFCL failure taxonomy");
+    println!("cases:               {}", analysis.total_cases);
+    println!(
+        "argument_accuracy:   {}",
+        format_score_rate(analysis.argument_accuracy)
+    );
+    println!(
+        "grounded_arg_acc:    {}",
+        format_score_rate(analysis.grounded_argument_accuracy)
+    );
+    println!(
+        "grounding_gap:       {}",
+        format_score_rate(analysis.grounding_gap)
+    );
+    println!("strict_passes:       {}", analysis.strict_passes);
+    println!("grounded_recoveries: {}", analysis.grounded_recoveries);
+    println!("residual_failures:   {}", analysis.residual_failures);
+
+    let mut buckets: Vec<(&FailureClass, Vec<&genie_core::eval::analyze::CaseAnalysis>)> =
+        Vec::new();
+    for case in &analysis.cases {
+        match buckets.iter_mut().find(|(class, _)| **class == case.class) {
+            Some((_, members)) => members.push(case),
+            None => buckets.push((&case.class, vec![case])),
+        }
+    }
+    // Largest bucket first: the report is read to find where the mass is.
+    buckets.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.label().cmp(right.0.label()))
+    });
+
+    for (class, members) in buckets {
+        if *class == FailureClass::StrictPass {
+            continue;
+        }
+        let kind = if class.is_recovery() {
+            "recovery"
+        } else {
+            "failure"
+        };
+        println!();
+        println!("[{kind}] {} — {} case(s)", class.label(), members.len());
+        for case in members.iter().take(examples) {
+            if case.detail.is_empty() {
+                println!("  {}", case.id);
+            } else {
+                println!("  {} — {}", case.id, case.detail);
+            }
+        }
+        if members.len() > examples {
+            println!("  … {} more", members.len() - examples);
+        }
+    }
 }
 
 /// Fail the process when a `--min-strict` gate is set and strict accuracy is below it.
@@ -3095,6 +3274,82 @@ mod tests {
         assert_eq!(parsed.cases, PathBuf::from("cases.jsonl"));
         assert_eq!(parsed.predictions, PathBuf::from("predictions.jsonl"));
         assert!(!parsed.json);
+    }
+
+    #[test]
+    fn parse_bfcl_analyze_args_supports_space_and_equals_forms() {
+        let space = vec![
+            "--cases".to_string(),
+            "cases.jsonl".to_string(),
+            "--predictions".to_string(),
+            "preds.jsonl".to_string(),
+            "--json".to_string(),
+        ];
+        let equals = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--preds=preds.jsonl".to_string(),
+            "--json".to_string(),
+        ];
+
+        let from_space = parse_bfcl_analyze_args(&space).unwrap();
+        let from_equals = parse_bfcl_analyze_args(&equals).unwrap();
+
+        assert_eq!(from_space, from_equals);
+        assert_eq!(from_space.cases, PathBuf::from("cases.jsonl"));
+        assert_eq!(from_space.predictions, PathBuf::from("preds.jsonl"));
+        assert!(from_space.json);
+        assert_eq!(from_space.examples, BFCL_ANALYZE_DEFAULT_EXAMPLES);
+    }
+
+    #[test]
+    fn parse_bfcl_analyze_args_parses_example_count() {
+        let space = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--preds=preds.jsonl".to_string(),
+            "--examples".to_string(),
+            "10".to_string(),
+        ];
+        let equals = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--preds=preds.jsonl".to_string(),
+            "--examples=10".to_string(),
+        ];
+
+        assert_eq!(parse_bfcl_analyze_args(&space).unwrap().examples, 10);
+        assert_eq!(parse_bfcl_analyze_args(&equals).unwrap().examples, 10);
+        // 0 is meaningful: print bucket counts without per-case examples.
+        let zero = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--preds=preds.jsonl".to_string(),
+            "--examples=0".to_string(),
+        ];
+        assert_eq!(parse_bfcl_analyze_args(&zero).unwrap().examples, 0);
+    }
+
+    #[test]
+    fn parse_bfcl_analyze_args_requires_both_paths() {
+        let only_cases = vec!["--cases=cases.jsonl".to_string()];
+        let only_preds = vec!["--preds=preds.jsonl".to_string()];
+
+        assert!(parse_bfcl_analyze_args(&only_cases).is_err());
+        assert!(parse_bfcl_analyze_args(&only_preds).is_err());
+    }
+
+    #[test]
+    fn parse_bfcl_analyze_args_rejects_unknown_option_and_bad_count() {
+        let unknown = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--preds=preds.jsonl".to_string(),
+            "--nope".to_string(),
+        ];
+        let bad_count = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--preds=preds.jsonl".to_string(),
+            "--examples=many".to_string(),
+        ];
+
+        assert!(parse_bfcl_analyze_args(&unknown).is_err());
+        assert!(parse_bfcl_analyze_args(&bad_count).is_err());
     }
 
     #[test]
