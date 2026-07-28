@@ -2774,7 +2774,24 @@ fn home_status_target(text: &str) -> Option<String> {
     }
 
     if contains_any(&target, &["freezer", "garage freezer"]) {
-        return Some(if target.contains("garage") {
+        // Keep a qualifier the caller named, like the sibling branches here
+        // (switches, covers, locks, lights, dryer) already do: this branch
+        // special-cased "garage" and canonicalized every other target
+        // unconditionally, so "is the basement freezer on" reported the bare
+        // "freezer" — a different appliance from the one asked about. Key on
+        // the device word's position, exactly like the dryer branch above: a
+        // qualifier precedes the device ("basement freezer"), while a leftover
+        // state word trails it, so only a genuinely qualified target is
+        // preserved. The word-order variant "freezer in the garage" still
+        // canonicalizes through the garage arm.
+        let names_a_qualified_freezer = target.split_whitespace().count() > 1
+            && matches!(
+                target.split_whitespace().next_back(),
+                Some("freezer" | "freezers")
+            );
+        return Some(if names_a_qualified_freezer {
+            target
+        } else if target.contains("garage") {
             "garage freezer".into()
         } else {
             "freezer".into()
@@ -6340,6 +6357,32 @@ mod tests {
         // Still a memory question — not a live device-state check.
         let call = route("Is the garage freezer cold enough?").unwrap();
         assert_eq!(call.name, "memory_recall");
+    }
+
+    #[test]
+    fn freezer_status_keeps_a_named_qualifier() {
+        // "Is the basement freezer on?" asks about the basement freezer. The
+        // freezer branch special-cased "garage" and canonicalized every other
+        // target to the bare "freezer", so the caller's qualifier was silently
+        // dropped and a different appliance was reported — the same
+        // unconditional collapse the dryer branch fixed. A qualifier precedes
+        // the device word, so key on its position like the dryer branch does.
+        for (utterance, entity) in [
+            ("Is the basement freezer on?", "basement freezer"),
+            ("check the basement freezer", "basement freezer"),
+            ("Is the kitchen freezer on?", "kitchen freezer"),
+            // Canonical and garage forms are unchanged. (The bare "is the
+            // garage freezer on" is a semantic memory question by design, and
+            // "freezer in the garage" is claimed by the garage/covers branch
+            // earlier, so the garage arm's guardrail is the priority too-warm
+            // path.)
+            ("Is the freezer on?", "freezer"),
+            ("Sarah: Is the garage freezer too warm?", "garage freezer"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
     }
 
     #[test]
