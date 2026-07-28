@@ -343,11 +343,14 @@ fn classify_entity_surface_delta(expected: &str, actual: &str) -> FailureClass {
     let actual_lower = actual.trim().to_lowercase();
 
     // `light.kitchen` — a Home Assistant entity id rather than a display name.
-    if actual_lower.contains('.') && !expected_lower.contains('.') {
+    // Tested as "exactly one side carries it" rather than "the prediction does":
+    // today's gold strings are display names, but an imported suite could invert
+    // that, and the bucket describes the *delta*, not which side produced it.
+    if actual_lower.contains('.') != expected_lower.contains('.') {
         return FailureClass::RecoveredEntityIdForm;
     }
     // `kitchen_light` — right words, wrong separator.
-    if actual_lower.contains('_') && !expected_lower.contains('_') {
+    if actual_lower.contains('_') != expected_lower.contains('_') {
         return FailureClass::RecoveredSnakeCase;
     }
     if is_plural_variant(&expected_lower, &actual_lower) {
@@ -613,6 +616,19 @@ mod tests {
             class_for(
                 json!({ "entity": "kitchen lights", "action": "turn_on" }),
                 json!({ "entity": "light.kitchen", "action": "turn_on" }),
+            ),
+            FailureClass::RecoveredEntityIdForm
+        );
+    }
+
+    #[test]
+    fn entity_id_form_is_detected_from_either_side() {
+        // The bucket names the delta, not which side produced it: a suite whose
+        // gold strings are entity ids must classify the same way.
+        assert_eq!(
+            class_for(
+                json!({ "entity": "light.kitchen", "action": "turn_on" }),
+                json!({ "entity": "kitchen lights", "action": "turn_on" }),
             ),
             FailureClass::RecoveredEntityIdForm
         );

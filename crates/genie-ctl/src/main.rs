@@ -272,6 +272,9 @@ COMMANDS:
     bfcl-score-llm --cases C [--out P] [--json] [--max-tokens N] [--limit N] [--min-strict PCT]
                         Generate and score local LLM predictions without executing tools
                         (--min-strict PCT fails when strict accuracy < PCT)
+    bfcl-analyze --cases C --predictions P [--json] [--examples N]
+                        Classify scored cases into a failure taxonomy and explain
+                        the raw vs grounded argument-accuracy gap
     bfcl-predict-quick --cases C --out P
                         Generate deterministic quick-router predictions
     bfcl-predict-llm --cases C --out P [--max-tokens N] [--limit N]
@@ -3094,6 +3097,27 @@ mod tests {
         let version = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty());
         assert!(version.contains('.')); // Semver: x.y.z
+    }
+
+    #[test]
+    fn usage_lists_every_bfcl_subcommand() {
+        // Regression: `bfcl-analyze` shipped documented only in the module-level
+        // Rustdoc, so `genie-ctl help` did not list it. Every dispatched bfcl
+        // subcommand must appear in the runtime help.
+        let usage = usage_text();
+        for command in [
+            "bfcl-score",
+            "bfcl-score-llm",
+            "bfcl-analyze",
+            "bfcl-predict-quick",
+            "bfcl-predict-llm",
+            "bfcl-import-ha-intents",
+        ] {
+            assert!(
+                usage.contains(command),
+                "`{command}` should be listed in usage text:\n{usage}"
+            );
+        }
     }
 
     #[test]
