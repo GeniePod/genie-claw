@@ -2461,31 +2461,39 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("self-cleaning oven".into());
     }
 
-    // The oven branch keyed on the bare phrase with no question-shape gate and
-    // no word boundary, which broke it two ways:
+    // The oven branch keyed on the bare phrase "oven on" / "leave the oven"
+    // with no question shape and no word boundary, so it fired on anything that
+    // merely contained the letters:
     //
     //   * A *command* was answered with a status read. "turn the oven on" and
-    //     "remind me to turn the oven on at six" both contain "oven on", so the
-    //     router returned home_status{entity:"oven"} and the oven never
-    //     actuated. Every other device already abstains here and lets the LLM
-    //     ground the write — "turn the lights on" and "turn the fan on" both
-    //     fall through — so the oven was the one appliance a trailing-particle
+    //     "remind me to turn the oven on at six" both returned
+    //     home_status{entity:"oven"}, so the oven never actuated. Every other
+    //     device already abstains on this word order and lets the LLM ground
+    //     the write — "turn the lights on" and "turn the fan on" both fall
+    //     through — so the oven was the one appliance a trailing-particle
     //     command silently failed on.
-    //   * "oven" matched inside "pr[oven]" / "w[oven]", so "is that theory
-    //     proven on the test bench" reported the oven.
+    //   * A command or hypothetical *embedded* in a question ("what happens if
+    //     i turn the oven on", "check if i should turn the oven on") is
+    //     question-shaped without asking about the oven's state, so a generic
+    //     `looks_like_status_query` gate does not separate it either.
+    //   * "oven" matched inside "pr[oven]" / "w[oven]" / "leave the [oven]ware",
+    //     so "is that theory proven on the test bench" reported the oven.
     //
-    // Require the status-question shape the iron block below uses (the standard
-    // gate plus the "did ..." form the gate prefixes do not cover) and match
-    // "oven" as a whole word, the same treatment the bare "oven" token gets in
-    // the cooktop branch further down.
-    let asks_about_the_oven = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|pair| pair == ["oven", "on"])
-        || text.contains("leave the oven");
-    if asks_about_the_oven
-        && (looks_like_status_query(text) || text.starts_with("did "))
+    // Admit only the two shapes that actually ask about the oven's state, every
+    // token matched whole: the copular reading where the oven is the subject
+    // ("is/are the oven ... on") and the "did ... leave the oven ..."
+    // past-action check that the standard status-query prefixes do not cover.
+    // Anchoring on the subject rather than on a bare "is "/"are " prefix is what
+    // keeps the embedded-command forms out ("are you going to turn the oven on").
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    let asks_oven_state = matches!(words.first().copied(), Some("is" | "are"))
+        && words.get(1..3) == Some(&["the", "oven"][..])
+        && words.get(3..).is_some_and(|rest| rest.contains(&"on"));
+    let asks_oven_left_on = words.first().copied() == Some("did")
+        && words
+            .windows(3)
+            .any(|triple| triple == ["leave", "the", "oven"]);
+    if (asks_oven_state || asks_oven_left_on)
         && !text.contains("self cleaning")
         && !text.contains("self clean")
     {
@@ -5866,11 +5874,13 @@ mod tests {
             assert!(route(utterance).is_none(), "{utterance:?}");
         }
 
-        // "oven" as a substring of "pr[oven]" / "w[oven]" must not report the
-        // oven either, even though both utterances are status-shaped.
+        // "oven" as a substring of "pr[oven]" / "w[oven]" / "leave the
+        // [oven]ware" must not report the oven either, even though all three
+        // utterances are status-shaped.
         for utterance in [
             "Is that theory proven on the test bench?",
             "Is the basket woven on a loom?",
+            "Did I leave the ovenware on?",
         ] {
             assert!(
                 route(utterance).is_none(),
@@ -5878,9 +5888,35 @@ mod tests {
             );
         }
 
+        // A command or hypothetical embedded in a question is question-shaped
+        // without asking about the oven's state, so this branch must not claim
+        // it. These currently fall through to the cooktop branch and report
+        // `stove` — a separate pre-existing gap in that branch (same class as
+        // #861), so the assertion is scoped to what this branch owns.
+        for utterance in [
+            "What happens if I turn the oven on?",
+            "Check if I should turn the oven on",
+            "Are you going to turn the oven on?",
+            "What happens if I leave the oven on?",
+        ] {
+            assert_ne!(
+                route(utterance)
+                    .as_ref()
+                    .and_then(|call| call.arguments.get("entity"))
+                    .and_then(|entity| entity.as_str()),
+                Some("oven"),
+                "{utterance:?} must not resolve to the oven status entity"
+            );
+        }
+
         // Genuine oven status questions still resolve, including the "did ..."
         // form the standard gate prefixes do not cover.
-        for utterance in ["Is the oven on?", "Did I leave the oven on?"] {
+        for utterance in [
+            "Is the oven on?",
+            "Is the oven still on?",
+            "Did I leave the oven on?",
+            "Did you leave the oven on?",
+        ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "home_status", "{utterance:?}");
             assert_eq!(call.arguments["entity"], "oven", "{utterance:?}");
