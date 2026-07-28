@@ -170,7 +170,7 @@ async fn handle_connection(
         ("POST", "/api/memories/delete") => routes::post_memory_delete(config, body).await,
         ("POST", "/api/memories/reorder") => routes::post_memory_reorder(config, body).await,
         ("POST", "/api/mode") => routes::post_mode(body).await,
-        ("GET", "/" | "/index.html") => routes::serve_dashboard(&config.http.local_api_token),
+        ("GET", "/" | "/index.html") => routes::serve_dashboard(),
         ("GET", "/dashboard.js") => routes::serve_dashboard_js(),
         _ => Response {
             status: 404,
@@ -454,11 +454,12 @@ mod tests {
             "{actuation_no_tok:?}"
         );
 
-        // The served dashboard carries the injected token.
+        // The dashboard must not disclose the bearer token it is meant to
+        // protect.
         let root = roundtrip(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(
-            root.contains(r#"content="s3cret""#),
-            "token must be injected into the dashboard: {root:?}"
+            !root.contains("s3cret"),
+            "configured token leaked into the dashboard: {root:?}"
         );
     }
 }
