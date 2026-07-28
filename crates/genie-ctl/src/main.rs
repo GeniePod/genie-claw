@@ -1874,8 +1874,14 @@ fn format_score_rate(rate: f64) -> String {
 }
 
 async fn cmd_history() -> Result<()> {
-    let core = load_core_addr()?;
-    let body = http_get(&core, "/api/chat/history").await?;
+    let config = Config::load()?;
+    let core = config.core_http_addr();
+    let body = http_get_with_token(
+        &core,
+        "/api/chat/history",
+        &config.http.local_api_token,
+    )
+    .await?;
     let messages: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
 
     if messages.is_empty() {
@@ -2053,8 +2059,14 @@ async fn cmd_health() -> Result<()> {
 }
 
 async fn cmd_conversations() -> Result<()> {
-    let core = load_core_addr()?;
-    let body = http_get(&core, "/api/conversations").await?;
+    let config = Config::load()?;
+    let core = config.core_http_addr();
+    let body = http_get_with_token(
+        &core,
+        "/api/conversations",
+        &config.http.local_api_token,
+    )
+    .await?;
     let convos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
 
     if convos.is_empty() {
@@ -2635,6 +2647,10 @@ fn tail_jsonl_file(path: &Path, limit: usize) -> Vec<serde_json::Value> {
 // ── HTTP helpers ───────────────────────────────────────────────
 
 async fn http_get(addr: &str, path: &str) -> Result<String> {
+    http_get_with_token(addr, path, "").await
+}
+
+async fn http_get_with_token(addr: &str, path: &str, token: &str) -> Result<String> {
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         tokio::net::TcpStream::connect(addr),
@@ -2643,10 +2659,14 @@ async fn http_get(addr: &str, path: &str) -> Result<String> {
     .map_err(|_| anyhow::anyhow!("timeout"))??;
 
     let (reader, mut writer) = stream.into_split();
-    let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        path, addr
-    );
+    let token = token.trim();
+    let auth = if token.is_empty() {
+        String::new()
+    } else {
+        format!("X-Genie-Token: {token}\r\n")
+    };
+    let req =
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
     writer.write_all(req.as_bytes()).await?;
 
     read_http_body(reader).await
