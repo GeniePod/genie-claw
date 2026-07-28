@@ -1876,12 +1876,8 @@ fn format_score_rate(rate: f64) -> String {
 async fn cmd_history() -> Result<()> {
     let config = Config::load()?;
     let core = config.core_http_addr();
-    let body = http_get_with_token(
-        &core,
-        "/api/chat/history",
-        &config.http.local_api_token,
-    )
-    .await?;
+    let body =
+        http_get_with_token(&core, "/api/chat/history", &config.http.local_api_token).await?;
     let messages: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
 
     if messages.is_empty() {
@@ -2061,12 +2057,8 @@ async fn cmd_health() -> Result<()> {
 async fn cmd_conversations() -> Result<()> {
     let config = Config::load()?;
     let core = config.core_http_addr();
-    let body = http_get_with_token(
-        &core,
-        "/api/conversations",
-        &config.http.local_api_token,
-    )
-    .await?;
+    let body =
+        http_get_with_token(&core, "/api/conversations", &config.http.local_api_token).await?;
     let convos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
 
     if convos.is_empty() {
@@ -2665,8 +2657,7 @@ async fn http_get_with_token(addr: &str, path: &str, token: &str) -> Result<Stri
     } else {
         format!("X-Genie-Token: {token}\r\n")
     };
-    let req =
-        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
     writer.write_all(req.as_bytes()).await?;
 
     read_http_body(reader).await
