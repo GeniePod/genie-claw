@@ -3062,6 +3062,17 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
         return None;
     }
 
+    // A "remind me/us …" utterance is a command to schedule a reminder, not a
+    // question to answer now. The stock-price branch below matches its keyword
+    // anywhere in the utterance, and this extractor runs before the timer path,
+    // so "remind me to check the tesla stock price in 20 minutes" was hijacked
+    // into an immediate web_search — the caller got a price now and the
+    // reminder was silently dropped. Abstain so the reminder path downstream
+    // schedules it, with the task clause as the label.
+    if text.starts_with("remind me ") || text.starts_with("remind us ") {
+        return None;
+    }
+
     if text.contains("stock price") {
         // The company can be named after the keyword ("stock price of apple") or
         // before it ("apple stock price", "what's the nvidia stock price"). The
@@ -6286,6 +6297,43 @@ mod tests {
             assert_eq!(call.name, "web_search", "{utterance:?}");
             assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
         }
+    }
+
+    #[test]
+    fn reminder_command_naming_a_stock_price_sets_the_reminder_not_a_search() {
+        // "remind me to check the tesla stock price in 20 minutes" is a command
+        // to schedule a reminder. The stock-price branch matches its keyword
+        // anywhere in the utterance, and web_search runs before the timer path,
+        // so the reminder was hijacked into an immediate web_search: the caller
+        // got a price now and the reminder was silently dropped.
+        for (utterance, seconds, label) in [
+            (
+                "remind me to check the tesla stock price in 20 minutes",
+                1200,
+                "check the tesla stock price",
+            ),
+            (
+                "Jared: remind me to check the nvidia stock price in 10 minutes",
+                600,
+                "check the nvidia stock price",
+            ),
+            (
+                "remind us to look at the apple stock price in an hour",
+                3600,
+                "look at the apple stock price",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "set_timer", "{utterance:?}");
+            assert_eq!(call.arguments["seconds"], seconds, "{utterance:?}");
+            assert_eq!(call.arguments["label"], label, "{utterance:?}");
+        }
+
+        // A stock-price *question* still routes to a fresh web_search.
+        let call = route("what is the stock price of tesla").unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "TSLA stock price");
+        assert_eq!(call.arguments["fresh"], true);
     }
 
     #[test]
