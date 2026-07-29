@@ -2990,12 +2990,24 @@ fn is_time_expression(location: &str) -> bool {
     // query ("will it rain in a month") and a scheduled control ("turn on the
     // lights in a month") both mishandled them — the same class the shorter
     // day/week units already cover.
+    //
+    // A trailing time-of-day word is a time, not a place, even with a qualifier
+    // in front of it: "tonight", "this morning", "tomorrow night". A bare
+    // "morning"/"evening"/"night" is already caught by TIME_PHRASES above, but
+    // "weather for tonight" and "weather for this morning" reached here with a
+    // non-matching last token and used to route to get_weather{location:"tonight"}.
+    // "tonight" is the sibling of the today/tomorrow the weather/rain paths
+    // already special-case.
     matches!(
         location.split_whitespace().next_back(),
         Some(last) if is_time_unit(last)
             || matches!(
                 last,
-                "day" | "days"
+                "morning" | "afternoon"
+                    | "evening" | "night"
+                    | "tonight" | "midday"
+                    | "noon" | "midnight"
+                    | "day" | "days"
                     | "week" | "weeks"
                     | "month" | "months"
                     | "year" | "years"
@@ -3057,6 +3069,36 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
     Some((location, forecast))
 }
 
+/// A request for the day's news headlines. The exact trio
+/// ("read the news" | "read news" | "what s the news") missed the most common
+/// spoken forms — a trailing "today"/"right now", "give me/show me/tell me the
+/// news", "the latest news", "what's in the news" — so they fell through to the
+/// LLM. Deliberately a curated set (not a bare `contains("news")`) so it never
+/// swallows the play_media "morning news" audio-briefing forms handled later in
+/// dispatch.
+fn asks_for_news(text: &str) -> bool {
+    let text = text.trim_end_matches(" please").trim_end();
+    let text = strip_trailing_time_qualifier(text);
+    matches!(
+        text,
+        "read the news"
+            | "read news"
+            | "what s the news"
+            | "what is the news"
+            | "whats the news"
+            | "the latest news"
+            | "latest news"
+            | "what s the latest news"
+            | "what is the latest news"
+            | "give me the news"
+            | "show me the news"
+            | "tell me the news"
+            | "catch me up on the news"
+            | "what s in the news"
+            | "what s happening in the news"
+    )
+}
+
 fn web_search_request(text: &str) -> Option<(String, bool)> {
     if text.starts_with("search memory ") || text.starts_with("search memories ") {
         return None;
@@ -3093,7 +3135,7 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
         return Some((query, true));
     }
 
-    if matches!(text, "read the news" | "read news" | "what s the news") {
+    if asks_for_news(text) {
         // News headlines are inherently time-sensitive — the caller always wants
         // the current top stories — so mark the query fresh, the same as a
         // stock-price query. Returning `false` here let a stale cached result
@@ -3307,6 +3349,10 @@ fn arithmetic_expression(text: &str) -> Option<String> {
     let expression = text
         .strip_prefix("calculate ")
         .or_else(|| text.strip_prefix("what is "))
+        // "how much is" already routes to the calculator for percentages
+        // (percentage_expression strips no lead-in), so strip it here too or
+        // arithmetic behind the same lead-in stays stuck with the LLM.
+        .or_else(|| text.strip_prefix("how much is "))
         .or_else(|| text.strip_prefix("whats "))
         .or_else(|| text.strip_prefix("what s "))
         .or_else(|| text.strip_prefix("what's "))
@@ -3864,6 +3910,15 @@ fn asks_current_time(text: &str) -> bool {
             | "what is the date"
             | "whats the date"
             | "what s the date"
+            // Date counterparts of the "current time" / "tell me the time" forms
+            // above — a clock reading has them but the parallel date phrasings
+            // fell through to the LLM. "today's date" (normalized to "today s
+            // date") is the most common spoken date question and was missing too.
+            | "current date"
+            | "tell me the date"
+            | "today s date"
+            | "what s today s date"
+            | "whats today s date"
             | "what is today"
             | "what day is it"
             | "date and time"
@@ -6467,6 +6522,26 @@ mod tests {
     }
 
     #[test]
+    fn routes_date_counterparts_of_the_time_phrasings_to_get_time() {
+        // "current time" and "tell me the time" route to get_time, but their date
+        // counterparts fell through to the LLM; "today's date" (the most common
+        // spoken date question, normalized to "today s date") was missing too.
+        for utterance in [
+            "Current date",
+            "Tell me the date",
+            "What's today's date?",
+            "Whats today's date",
+            "today's date",
+            // Politeness still comes off, like the time phrasings.
+            "Current date please",
+            "Tell me the date, please",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_time", "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_named_timer_label_before_duration() {
         let call = route("Leo: Set a cookie timer for 12 minutes.").unwrap();
         assert_eq!(call.name, "set_timer");
@@ -6958,6 +7033,26 @@ mod tests {
     }
 
     #[test]
+    fn weather_for_a_bare_time_of_day_abstains() {
+        // A bare time-of-day word after "for"/"in" names a *time*, not a place:
+        // "weather for tonight" must fall back to the local forecast (abstain),
+        // not look up a city called "tonight". "tonight" and the "this <part of
+        // day>" forms were the siblings of the today/tomorrow/morning the path
+        // already handled; they used to emit get_weather{location:"tonight"}.
+        for utterance in [
+            "what's the weather for tonight",
+            "what's the weather for this morning",
+            "what's the weather for this evening",
+            "what's the weather in the evening",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} should abstain (local forecast), not route a time as a place"
+            );
+        }
+    }
+
+    #[test]
     fn weather_location_drops_trailing_please() {
         // A trailing "please" is politeness, not part of the city: the location
         // argument must be just the city, not "paris please". Mirrors the other
@@ -7049,6 +7144,32 @@ mod tests {
     }
 
     #[test]
+    fn routes_natural_news_phrasings_to_web_search() {
+        // The news matcher was an exact trio ("read the news" | "read news" |
+        // "what s the news"), so the most common spoken forms fell through to the
+        // LLM. Route them to a fresh web_search for the top headlines.
+        for utterance in [
+            "What's the news today?",
+            "What is the news?",
+            "What's the latest news?",
+            "Give me the news",
+            "Show me the news",
+            "Tell me the news",
+            "What's in the news?",
+            "Catch me up on the news",
+            "read the news right now",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(
+                call.arguments["query"], "top news headlines",
+                "{utterance:?}"
+            );
+            assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_lookup_to_web_search() {
         let call = route("look up ESP32 C6 Thread support").unwrap();
         assert_eq!(call.name, "web_search");
@@ -7111,6 +7232,23 @@ mod tests {
             ("What's 2 plus 2?", "2 + 2"),
             ("what's 5 times 3", "5 * 3"),
             ("What's two plus three?", "2 + 3"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "calculate", "{utterance:?}");
+            assert_eq!(call.arguments["expression"], expression, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn routes_how_much_is_arithmetic_to_calculate() {
+        // "how much is" already routes to the calculator for percentages (via
+        // percentage_expression, which strips no lead-in), so arithmetic behind
+        // the same lead-in must route too — otherwise "how much is 45 times 6"
+        // fell through to the LLM while "what is 45 times 6" did not.
+        for (utterance, expression) in [
+            ("how much is 45 times 6", "45 * 6"),
+            ("how much is 100 divided by 4", "100 / 4"),
+            ("how much is 2 plus 2", "2 + 2"),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "calculate", "{utterance:?}");
