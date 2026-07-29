@@ -3906,6 +3906,15 @@ fn asks_current_time(text: &str) -> bool {
             | "what is the date"
             | "whats the date"
             | "what s the date"
+            // Date counterparts of the "current time" / "tell me the time" forms
+            // above — a clock reading has them but the parallel date phrasings
+            // fell through to the LLM. "today's date" (normalized to "today s
+            // date") is the most common spoken date question and was missing too.
+            | "current date"
+            | "tell me the date"
+            | "today s date"
+            | "what s today s date"
+            | "whats today s date"
             | "what is today"
             | "what day is it"
             | "date and time"
@@ -6505,6 +6514,26 @@ mod tests {
                     .unwrap_or(true),
                 "{utterance:?} must not route to get_time"
             );
+        }
+    }
+
+    #[test]
+    fn routes_date_counterparts_of_the_time_phrasings_to_get_time() {
+        // "current time" and "tell me the time" route to get_time, but their date
+        // counterparts fell through to the LLM; "today's date" (the most common
+        // spoken date question, normalized to "today s date") was missing too.
+        for utterance in [
+            "Current date",
+            "Tell me the date",
+            "What's today's date?",
+            "Whats today's date",
+            "today's date",
+            // Politeness still comes off, like the time phrasings.
+            "Current date please",
+            "Tell me the date, please",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_time", "{utterance:?}");
         }
     }
 
