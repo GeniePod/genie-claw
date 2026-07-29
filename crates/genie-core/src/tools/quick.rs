@@ -2526,7 +2526,21 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("baby breathing monitor".into());
     }
 
-    if text.starts_with("did ") && text.contains("mail") {
+    // Match "mail" as a whole word, not a substring: a bare `contains` fired on
+    // "e[mail]", "voice[mail]", "g[mail]" and "[mail]ing list", so "did you
+    // email the landlord" and "did i get any email from the school" were
+    // answered with the physical mailbox status instead of falling through to
+    // the LLM. Mirrors the ice/iron/cooktop/cover/lock whole-word fixes below.
+    // The compounds that *do* name the physical delivery are listed explicitly,
+    // so every utterance the substring test resolved correctly still resolves.
+    if text.starts_with("did ")
+        && text.split_whitespace().any(|word| {
+            matches!(
+                word,
+                "mail" | "mailbox" | "mailboxes" | "mailman" | "mailmen"
+            )
+        })
+    {
         return Some("mailbox".into());
     }
 
@@ -5812,6 +5826,45 @@ mod tests {
         let call = route("is the iron on").unwrap_or_else(|| panic!("no route for iron query"));
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "iron");
+    }
+
+    #[test]
+    fn mail_status_matches_whole_words_not_substrings() {
+        // "mail" was matched as a substring behind the "did " prefix, so every
+        // "e[mail]" / "voice[mail]" / "g[mail]" / "[mail]ing list" question was
+        // answered with the physical mailbox status: "Did you get my email?"
+        // returned home_status{entity:"mailbox"} on `main`, with no device word
+        // in the utterance at all.
+        for utterance in [
+            "Did you get my email?",
+            "Did you email the landlord?",
+            "Did I get any email from the school?",
+            "Did the voicemail come through?",
+            "Did Sarah check her gmail?",
+            "Did the mailing list go out?",
+        ] {
+            // Assert the router abstains outright, not merely that it picked
+            // some other entity: every `Some(call)` is executed, so only `None`
+            // proves the utterance reaches the LLM. Same bar as
+            // `iron_verb_uses_do_not_report_iron_status`.
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain and reach the LLM"
+            );
+        }
+
+        // Genuine mail-delivery questions still resolve to the mailbox.
+        for utterance in [
+            "Did the mail arrive?",
+            "Did the mail come yet?",
+            "Did we get any mail today?",
+            "Did the mailman come?",
+            "Did anyone check the mailbox?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "mailbox", "{utterance:?}");
+        }
     }
 
     #[test]
