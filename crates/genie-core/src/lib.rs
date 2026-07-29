@@ -40,8 +40,17 @@
 //! - **Single-threaded** — `tokio::main(flavor = "current_thread")`
 //! - **AGPL-3.0-only** — network-facing modifications must stay available to users
 
-// Allow dead code during development — modules are built incrementally.
-#![allow(dead_code, unused_variables, unused_assignments)]
+// `dead_code` stays allowed: this crate is built in several feature
+// combinations, and an item that is live in one is genuinely unreachable in
+// another (e.g. `render_voice` is dead without `voice`, while `play_wake_tone`
+// and `WAKE_TONE_PLAYBACK_TIMEOUT` are dead with it). Enforcing it would mean
+// feature-conditional `#[allow]`s at a dozen sites for no safety gain.
+//
+// `unused_variables` and `unused_assignments` are NOT that kind of noise —
+// they flag mistakes rather than configuration, and blanket-allowing them here
+// hid a stale duplicate of the route auth policy (see `RequestRoute` in
+// `server.rs`). They are enforced.
+#![allow(dead_code)]
 #![allow(clippy::too_many_arguments, clippy::empty_line_after_doc_comments)]
 
 pub mod agent_harness;

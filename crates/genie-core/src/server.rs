@@ -403,28 +403,15 @@ enum RequestRoute<'a> {
     NotFound,
 }
 
-impl RequestRoute<'_> {
-    /// True for state-changing or sensitive actuation endpoints, which require
-    /// the shared local API token when one is configured (issue #228, #658).
-    /// Other read-only routes are guarded by the Origin/Host gate alone.
-    fn is_mutating(&self) -> bool {
-        matches!(
-            self,
-            RequestRoute::ChatStream
-                | RequestRoute::Chat
-                | RequestRoute::Clear
-                | RequestRoute::WebSearchPost
-                | RequestRoute::ActuationPending
-                | RequestRoute::ActuationActions
-                | RequestRoute::ActuationConfirm
-                | RequestRoute::MemoriesUpdate
-                | RequestRoute::MemoriesDelete
-                | RequestRoute::MemoriesReorder
-                | RequestRoute::OpenAiChat
-        )
-    }
-}
-
+// Which routes need the shared local API token is decided solely by
+// `genie_common::http::route_requires_local_token`, which both this server and
+// genie-api call (issue #228, #658). `RequestRoute` deliberately carries no
+// second opinion: an `is_mutating` predicate used to live here and had drifted
+// out of agreement with that function, omitting `History`, `Conversations`,
+// `MemoriesList` and `Export` — all of which the real gate treats as sensitive
+// because they expose transcripts or household memory. It was unreachable, so
+// it changed nothing at runtime, but wiring it up would have silently dropped
+// authentication on those four reads.
 fn classify_route<'a>(method: &str, path: &'a str) -> RequestRoute<'a> {
     match (method, path) {
         ("GET", "/" | "/index.html") => RequestRoute::Root,

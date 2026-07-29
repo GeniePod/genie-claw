@@ -296,7 +296,6 @@ mod tests {
         // Apply AEC.
         let mic_rms_before = rms(&mic);
         cancel_echo(&mut mic, sample_rate);
-        let mic_rms_after = rms(&mic);
 
         // The echo component should be reduced.
         // Note: NLMS needs convergence time, so early samples won't be cancelled.

@@ -264,8 +264,10 @@ async fn run_with_wakeword(
             "[voice] Wake word listener ready — default development wake phrase: \"Hey Jarvis\""
         );
 
-        // Inner loop: process wake events until pipe breaks.
-        let mut restart_needed = false;
+        // Inner loop: process wake events until pipe breaks. Every exit from the
+        // loop below sets this, so it is left uninitialized rather than seeded
+        // with a value the compiler can prove is never read.
+        let restart_needed;
         loop {
             line.clear();
             let n = reader.read_line(&mut line).await.unwrap_or(0);
