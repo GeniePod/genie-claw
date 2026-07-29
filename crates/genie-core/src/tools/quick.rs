@@ -2461,7 +2461,39 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("self-cleaning oven".into());
     }
 
-    if (text.contains("oven on") || text.contains("leave the oven"))
+    // The oven branch keyed on the bare phrase "oven on" / "leave the oven"
+    // with no question shape and no word boundary, so it fired on anything that
+    // merely contained the letters:
+    //
+    //   * A *command* was answered with a status read. "turn the oven on" and
+    //     "remind me to turn the oven on at six" both returned
+    //     home_status{entity:"oven"}, so the oven never actuated. Every other
+    //     device already abstains on this word order and lets the LLM ground
+    //     the write — "turn the lights on" and "turn the fan on" both fall
+    //     through — so the oven was the one appliance a trailing-particle
+    //     command silently failed on.
+    //   * A command or hypothetical *embedded* in a question ("what happens if
+    //     i turn the oven on", "check if i should turn the oven on") is
+    //     question-shaped without asking about the oven's state, so a generic
+    //     `looks_like_status_query` gate does not separate it either.
+    //   * "oven" matched inside "pr[oven]" / "w[oven]" / "leave the [oven]ware",
+    //     so "is that theory proven on the test bench" reported the oven.
+    //
+    // Admit only the two shapes that actually ask about the oven's state, every
+    // token matched whole: the copular reading where the oven is the subject
+    // ("is/are the oven ... on") and the "did ... leave the oven ..."
+    // past-action check that the standard status-query prefixes do not cover.
+    // Anchoring on the subject rather than on a bare "is "/"are " prefix is what
+    // keeps the embedded-command forms out ("are you going to turn the oven on").
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    let asks_oven_state = matches!(words.first().copied(), Some("is" | "are"))
+        && words.get(1..3) == Some(&["the", "oven"][..])
+        && words.get(3..).is_some_and(|rest| rest.contains(&"on"));
+    let asks_oven_left_on = words.first().copied() == Some("did")
+        && words
+            .windows(3)
+            .any(|triple| triple == ["leave", "the", "oven"]);
+    if (asks_oven_state || asks_oven_left_on)
         && !text.contains("self cleaning")
         && !text.contains("self clean")
     {
@@ -2526,7 +2558,21 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("baby breathing monitor".into());
     }
 
-    if text.starts_with("did ") && text.contains("mail") {
+    // Match "mail" as a whole word, not a substring: a bare `contains` fired on
+    // "e[mail]", "voice[mail]", "g[mail]" and "[mail]ing list", so "did you
+    // email the landlord" and "did i get any email from the school" were
+    // answered with the physical mailbox status instead of falling through to
+    // the LLM. Mirrors the ice/iron/cooktop/cover/lock whole-word fixes below.
+    // The compounds that *do* name the physical delivery are listed explicitly,
+    // so every utterance the substring test resolved correctly still resolves.
+    if text.starts_with("did ")
+        && text.split_whitespace().any(|word| {
+            matches!(
+                word,
+                "mail" | "mailbox" | "mailboxes" | "mailman" | "mailmen"
+            )
+        })
+    {
         return Some("mailbox".into());
     }
 
@@ -2990,12 +3036,24 @@ fn is_time_expression(location: &str) -> bool {
     // query ("will it rain in a month") and a scheduled control ("turn on the
     // lights in a month") both mishandled them — the same class the shorter
     // day/week units already cover.
+    //
+    // A trailing time-of-day word is a time, not a place, even with a qualifier
+    // in front of it: "tonight", "this morning", "tomorrow night". A bare
+    // "morning"/"evening"/"night" is already caught by TIME_PHRASES above, but
+    // "weather for tonight" and "weather for this morning" reached here with a
+    // non-matching last token and used to route to get_weather{location:"tonight"}.
+    // "tonight" is the sibling of the today/tomorrow the weather/rain paths
+    // already special-case.
     matches!(
         location.split_whitespace().next_back(),
         Some(last) if is_time_unit(last)
             || matches!(
                 last,
-                "day" | "days"
+                "morning" | "afternoon"
+                    | "evening" | "night"
+                    | "tonight" | "midday"
+                    | "noon" | "midnight"
+                    | "day" | "days"
                     | "week" | "weeks"
                     | "month" | "months"
                     | "year" | "years"
@@ -3057,6 +3115,36 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
     Some((location, forecast))
 }
 
+/// A request for the day's news headlines. The exact trio
+/// ("read the news" | "read news" | "what s the news") missed the most common
+/// spoken forms — a trailing "today"/"right now", "give me/show me/tell me the
+/// news", "the latest news", "what's in the news" — so they fell through to the
+/// LLM. Deliberately a curated set (not a bare `contains("news")`) so it never
+/// swallows the play_media "morning news" audio-briefing forms handled later in
+/// dispatch.
+fn asks_for_news(text: &str) -> bool {
+    let text = text.trim_end_matches(" please").trim_end();
+    let text = strip_trailing_time_qualifier(text);
+    matches!(
+        text,
+        "read the news"
+            | "read news"
+            | "what s the news"
+            | "what is the news"
+            | "whats the news"
+            | "the latest news"
+            | "latest news"
+            | "what s the latest news"
+            | "what is the latest news"
+            | "give me the news"
+            | "show me the news"
+            | "tell me the news"
+            | "catch me up on the news"
+            | "what s in the news"
+            | "what s happening in the news"
+    )
+}
+
 fn web_search_request(text: &str) -> Option<(String, bool)> {
     if text.starts_with("search memory ") || text.starts_with("search memories ") {
         return None;
@@ -3104,7 +3192,7 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
         return Some((query, true));
     }
 
-    if matches!(text, "read the news" | "read news" | "what s the news") {
+    if asks_for_news(text) {
         // News headlines are inherently time-sensitive — the caller always wants
         // the current top stories — so mark the query fresh, the same as a
         // stock-price query. Returning `false` here let a stale cached result
@@ -3318,6 +3406,10 @@ fn arithmetic_expression(text: &str) -> Option<String> {
     let expression = text
         .strip_prefix("calculate ")
         .or_else(|| text.strip_prefix("what is "))
+        // "how much is" already routes to the calculator for percentages
+        // (percentage_expression strips no lead-in), so strip it here too or
+        // arithmetic behind the same lead-in stays stuck with the LLM.
+        .or_else(|| text.strip_prefix("how much is "))
         .or_else(|| text.strip_prefix("whats "))
         .or_else(|| text.strip_prefix("what s "))
         .or_else(|| text.strip_prefix("what's "))
@@ -3875,6 +3967,15 @@ fn asks_current_time(text: &str) -> bool {
             | "what is the date"
             | "whats the date"
             | "what s the date"
+            // Date counterparts of the "current time" / "tell me the time" forms
+            // above — a clock reading has them but the parallel date phrasings
+            // fell through to the LLM. "today's date" (normalized to "today s
+            // date") is the most common spoken date question and was missing too.
+            | "current date"
+            | "tell me the date"
+            | "today s date"
+            | "what s today s date"
+            | "whats today s date"
             | "what is today"
             | "what day is it"
             | "date and time"
@@ -5771,6 +5872,45 @@ mod tests {
     }
 
     #[test]
+    fn mail_status_matches_whole_words_not_substrings() {
+        // "mail" was matched as a substring behind the "did " prefix, so every
+        // "e[mail]" / "voice[mail]" / "g[mail]" / "[mail]ing list" question was
+        // answered with the physical mailbox status: "Did you get my email?"
+        // returned home_status{entity:"mailbox"} on `main`, with no device word
+        // in the utterance at all.
+        for utterance in [
+            "Did you get my email?",
+            "Did you email the landlord?",
+            "Did I get any email from the school?",
+            "Did the voicemail come through?",
+            "Did Sarah check her gmail?",
+            "Did the mailing list go out?",
+        ] {
+            // Assert the router abstains outright, not merely that it picked
+            // some other entity: every `Some(call)` is executed, so only `None`
+            // proves the utterance reaches the LLM. Same bar as
+            // `iron_verb_uses_do_not_report_iron_status`.
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain and reach the LLM"
+            );
+        }
+
+        // Genuine mail-delivery questions still resolve to the mailbox.
+        for utterance in [
+            "Did the mail arrive?",
+            "Did the mail come yet?",
+            "Did we get any mail today?",
+            "Did the mailman come?",
+            "Did anyone check the mailbox?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "mailbox", "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn iron_verb_uses_do_not_report_iron_status() {
         // "iron" is also a household *verb*. The appliance check runs before the
         // status-query gate, so keying on the bare word reported home_status
@@ -5827,6 +5967,87 @@ mod tests {
             assert_eq!(call.name, "home_status", "{utterance:?}");
             assert_eq!(call.arguments["entity"], "stove", "{utterance:?}");
         }
+    }
+
+    #[test]
+    fn turning_the_oven_on_is_a_command_not_a_status_read() {
+        // The "oven on" branch had no question-shape gate, so a command that
+        // merely contained the phrase was answered with a status report and the
+        // oven never actuated. Every other device already abstains on this word
+        // order (asserted below), which is what made the oven the odd one out.
+        for utterance in [
+            "Turn the oven on",
+            "Switch the oven on",
+            "Please turn the oven on",
+            "Can you turn the oven on?",
+            "Remind me to turn the oven on at six",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain so the LLM can actuate the oven"
+            );
+        }
+
+        // The reference behavior the oven was diverging from.
+        for utterance in ["Turn the lights on", "Turn the fan on"] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // "oven" as a substring of "pr[oven]" / "w[oven]" / "leave the
+        // [oven]ware" must not report the oven either, even though all three
+        // utterances are status-shaped.
+        for utterance in [
+            "Is that theory proven on the test bench?",
+            "Is the basket woven on a loom?",
+            "Did I leave the ovenware on?",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} must abstain and reach the LLM"
+            );
+        }
+
+        // A command or hypothetical embedded in a question is question-shaped
+        // without asking about the oven's state, so this branch must not claim
+        // it. These currently fall through to the cooktop branch and report
+        // `stove` — a separate pre-existing gap in that branch (same class as
+        // #861), so the assertion is scoped to what this branch owns.
+        for utterance in [
+            "What happens if I turn the oven on?",
+            "Check if I should turn the oven on",
+            "Are you going to turn the oven on?",
+            "What happens if I leave the oven on?",
+        ] {
+            assert_ne!(
+                route(utterance)
+                    .as_ref()
+                    .and_then(|call| call.arguments.get("entity"))
+                    .and_then(|entity| entity.as_str()),
+                Some("oven"),
+                "{utterance:?} must not resolve to the oven status entity"
+            );
+        }
+
+        // Genuine oven status questions still resolve, including the "did ..."
+        // form the standard gate prefixes do not cover.
+        for utterance in [
+            "Is the oven on?",
+            "Is the oven still on?",
+            "Did I leave the oven on?",
+            "Did you leave the oven on?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], "oven", "{utterance:?}");
+        }
+
+        // The self-cleaning cycle keeps its own entity, and a setpoint keeps
+        // actuating through home_control.
+        let call = route("Is the self-cleaning oven on?").expect("self-cleaning oven route");
+        assert_eq!(call.arguments["entity"], "self-cleaning oven");
+        let call = route("Set the oven to 400 degrees").expect("oven setpoint route");
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["action"], "set_temperature");
     }
 
     #[test]
@@ -6515,6 +6736,26 @@ mod tests {
     }
 
     #[test]
+    fn routes_date_counterparts_of_the_time_phrasings_to_get_time() {
+        // "current time" and "tell me the time" route to get_time, but their date
+        // counterparts fell through to the LLM; "today's date" (the most common
+        // spoken date question, normalized to "today s date") was missing too.
+        for utterance in [
+            "Current date",
+            "Tell me the date",
+            "What's today's date?",
+            "Whats today's date",
+            "today's date",
+            // Politeness still comes off, like the time phrasings.
+            "Current date please",
+            "Tell me the date, please",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_time", "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_named_timer_label_before_duration() {
         let call = route("Leo: Set a cookie timer for 12 minutes.").unwrap();
         assert_eq!(call.name, "set_timer");
@@ -7006,6 +7247,26 @@ mod tests {
     }
 
     #[test]
+    fn weather_for_a_bare_time_of_day_abstains() {
+        // A bare time-of-day word after "for"/"in" names a *time*, not a place:
+        // "weather for tonight" must fall back to the local forecast (abstain),
+        // not look up a city called "tonight". "tonight" and the "this <part of
+        // day>" forms were the siblings of the today/tomorrow/morning the path
+        // already handled; they used to emit get_weather{location:"tonight"}.
+        for utterance in [
+            "what's the weather for tonight",
+            "what's the weather for this morning",
+            "what's the weather for this evening",
+            "what's the weather in the evening",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} should abstain (local forecast), not route a time as a place"
+            );
+        }
+    }
+
+    #[test]
     fn weather_location_drops_trailing_please() {
         // A trailing "please" is politeness, not part of the city: the location
         // argument must be just the city, not "paris please". Mirrors the other
@@ -7097,6 +7358,32 @@ mod tests {
     }
 
     #[test]
+    fn routes_natural_news_phrasings_to_web_search() {
+        // The news matcher was an exact trio ("read the news" | "read news" |
+        // "what s the news"), so the most common spoken forms fell through to the
+        // LLM. Route them to a fresh web_search for the top headlines.
+        for utterance in [
+            "What's the news today?",
+            "What is the news?",
+            "What's the latest news?",
+            "Give me the news",
+            "Show me the news",
+            "Tell me the news",
+            "What's in the news?",
+            "Catch me up on the news",
+            "read the news right now",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(
+                call.arguments["query"], "top news headlines",
+                "{utterance:?}"
+            );
+            assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_lookup_to_web_search() {
         let call = route("look up ESP32 C6 Thread support").unwrap();
         assert_eq!(call.name, "web_search");
@@ -7159,6 +7446,23 @@ mod tests {
             ("What's 2 plus 2?", "2 + 2"),
             ("what's 5 times 3", "5 * 3"),
             ("What's two plus three?", "2 + 3"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "calculate", "{utterance:?}");
+            assert_eq!(call.arguments["expression"], expression, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn routes_how_much_is_arithmetic_to_calculate() {
+        // "how much is" already routes to the calculator for percentages (via
+        // percentage_expression, which strips no lead-in), so arithmetic behind
+        // the same lead-in must route too — otherwise "how much is 45 times 6"
+        // fell through to the LLM while "what is 45 times 6" did not.
+        for (utterance, expression) in [
+            ("how much is 45 times 6", "45 * 6"),
+            ("how much is 100 divided by 4", "100 / 4"),
+            ("how much is 2 plus 2", "2 + 2"),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "calculate", "{utterance:?}");

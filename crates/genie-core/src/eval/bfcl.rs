@@ -618,6 +618,49 @@ fn canon_action(text: &str) -> String {
     }
 }
 
+/// Resolve an entity-like surface string against the BFCL reference home and
+/// return the sorted entity ids the runtime resolver would act on, or `None`
+/// when the string resolves to nothing.
+///
+/// This is the same resolution the grounded metric uses internally
+/// ([`canonicalize_entity_value`]); it is exposed so the failure taxonomy in
+/// [`crate::eval::analyze`] can tell a *hallucinated* entity (resolves to
+/// nothing — e.g. a room the reference home does not have) apart from one that
+/// resolves to the *wrong* device. Those two look identical in the scorer's
+/// pass/fail bit but call for opposite fixes, which is the distinction #387
+/// asks contributors to characterize.
+pub fn resolve_reference_home_entity_ids(text: &str) -> Option<Vec<String>> {
+    let graph = bfcl_reference_home();
+    match HomeAssistantProvider::resolve_target_in_graph(&graph, text, None) {
+        Some(target) if !target.entity_ids.is_empty() => {
+            let mut ids = target.entity_ids;
+            ids.sort();
+            Some(ids)
+        }
+        _ => None,
+    }
+}
+
+/// Canonical form of an action verb as the grounded metric compares it, so the
+/// taxonomy can separate a mere synonym (`deactivate` vs `turn_off`, which the
+/// agent executes identically) from a genuinely wrong action.
+pub fn canonical_action(text: &str) -> String {
+    canon_action(text)
+}
+
+/// Object keys the grounded metric treats as entity-like references.
+/// Re-exported so the taxonomy classifies argument deltas on the same keys the
+/// scorer grounds, rather than keeping a second list that could drift.
+pub fn entity_argument_keys() -> &'static [&'static str] {
+    &ENTITY_ARG_KEYS
+}
+
+/// Object keys the grounded metric treats as action verbs. See
+/// [`entity_argument_keys`] for why this is shared rather than duplicated.
+pub fn action_argument_keys() -> &'static [&'static str] {
+    &ACTION_ARG_KEYS
+}
+
 struct BfclCatalogHomeStub;
 
 #[async_trait]

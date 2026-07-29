@@ -793,7 +793,7 @@ fn parse_data_entry(value: &Yaml) -> Result<HaDataEntry> {
         .unwrap_or_default();
     let requires_context = yaml_hash_get(value, "requires_context").cloned();
     let name_domains = yaml_hash_get(value, "name_domains")
-        .map(parse_string_array)
+        .map(parse_string_or_array)
         .transpose()?
         .unwrap_or_default();
 
@@ -805,12 +805,44 @@ fn parse_data_entry(value: &Yaml) -> Result<HaDataEntry> {
     })
 }
 
+/// Read a strictly sequence-shaped string list (`sentences`).
+///
+/// Kept strict on purpose: these entries become the accuracy benchmark, so a
+/// malformed `sentences:` scalar should fail loudly rather than be silently
+/// coerced into a one-sentence template. Fields that genuinely have a scalar
+/// shorthand upstream use [`parse_string_or_array`] instead.
 fn parse_string_array(value: &Yaml) -> Result<Vec<String>> {
     let Some(items) = value.as_vec() else {
         anyhow::bail!("expected YAML sequence of strings");
     };
 
     Ok(items.iter().filter_map(yaml_string).collect())
+}
+
+/// Read a string list that upstream writes either as a sequence or as a bare
+/// scalar shorthand (`name_domains`).
+///
+/// OHF-Voice/intents uses both shapes:
+///
+/// ```yaml
+/// name_domains:          # 83 files under sentences/en/**
+///   - light
+///   - switch
+/// ```
+///
+/// ```yaml
+/// name_domains: "default"   # 6 files under sentences/en/**
+/// ```
+///
+/// Requiring a sequence made the importer hard-fail the whole run on the first
+/// scalar it met (`sentences/en/HassTurnOff/name_area.yaml`), so no HA-Intents
+/// suite could be generated at all. A lone scalar is a one-element list.
+fn parse_string_or_array(value: &Yaml) -> Result<Vec<String>> {
+    if let Some(single) = yaml_string(value) {
+        return Ok(vec![single]);
+    }
+
+    parse_string_array(value)
 }
 
 fn yaml_hash_get<'a>(value: &'a Yaml, key: &str) -> Option<&'a Yaml> {
@@ -954,6 +986,93 @@ fn slug(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: upstream OHF-Voice/intents writes `name_domains` as a bare
+    /// scalar in six `sentences/en/**` files (e.g. `HassTurnOff/name_area.yaml`).
+    /// Requiring a sequence aborted the whole import on the first one, so no
+    /// HA-Intents suite could be generated at all.
+    #[test]
+    fn name_domains_accepts_the_scalar_shorthand() {
+        let file = parse_ha_sentence_file(
+            r#"
+language: "en"
+data:
+  - sentences:
+      - "<turn> off [<the>] {name}"
+    name_domains: "default"
+"#,
+        )
+        .expect("a scalar name_domains must parse, not abort the run");
+
+        assert_eq!(file.data.len(), 1);
+        assert_eq!(file.data[0].name_domains, vec!["default".to_string()]);
+    }
+
+    /// The scalar allowance is scoped to `name_domains`. `sentences` stays
+    /// sequence-only: these entries become the accuracy benchmark, so a
+    /// malformed scalar must fail loudly rather than be coerced into a
+    /// one-sentence template.
+    #[test]
+    fn scalar_sentences_is_still_rejected() {
+        let result = parse_ha_sentence_file(
+            r#"
+language: "en"
+data:
+  - sentences: "<turn> off [<the>] {name}"
+"#,
+        );
+
+        assert!(
+            result.is_err(),
+            "a scalar `sentences` must not be silently coerced into a list"
+        );
+    }
+
+    /// The sequence form — the shape 83 of the 89 upstream files use — must keep
+    /// parsing exactly as before.
+    #[test]
+    fn name_domains_still_accepts_a_sequence() {
+        let file = parse_ha_sentence_file(
+            r#"
+language: "en"
+data:
+  - sentences:
+      - "<turn> off [<the>] {name}"
+    name_domains:
+      - light
+      - switch
+"#,
+        )
+        .expect("sequence form must keep working");
+
+        assert_eq!(
+            file.data[0].name_domains,
+            vec!["light".to_string(), "switch".to_string()]
+        );
+    }
+
+    /// `"default"` is a placeholder, not a real domain, so it must not be picked
+    /// as the entry's domain — resolution falls through to the template
+    /// heuristic exactly as it does when `name_domains` is absent.
+    #[test]
+    fn scalar_default_domain_placeholder_does_not_win_domain_resolution() {
+        let file = parse_ha_sentence_file(
+            r#"
+language: "en"
+data:
+  - sentences:
+      - "<turn> off [<the>] {name} <light>"
+    name_domains: "default"
+"#,
+        )
+        .expect("parses");
+
+        assert_eq!(
+            domain_for_entry(&file.data[0], "<turn> off [<the>] {name} <light>"),
+            Some("light".to_string()),
+            "the <light> template marker should resolve the domain, not \"default\""
+        );
+    }
 
     #[test]
     fn renders_home_assistant_template_with_sample_slots() {
