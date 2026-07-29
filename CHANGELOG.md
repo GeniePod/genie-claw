@@ -4,6 +4,11 @@
 
 ### Quick-router tool-call accuracy
 
+- **Scene / routine**: strip a leading `please` before the exact-match set and
+  the `activate`/`start`/`run` prefix loop, so polite forms
+  (`please activate the movie scene`, `please goodnight`, `please I am home`)
+  route the same as their non-`please` counterparts — trailing `please` was
+  already handled inside the loop (#894).
 - **Shopping list**: accept the article-less list suffix on removals
   (`take milk off shopping list` / `remove eggs from shopping list`), matching
   the add path — previously only the articled `off/from the shopping list`
