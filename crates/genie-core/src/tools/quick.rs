@@ -3349,6 +3349,10 @@ fn arithmetic_expression(text: &str) -> Option<String> {
     let expression = text
         .strip_prefix("calculate ")
         .or_else(|| text.strip_prefix("what is "))
+        // "how much is" already routes to the calculator for percentages
+        // (percentage_expression strips no lead-in), so strip it here too or
+        // arithmetic behind the same lead-in stays stuck with the LLM.
+        .or_else(|| text.strip_prefix("how much is "))
         .or_else(|| text.strip_prefix("whats "))
         .or_else(|| text.strip_prefix("what s "))
         .or_else(|| text.strip_prefix("what's "))
@@ -7228,6 +7232,23 @@ mod tests {
             ("What's 2 plus 2?", "2 + 2"),
             ("what's 5 times 3", "5 * 3"),
             ("What's two plus three?", "2 + 3"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "calculate", "{utterance:?}");
+            assert_eq!(call.arguments["expression"], expression, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn routes_how_much_is_arithmetic_to_calculate() {
+        // "how much is" already routes to the calculator for percentages (via
+        // percentage_expression, which strips no lead-in), so arithmetic behind
+        // the same lead-in must route too — otherwise "how much is 45 times 6"
+        // fell through to the LLM while "what is 45 times 6" did not.
+        for (utterance, expression) in [
+            ("how much is 45 times 6", "45 * 6"),
+            ("how much is 100 divided by 4", "100 / 4"),
+            ("how much is 2 plus 2", "2 + 2"),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "calculate", "{utterance:?}");
