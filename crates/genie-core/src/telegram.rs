@@ -38,6 +38,126 @@ fn next_temp_nonce() -> u64 {
     TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Cap on Telegram chat drivers kept alive at once. Matches
+/// `session::DEFAULT_MAX_ACTIVE_SESSIONS` — a chat without a live driver simply
+/// gets a fresh one on its next message, so the cap costs a task respawn, not
+/// continuity.
+const MAX_ACTIVE_CHAT_DRIVERS: usize = 32;
+
+/// Idle window before a chat's driver is retired (30 minutes), mirroring
+/// `session::DEFAULT_SESSION_IDLE_TTL_MS`.
+const CHAT_DRIVER_IDLE_TTL_MS: i64 = 30 * 60 * 1000;
+
+fn chat_driver_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// One live per-chat `serve_channel` driver.
+struct ChatDriver {
+    sender: mpsc::Sender<TelegramMessage>,
+    last_active_ms: i64,
+}
+
+/// Bounded, idle-expiring set of per-chat driver tasks.
+///
+/// The dispatcher spawns one `serve_channel` task per chat and holds its
+/// `mpsc::Sender`. Retaining that sender is what keeps the driver alive:
+/// `inbox.recv()` only yields `None` once every sender is dropped, so a driver
+/// whose entry is never removed parks forever. The previous plain `HashMap`
+/// removed an entry only when a `send` failed, and `Sender::is_closed()` cannot
+/// become true while the map still holds the sender — so a chat that sent one
+/// message and went quiet leaked both a map entry *and* a parked tokio task for
+/// the lifetime of the process, unbounded in the number of distinct chats.
+///
+/// Dropping the sender is therefore the reclamation path: the inbox closes,
+/// `serve_channel` returns, and the task exits. This bounds the live set the
+/// same way [`crate::session::SessionRegistry`] bounds sessions — idle expiry
+/// plus a hard cap that retires the least-recently-active chat — so a long-lived
+/// bot stays inside the Jetson budget.
+struct ChatDriverRegistry {
+    drivers: HashMap<i64, ChatDriver>,
+    max_active: usize,
+    idle_ttl_ms: i64,
+}
+
+impl ChatDriverRegistry {
+    fn new(max_active: usize, idle_ttl_ms: i64) -> Self {
+        Self {
+            drivers: HashMap::new(),
+            max_active: max_active.max(1),
+            idle_ttl_ms: idle_ttl_ms.max(1),
+        }
+    }
+
+    fn with_defaults() -> Self {
+        Self::new(MAX_ACTIVE_CHAT_DRIVERS, CHAT_DRIVER_IDLE_TTL_MS)
+    }
+
+    fn len(&self) -> usize {
+        self.drivers.len()
+    }
+
+    /// Sender for a chat that still has a live driver, refreshing its activity
+    /// stamp. Returns `None` when the chat has no driver or its driver has
+    /// already exited, in which case the caller spawns a fresh one.
+    fn live_sender(&mut self, chat_id: i64, now_ms: i64) -> Option<mpsc::Sender<TelegramMessage>> {
+        let driver = self.drivers.get_mut(&chat_id)?;
+        if driver.sender.is_closed() {
+            self.drivers.remove(&chat_id);
+            return None;
+        }
+        driver.last_active_ms = now_ms;
+        Some(driver.sender.clone())
+    }
+
+    /// Register a freshly spawned driver, first reclaiming idle ones and then
+    /// enforcing the cap so the live set never exceeds `max_active`.
+    fn insert(&mut self, chat_id: i64, sender: mpsc::Sender<TelegramMessage>, now_ms: i64) {
+        self.retire_idle(now_ms);
+        self.enforce_cap();
+        self.drivers.insert(
+            chat_id,
+            ChatDriver {
+                sender,
+                last_active_ms: now_ms,
+            },
+        );
+    }
+
+    fn remove(&mut self, chat_id: i64) {
+        self.drivers.remove(&chat_id);
+    }
+
+    /// Drop drivers idle for longer than the TTL, and any whose task already
+    /// exited. Dropping the sender closes the inbox so the task finishes.
+    fn retire_idle(&mut self, now_ms: i64) -> usize {
+        let cutoff = now_ms.saturating_sub(self.idle_ttl_ms);
+        let before = self.drivers.len();
+        self.drivers
+            .retain(|_, driver| driver.last_active_ms >= cutoff && !driver.sender.is_closed());
+        before - self.drivers.len()
+    }
+
+    /// Make room for one more driver by retiring the least-recently-active
+    /// chats until the set is below the cap.
+    fn enforce_cap(&mut self) {
+        while self.drivers.len() >= self.max_active {
+            let Some(oldest) = self
+                .drivers
+                .iter()
+                .min_by_key(|(chat_id, driver)| (driver.last_active_ms, **chat_id))
+                .map(|(chat_id, _)| *chat_id)
+            else {
+                return;
+            };
+            self.drivers.remove(&oldest);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TelegramRuntimeConfig {
     pub api_base: String,
@@ -113,10 +233,23 @@ pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
     // (#278) is applied per *turn* inside the handler (an `update_permits`
     // permit is held only across `chat_core`, not pinned to a long-lived driver),
     // and voice STT stays bounded by `voice_permits` inside `handle_voice_message`.
-    let mut drivers: HashMap<i64, mpsc::Sender<TelegramMessage>> = HashMap::new();
+    // Bounded and idle-expiring: holding a chat's sender is what keeps its
+    // driver task alive, so an entry that is never removed parks that task
+    // forever. See `ChatDriverRegistry`.
+    let mut drivers = ChatDriverRegistry::with_defaults();
     loop {
         match api.get_updates(offset).await {
             Ok(updates) => {
+                // Reclaim quiet chats even across batches that never mention
+                // them, so an idle driver is not held until its chat speaks again.
+                let retired = drivers.retire_idle(chat_driver_now_ms());
+                if retired > 0 {
+                    tracing::debug!(
+                        retired,
+                        live = drivers.len(),
+                        "retired idle telegram chat drivers"
+                    );
+                }
                 for update in updates {
                     offset = offset.max(update.update_id.saturating_add(1));
                     let Some(message) = update.message else {
@@ -139,9 +272,10 @@ pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
                             .await;
                         continue;
                     }
-                    let sender = match drivers.get(&chat_id) {
-                        Some(tx) if !tx.is_closed() => tx.clone(),
-                        _ => {
+                    let now_ms = chat_driver_now_ms();
+                    let sender = match drivers.live_sender(chat_id, now_ms) {
+                        Some(tx) => tx,
+                        None => {
                             let (tx, rx) = mpsc::channel::<TelegramMessage>(64);
                             let api2 = Arc::clone(&api);
                             tokio::spawn(async move {
@@ -168,14 +302,14 @@ pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
                                     tracing::warn!(chat_id, error = %e, "telegram chat driver ended");
                                 }
                             });
-                            drivers.insert(chat_id, tx.clone());
+                            drivers.insert(chat_id, tx.clone(), now_ms);
                             tx
                         }
                     };
                     if sender.send(message).await.is_err() {
                         // The driver exited between the check and the send; drop the
                         // stale sender so the next message spawns a fresh driver.
-                        drivers.remove(&chat_id);
+                        drivers.remove(chat_id);
                     }
                 }
             }
@@ -1471,5 +1605,36 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "must fail fast on the timeout, not wait for the child: took {elapsed:?}"
         );
+    }
+
+    /// A chat that goes quiet must have its driver reclaimed. Holding the sender
+    /// is what keeps the task parked, so the entry has to be dropped.
+    /// Receivers are kept alive so `is_closed()` does not mask the TTL path.
+    #[tokio::test]
+    async fn idle_chats_are_retired() {
+        let (tx, _rx) = mpsc::channel::<super::TelegramMessage>(1);
+        let mut reg = super::ChatDriverRegistry::new(8, 1_000);
+        reg.insert(1, tx, 0);
+
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.retire_idle(5_000), 1, "idle driver must be reclaimed");
+        assert_eq!(reg.len(), 0);
+    }
+
+    /// The cap bounds the live set no matter how many distinct chats appear, and
+    /// retires the least-recently-active one first.
+    #[tokio::test]
+    async fn distinct_chats_stay_under_the_cap() {
+        let mut reg = super::ChatDriverRegistry::new(2, super::CHAT_DRIVER_IDLE_TTL_MS);
+        let mut keep_alive = Vec::new();
+        for chat_id in 1..=5_i64 {
+            let (tx, rx) = mpsc::channel::<super::TelegramMessage>(1);
+            keep_alive.push(rx);
+            reg.insert(chat_id, tx, chat_id);
+        }
+
+        assert!(reg.len() <= 2, "live drivers must stay under the cap");
+        assert!(reg.live_sender(5, 99).is_some(), "newest chat stays live");
+        assert!(reg.live_sender(1, 99).is_none(), "oldest chat was retired");
     }
 }
