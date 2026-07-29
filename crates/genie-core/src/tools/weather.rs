@@ -187,6 +187,21 @@ async fn fetch_forecast(lat: f64, lon: f64) -> Result<Vec<ForecastDay>> {
         .get("daily")
         .ok_or_else(|| anyhow::anyhow!("no forecast data"))?;
 
+    Ok(forecast_from_daily(daily))
+}
+
+/// Assemble the day list from Open-Meteo's `daily` object.
+///
+/// `time`, `temperature_2m_max`, `temperature_2m_min`, and `weather_code` are
+/// four parallel arrays read straight from an external network response, which
+/// does not guarantee they are equal length. The loop is therefore bounded by
+/// the *shortest* of the four (capped at 7 days) rather than by `time` alone —
+/// a short or truncated value array would otherwise index past its end. That
+/// out-of-bounds access is not a recoverable error: the workspace builds with
+/// `panic = "abort"`, so it would take down the whole always-on daemon. Only
+/// days for which all four fields are present are emitted; well-formed
+/// (equal-length) responses are unaffected.
+fn forecast_from_daily(daily: &serde_json::Value) -> Vec<ForecastDay> {
     let dates = daily.get("time").and_then(|v| v.as_array());
     let maxs = daily.get("temperature_2m_max").and_then(|v| v.as_array());
     let mins = daily.get("temperature_2m_min").and_then(|v| v.as_array());
@@ -194,7 +209,13 @@ async fn fetch_forecast(lat: f64, lon: f64) -> Result<Vec<ForecastDay>> {
 
     let mut forecast = Vec::new();
     if let (Some(dates), Some(maxs), Some(mins), Some(codes)) = (dates, maxs, mins, codes) {
-        for i in 0..dates.len().min(7) {
+        let days = dates
+            .len()
+            .min(maxs.len())
+            .min(mins.len())
+            .min(codes.len())
+            .min(7);
+        for i in 0..days {
             forecast.push(ForecastDay {
                 date: dates[i].as_str().unwrap_or("").to_string(),
                 temp_max: maxs[i].as_f64().unwrap_or(0.0),
@@ -204,7 +225,7 @@ async fn fetch_forecast(lat: f64, lon: f64) -> Result<Vec<ForecastDay>> {
         }
     }
 
-    Ok(forecast)
+    forecast
 }
 
 /// HTTPS GET against an Open-Meteo host via the shared outbound HTTP
@@ -326,6 +347,54 @@ mod tests {
         assert_eq!(wmo_code_to_description(61), "rain");
         assert_eq!(wmo_code_to_description(95), "thunderstorm");
         assert_eq!(wmo_code_to_description(999), "unknown conditions");
+    }
+
+    /// Regression: the forecast loop used to iterate `0..time.len()` and then
+    /// index the three *other* parallel arrays with the same `i`. A response
+    /// whose value arrays are shorter than `time` (truncated/partial upstream,
+    /// an API change, or a spoofed host) panicked on `maxs[i]`/`mins[i]`/
+    /// `codes[i]` — and under `panic = "abort"` that aborts the daemon. The
+    /// loop is now bounded by the shortest array, so it just emits fewer days.
+    #[test]
+    fn forecast_from_daily_bounds_on_shortest_array() {
+        let daily = serde_json::json!({
+            "time": ["2026-07-28", "2026-07-29", "2026-07-30"],
+            "temperature_2m_max": [31.0],
+            "temperature_2m_min": [18.0],
+            "weather_code": [1],
+        });
+        let forecast = forecast_from_daily(&daily);
+        assert_eq!(forecast.len(), 1);
+        assert_eq!(forecast[0].date, "2026-07-28");
+        assert_eq!(forecast[0].temp_max, 31.0);
+        assert_eq!(forecast[0].temp_min, 18.0);
+        assert_eq!(forecast[0].description, "mainly clear");
+    }
+
+    /// Well-formed (equal-length) responses are unchanged, capped at 7 days.
+    #[test]
+    fn forecast_from_daily_reads_matching_arrays() {
+        let daily = serde_json::json!({
+            "time": ["2026-07-28", "2026-07-29"],
+            "temperature_2m_max": [31.0, 30.0],
+            "temperature_2m_min": [18.0, 17.0],
+            "weather_code": [0, 61],
+        });
+        let forecast = forecast_from_daily(&daily);
+        assert_eq!(forecast.len(), 2);
+        assert_eq!(forecast[0].description, "clear sky");
+        assert_eq!(forecast[1].description, "rain");
+    }
+
+    /// A missing value array yields an empty forecast rather than a panic.
+    #[test]
+    fn forecast_from_daily_handles_missing_array() {
+        let daily = serde_json::json!({
+            "time": ["2026-07-28", "2026-07-29"],
+            "temperature_2m_max": [31.0, 30.0],
+            "temperature_2m_min": [18.0, 17.0],
+        });
+        assert!(forecast_from_daily(&daily).is_empty());
     }
 
     /// Direct unit coverage on the URL-encoding helper. The bug being fixed
