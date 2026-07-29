@@ -4216,14 +4216,27 @@ mod tests {
                     "{export_with_tok:?}"
                 );
 
-                // The conversation *list* (metadata only) stays open without a
-                // token — deliberate carve-out preserved from #757.
-                let read = http_roundtrip(
+                // Conversation titles contain the first user message, so the
+                // index is sensitive even without full message bodies.
+                let conversations_no_tok = http_roundtrip(
                     port,
                     "GET /api/conversations HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 )
                 .await;
-                assert!(read.starts_with("HTTP/1.1 200"), "{read:?}");
+                assert!(
+                    conversations_no_tok.starts_with("HTTP/1.1 403"),
+                    "{conversations_no_tok:?}"
+                );
+
+                let conversations_with_tok = http_roundtrip(
+                    port,
+                    "GET /api/conversations HTTP/1.1\r\nHost: localhost\r\nX-Genie-Token: s3cret\r\n\r\n",
+                )
+                .await;
+                assert!(
+                    conversations_with_tok.starts_with("HTTP/1.1 200"),
+                    "{conversations_with_tok:?}"
+                );
 
                 // The dashboard must never bootstrap authentication by
                 // disclosing the configured bearer token.
