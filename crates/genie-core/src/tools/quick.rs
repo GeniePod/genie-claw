@@ -988,6 +988,8 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
             | "good night"
             | "i m home"
             | "i am home"
+            | "we re home"
+            | "we are home"
             | "lock up the house"
             | "lock up house"
             | "turn off everything"
@@ -996,7 +998,10 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
             | "i am back"
     ) {
         return Some(
-            if matches!(text, "i m home" | "i am home" | "i m back" | "i am back") {
+            if matches!(
+                text,
+                "i m home" | "i am home" | "we re home" | "we are home" | "i m back" | "i am back"
+            ) {
                 "arrival".into()
             } else if text == "lock up the house" || text == "lock up house" {
                 "lock up house".into()
@@ -4633,6 +4638,19 @@ mod tests {
         ] {
             let call = route(query).unwrap();
             assert_eq!(call.name, "memory_recall", "{query}");
+        }
+    }
+
+    #[test]
+    fn plural_arrival_triggers_the_arrival_scene() {
+        // A family arriving together ("we're home") should fire the arrival
+        // scene just like one person's "I'm home", which already routes — the
+        // plural form fell through to the LLM.
+        for u in ["We're home", "We are home"] {
+            let call = route(u).unwrap_or_else(|| panic!("no route for {u:?}"));
+            assert_eq!(call.name, "home_control", "{u:?}");
+            assert_eq!(call.arguments["entity"], "arrival", "{u:?}");
+            assert_eq!(call.arguments["action"], "activate", "{u:?}");
         }
     }
 
