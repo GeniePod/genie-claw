@@ -1042,6 +1042,10 @@ fn scene_or_routine_activation_request(text: &str) -> Option<String> {
 }
 
 fn play_media_request(text: &str) -> Option<String> {
+    // A leading "please" is politeness, not part of the command — strip it so
+    // every form below (the named-media sets and all playlist verbs) routes,
+    // not just the one "please play " prefix. Mirrors shopping_list_add_request.
+    let text = text.strip_prefix("please ").unwrap_or(text);
     if matches!(
         text,
         "play focus music" | "start focus music" | "focus music"
@@ -1069,7 +1073,7 @@ fn play_media_request(text: &str) -> Option<String> {
         return Some("local weather report".into());
     }
 
-    for prefix in ["please play ", "play ", "start ", "put on "] {
+    for prefix in ["play ", "start ", "put on "] {
         if let Some(rest) = text.strip_prefix(prefix).map(str::trim)
             && rest.contains("playlist")
         {
@@ -4706,6 +4710,24 @@ mod tests {
         // No speaker prefix -> the literal possessive is preserved (unchanged).
         let call = route("Play my Morning Boost playlist").unwrap();
         assert_eq!(call.arguments["query"], "my morning boost playlist");
+    }
+
+    #[test]
+    fn play_media_accepts_a_leading_please() {
+        // play_media honored a leading "please" for exactly one verb ("please
+        // play … playlist"); the other verbs and the named-media sets did not,
+        // so "please put on the party playlist" fell through to the LLM while
+        // "put on the party playlist" routed. Strip a leading "please" for the
+        // whole matcher, like shopping_list_add_request already does.
+        for (utterance, query) in [
+            ("Please put on the party playlist", "party playlist"),
+            ("Please start the workout playlist", "workout playlist"),
+            ("Please put on the morning news", "morning news"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "play_media", "{utterance:?}");
+            assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
     }
 
     #[test]
