@@ -38,125 +38,34 @@ fn next_temp_nonce() -> u64 {
     TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Cap on Telegram chat drivers kept alive at once. Matches
-/// `session::DEFAULT_MAX_ACTIVE_SESSIONS` — a chat without a live driver simply
-/// gets a fresh one on its next message, so the cap costs a task respawn, not
-/// continuity.
-const MAX_ACTIVE_CHAT_DRIVERS: usize = 32;
-
-/// Idle window before a chat's driver is retired (30 minutes), mirroring
-/// `session::DEFAULT_SESSION_IDLE_TTL_MS`.
-const CHAT_DRIVER_IDLE_TTL_MS: i64 = 30 * 60 * 1000;
-
-fn chat_driver_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-/// One live per-chat `serve_channel` driver.
-struct ChatDriver {
-    sender: mpsc::Sender<TelegramMessage>,
-    last_active_ms: i64,
-}
-
-/// Bounded, idle-expiring set of per-chat driver tasks.
+/// How long a per-chat driver waits for its next message before retiring itself.
 ///
-/// The dispatcher spawns one `serve_channel` task per chat and holds its
-/// `mpsc::Sender`. Retaining that sender is what keeps the driver alive:
-/// `inbox.recv()` only yields `None` once every sender is dropped, so a driver
-/// whose entry is never removed parks forever. The previous plain `HashMap`
-/// removed an entry only when a `send` failed, and `Sender::is_closed()` cannot
-/// become true while the map still holds the sender — so a chat that sent one
-/// message and went quiet leaked both a map entry *and* a parked tokio task for
-/// the lifetime of the process, unbounded in the number of distinct chats.
+/// The dispatcher spawns one `serve_channel` driver task per chat and keeps its
+/// `mpsc::Sender`. Holding that sender is what keeps the driver alive —
+/// `inbox.recv()` only yields `None` once every sender is dropped — so a chat
+/// that sent one message and went quiet used to leave its task parked forever,
+/// unbounded in the number of distinct chats. The `Some(tx) if !tx.is_closed()`
+/// guard could not help: `is_closed()` reports whether the *receiver* went away,
+/// and the receiver lives inside the driver, which cannot exit while the map
+/// still holds a sender.
 ///
-/// Dropping the sender is therefore the reclamation path: the inbox closes,
-/// `serve_channel` returns, and the task exits. This bounds the live set the
-/// same way [`crate::session::SessionRegistry`] bounds sessions — idle expiry
-/// plus a hard cap that retires the least-recently-active chat — so a long-lived
-/// bot stays inside the Jetson budget.
-struct ChatDriverRegistry {
-    drivers: HashMap<i64, ChatDriver>,
-    max_active: usize,
-    idle_ttl_ms: i64,
-}
-
-impl ChatDriverRegistry {
-    fn new(max_active: usize, idle_ttl_ms: i64) -> Self {
-        Self {
-            drivers: HashMap::new(),
-            max_active: max_active.max(1),
-            idle_ttl_ms: idle_ttl_ms.max(1),
-        }
-    }
-
-    fn with_defaults() -> Self {
-        Self::new(MAX_ACTIVE_CHAT_DRIVERS, CHAT_DRIVER_IDLE_TTL_MS)
-    }
-
-    fn len(&self) -> usize {
-        self.drivers.len()
-    }
-
-    /// Sender for a chat that still has a live driver, refreshing its activity
-    /// stamp. Returns `None` when the chat has no driver or its driver has
-    /// already exited, in which case the caller spawns a fresh one.
-    fn live_sender(&mut self, chat_id: i64, now_ms: i64) -> Option<mpsc::Sender<TelegramMessage>> {
-        let driver = self.drivers.get_mut(&chat_id)?;
-        if driver.sender.is_closed() {
-            self.drivers.remove(&chat_id);
-            return None;
-        }
-        driver.last_active_ms = now_ms;
-        Some(driver.sender.clone())
-    }
-
-    /// Register a freshly spawned driver, first reclaiming idle ones and then
-    /// enforcing the cap so the live set never exceeds `max_active`.
-    fn insert(&mut self, chat_id: i64, sender: mpsc::Sender<TelegramMessage>, now_ms: i64) {
-        self.retire_idle(now_ms);
-        self.enforce_cap();
-        self.drivers.insert(
-            chat_id,
-            ChatDriver {
-                sender,
-                last_active_ms: now_ms,
-            },
-        );
-    }
-
-    fn remove(&mut self, chat_id: i64) {
-        self.drivers.remove(&chat_id);
-    }
-
-    /// Drop drivers idle for longer than the TTL, and any whose task already
-    /// exited. Dropping the sender closes the inbox so the task finishes.
-    fn retire_idle(&mut self, now_ms: i64) -> usize {
-        let cutoff = now_ms.saturating_sub(self.idle_ttl_ms);
-        let before = self.drivers.len();
-        self.drivers
-            .retain(|_, driver| driver.last_active_ms >= cutoff && !driver.sender.is_closed());
-        before - self.drivers.len()
-    }
-
-    /// Make room for one more driver by retiring the least-recently-active
-    /// chats until the set is below the cap.
-    fn enforce_cap(&mut self) {
-        while self.drivers.len() >= self.max_active {
-            let Some(oldest) = self
-                .drivers
-                .iter()
-                .min_by_key(|(chat_id, driver)| (driver.last_active_ms, **chat_id))
-                .map(|(chat_id, _)| *chat_id)
-            else {
-                return;
-            };
-            self.drivers.remove(&oldest);
-        }
-    }
-}
+/// Retiring from inside the driver's own `recv` is what makes this safe. `recv`
+/// is awaited only *between* turns — the handler runs outside it — so this
+/// timeout can never fire while a reply is in flight, and can never interleave
+/// two drivers for one chat. That preserves the per-chat sequencing issue #77
+/// added. Retiring the other way round — having the dispatcher drop a sender it
+/// picks — cannot offer that, because the dispatcher has no idea whether the
+/// driver it just evicted is mid-turn.
+///
+/// A retiring driver closes its inbox before returning, which is the handshake
+/// with the dispatcher: `is_closed()` finally becomes meaningful, so the map
+/// entry is reclaimed, and a message that races the retirement fails to send and
+/// is redelivered to a fresh driver rather than being dropped.
+///
+/// 30 minutes mirrors `session::DEFAULT_SESSION_IDLE_TTL_MS`. A retired chat
+/// costs only a task respawn on its next message, not conversation continuity —
+/// the conversation id is resolved separately in `server.rs`.
+const CHAT_DRIVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug)]
 pub struct TelegramRuntimeConfig {
@@ -233,23 +142,15 @@ pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
     // (#278) is applied per *turn* inside the handler (an `update_permits`
     // permit is held only across `chat_core`, not pinned to a long-lived driver),
     // and voice STT stays bounded by `voice_permits` inside `handle_voice_message`.
-    // Bounded and idle-expiring: holding a chat's sender is what keeps its
-    // driver task alive, so an entry that is never removed parks that task
-    // forever. See `ChatDriverRegistry`.
-    let mut drivers = ChatDriverRegistry::with_defaults();
+    let mut drivers: HashMap<i64, mpsc::Sender<TelegramMessage>> = HashMap::new();
     loop {
         match api.get_updates(offset).await {
             Ok(updates) => {
-                // Reclaim quiet chats even across batches that never mention
-                // them, so an idle driver is not held until its chat speaks again.
-                let retired = drivers.retire_idle(chat_driver_now_ms());
-                if retired > 0 {
-                    tracing::debug!(
-                        retired,
-                        live = drivers.len(),
-                        "retired idle telegram chat drivers"
-                    );
-                }
+                // Drop senders whose driver has retired itself (see
+                // `CHAT_DRIVER_IDLE_TIMEOUT`). Without this the map keeps an entry
+                // per chat ever seen; the driver tasks are already reclaimed by
+                // then, this reclaims the bookkeeping alongside them.
+                drivers.retain(|_, tx| !tx.is_closed());
                 for update in updates {
                     offset = offset.max(update.update_id.saturating_add(1));
                     let Some(message) = update.message else {
@@ -272,44 +173,27 @@ pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
                             .await;
                         continue;
                     }
-                    let now_ms = chat_driver_now_ms();
-                    let sender = match drivers.live_sender(chat_id, now_ms) {
-                        Some(tx) => tx,
-                        None => {
-                            let (tx, rx) = mpsc::channel::<TelegramMessage>(64);
-                            let api2 = Arc::clone(&api);
-                            tokio::spawn(async move {
-                                let mut channel = TelegramChatChannel {
-                                    chat_id,
-                                    api: Arc::clone(&api2),
-                                    inbox: rx,
-                                };
-                                let result = serve_channel(&mut channel, |turn: IncomingTurn| {
-                                    let api3 = Arc::clone(&api2);
-                                    async move {
-                                        // Per-turn backpressure (#278): hold an update
-                                        // permit only across the core call.
-                                        let _permit =
-                                            api3.update_permits.acquire().await.context(
-                                                "telegram update permit semaphore closed",
-                                            )?;
-                                        let reply = api3.chat_core(chat_id, &turn.text).await?;
-                                        Ok(OutgoingResponse::new(reply, turn.session_id))
-                                    }
-                                })
-                                .await;
-                                if let Err(e) = result {
-                                    tracing::warn!(chat_id, error = %e, "telegram chat driver ended");
-                                }
-                            });
-                            drivers.insert(chat_id, tx.clone(), now_ms);
+                    let sender = match drivers.get(&chat_id) {
+                        Some(tx) if !tx.is_closed() => tx.clone(),
+                        _ => {
+                            let tx = spawn_chat_driver(&api, chat_id);
+                            drivers.insert(chat_id, tx.clone());
                             tx
                         }
                     };
-                    if sender.send(message).await.is_err() {
-                        // The driver exited between the check and the send; drop the
-                        // stale sender so the next message spawns a fresh driver.
-                        drivers.remove(chat_id);
+                    if let Err(undelivered) = sender.send(message).await {
+                        // The driver retired itself (see `CHAT_DRIVER_IDLE_TIMEOUT`)
+                        // between the liveness check above and this send. Closing
+                        // its inbox is what made this fail, and `SendError` hands
+                        // the message back — so redeliver it to a fresh driver
+                        // instead of dropping the user's message on the floor.
+                        let tx = spawn_chat_driver(&api, chat_id);
+                        if tx.send(undelivered.0).await.is_err() {
+                            tracing::warn!(chat_id, "telegram chat driver died on spawn");
+                            drivers.remove(&chat_id);
+                            continue;
+                        }
+                        drivers.insert(chat_id, tx);
                     }
                 }
             }
@@ -321,6 +205,42 @@ pub async fn run(config: TelegramRuntimeConfig) -> Result<()> {
     }
 }
 
+/// Spawn the `serve_channel` driver task for one chat and return its inbox
+/// sender. The dispatcher calls this on a chat's first message, and again when a
+/// send fails because the previous driver retired itself — hence a function
+/// rather than an inline block.
+fn spawn_chat_driver(api: &Arc<TelegramApi>, chat_id: i64) -> mpsc::Sender<TelegramMessage> {
+    let (tx, rx) = mpsc::channel::<TelegramMessage>(64);
+    let api2 = Arc::clone(api);
+    tokio::spawn(async move {
+        let mut channel = TelegramChatChannel {
+            chat_id,
+            api: Arc::clone(&api2),
+            inbox: rx,
+            idle_timeout: CHAT_DRIVER_IDLE_TIMEOUT,
+        };
+        let result = serve_channel(&mut channel, |turn: IncomingTurn| {
+            let api3 = Arc::clone(&api2);
+            async move {
+                // Per-turn backpressure (#278): hold an update permit only
+                // across the core call.
+                let _permit = api3
+                    .update_permits
+                    .acquire()
+                    .await
+                    .context("telegram update permit semaphore closed")?;
+                let reply = api3.chat_core(chat_id, &turn.text).await?;
+                Ok(OutgoingResponse::new(reply, turn.session_id))
+            }
+        })
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(chat_id, error = %e, "telegram chat driver ended");
+        }
+    });
+    tx
+}
+
 /// A single Telegram chat as a [`Channel`] (#701). The poll-loop dispatcher owns
 /// the `getUpdates` stream and feeds this chat's messages in over `inbox`;
 /// `serve_channel` drives `recv -> handle -> send` for just this chat, so its
@@ -330,6 +250,9 @@ struct TelegramChatChannel {
     chat_id: i64,
     api: Arc<TelegramApi>,
     inbox: mpsc::Receiver<TelegramMessage>,
+    /// Always [`CHAT_DRIVER_IDLE_TIMEOUT`] in production; a field so the
+    /// retirement tests can use a short window instead of waiting 30 minutes.
+    idle_timeout: Duration,
 }
 
 #[async_trait]
@@ -339,7 +262,36 @@ impl Channel for TelegramChatChannel {
     }
 
     async fn recv(&mut self) -> Option<IncomingTurn> {
-        while let Some(message) = self.inbox.recv().await {
+        loop {
+            let message = match tokio::time::timeout(self.idle_timeout, self.inbox.recv()).await {
+                Ok(Some(message)) => message,
+                // The dispatcher dropped our sender: no more updates for this chat.
+                Ok(None) => return None,
+                // Idle past the timeout — retire, but only once the inbox is
+                // actually empty. `try_recv` tests *and* takes, so a message that
+                // landed while the timer was firing is served here rather than
+                // stranded in a buffer this task is about to drop.
+                Err(_) => match self.inbox.try_recv() {
+                    Ok(message) => message,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // Closing the inbox is the handshake with the dispatcher:
+                        // it turns the dispatcher's next `send` into an error that
+                        // hands the message back, so the message is redelivered to
+                        // a fresh driver instead of landing in a buffer nobody will
+                        // read. Nothing is in flight here — `recv` is only awaited
+                        // between turns — so this task exits with no turn
+                        // outstanding and two drivers for one chat never overlap
+                        // (#77).
+                        self.inbox.close();
+                        tracing::debug!(
+                            chat_id = self.chat_id,
+                            "retired idle telegram chat driver"
+                        );
+                        return None;
+                    }
+                },
+            };
             // Voice/audio is transport I/O owned by the channel: it is downloaded,
             // transcribed (bounded by `voice_permits`), answered, and replied to
             // fully here — sequentially per chat so ordering holds — then we wait
@@ -373,7 +325,6 @@ impl Channel for TelegramChatChannel {
                 ChannelKind::Telegram,
             ));
         }
-        None
     }
 
     async fn send(&mut self, response: OutgoingResponse) -> Result<()> {
@@ -1249,6 +1200,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
     fn test_api(max_parallel_voice: usize, max_parallel_updates: usize) -> TelegramApi {
@@ -1520,6 +1472,7 @@ mod tests {
             chat_id: 7,
             api,
             inbox: rx,
+            idle_timeout: super::CHAT_DRIVER_IDLE_TIMEOUT,
         };
 
         tx.send(text_message(7, "first")).await.unwrap();
@@ -1556,11 +1509,13 @@ mod tests {
             chat_id: 1,
             api: Arc::clone(&api),
             inbox: rx_a,
+            idle_timeout: super::CHAT_DRIVER_IDLE_TIMEOUT,
         };
         let mut chat_b = super::TelegramChatChannel {
             chat_id: 2,
             api,
             inbox: rx_b,
+            idle_timeout: super::CHAT_DRIVER_IDLE_TIMEOUT,
         };
 
         // Feed only chat B, then close both. Chat A yields nothing immediately;
@@ -1588,8 +1543,6 @@ mod tests {
     /// block the caller.
     #[tokio::test]
     async fn timeout_wrap_bounds_a_hung_child() {
-        use std::time::Duration;
-
         let mut cmd = super::Command::new("sleep");
         cmd.arg("30").kill_on_drop(true);
 
@@ -1607,34 +1560,93 @@ mod tests {
         );
     }
 
-    /// A chat that goes quiet must have its driver reclaimed. Holding the sender
-    /// is what keeps the task parked, so the entry has to be dropped.
-    /// Receivers are kept alive so `is_closed()` does not mask the TTL path.
-    #[tokio::test]
-    async fn idle_chats_are_retired() {
-        let (tx, _rx) = mpsc::channel::<super::TelegramMessage>(1);
-        let mut reg = super::ChatDriverRegistry::new(8, 1_000);
-        reg.insert(1, tx, 0);
+    /// Short stand-in for `CHAT_DRIVER_IDLE_TIMEOUT` so the retirement tests
+    /// don't wait 30 minutes. The timeout is a field precisely so these can run
+    /// against the real `recv` on the real clock.
+    const TEST_IDLE_TIMEOUT: Duration = Duration::from_millis(50);
 
-        assert_eq!(reg.len(), 1);
-        assert_eq!(reg.retire_idle(5_000), 1, "idle driver must be reclaimed");
-        assert_eq!(reg.len(), 0);
+    /// #77's per-chat ordering relies on exactly one driver per chat, so the
+    /// driver must retire itself from `recv` — which is only awaited *between*
+    /// turns — rather than being evicted mid-reply by the dispatcher. Proves the
+    /// idle timeout ends `recv`, which is what lets the task and its inbox go.
+    #[tokio::test]
+    async fn an_idle_driver_retires_itself() {
+        use crate::channel::Channel;
+
+        let api = Arc::new(test_api(2, 8));
+        // The sender stays alive, so nothing but the idle timeout can end this.
+        let (_tx, rx) = mpsc::channel::<super::TelegramMessage>(8);
+        let mut channel = super::TelegramChatChannel {
+            chat_id: 7,
+            api,
+            inbox: rx,
+            idle_timeout: TEST_IDLE_TIMEOUT,
+        };
+
+        assert!(
+            channel.recv().await.is_none(),
+            "an idle driver must end its recv loop so its task can exit"
+        );
     }
 
-    /// The cap bounds the live set no matter how many distinct chats appear, and
-    /// retires the least-recently-active one first.
+    /// The idle window may only end a driver that has nothing to do: a queued
+    /// message is served, and serving it leaves the driver live for the next
+    /// turn. Guards the cost side of the change — adding a timeout to `recv`
+    /// must not cost a turn or churn a driver that is still in use.
     #[tokio::test]
-    async fn distinct_chats_stay_under_the_cap() {
-        let mut reg = super::ChatDriverRegistry::new(2, super::CHAT_DRIVER_IDLE_TTL_MS);
-        let mut keep_alive = Vec::new();
-        for chat_id in 1..=5_i64 {
-            let (tx, rx) = mpsc::channel::<super::TelegramMessage>(1);
-            keep_alive.push(rx);
-            reg.insert(chat_id, tx, chat_id);
-        }
+    async fn a_queued_message_is_served_not_stranded_by_the_idle_timer() {
+        use crate::channel::Channel;
 
-        assert!(reg.len() <= 2, "live drivers must stay under the cap");
-        assert!(reg.live_sender(5, 99).is_some(), "newest chat stays live");
-        assert!(reg.live_sender(1, 99).is_none(), "oldest chat was retired");
+        let api = Arc::new(test_api(2, 8));
+        let (tx, rx) = mpsc::channel::<super::TelegramMessage>(8);
+        let mut channel = super::TelegramChatChannel {
+            chat_id: 7,
+            api,
+            inbox: rx,
+            idle_timeout: TEST_IDLE_TIMEOUT,
+        };
+
+        tx.send(text_message(7, "queued")).await.unwrap();
+        let turn = channel.recv().await.expect("a queued message is served");
+        assert_eq!(turn.text, "queued");
+        assert!(
+            !tx.is_closed(),
+            "serving a message must not retire the driver"
+        );
+    }
+
+    /// A retiring driver closes its inbox on the way out, and that close is the
+    /// dispatcher's only signal. It has to do two things: mark the entry stale so
+    /// the next message spawns a fresh driver, and make a racing `send` *fail* —
+    /// `SendError` hands the message back, which is what lets the dispatcher
+    /// redeliver it instead of dropping it into a buffer nobody will read.
+    #[tokio::test]
+    async fn a_retired_driver_hands_back_a_racing_message() {
+        use crate::channel::Channel;
+
+        let api = Arc::new(test_api(2, 8));
+        let (tx, rx) = mpsc::channel::<super::TelegramMessage>(8);
+        let mut channel = super::TelegramChatChannel {
+            chat_id: 7,
+            api,
+            inbox: rx,
+            idle_timeout: TEST_IDLE_TIMEOUT,
+        };
+
+        assert!(channel.recv().await.is_none(), "driver retires when idle");
+
+        assert!(
+            tx.is_closed(),
+            "the dispatcher must see the retirement, or it reuses a dead sender forever"
+        );
+        let handed_back = tx
+            .send(text_message(7, "raced the retirement"))
+            .await
+            .expect_err("a send to a retired driver must fail, not be silently buffered");
+        assert_eq!(
+            handed_back.0.text.as_deref(),
+            Some("raced the retirement"),
+            "the message comes back so the dispatcher can redeliver it"
+        );
     }
 }
