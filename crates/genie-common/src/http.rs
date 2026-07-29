@@ -57,11 +57,12 @@ pub fn route_requires_local_token(surface: RoutePolicySurface, method: &str, pat
         | ("GET", "/api/actuation/actions") => true,
         ("GET", "/api/actuation/audit") => matches!(surface, RoutePolicySurface::GenieApi),
 
-        // Sensitive conversation reads: these return full transcript content
-        // (household and family context), the same disclosure class the
-        // `/api/memories` read is gated for. The `/api/conversations` *list*
-        // (ids + titles only) stays open, matching the carve-out in #757.
-        ("GET", "/api/chat/history") | ("GET", "/api/chat/export") => true,
+        // Sensitive conversation reads. Titles in `/api/conversations` are
+        // derived from the first user message, so the index leaks household
+        // content even though it does not include complete transcripts.
+        ("GET", "/api/chat/history")
+        | ("GET", "/api/chat/export")
+        | ("GET", "/api/conversations") => true,
 
         // Sensitive memory routes (list exposes full household memory content).
         ("GET", "/api/memories")
@@ -1213,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_route_token_policy_covers_conversation_transcript_reads() {
+    fn shared_route_token_policy_covers_sensitive_conversation_reads() {
         for surface in [RoutePolicySurface::GenieCore, RoutePolicySurface::GenieApi] {
             assert!(route_requires_local_token(
                 surface,
@@ -1233,9 +1234,7 @@ mod tests {
                 "/api/chat/export?id=42"
             ));
 
-            // The conversation *list* (ids + titles, no message bodies) stays
-            // open without a token, matching the deliberate carve-out in #757.
-            assert!(!route_requires_local_token(
+            assert!(route_requires_local_token(
                 surface,
                 "GET",
                 "/api/conversations"
