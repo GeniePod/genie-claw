@@ -3069,6 +3069,36 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
     Some((location, forecast))
 }
 
+/// A request for the day's news headlines. The exact trio
+/// ("read the news" | "read news" | "what s the news") missed the most common
+/// spoken forms — a trailing "today"/"right now", "give me/show me/tell me the
+/// news", "the latest news", "what's in the news" — so they fell through to the
+/// LLM. Deliberately a curated set (not a bare `contains("news")`) so it never
+/// swallows the play_media "morning news" audio-briefing forms handled later in
+/// dispatch.
+fn asks_for_news(text: &str) -> bool {
+    let text = text.trim_end_matches(" please").trim_end();
+    let text = strip_trailing_time_qualifier(text);
+    matches!(
+        text,
+        "read the news"
+            | "read news"
+            | "what s the news"
+            | "what is the news"
+            | "whats the news"
+            | "the latest news"
+            | "latest news"
+            | "what s the latest news"
+            | "what is the latest news"
+            | "give me the news"
+            | "show me the news"
+            | "tell me the news"
+            | "catch me up on the news"
+            | "what s in the news"
+            | "what s happening in the news"
+    )
+}
+
 fn web_search_request(text: &str) -> Option<(String, bool)> {
     if text.starts_with("search memory ") || text.starts_with("search memories ") {
         return None;
@@ -3105,7 +3135,7 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
         return Some((query, true));
     }
 
-    if matches!(text, "read the news" | "read news" | "what s the news") {
+    if asks_for_news(text) {
         // News headlines are inherently time-sensitive — the caller always wants
         // the current top stories — so mark the query fresh, the same as a
         // stock-price query. Returning `false` here let a stale cached result
@@ -7078,6 +7108,32 @@ mod tests {
         // News is time-sensitive, so the query must be fresh (no stale cache),
         // the same as a stock-price query.
         assert_eq!(call.arguments["fresh"], true);
+    }
+
+    #[test]
+    fn routes_natural_news_phrasings_to_web_search() {
+        // The news matcher was an exact trio ("read the news" | "read news" |
+        // "what s the news"), so the most common spoken forms fell through to the
+        // LLM. Route them to a fresh web_search for the top headlines.
+        for utterance in [
+            "What's the news today?",
+            "What is the news?",
+            "What's the latest news?",
+            "Give me the news",
+            "Show me the news",
+            "Tell me the news",
+            "What's in the news?",
+            "Catch me up on the news",
+            "read the news right now",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(
+                call.arguments["query"], "top news headlines",
+                "{utterance:?}"
+            );
+            assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
+        }
     }
 
     #[test]
