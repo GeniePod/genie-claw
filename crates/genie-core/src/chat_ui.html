@@ -3,8 +3,6 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- Local API token injected by genie-core; authenticates mutating calls (issue #228). -->
-<meta name="genie-local-token" content="__GENIE_LOCAL_TOKEN__">
 <title>GeniePod</title>
 <style>
 :root {
@@ -165,15 +163,41 @@ const sendBtn = document.getElementById('send-btn');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 
-// Local API token for mutating calls (issue #228). genie-core injects it into
-// the meta tag; left blank when token enforcement is disabled.
-const LOCAL_TOKEN = document.querySelector('meta[name="genie-local-token"]')?.content || '';
+const TOKEN_STORAGE_KEY = 'genie-local-api-token';
+let localToken = sessionStorage.getItem(TOKEN_STORAGE_KEY) || '';
+let tokenPrompt = null;
 
-// Build request headers, adding the local token only when one was injected.
 function apiHeaders(extra) {
   const headers = Object.assign({ 'Content-Type': 'application/json' }, extra || {});
-  if (LOCAL_TOKEN) headers['X-Genie-Token'] = LOCAL_TOKEN;
+  if (localToken) headers['X-Genie-Token'] = localToken;
   return headers;
+}
+
+async function promptForToken() {
+  if (!tokenPrompt) {
+    tokenPrompt = Promise.resolve(window.prompt('Local API token'))
+      .then(value => {
+        localToken = (value || '').trim();
+        if (localToken) sessionStorage.setItem(TOKEN_STORAGE_KEY, localToken);
+        return localToken;
+      })
+      .finally(() => { tokenPrompt = null; });
+  }
+  return tokenPrompt;
+}
+
+async function apiFetch(url, options) {
+  const request = options || {};
+  let response = await fetch(url, {
+    ...request,
+    headers: apiHeaders(request.headers),
+  });
+  if (response.status !== 403 || !await promptForToken()) return response;
+  response = await fetch(url, {
+    ...request,
+    headers: apiHeaders(request.headers),
+  });
+  return response;
 }
 
 let sending = false;
@@ -262,9 +286,9 @@ async function sendMessage() {
   const replyEl = addStreamingMessage();
 
   try {
-    const r = await fetch('/api/chat/stream', {
+    const r = await apiFetch('/api/chat/stream', {
       method: 'POST',
-      headers: apiHeaders({ 'X-Genie-Origin': 'dashboard' }),
+      headers: { 'X-Genie-Origin': 'dashboard' },
       body: JSON.stringify({ message: text }),
     });
 
@@ -276,9 +300,9 @@ async function sendMessage() {
     }
 
     if (!r.body) {
-      const fallback = await fetch('/api/chat', {
+      const fallback = await apiFetch('/api/chat', {
         method: 'POST',
-        headers: apiHeaders({ 'X-Genie-Origin': 'dashboard' }),
+        headers: { 'X-Genie-Origin': 'dashboard' },
         body: JSON.stringify({ message: text }),
       });
       const data = await fallback.json();
@@ -364,7 +388,7 @@ async function sendMessage() {
 
 async function clearChat() {
   try {
-    await fetch('/api/chat/clear', { method: 'POST', headers: apiHeaders() });
+    await apiFetch('/api/chat/clear', { method: 'POST' });
     messagesEl.innerHTML = '';
     addMessage('system', 'Conversation cleared.');
   } catch (e) {

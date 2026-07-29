@@ -37,12 +37,6 @@ const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 /// header phase as the `[http]` `max_header_bytes` default). Issue #195.
 const CORE_MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// Placeholder in the served HTML, replaced at request time with the configured
-/// local API token so the first-party UI can authenticate mutating calls
-/// (issue #228). Safe to embed: the page is only readable same-origin (no
-/// wildcard ACAO) and from an allowlisted Origin.
-const TOKEN_PLACEHOLDER: &str = "__GENIE_LOCAL_TOKEN__";
-
 struct StaticHtml {
     body: &'static str,
 }
@@ -52,12 +46,8 @@ impl StaticHtml {
         Self { body }
     }
 
-    fn response(&self, local_api_token: &str) -> (u16, &'static str, String) {
-        (
-            200,
-            HTML_CONTENT_TYPE,
-            self.body.replace(TOKEN_PLACEHOLDER, local_api_token),
-        )
+    fn response(&self) -> (u16, &'static str, String) {
+        (200, HTML_CONTENT_TYPE, self.body.to_string())
     }
 }
 
@@ -796,7 +786,7 @@ async fn handle_request(
     }
 
     let (status, content_type, response_body) = match route {
-        RequestRoute::Root => CHAT_UI.response(&ctx.http_config.local_api_token),
+        RequestRoute::Root => CHAT_UI.response(),
         RequestRoute::Chat => match chat_gate.try_acquire().await {
             Some(_guard) => {
                 handle_chat(
@@ -4113,7 +4103,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn local_token_gates_mutating_endpoints_and_is_injected_into_ui() {
+    async fn local_token_gates_mutating_endpoints_without_leaking_into_ui() {
         let (memory_path, conv_path) = unique_db_paths("genie-token");
         let http = genie_common::config::HttpServerConfig {
             local_api_token: "s3cret".into(),
@@ -4248,12 +4238,13 @@ mod tests {
                     "{conversations_with_tok:?}"
                 );
 
-                // The served UI carries the injected token for its own fetches.
+                // The dashboard must never bootstrap authentication by
+                // disclosing the configured bearer token.
                 let root =
                     http_roundtrip(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
                 assert!(
-                    root.contains(r#"content="s3cret""#),
-                    "token must be injected into the served UI: {root:?}"
+                    !root.contains("s3cret"),
+                    "configured token leaked into the served UI: {root:?}"
                 );
 
                 let _ = std::fs::remove_file(&memory_path);

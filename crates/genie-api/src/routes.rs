@@ -602,18 +602,12 @@ async fn query_governor(json_cmd: &str) -> Option<serde_json::Value> {
     line.and_then(|l| serde_json::from_str(&l).ok())
 }
 
-/// Placeholder in the dashboard HTML, replaced at request time with the
-/// configured local API token so the same-origin dashboard can authenticate its
-/// mutating calls to genie-api (issue #228).
-const TOKEN_PLACEHOLDER: &str = "__GENIE_LOCAL_TOKEN__";
-
-/// GET / — serve the dashboard HTML with the local API token injected.
-pub fn serve_dashboard(local_api_token: &str) -> Response {
+/// GET / — serve static dashboard HTML without embedding credentials.
+pub fn serve_dashboard() -> Response {
     Response {
         status: 200,
         content_type: "text/html; charset=utf-8",
-        body: include_str!("../../dashboard/index.html")
-            .replace(TOKEN_PLACEHOLDER, local_api_token),
+        body: include_str!("../../dashboard/index.html").into(),
     }
 }
 

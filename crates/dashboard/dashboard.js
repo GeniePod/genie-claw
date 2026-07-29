@@ -77,16 +77,38 @@ function setText(id, val) {
   if (el) el.textContent = val;
 }
 
-// Local API token for authenticated API calls (issue #228). genie-api injects
-// it into the meta tag; left blank when token enforcement is disabled.
-const LOCAL_TOKEN = document.querySelector('meta[name="genie-local-token"]')?.content || '';
+const TOKEN_STORAGE_KEY = 'genie-local-api-token';
+let localToken = sessionStorage.getItem(TOKEN_STORAGE_KEY) || '';
+let tokenPrompt = null;
 
 // --- Fetch helpers ---
+async function promptForToken() {
+  if (!tokenPrompt) {
+    tokenPrompt = Promise.resolve(window.prompt('Local API token'))
+      .then(value => {
+        localToken = (value || '').trim();
+        if (localToken) sessionStorage.setItem(TOKEN_STORAGE_KEY, localToken);
+        return localToken;
+      })
+      .finally(() => { tokenPrompt = null; });
+  }
+  return tokenPrompt;
+}
+
+async function apiFetch(url, options) {
+  const request = options || {};
+  const headers = { ...(request.headers || {}) };
+  if (localToken) headers['X-Genie-Token'] = localToken;
+  let response = await fetch(url, { ...request, headers });
+  if (response.status !== 403 || !await promptForToken()) return response;
+  headers['X-Genie-Token'] = localToken;
+  response = await fetch(url, { ...request, headers });
+  return response;
+}
+
 async function fetchJson(url) {
   try {
-    const headers = {};
-    if (LOCAL_TOKEN) headers['X-Genie-Token'] = LOCAL_TOKEN;
-    const r = await fetch(url, { headers });
+    const r = await apiFetch(url);
     return await r.json();
   } catch {
     return null;
@@ -240,8 +262,7 @@ async function pollSecurity() {
 
 async function postJson(url, payload) {
   const headers = { 'Content-Type': 'application/json' };
-  if (LOCAL_TOKEN) headers['X-Genie-Token'] = LOCAL_TOKEN;
-  const r = await fetch(url, {
+  const r = await apiFetch(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(payload),
