@@ -113,7 +113,7 @@ impl Governor {
                     // marker we just removed) returned Media, so the transition
                     // was a no-op that left the system stuck in Media until the
                     // next tick and wrongly reported `mode: media` in the reply.
-                    let target = self.determine_mode(mem_avail, false);
+                    let target = self.determine_mode_after_media(mem_avail);
                     self.transition(ts, target).await?;
                     Ok(target)
                 }
@@ -194,13 +194,14 @@ impl Governor {
     }
 
     fn determine_mode(&self, mem_avail_mb: Option<u64>, media_active: bool) -> Mode {
-        // Priority: Pressure > Media (external trigger) > Time-based. An unknown
-        // level holds the current mode rather than actuating either way.
+        // Priority: Pressure > Media (external trigger) > Time-based.
         match mem_avail_mb {
             Some(mb) if mb < self.config.governor.pressure.stop_optins_mb => {
                 return Mode::Pressure;
             }
-            None if self.current_mode == Mode::Pressure => return Mode::Pressure,
+            // Unknown level: hold the current mode so a failed read cannot
+            // transition or actuate services in either direction.
+            None => return self.current_mode,
             _ => {}
         }
 
@@ -208,6 +209,27 @@ impl Governor {
             return Mode::Media;
         }
 
+        self.time_based_mode()
+    }
+
+    /// Target mode once the media marker has been cleared.
+    ///
+    /// `determine_mode` holds the current mode on an unknown level, which is
+    /// wrong for `Media`: holding it would make the transition a no-op and
+    /// leave the device in `Media` until the next tick. Leaving `Media`
+    /// actuates nothing that memory pressure protects, so an unknown level
+    /// resolves to the time-based mode — except from `Pressure`, which is held,
+    /// because leaving it on a failed read is the protection-removing direction
+    /// this path used to take with its `unwrap_or(4096)`.
+    fn determine_mode_after_media(&self, mem_avail_mb: Option<u64>) -> Mode {
+        match mem_avail_mb {
+            Some(mb) if mb < self.config.governor.pressure.stop_optins_mb => Mode::Pressure,
+            None if self.current_mode == Mode::Pressure => Mode::Pressure,
+            _ => self.time_based_mode(),
+        }
+    }
+
+    fn time_based_mode(&self) -> Mode {
         let hour = current_hour();
         let night_start = self.config.governor.night_start_hour;
         let day_start = self.config.governor.day_start_hour;
@@ -579,6 +601,54 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&db_path);
         Store::open(&db_path).unwrap()
+    }
+
+    #[test]
+    fn unknown_memory_holds_the_current_mode() {
+        let mut gov = make_governor();
+        for mode in [
+            Mode::Day,
+            Mode::NightA,
+            Mode::NightB,
+            Mode::Media,
+            Mode::Pressure,
+        ] {
+            gov.current_mode = mode;
+            assert_eq!(gov.determine_mode(None, false), mode);
+            assert_eq!(gov.determine_mode(None, true), mode);
+        }
+    }
+
+    #[test]
+    fn unknown_memory_after_media_resolves_off_media() {
+        let mut gov = make_governor();
+        gov.current_mode = Mode::Media;
+        assert_ne!(gov.determine_mode_after_media(None), Mode::Media);
+        assert_eq!(gov.determine_mode_after_media(Some(0)), Mode::Pressure);
+    }
+
+    #[test]
+    fn unknown_memory_after_media_still_holds_pressure() {
+        let mut gov = make_governor();
+        gov.current_mode = Mode::Pressure;
+        // The `unwrap_or(4096)` this replaced cleared every threshold here, so a
+        // failed read pulled a starved device out of Pressure. Leaving Pressure
+        // needs a reading that says memory is fine, not the absence of one.
+        assert_eq!(gov.determine_mode_after_media(None), Mode::Pressure);
+        assert_ne!(gov.determine_mode_after_media(Some(3000)), Mode::Pressure);
+    }
+
+    #[tokio::test]
+    async fn a_read_never_discards_the_last_known_value() {
+        let mut gov = make_governor();
+        gov.last_mem_avail_mb = Some(1234);
+        let got = gov.read_mem_avail_mb().await;
+        // Holds on both branches without needing to force a read failure: a
+        // successful read refreshes the cache, a failed one falls back to it.
+        // Either way the level stays known, where the pre-fix code substituted
+        // a literal that disagreed between call sites.
+        assert!(got.is_some());
+        assert_eq!(got, gov.last_mem_avail_mb);
     }
 
     #[test]
