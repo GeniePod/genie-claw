@@ -3147,6 +3147,11 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
 /// swallows the play_media "morning news" audio-briefing forms handled later in
 /// dispatch.
 fn asks_for_news(text: &str) -> bool {
+    // A leading "please" is politeness, not part of the request. The set below
+    // is exact, so "please read the news" / "please tell me the news" fell
+    // through to the LLM even though the trailing-"please" forms already
+    // route. Mirror asks_current_time / scene-routine / shopping-list.
+    let text = text.strip_prefix("please ").unwrap_or(text);
     let text = text.trim_end_matches(" please").trim_end();
     let text = strip_trailing_time_qualifier(text);
     matches!(
@@ -7467,6 +7472,41 @@ mod tests {
             );
             assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
         }
+    }
+
+    #[test]
+    fn news_request_accepts_a_leading_please() {
+        // Trailing "please" is already stripped in asks_for_news. A leading
+        // "please" was not: the set is exact, so polite forms fell through to
+        // the LLM even though their non-"please" / trailing-"please" versions
+        // already route.
+        for utterance in [
+            "Please read the news",
+            "Please what's the news?",
+            "Please tell me the news",
+            "Please give me the news",
+            "Please show me the news",
+            "Please the latest news",
+            "Please catch me up on the news",
+            // Leading politeness composes with trailing tails.
+            "Please read the news please",
+            "Please what's the news today?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(
+                call.arguments["query"], "top news headlines",
+                "{utterance:?}"
+            );
+            assert_eq!(call.arguments["fresh"], true, "{utterance:?}");
+        }
+
+        // Negatives: stripping "please" must not invent a news route for an
+        // unrelated polite request, and must not steal play_media briefing forms.
+        assert!(route("please help me").is_none());
+        let call = route("please put on the morning news").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "morning news");
     }
 
     #[test]

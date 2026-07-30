@@ -4,6 +4,10 @@
 
 ### Quick-router tool-call accuracy
 
+- **News**: strip a leading `please` in `asks_for_news` so polite forms
+  (`please read the news`, `please tell me the news`) route to a fresh
+  `web_search` for top headlines — trailing `please` / time qualifiers were
+  already handled (#908).
 - **Scene / routine**: strip a leading `please` before the exact-match set and
   the `activate`/`start`/`run` prefix loop, so polite forms
   (`please activate the movie scene`, `please goodnight`, `please I am home`)
