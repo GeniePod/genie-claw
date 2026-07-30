@@ -266,10 +266,7 @@ async fn read_http_body(
 ) -> Result<String> {
     let mut body = buf.split_off(header_end);
 
-    if headers
-        .lines()
-        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"))
-    {
+    if is_chunked(headers) {
         let decoded =
             read_chunked_body(stream, &mut body, read_timeout, max_response_bytes).await?;
         return Ok(String::from_utf8_lossy(&decoded).trim().to_string());
@@ -409,6 +406,27 @@ async fn read_with_timeout(
         .await
         .map_err(|_| anyhow::anyhow!("read timeout"))?
         .context("failed to read HTTP response")
+}
+
+/// True when the response body is chunk-framed.
+///
+/// Parsed the same way as [`parse_content_length`] rather than by matching the
+/// whole header line: RFC 7230 §3.2 allows zero or more spaces after the colon,
+/// and §3.3.1 permits a codings list (`gzip, chunked`) whose final entry is
+/// what frames the body. An exact-string match missed both, and since a chunked
+/// response carries no `Content-Length`, the miss fell through to the
+/// read-to-EOF path and handed the caller the raw chunk-size lines as content.
+fn is_chunked(headers: &str) -> bool {
+    headers.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .rsplit(',')
+                .next()
+                .is_some_and(|last| last.trim().eq_ignore_ascii_case("chunked"))
+    })
 }
 
 fn parse_content_length(headers: &str) -> Option<usize> {
@@ -717,6 +735,47 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(decoded, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn chunked_body_decoded_for_noncanonical_transfer_encoding() {
+        // RFC 7230 allows zero or more spaces after the colon, and permits a
+        // codings list whose final entry is `chunked`. The old exact-string
+        // match on "transfer-encoding: chunked" missed both, so the raw
+        // chunk-size lines came back as the body.
+        for header in [
+            "Transfer-Encoding:chunked",
+            "Transfer-Encoding:  chunked",
+            "transfer-encoding: gzip, chunked",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let owned = header.to_string();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n{owned}\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+
+            let body = probe_http_get_body(
+                &addr.to_string(),
+                "/",
+                false,
+                ProbeTimeouts {
+                    connect: Duration::from_secs(2),
+                    read: Duration::from_secs(2),
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(body, "hello world", "header was {header:?}");
+            server.abort();
+        }
     }
 
     #[tokio::test]
