@@ -6457,31 +6457,31 @@ mod tests {
                 "set the thermostat to 68",
                 "thermostat",
                 "set_temperature",
-                68,
+                serde_json::json!(68),
             ),
             (
                 "set the thermostat at 68",
                 "thermostat",
                 "set_temperature",
-                68,
+                serde_json::json!(68),
             ),
             (
                 "set the thermostat to 68 in the den",
                 "thermostat",
                 "set_temperature",
-                68,
+                serde_json::json!(68),
             ),
             (
                 "set the oven to 400 degrees",
                 "oven",
                 "set_temperature",
-                400,
+                serde_json::json!(400),
             ),
             (
                 "set the lights to 40 percent",
                 "lights",
                 "set_brightness",
-                40,
+                serde_json::json!(40.0),
             ),
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
