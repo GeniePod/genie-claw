@@ -144,7 +144,8 @@ impl HaClient {
             return Ok(Vec::new());
         }
 
-        serde_json::from_str(&body).or_else(|_| Ok(Vec::new()))
+        serde_json::from_str(&body)
+            .context("Home Assistant service response was not a JSON entity list")
     }
 
     /// Render a Home Assistant template and return its plain-text output.
@@ -424,6 +425,39 @@ mod tests {
         let client = test_client(addr);
         let entities = client.get_states().await.unwrap();
         assert!(entities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_service_response_is_not_reported_as_success() {
+        let addr = spawn_listener(|mut conn| async move {
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut conn, &mut buf).await;
+            let body = "not-json";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.shutdown().await;
+        })
+        .await;
+
+        let client = test_client(addr);
+        let error = client
+            .call_service(
+                "light",
+                "turn_on",
+                &serde_json::json!({"entity_id": "light.kitchen"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("not a JSON entity list"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Server that advertises `Content-Length` larger than `max_response_bytes`.
