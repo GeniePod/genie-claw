@@ -3086,10 +3086,27 @@ fn is_time_expression(location: &str) -> bool {
     )
 }
 
+/// Whether a weather utterance asks past current conditions, i.e. wants the
+/// multi-day forecast rather than a right-now reading.
+///
+/// Shared by both branches of [`weather_request`]. The rain branch used to
+/// hardcode `forecast: false` on every return, so "will it rain tomorrow"
+/// requested *today's* conditions while the general branch answered "what's the
+/// weather in Denver tomorrow" with the forecast — the same question, two
+/// different answers, depending only on which verb the caller used.
+fn asks_for_forecast(text: &str) -> bool {
+    text.contains("forecast")
+        || text.contains("tomorrow")
+        || text.contains("week")
+        || text.contains("7 day")
+        || text.contains("seven day")
+}
+
 fn weather_request(text: &str) -> Option<(String, bool)> {
     if text.starts_with("is it rain") || text.starts_with("will it rain") {
+        let forecast = asks_for_forecast(text);
         if text.contains("school pickup") {
-            return Some(("home".into(), false));
+            return Some(("home".into(), forecast));
         }
         // Accept a named place after "in"/"for" ("will it rain in Seattle"), but
         // not a time expression ("will it rain in the morning" / "in an hour"),
@@ -3103,11 +3120,11 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
             && !is_time_expression(&location)
         {
             if location.contains("school pickup") {
-                return Some(("home".into(), false));
+                return Some(("home".into(), forecast));
             }
-            return Some((location, false));
+            return Some((location, forecast));
         }
-        return Some(("home".into(), false));
+        return Some(("home".into(), forecast));
     }
 
     if !(text.contains("weather") || text.contains("forecast")) {
@@ -3130,13 +3147,7 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
         return None;
     }
 
-    let forecast = text.contains("forecast")
-        || text.contains("tomorrow")
-        || text.contains("week")
-        || text.contains("7 day")
-        || text.contains("seven day");
-
-    Some((location, forecast))
+    Some((location, asks_for_forecast(text)))
 }
 
 /// A request for the day's news headlines. The exact trio
@@ -7407,6 +7418,44 @@ mod tests {
             assert_eq!(call.name, "get_weather", "{utterance:?}");
             assert_eq!(call.arguments["location"], location, "{utterance:?}");
         }
+    }
+
+    #[test]
+    fn rain_query_asks_for_the_forecast_when_the_question_is_about_a_future_day() {
+        // The rain branch hardcoded `forecast: false` on every return, so
+        // "will it rain tomorrow" fetched *current* conditions — the caller
+        // asked about tomorrow and was answered about right now. The general
+        // weather branch already applied the forecast rule, so the same
+        // question got two different answers depending on the verb used.
+        for utterance in [
+            "will it rain tomorrow",
+            "will it rain next week",
+            "will it rain in Seattle tomorrow?",
+            "will it rain in New York this weekend",
+            "is it raining tomorrow",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_weather", "{utterance:?}");
+            assert_eq!(call.arguments["forecast"], true, "{utterance:?}");
+        }
+
+        // A question about right now still asks for current conditions.
+        for utterance in [
+            "is it raining",
+            "is it raining in Denver",
+            "will it rain this afternoon",
+            "will it rain in the morning",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_weather", "{utterance:?}");
+            assert_eq!(call.arguments["forecast"], false, "{utterance:?}");
+        }
+
+        // Both branches now answer the same question the same way.
+        let rain = route("will it rain in Denver tomorrow").expect("rain route");
+        let weather = route("what's the weather in Denver tomorrow").expect("weather route");
+        assert_eq!(rain.arguments["forecast"], weather.arguments["forecast"]);
+        assert_eq!(rain.arguments["location"], weather.arguments["location"]);
     }
 
     #[test]
