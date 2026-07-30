@@ -978,6 +978,14 @@ fn is_app_only_secret_question(text: &str) -> bool {
 }
 
 fn scene_or_routine_activation_request(text: &str) -> Option<String> {
+    // A leading "please" is politeness, not part of the command. The activate/
+    // start/run loop below is prefix-anchored, and the exact-match set is
+    // exact, so "please activate the movie scene" / "please goodnight" /
+    // "please lock up the house" previously fell through to the LLM even
+    // though their non-"please" forms already route. Mirror shopping-list
+    // add/remove, which already strip a leading "please" for the same reason.
+    let text = text.strip_prefix("please ").unwrap_or(text);
+
     if matches!(
         text,
         "goodnight genieclaw"
@@ -4716,6 +4724,37 @@ mod tests {
 
         let call = route("run the away routine please").unwrap();
         assert_eq!(call.arguments["entity"], "away");
+    }
+
+    #[test]
+    fn scene_activation_accepts_a_leading_please() {
+        // Trailing "please" is already dropped inside the activate/start/run
+        // loop. A *leading* "please" was not: the loop is prefix-anchored on
+        // "activate "/"start "/"run ", and the exact-match set is exact, so
+        // polite forms fell through to the LLM even though their non-"please"
+        // versions already route. Same pattern as shopping-list leading please.
+        for (utterance, entity) in [
+            ("please activate the movie scene", "movie"),
+            ("please run the bedtime routine", "bedtime"),
+            ("please start the away routine", "away"),
+            ("please goodnight", "goodnight"),
+            ("please lock up the house", "lock up house"),
+            ("please i am home", "arrival"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["action"], "activate", "{utterance:?}");
+        }
+
+        // Negatives still abstain: stripping "please" must not invent a scene
+        // route for an unrelated polite request. "please help me" has no
+        // activate/start/run prefix and is not in the exact-match set.
+        assert!(route("please help me").is_none());
+        // And a home_control-shaped polite request must not be claimed as a
+        // scene activation either (no "activate"/"start"/"run" … "scene"/
+        // "routine" shape).
+        assert!(route("please turn on the lights").is_none());
     }
 
     #[test]
