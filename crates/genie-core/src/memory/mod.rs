@@ -16,7 +16,11 @@ use std::time::Duration;
 
 const MAX_QUERY_HASHES: usize = 16;
 
-const DERIVATION_VERSION: i64 = 1;
+// 2: `semantic_search` now trusts `embedded_memories.memory_type` for the
+// same-type score boost instead of re-deriving it per row, so every stored
+// row must carry a type stamped by the current classifier. The bump forces
+// one open-time rebuild that restamps rows embedded before this change.
+const DERIVATION_VERSION: i64 = 2;
 const SCHEMA_VERSION: i64 = 1;
 
 /// Persistent conversational memory with dreaming-inspired consolidation.
@@ -2053,7 +2057,7 @@ impl Memory {
             "SELECT m.id, m.kind, m.content, m.created_ms, m.accessed_ms,
                     m.recall_count, m.max_score, m.promoted, m.scope,
                     m.sensitivity, m.spoken_policy,
-                    e.embedding_model, e.dimensions, e.embedding
+                    e.embedding_model, e.dimensions, e.embedding, e.memory_type
              FROM embedded_memories e
              JOIN memories m ON m.id = e.source_memory_id
              WHERE e.embedding_model = ?1",
@@ -2065,24 +2069,44 @@ impl Memory {
                 let embedding_model: String = row.get(11)?;
                 let dimensions: i64 = row.get(12)?;
                 let embedding_blob: Vec<u8> = row.get(13)?;
-                Ok((entry, embedding_model, dimensions as usize, embedding_blob))
+                let memory_type: String = row.get(14)?;
+                Ok((
+                    entry,
+                    embedding_model,
+                    dimensions as usize,
+                    embedding_blob,
+                    memory_type,
+                ))
             })?
             .filter_map(|row| row.ok())
-            .filter_map(|(entry, embedding_model, dimensions, embedding_blob)| {
-                parse_embedding(&embedding_blob, dimensions).map(|embedding| {
-                    let mut score = embedding::cosine_similarity(&query_embedding, &embedding);
-                    if query_type.as_deref().is_some_and(|expected| {
-                        expected == semantic_memory_type(&entry.kind, &entry.content)
-                    }) {
-                        score = score.max(0.95 + query_lex.word_overlap(&entry.content) * 0.04);
-                    }
-                    SemanticMemoryHit {
-                        entry,
-                        score,
-                        embedding_model,
-                    }
-                })
-            })
+            .filter_map(
+                |(entry, embedding_model, dimensions, embedding_blob, memory_type)| {
+                    parse_embedding(&embedding_blob, dimensions).map(|embedding| {
+                        let mut score = embedding::cosine_similarity(&query_embedding, &embedding);
+                        // The row's semantic type was classified once at embed time by
+                        // `upsert_embedded_memory_from_memory` and stored alongside the
+                        // embedding it is baked into (`embedding_text_for_memory`
+                        // prefixes the same type). Re-deriving it here ran the full
+                        // `semantic_memory_type` cascade — a few hundred substring
+                        // probes plus a content lowercase — once per embedded row on
+                        // every typed recall; reading the stored column keeps the boost
+                        // decision identical while doing that work once per row
+                        // lifetime. `DERIVATION_VERSION` guards freshness: a classifier
+                        // change bumps it and the open-time rebuild restamps every row.
+                        if query_type
+                            .as_deref()
+                            .is_some_and(|expected| expected == memory_type)
+                        {
+                            score = score.max(0.95 + query_lex.word_overlap(&entry.content) * 0.04);
+                        }
+                        SemanticMemoryHit {
+                            entry,
+                            score,
+                            embedding_model,
+                        }
+                    })
+                },
+            )
             .filter(|hit| hit.score >= embedding::SEMANTIC_MIN_SCORE)
             .collect::<Vec<_>>();
 
@@ -12189,6 +12213,87 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].entry.content.contains("Iron Giant"));
+    }
+
+    #[test]
+    fn stored_memory_type_matches_a_fresh_classification() {
+        // `semantic_search` trusts the `memory_type` stamped at embed time for
+        // its same-type score boost, so the stored value must always agree with
+        // what `semantic_memory_type` derives from the row's current kind and
+        // content. Pin that invariant for contents that land in different
+        // cascade branches — the batch-five prefilter, the main cascade, and
+        // contents with no dedicated branch.
+        let mem = temp_memory();
+        for (kind, content) in [
+            ("note", "Leo asked for a bedtime story about dragons."),
+            ("note", "The blue backpack is in the mudroom cubby."),
+            ("note", "The rain boots are in the garage by the door."),
+            (
+                "preference",
+                "Jared prefers the living room thermostat at 72F.",
+            ),
+            ("fact", "The car insurance renews in October."),
+        ] {
+            mem.store(kind, content).unwrap();
+        }
+
+        let mut stmt = mem
+            .conn
+            .prepare(
+                "SELECT m.kind, m.content, e.memory_type
+                 FROM embedded_memories e
+                 JOIN memories m ON m.id = e.source_memory_id",
+            )
+            .unwrap();
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(
+            rows.len() >= 3,
+            "corpus rows must be embedded, got {rows:?}"
+        );
+        for (kind, content, stored) in rows {
+            assert_eq!(
+                stored,
+                semantic_memory_type(&kind, &content),
+                "stored memory_type must match a fresh classification for {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_typed_boost_follows_a_managed_content_update() {
+        // The typed boost reads the embed-time `memory_type` column, so an
+        // update that changes a memory's semantic type must restamp the column
+        // (update_managed re-runs upsert_embedded_memory_from_memory) and the
+        // boost must move with the new content.
+        let mem = temp_memory();
+        let id = mem
+            .store("note", "The blue backpack is in the mudroom cubby.")
+            .unwrap();
+
+        let hits = mem.semantic_search("where is my backpack", 3).unwrap();
+        assert!(!hits.is_empty(), "typed backpack query must hit");
+        assert!(hits[0].entry.content.contains("backpack"));
+        assert!(
+            hits[0].score >= 0.95,
+            "same-type hit must carry the boost, got {}",
+            hits[0].score
+        );
+
+        mem.update_managed(id, "The rain boots are in the garage by the door.", None)
+            .unwrap();
+
+        let boots = mem.semantic_search("where are my rain boots", 3).unwrap();
+        assert!(!boots.is_empty(), "typed rain-boots query must hit");
+        assert!(boots[0].entry.content.contains("rain boots"));
+        assert!(
+            boots[0].score >= 0.95,
+            "updated row must be boosted under its restamped type, got {}",
+            boots[0].score
+        );
     }
 
     #[test]

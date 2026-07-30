@@ -1993,7 +1993,17 @@ async fn handle_export(
 ) -> (u16, &'static str, String) {
     match conversations.export_json(conv_id).await {
         Ok(json) => (200, "application/json", json),
-        Err(e) => (404, "application/json", format!(r#"{{"error":"{}"}}"#, e)),
+        // Serialize the error body instead of string-formatting it: the message
+        // embeds the caller-supplied conversation id (`conversation not found:
+        // <id>`), and a raw `format!` produced invalid JSON from this
+        // `application/json` endpoint when the id contained a `"`, `\`, or a
+        // control character. `serde_json` escapes those so the body always
+        // parses.
+        Err(e) => (
+            404,
+            "application/json",
+            serde_json::json!({ "error": e.to_string() }).to_string(),
+        ),
     }
 }
 
@@ -4082,6 +4092,53 @@ mod tests {
                 )
                 .await;
                 assert!(rebind.starts_with("HTTP/1.1 403"), "{rebind:?}");
+
+                let _ = std::fs::remove_file(&memory_path);
+                let _ = std::fs::remove_file(&conv_path);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn export_error_body_stays_valid_json_for_a_quoted_id() {
+        let (memory_path, conv_path) = unique_db_paths("genie-export-json");
+        let server = offline_server(
+            &memory_path,
+            &conv_path,
+            genie_common::config::HttpServerConfig::default(),
+        )
+        .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let _ = server.serve_listener(listener).await;
+                });
+
+                // The id is echoed into the error body ("conversation not
+                // found: <id>"). A `"` in it used to break the raw `format!`
+                // and emit invalid JSON from this `application/json` endpoint.
+                let resp = http_roundtrip(
+                    port,
+                    "GET /api/chat/export?id=a\"b HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await;
+                assert!(resp.starts_with("HTTP/1.1 404"), "{resp:?}");
+
+                let body = resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|e| {
+                    panic!("export error body must be valid JSON: {e}; body={body:?}")
+                });
+                assert!(
+                    parsed
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s.contains("a\"b")),
+                    "error should echo the requested id: {parsed:?}"
+                );
 
                 let _ = std::fs::remove_file(&memory_path);
                 let _ = std::fs::remove_file(&conv_path);
