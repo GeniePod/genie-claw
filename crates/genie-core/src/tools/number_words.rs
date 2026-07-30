@@ -8,7 +8,16 @@ enum CardinalWord {
 
 pub(crate) fn parse_spoken_number(tokens: &[&str], start: usize) -> Option<(u64, usize)> {
     if let Some(Ok(value)) = tokens.get(start).map(|token| token.parse::<u64>()) {
-        return Some((value, start + 1));
+        // Compose a digit token with an immediately following magnitude word so
+        // "100 thousand" / "5 hundred" scale correctly. Without this the digit
+        // returned alone and the magnitude word was later mis-parsed as its own
+        // number ("100 thousand" -> "100 1000"). A digit with no magnitude word
+        // still returns as-is.
+        return Some(match tokens.get(start + 1) {
+            Some(&"hundred") => (value.saturating_mul(100), start + 2),
+            Some(&"thousand") => (value.saturating_mul(1000), start + 2),
+            _ => (value, start + 1),
+        });
     }
 
     let mut total: u64 = 0;
