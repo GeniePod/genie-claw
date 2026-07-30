@@ -2047,18 +2047,25 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
     // Only emit a deterministic call for device classes the router can name
     // unambiguously: fans, fireplaces, and lights (#523, e.g. "turn on the
     // kitchen lights"). The light gate matches the device itself (a trailing
-    // "light"/"lights" or the bare word); match fan/fireplace as whole words the
-    // same way. A substring test ("infant monitor".contains("fan")) misfires on a
-    // device whose *name* merely contains those letters, actuating a turn_on the
-    // caller never asked for instead of falling through to the LLM.
+    // "light"/"lights"/"lamp"/"lamps" or the bare word); match fan/fireplace as
+    // whole words the same way. A "lamp" is a light — is_light_entity and the
+    // home_status lamp matcher both treat it as one, and "set the bedroom lamp
+    // to 30%" already routes — so "turn on the desk lamp" must route too instead
+    // of abstaining. A substring test ("infant monitor".contains("fan"))
+    // misfires on a device whose *name* merely contains those letters, actuating
+    // a turn_on the caller never asked for instead of falling through to the LLM.
     let names_fan_or_fireplace = entity
         .split_whitespace()
         .any(|word| matches!(word, "fan" | "fans" | "fireplace" | "fireplaces"));
     let known_device = names_fan_or_fireplace
         || entity == "light"
         || entity == "lights"
+        || entity == "lamp"
+        || entity == "lamps"
         || entity.ends_with(" light")
-        || entity.ends_with(" lights");
+        || entity.ends_with(" lights")
+        || entity.ends_with(" lamp")
+        || entity.ends_with(" lamps");
     if !known_device {
         return None;
     }
@@ -7619,6 +7626,23 @@ mod tests {
         let call = route("Turn off the lights").unwrap();
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "lights");
+        assert_eq!(call.arguments["action"], "turn_off");
+    }
+
+    #[test]
+    fn routes_lamp_turn_command_like_a_light() {
+        // A lamp is a light: is_light_entity and the home_status matcher both
+        // treat it as one, and "set the bedroom lamp to 30%" already routes to
+        // set_brightness — but "turn on the desk lamp" used to abstain because the
+        // turn_on/off gate listed only light/lights, not lamp/lamps.
+        let call = route("turn on the desk lamp").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "desk lamp");
+        assert_eq!(call.arguments["action"], "turn_on");
+
+        let call = route("turn off the bedside lamp").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "bedside lamp");
         assert_eq!(call.arguments["action"], "turn_off");
     }
 
