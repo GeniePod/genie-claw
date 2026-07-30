@@ -34,6 +34,7 @@
 
 use anyhow::{Context, Result};
 use genie_common::config::{Config, ServiceProbeTarget, parse_service_probe_target};
+use genie_common::http::{HttpResponseLimits, read_response};
 use genie_common::probe::{ProbeTimeouts, probe_service_target};
 use genie_core::skills::{
     SkillLoader, SkillManifestAudit, find_manifest_sidecar, manifest_sidecar_candidates,
@@ -54,6 +55,7 @@ mod bfcl_import;
 
 const GOVERNOR_SOCK: &str = "/run/geniepod/governor.sock";
 const BFCL_LLM_DEFAULT_MAX_TOKENS: u32 = 160;
+const CLI_MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 fn load_core_addr() -> Result<String> {
     Ok(Config::load()?.core_http_addr())
@@ -2885,23 +2887,19 @@ async fn http_post_inner(
 
 async fn read_http_body(reader: tokio::net::tcp::OwnedReadHalf) -> Result<String> {
     let mut buf_reader = BufReader::new(reader);
-    let mut body = String::new();
-    let mut in_body = false;
-
-    loop {
-        let mut line = String::new();
-        let n = buf_reader.read_line(&mut line).await?;
-        if n == 0 {
-            break;
+    let limits = HttpResponseLimits::with_body_cap(CLI_MAX_HTTP_RESPONSE_BYTES);
+    let response = read_response(&mut buf_reader, &limits)
+        .await
+        .map_err(|error| anyhow::anyhow!("invalid HTTP response: {error}"))?;
+    if !(200..300).contains(&response.status) {
+        let detail = response.body.trim().replace('\n', " ");
+        if detail.is_empty() {
+            anyhow::bail!("HTTP {}", response.status);
         }
-        if in_body {
-            body.push_str(&line);
-        } else if line.trim().is_empty() {
-            in_body = true;
-        }
+        anyhow::bail!("HTTP {}: {}", response.status, detail);
     }
 
-    Ok(body.trim().to_string())
+    Ok(response.body.trim().to_string())
 }
 
 async fn governor_cmd(json: &str) -> Option<serde_json::Value> {
@@ -2940,6 +2938,40 @@ mod tests {
 
     fn default_test_config() -> Config {
         toml::from_str("").expect("default config should parse from empty TOML")
+    }
+
+    async fn serve_one_http_response(response: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        addr.to_string()
+    }
+
+    #[tokio::test]
+    async fn http_get_returns_success_body() {
+        let addr = serve_one_http_response(
+            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        )
+        .await;
+
+        assert_eq!(http_get(&addr, "/test").await.unwrap(), r#"{"ok":true}"#);
+    }
+
+    #[tokio::test]
+    async fn http_get_rejects_error_status_with_response_detail() {
+        let addr = serve_one_http_response(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"error\":\"denied\"}",
+        )
+        .await;
+
+        let error = http_get(&addr, "/protected").await.unwrap_err().to_string();
+        assert!(error.contains("HTTP 403"), "got: {error}");
+        assert!(error.contains("denied"), "got: {error}");
     }
 
     #[test]
