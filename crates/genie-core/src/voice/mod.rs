@@ -174,9 +174,8 @@ impl VoiceOrchestrator {
         messages.extend_from_slice(&self.conversation[history_start..]);
 
         // Stream LLM response.
-        let mut full_response = String::new();
         print!("\nGeniePod: ");
-        match self
+        let full_response = match self
             .llm
             .chat_stream(&messages, Some(512), |token| {
                 print!("{}", token);
@@ -184,14 +183,14 @@ impl VoiceOrchestrator {
             .await
         {
             Ok(response) => {
-                full_response = response;
                 println!();
+                response
             }
             Err(e) => {
                 println!("\n[ERROR] LLM: {}", e);
                 return;
             }
-        }
+        };
 
         // Check if the response contains a tool call.
         if let Some(tool_result) = self.try_tool_call(&full_response).await {

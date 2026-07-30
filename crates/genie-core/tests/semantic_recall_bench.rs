@@ -69,3 +69,67 @@ fn bench_semantic_search_recall() {
     let _ = std::fs::remove_file(&path);
     assert!(total_hits > 0, "benchmark should return hits");
 }
+
+/// Typed-recall variant: every query here carries a `semantic_query_type`, so
+/// the same-type score boost check runs for each embedded row. On `main` that
+/// check re-derives `semantic_memory_type` per row per recall (a content
+/// lowercase plus a few hundred substring probes through the classification
+/// cascade); on the perf branch it reads the `memory_type` column stamped at
+/// embed time. The untyped benchmark above is the control — its queries skip
+/// the boost check entirely, so the typed-minus-untyped gap isolates the
+/// per-row classification cost this change removes.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn bench_semantic_search_recall_typed() {
+    let path = std::env::temp_dir().join(format!(
+        "genie-semantic-typed-bench-{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mem = Memory::open(&path).expect("open memory db");
+
+    let memories = 1_000usize;
+    for i in 0..memories {
+        mem.store(
+            "fact",
+            &format!(
+                "Household note {i}: the family prefers the room {} thermostat warmer in the \
+                 evening and keeps grocery and lunchbox snacks stocked for school.",
+                i % 12
+            ),
+        )
+        .expect("store memory");
+    }
+
+    // Each of these resolves to Some(..) in semantic_query_type, so the
+    // per-row same-type check is exercised on every embedded row.
+    let queries = [
+        "where is my backpack",
+        "how much electricity did we use",
+        "where are my rain boots",
+        "can I watch cartoons",
+    ];
+
+    for q in &queries {
+        let _ = mem.semantic_search(q, 10).expect("warm recall");
+    }
+
+    let iterations = 100usize;
+    let start = std::time::Instant::now();
+    let mut total_results = 0usize;
+    for i in 0..iterations {
+        let hits = mem
+            .semantic_search(queries[i % queries.len()], 10)
+            .expect("recall");
+        total_results += hits.len();
+    }
+    let elapsed = start.elapsed();
+
+    eprintln!(
+        "BENCH semantic_search_recall_typed: {memories} embedded memories, {iterations} typed \
+         recalls, total {elapsed:?}, per-recall {:?} ({total_results} hits)",
+        elapsed / iterations as u32,
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
