@@ -2186,6 +2186,14 @@ fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
         "wife" => Some("wife"),
         "husband" => Some("husband"),
         "partner" => Some("partner"),
+        // Siblings and grandparents are as core to a household roster as the
+        // parents/children/spouse above; "who is the grandma in this house" used
+        // to miss them and fall through to the LLM. ("grandma" is already a
+        // recognized household member on the note path.)
+        "brother" | "brothers" => Some("brother"),
+        "sister" | "sisters" => Some("sister"),
+        "grandma" | "grandmother" | "grandmas" | "grandmothers" => Some("grandma"),
+        "grandpa" | "grandfather" | "grandpas" | "grandfathers" => Some("grandpa"),
         "dog" | "dogs" => Some("dog"),
         "cat" | "cats" => Some("cat"),
         "pet" | "pets" => Some("pet"),
@@ -4131,6 +4139,19 @@ mod tests {
         let call = route("Who are the children in our house?").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "child");
+
+        // Siblings and grandparents are household members too; these used to miss
+        // the role matcher and fall through to the LLM.
+        for (utterance, role) in [
+            ("Who is the grandma in this house?", "grandma"),
+            ("Who is the grandfather in this house?", "grandpa"),
+            ("Who is the brother in this household?", "brother"),
+            ("Who are the sisters in our house?", "sister"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "memory_recall", "{utterance:?}");
+            assert_eq!(call.arguments["query"], role, "{utterance:?}");
+        }
     }
 
     #[test]
