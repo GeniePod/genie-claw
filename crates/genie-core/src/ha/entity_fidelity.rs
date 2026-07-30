@@ -8,9 +8,17 @@ pub struct DomainArea<'a> {
 }
 
 /// Query words that do not pin a request to a specific place.
+///
+/// This includes the command verbs (`turn`, `switch`, `set`, `get`) and their
+/// state particles (`on`, `off`, `up`, `down`): a whole-home command like
+/// "turn on the lights" or "turn off all the lights" carries a verb and a
+/// particle around the bare domain, and neither names a place. Without the
+/// particles a valid "turn on the lights" failed the guard on the stray `on`
+/// token and the whole-home resolution was wrongly rejected, so the lights
+/// never actuated.
 const BENIGN_QUERY_TOKENS: &[&str] = &[
     "all", "the", "a", "an", "every", "any", "my", "our", "this", "that", "please", "now", "here",
-    "turn", "switch", "set", "get", "status", "of", "to", "in",
+    "turn", "switch", "set", "get", "status", "of", "to", "in", "on", "off", "up", "down",
 ];
 
 /// Split a free-text query into lowercase alphanumeric tokens.
@@ -105,5 +113,44 @@ mod tests {
             &entities,
             "kitchen lights"
         ));
+    }
+
+    /// A whole-home command carries a verb and a state particle around the bare
+    /// domain — "turn on the lights", "switch off all the lights". The verbs are
+    /// already benign; the particles (`on`/`off`/`up`/`down`) must be too, or the
+    /// stray particle token fails the guard and the valid resolution is rejected
+    /// (the lights never actuate).
+    #[test]
+    fn allows_command_particles_around_a_whole_home_domain() {
+        let entities = kitchen_light_home();
+        for command in [
+            "turn on the lights",
+            "turn off the lights",
+            "turn off all the lights",
+            "turn on the kitchen lights",
+            "turn up the lights",
+            "turn down the lights",
+        ] {
+            assert!(
+                whole_home_resolution_is_trustworthy(&entities, command),
+                "'{command}' is a valid whole-home command and must pass the fidelity guard"
+            );
+        }
+    }
+
+    /// The added particles must not weaken foreign-room rejection: a foreign
+    /// place token still fails even alongside a benign particle.
+    #[test]
+    fn command_particles_do_not_admit_foreign_rooms() {
+        let entities = kitchen_light_home();
+        for command in [
+            "turn on the upstairs lights",
+            "turn off the living room light",
+        ] {
+            assert!(
+                !whole_home_resolution_is_trustworthy(&entities, command),
+                "'{command}' names a foreign/deviceless room and must still be rejected"
+            );
+        }
     }
 }
