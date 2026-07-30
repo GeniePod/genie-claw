@@ -266,6 +266,15 @@ async fn read_http_body(
 ) -> Result<String> {
     let mut body = buf.split_off(header_end);
 
+    // Fail loudly rather than handing back an encoded payload as if it were
+    // text: removing chunk framing from a `gzip, chunked` body still leaves
+    // gzip bytes, which the lossy UTF-8 conversion below would silently mangle
+    // into a plausible-looking String no caller can detect as wrong.
+    let undecodable = undecodable_codings(headers);
+    if !undecodable.is_empty() {
+        anyhow::bail!("unsupported transfer coding: {}", undecodable.join(", "));
+    }
+
     if is_chunked(headers) {
         let decoded =
             read_chunked_body(stream, &mut body, read_timeout, max_response_bytes).await?;
@@ -416,17 +425,55 @@ async fn read_with_timeout(
 /// what frames the body. An exact-string match missed both, and since a chunked
 /// response carries no `Content-Length`, the miss fell through to the
 /// read-to-EOF path and handed the caller the raw chunk-size lines as content.
-fn is_chunked(headers: &str) -> bool {
-    headers.lines().any(|line| {
+/// The transfer codings applied to the body, in the order they were applied.
+///
+/// Repeated `Transfer-Encoding` fields are combined in the order received, as
+/// if their values were one comma-separated list (RFC 9110 §5.3), so
+/// `Transfer-Encoding: chunked` followed by `Transfer-Encoding: gzip` yields
+/// `[chunked, gzip]` — not two independent "is it chunked?" answers.
+fn transfer_codings(headers: &str) -> Vec<String> {
+    let mut codings = Vec::new();
+    for line in headers.lines() {
         let Some((name, value)) = line.split_once(':') else {
-            return false;
+            continue;
         };
-        name.trim().eq_ignore_ascii_case("transfer-encoding")
-            && value
-                .rsplit(',')
-                .next()
-                .is_some_and(|last| last.trim().eq_ignore_ascii_case("chunked"))
-    })
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            codings.extend(
+                value
+                    .split(',')
+                    .map(|coding| coding.trim().to_ascii_lowercase())
+                    .filter(|coding| !coding.is_empty()),
+            );
+        }
+    }
+    codings
+}
+
+/// True when chunk framing delimits the body.
+///
+/// Only the *final* coding decides this (RFC 9112 §6.1): when chunked is not
+/// last the message is close-delimited instead, so a scan for "is chunked
+/// present anywhere" would try to chunk-parse a body that is not chunk-framed.
+fn is_chunked(headers: &str) -> bool {
+    transfer_codings(headers)
+        .last()
+        .is_some_and(|last| last == "chunked")
+}
+
+/// Codings this reader cannot undo, outermost first.
+///
+/// Chunk framing is the one coding [`read_http_body`] removes, and only when it
+/// is final. Anything else — `gzip`, `deflate`, `br`, `compress` — leaves the
+/// payload encoded, and since the body is handed back as a `String` through a
+/// lossy UTF-8 conversion, decoding it later is not possible. `identity` is a
+/// no-op and needs no decoder.
+fn undecodable_codings(headers: &str) -> Vec<String> {
+    let mut codings = transfer_codings(headers);
+    if codings.last().is_some_and(|last| last == "chunked") {
+        codings.pop();
+    }
+    codings.retain(|coding| coding != "identity");
+    codings
 }
 
 fn parse_content_length(headers: &str) -> Option<usize> {
@@ -737,45 +784,82 @@ mod tests {
         assert_eq!(decoded, b"hello world");
     }
 
+    async fn get_body_with_headers(header_block: &str, body: &str) -> Result<String> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = format!("HTTP/1.1 200 OK\r\n{header_block}\r\n\r\n{body}");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let out = probe_http_get_body(
+            &addr.to_string(),
+            "/",
+            false,
+            ProbeTimeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_secs(2),
+            },
+        )
+        .await;
+        server.abort();
+        out
+    }
+
+    const CHUNKED_HELLO_WORLD: &str = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+
     #[tokio::test]
     async fn chunked_body_decoded_for_noncanonical_transfer_encoding() {
-        // RFC 7230 allows zero or more spaces after the colon, and permits a
-        // codings list whose final entry is `chunked`. The old exact-string
-        // match on "transfer-encoding: chunked" missed both, so the raw
-        // chunk-size lines came back as the body.
-        for header in [
-            "Transfer-Encoding:chunked",
-            "Transfer-Encoding:  chunked",
-            "transfer-encoding: gzip, chunked",
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let owned = header.to_string();
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf).await.unwrap();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\n{owned}\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            });
-
-            let body = probe_http_get_body(
-                &addr.to_string(),
-                "/",
-                false,
-                ProbeTimeouts {
-                    connect: Duration::from_secs(2),
-                    read: Duration::from_secs(2),
-                },
-            )
-            .await
-            .unwrap();
-
+        // RFC 9112 allows zero or more spaces after the colon. The old
+        // exact-string match on "transfer-encoding: chunked" missed these, so
+        // the raw chunk-size lines came back as the body.
+        for header in ["Transfer-Encoding:chunked", "Transfer-Encoding:  chunked"] {
+            let body = get_body_with_headers(header, CHUNKED_HELLO_WORLD)
+                .await
+                .unwrap();
             assert_eq!(body, "hello world", "header was {header:?}");
-            server.abort();
         }
+    }
+
+    #[test]
+    fn repeated_transfer_encoding_fields_combine_in_order() {
+        // RFC 9110 §5.3: repeated fields combine as one ordered list, and only
+        // the final coding frames the body (RFC 9112 §6.1). Scanning each line
+        // independently would call the first case chunked.
+        assert!(!is_chunked(
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n"
+        ));
+        assert!(is_chunked(
+            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n"
+        ));
+        assert_eq!(
+            transfer_codings("Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n"),
+            vec!["chunked".to_string(), "gzip".to_string()],
+        );
+        assert!(!is_chunked("Content-Length: 5\r\n"));
+    }
+
+    #[tokio::test]
+    async fn undecodable_transfer_coding_is_rejected_not_mangled() {
+        // Stripping chunk framing off a `gzip, chunked` body leaves gzip bytes;
+        // the lossy UTF-8 conversion would turn those into a plausible-looking
+        // String no caller could tell was wrong. Fail instead.
+        let err = get_body_with_headers("Transfer-Encoding: gzip, chunked", CHUNKED_HELLO_WORLD)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported transfer coding"),
+            "got: {err}"
+        );
+
+        // `identity` is a no-op, so it must not trip the same guard.
+        let body =
+            get_body_with_headers("Transfer-Encoding: identity, chunked", CHUNKED_HELLO_WORLD)
+                .await
+                .unwrap();
+        assert_eq!(body, "hello world");
     }
 
     #[tokio::test]
