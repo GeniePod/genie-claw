@@ -6,7 +6,7 @@
 
 - **Time / date**: strip a leading `please` in `asks_current_time` so polite
   forms (`please what time is it`, `please tell me the date`) route to
-  `get_time` — trailing `please` / `right now` were already handled.
+  `get_time` — trailing `please` / `right now` were already handled (#906).
 - **Scene / routine**: strip a leading `please` before the exact-match set and
   the `activate`/`start`/`run` prefix loop, so polite forms
   (`please activate the movie scene`, `please goodnight`, `please I am home`)
