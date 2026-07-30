@@ -30,7 +30,9 @@ pub enum Command {
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub mode: Mode,
-    pub mem_available_mb: u64,
+    /// `None` (JSON `null`) when unknown, so a consumer can tell it from a
+    /// genuine zero — `system.rs` falls back to its own read on `null`.
+    pub mem_available_mb: Option<u64>,
     pub uptime_secs: u64,
 }
 
