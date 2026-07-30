@@ -18,6 +18,15 @@
   mirroring the other paths that already drop it. Covers both the weather and
   `will it rain in <city>` branches (#758).
 
+### Performance
+
+- **Semantic recall**: read the semantic type stamped on each embedded memory
+  at embed time (`embedded_memories.memory_type`) for the same-type score boost
+  instead of re-running the `semantic_memory_type` cascade on every row of every
+  typed recall — a content lowercase plus a few-hundred-branch substring cascade
+  per embedded memory per query becomes a column read. `DERIVATION_VERSION` is
+  bumped so existing databases restamp their embedded rows once on open.
+
 ## 1.0.0-rc.4 - 2026-07-13
 
 Fourth release candidate. This RC drives **M2** forward: the portable
