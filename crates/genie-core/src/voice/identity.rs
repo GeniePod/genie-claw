@@ -864,6 +864,13 @@ mod tests {
         let result = read_wav_mono_f32(&path);
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert!(result.is_err(), "a truncated fmt chunk must be an error");
+        // Assert the specific rejection: any `Err` would also be produced by the
+        // later "expected 16-bit PCM" bail if the chunk were skipped rather than
+        // rejected, which would not exercise this guard.
+        let error = result.expect_err("a truncated fmt chunk must be an error");
+        assert!(
+            error.to_string().contains("invalid WAV fmt chunk"),
+            "expected the fmt-chunk rejection, got: {error}"
+        );
     }
 }
