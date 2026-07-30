@@ -20,6 +20,9 @@ pub struct Governor {
     start_time: std::time::Instant,
     /// Latest tegrastats snapshot (None if not on Jetson).
     tegra_rx: Option<watch::Receiver<TegraSnapshot>>,
+    /// Last successful `/proc/meminfo` reading, reused when a read fails so a
+    /// transient failure cannot be mistaken for a memory level.
+    last_mem_avail_mb: Option<u64>,
 }
 
 impl Governor {
@@ -32,6 +35,7 @@ impl Governor {
             prune_counter: 0,
             start_time: std::time::Instant::now(),
             tegra_rx: None,
+            last_mem_avail_mb: None,
         }
     }
 
@@ -97,7 +101,7 @@ impl Governor {
             }
             Command::MediaStop => {
                 let ts = store::now_ms();
-                let mem_avail = tegrastats::mem_available_mb_async().await.unwrap_or(4096);
+                let mem_avail = self.read_mem_avail_mb().await;
                 let result: Result<Mode, anyhow::Error> = async {
                     if let Err(error) = tokio::fs::remove_file("/run/geniepod/media_mode").await
                         && error.kind() != std::io::ErrorKind::NotFound
@@ -109,7 +113,7 @@ impl Governor {
                     // marker we just removed) returned Media, so the transition
                     // was a no-op that left the system stuck in Media until the
                     // next tick and wrongly reported `mode: media` in the reply.
-                    let target = self.determine_mode(mem_avail, false);
+                    let target = self.determine_mode_after_media(mem_avail);
                     self.transition(ts, target).await?;
                     Ok(target)
                 }
@@ -120,7 +124,7 @@ impl Governor {
                 }
             }
             Command::Status => {
-                let mem_avail = tegrastats::mem_available_mb_async().await.unwrap_or(0);
+                let mem_avail = self.read_mem_avail_mb().await;
                 let resp = StatusResponse {
                     mode: self.current_mode,
                     mem_available_mb: mem_avail,
@@ -131,11 +135,31 @@ impl Governor {
         }
     }
 
+    /// Available memory, or the last successful reading when a read fails.
+    /// Callers previously substituted disagreeing literals (0 in `tick`, 4096
+    /// in `MediaStop`); a failed read is not a memory level in either direction.
+    async fn read_mem_avail_mb(&mut self) -> Option<u64> {
+        match tegrastats::mem_available_mb_async().await {
+            Ok(mb) => {
+                self.last_mem_avail_mb = Some(mb);
+                Some(mb)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    last_known_mb = ?self.last_mem_avail_mb,
+                    "reading /proc/meminfo failed; reusing the last known value"
+                );
+                self.last_mem_avail_mb
+            }
+        }
+    }
+
     async fn tick(&mut self) -> Result<()> {
         let ts = store::now_ms();
 
-        // 1. Read memory from /proc/meminfo (always available).
-        let mem_avail = tegrastats::mem_available_mb_async().await.unwrap_or(0);
+        // 1. Read memory from /proc/meminfo.
+        let mem_avail = self.read_mem_avail_mb().await;
 
         // 2. If tegrastats is running, log the latest snapshot.
         if let Some(ref rx) = self.tegra_rx {
@@ -155,7 +179,9 @@ impl Governor {
         }
 
         // 5. Check pressure even within the same mode.
-        self.handle_pressure(mem_avail).await?;
+        if let Some(mem_avail_mb) = mem_avail {
+            self.handle_pressure(mem_avail_mb).await?;
+        }
 
         // 6. Prune DB hourly (~720 ticks at 5s interval).
         self.prune_counter += 1;
@@ -167,17 +193,43 @@ impl Governor {
         Ok(())
     }
 
-    fn determine_mode(&self, mem_avail_mb: u64, media_active: bool) -> Mode {
+    fn determine_mode(&self, mem_avail_mb: Option<u64>, media_active: bool) -> Mode {
         // Priority: Pressure > Media (external trigger) > Time-based.
-
-        if mem_avail_mb < self.config.governor.pressure.stop_optins_mb {
-            return Mode::Pressure;
+        match mem_avail_mb {
+            Some(mb) if mb < self.config.governor.pressure.stop_optins_mb => {
+                return Mode::Pressure;
+            }
+            // Unknown level: hold the current mode so a failed read cannot
+            // transition or actuate services in either direction.
+            None => return self.current_mode,
+            _ => {}
         }
 
         if media_active {
             return Mode::Media;
         }
 
+        self.time_based_mode()
+    }
+
+    /// Target mode once the media marker has been cleared.
+    ///
+    /// `determine_mode` holds the current mode on an unknown level, which is
+    /// wrong for `Media`: holding it would make the transition a no-op and
+    /// leave the device in `Media` until the next tick. Leaving `Media`
+    /// actuates nothing that memory pressure protects, so an unknown level
+    /// resolves to the time-based mode — except from `Pressure`, which is held,
+    /// because leaving it on a failed read is the protection-removing direction
+    /// this path used to take with its `unwrap_or(4096)`.
+    fn determine_mode_after_media(&self, mem_avail_mb: Option<u64>) -> Mode {
+        match mem_avail_mb {
+            Some(mb) if mb < self.config.governor.pressure.stop_optins_mb => Mode::Pressure,
+            None if self.current_mode == Mode::Pressure => Mode::Pressure,
+            _ => self.time_based_mode(),
+        }
+    }
+
+    fn time_based_mode(&self) -> Mode {
         let hour = current_hour();
         let night_start = self.config.governor.night_start_hour;
         let day_start = self.config.governor.day_start_hour;
@@ -552,10 +604,58 @@ mod tests {
     }
 
     #[test]
+    fn unknown_memory_holds_the_current_mode() {
+        let mut gov = make_governor();
+        for mode in [
+            Mode::Day,
+            Mode::NightA,
+            Mode::NightB,
+            Mode::Media,
+            Mode::Pressure,
+        ] {
+            gov.current_mode = mode;
+            assert_eq!(gov.determine_mode(None, false), mode);
+            assert_eq!(gov.determine_mode(None, true), mode);
+        }
+    }
+
+    #[test]
+    fn unknown_memory_after_media_resolves_off_media() {
+        let mut gov = make_governor();
+        gov.current_mode = Mode::Media;
+        assert_ne!(gov.determine_mode_after_media(None), Mode::Media);
+        assert_eq!(gov.determine_mode_after_media(Some(0)), Mode::Pressure);
+    }
+
+    #[test]
+    fn unknown_memory_after_media_still_holds_pressure() {
+        let mut gov = make_governor();
+        gov.current_mode = Mode::Pressure;
+        // The `unwrap_or(4096)` this replaced cleared every threshold here, so a
+        // failed read pulled a starved device out of Pressure. Leaving Pressure
+        // needs a reading that says memory is fine, not the absence of one.
+        assert_eq!(gov.determine_mode_after_media(None), Mode::Pressure);
+        assert_ne!(gov.determine_mode_after_media(Some(3000)), Mode::Pressure);
+    }
+
+    #[tokio::test]
+    async fn a_read_never_discards_the_last_known_value() {
+        let mut gov = make_governor();
+        gov.last_mem_avail_mb = Some(1234);
+        let got = gov.read_mem_avail_mb().await;
+        // Holds on both branches without needing to force a read failure: a
+        // successful read refreshes the cache, a failed one falls back to it.
+        // Either way the level stays known, where the pre-fix code substituted
+        // a literal that disagreed between call sites.
+        assert!(got.is_some());
+        assert_eq!(got, gov.last_mem_avail_mb);
+    }
+
+    #[test]
     fn determine_mode_day_with_plenty_of_memory() {
         let gov = make_governor();
         // 3000 MB available, well above all thresholds.
-        let mode = gov.determine_mode(3000, false);
+        let mode = gov.determine_mode(Some(3000), false);
         // Without media trigger file, should be Day or NightA depending on time.
         // At minimum, it should NOT be Pressure or Media.
         assert_ne!(mode, Mode::Pressure);
@@ -566,21 +666,21 @@ mod tests {
     fn determine_mode_reflects_media_active_flag() {
         let gov = make_governor();
         // Media active with healthy memory -> Media.
-        assert_eq!(gov.determine_mode(3000, true), Mode::Media);
+        assert_eq!(gov.determine_mode(Some(3000), true), Mode::Media);
         // Media inactive (e.g. just stopped) -> resolves to a non-Media mode,
         // never Media. MediaStop relies on this: it clears the marker and then
         // asks for the post-media target, so passing media_active=false must not
         // yield Media (the old code re-read the just-removed marker and stuck).
-        assert_ne!(gov.determine_mode(3000, false), Mode::Media);
+        assert_ne!(gov.determine_mode(Some(3000), false), Mode::Media);
         // Pressure still overrides an active media marker.
-        assert_eq!(gov.determine_mode(0, true), Mode::Pressure);
+        assert_eq!(gov.determine_mode(Some(0), true), Mode::Pressure);
     }
 
     #[test]
     fn determine_mode_pressure_on_low_memory() {
         let gov = make_governor();
         // 400 MB available, below stop_optins_mb (500).
-        let mode = gov.determine_mode(400, false);
+        let mode = gov.determine_mode(Some(400), false);
         assert_eq!(mode, Mode::Pressure);
     }
 
@@ -588,7 +688,7 @@ mod tests {
     fn determine_mode_pressure_takes_priority() {
         let gov = make_governor();
         // Even with 0 MB (and media active), pressure should override everything.
-        let mode = gov.determine_mode(0, true);
+        let mode = gov.determine_mode(Some(0), true);
         assert_eq!(mode, Mode::Pressure);
     }
 
@@ -644,7 +744,7 @@ mod tests {
         if is_night_always {
             // With huge day_start, determine_mode at any hour with enough RAM
             // should pick NightB (since night_model_swap=true).
-            let mode = gov.determine_mode(3000, false);
+            let mode = gov.determine_mode(Some(3000), false);
             assert_eq!(mode, Mode::NightB);
         }
     }
