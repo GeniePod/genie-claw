@@ -1984,6 +1984,14 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
                 return None;
             }
         }
+        // Absolute schedules ("at 9pm", "tonight"), conditionals ("when I get
+        // home"), and exclusions ("except the bedroom") must also abstain — the
+        // relative "in <duration>" guard above misses them, so the setpoint
+        // path used to actuate now and drop the qualifier (#914). Mirrors the
+        // multi-clause / schedule abstain on simple_turn_request.
+        if setpoint_has_schedule_or_condition(rest) {
+            return None;
+        }
         if let Some((entity, value)) = parse_temperature_target(rest) {
             // The action for a numeric setpoint depends on the device. A light
             // dims (set_brightness, #813); a thermostat/oven/heater sets
@@ -2002,6 +2010,81 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
     }
 
     None
+}
+
+/// True when a `set`/`preheat` remainder carries an absolute schedule,
+/// conditional, or exclusion that the quick-router must not actuate now.
+///
+/// Distinguishes `"set the thermostat to 68 at 9pm"` (schedule → abstain) from
+/// `"set the thermostat at 68"` (`at` is the value separator → keep).
+fn setpoint_has_schedule_or_condition(rest: &str) -> bool {
+    let scoped = format!(" {rest} ");
+    if scoped.contains(" everything ")
+        || scoped.contains(" except ")
+        || scoped.contains(" only ")
+        || scoped.contains(" when ")
+        || scoped.contains(" unless ")
+        || scoped.contains(" if ")
+        || scoped.contains(" and ")
+    {
+        return true;
+    }
+
+    // Trailing calendar / bedtime words that are not a room after "in the …".
+    if rest.ends_with(" tonight")
+        || rest.ends_with(" tomorrow")
+        || rest.ends_with(" today")
+        || rest.ends_with(" before bed")
+        || rest.ends_with(" before bedtime")
+        || rest.ends_with(" at bedtime")
+        || rest.ends_with(" at night")
+        || rest.ends_with(" at noon")
+        || rest.ends_with(" at midnight")
+        || rest.ends_with(" at midday")
+    {
+        return true;
+    }
+
+    // "to <value> at <schedule>" — once `to` already introduced the setpoint,
+    // a later `at` is a clock/time qualifier, not the value separator used by
+    // `parse_temperature_target` for `"set the thermostat at 68"`.
+    if let Some((_, after_to)) = rest.split_once(" to ")
+        && let Some((_, at_tail)) = after_to.rsplit_once(" at ")
+    {
+        let at_tail = at_tail.trim();
+        if is_absolute_schedule_tail(at_tail) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_absolute_schedule_tail(tail: &str) -> bool {
+    if tail.is_empty() {
+        return false;
+    }
+    if is_time_expression(tail)
+        || matches!(
+            tail,
+            "bedtime" | "night" | "noon" | "midnight" | "midday" | "tonight" | "tomorrow" | "today"
+        )
+    {
+        return true;
+    }
+    // Clock times: "9pm", "9 pm", "9:30", "9:30pm".
+    let compact: String = tail
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if compact.ends_with("am") || compact.ends_with("pm") {
+        return true;
+    }
+    if compact.contains(':') {
+        return true;
+    }
+    false
 }
 
 fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
@@ -6344,6 +6427,69 @@ mod tests {
         assert_eq!(call.arguments["entity"], "thermostat");
         assert_eq!(call.arguments["action"], "set_temperature");
         assert_eq!(call.arguments["value"], 68);
+    }
+
+    #[test]
+    fn setpoint_with_absolute_schedule_or_condition_abstains() {
+        // Relative "in <duration>" was already guarded (#829). Absolute schedules,
+        // conditionals, and exclusions still actuated now and dropped the
+        // qualifier (#914). Abstain so the LLM can arm them — same resolution as
+        // turn_on/turn_off.
+        for utterance in [
+            "set the thermostat to 68 at 9pm",
+            "set the thermostat to 68 at bedtime",
+            "set the thermostat to 68 tonight",
+            "set the thermostat to 68 tomorrow",
+            "set the thermostat to 68 before bed",
+            "set the lights to 30 percent at 9pm",
+            "set the thermostat to 68 when I get home",
+            "set the thermostat to 68 unless it is cold",
+            "set the thermostat to 68 only at night",
+            "set the lights to 40 percent except the bedroom",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // Unqualified setpoints — including `at` as the value separator and a
+        // trailing room after "in the …" — must still actuate now.
+        for (utterance, entity, action, value) in [
+            (
+                "set the thermostat to 68",
+                "thermostat",
+                "set_temperature",
+                68,
+            ),
+            (
+                "set the thermostat at 68",
+                "thermostat",
+                "set_temperature",
+                68,
+            ),
+            (
+                "set the thermostat to 68 in the den",
+                "thermostat",
+                "set_temperature",
+                68,
+            ),
+            (
+                "set the oven to 400 degrees",
+                "oven",
+                "set_temperature",
+                400,
+            ),
+            (
+                "set the lights to 40 percent",
+                "lights",
+                "set_brightness",
+                40,
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["action"], action, "{utterance:?}");
+            assert_eq!(call.arguments["value"], value, "{utterance:?}");
+        }
     }
 
     #[test]
