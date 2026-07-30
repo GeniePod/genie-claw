@@ -773,6 +773,7 @@ async fn handle_request(
             &ctx.agent_config,
             &ctx.optional_ai_provider,
             echo_origin.as_deref(),
+            privacy_proxy,
         )
         .await
         {
@@ -976,6 +977,7 @@ async fn handle_chat_stream(
     agent_config: &AgentConfig,
     optional_ai_provider: &OptionalAiProviderConfig,
     reflect_origin: Option<&str>,
+    privacy_proxy: Option<&PrivacyProxyConfig>,
 ) -> Result<()> {
     let Some(body) = body else {
         write_stream_headers(writer, 400, reflect_origin).await?;
@@ -1117,13 +1119,68 @@ async fn handle_chat_stream(
     )
     .await?;
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let request_hints = LlmRequestHints::agent_turn(&conv_id, 512);
 
-    // Run producer and consumer in the same block so both are dropped — and
-    // their mutable borrow on `writer` released — before we write the final
-    // "done" event below.
-    let (llm_result, mut state) = {
-        let request_hints = LlmRequestHints::agent_turn(&conv_id, 512);
+    // Escalate on overflow before attempting the local model — mirrors
+    // process_chat_turn (POST /api/chat); sending an overflowing request to
+    // the local model would just error anyway (#818).
+    let estimated_tokens: usize = messages.iter().map(|m| m.content.len() / 4).sum();
+    let context_overflowed = estimated_tokens + crate::agent_harness::RESPONSE_RESERVE_TOKENS
+        > crate::runtime_boundary::JETSON_BASELINE_CONTEXT_TOKENS as usize;
+
+    let overflow_proxy_response = if context_overflowed {
+        match may_escalate(privacy_proxy, EscalationReason::ContextOverflow) {
+            Some(proxy) => {
+                tracing::info!(
+                    estimated_tokens,
+                    "context overflow; escalating via PrivacyProxy (stream)"
+                );
+                match escalate_via_privacy_proxy(
+                    proxy,
+                    &messages,
+                    memory,
+                    EscalationReason::ContextOverflow,
+                )
+                .await
+                {
+                    Ok(r) => Some(r),
+                    Err(proxy_err) => {
+                        tracing::warn!(
+                            error = %proxy_err,
+                            "PrivacyProxy escalation failed; attempting local model (stream)"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    // `llm_result`/`state` come from either the PrivacyProxy overflow
+    // escalation above (a plain, non-streamed response — stashed into
+    // `state.pending` so the tool-detection/finalization code below treats
+    // it exactly like buffered-but-not-yet-flushed stream output, with no
+    // further special-casing needed) or the normal producer/consumer stream.
+    let (llm_result, mut state): (Result<String>, StreamState) = if let Some(response) =
+        overflow_proxy_response
+    {
+        (
+            Ok(response.clone()),
+            StreamState {
+                mode: StreamMode::Undecided,
+                pending: response,
+                emitted_text: false,
+            },
+        )
+    } else {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // Run producer and consumer in the same block so both are dropped —
+        // and their mutable borrow on `writer` released — before we
+        // possibly escalate or write the final "done"/"error" event below.
         let producer =
             llm.chat_stream_with_hints(&messages, Some(512), &request_hints, move |token| {
                 let _ = tx.send(token.to_string());
@@ -1153,10 +1210,10 @@ async fn handle_chat_stream(
                             match detect_stream_mode(&state.pending) {
                                 StreamMode::Text => {
                                     write_stream_event(
-                                        writer,
-                                        &serde_json::json!({"type":"token","content": state.pending}),
-                                    )
-                                    .await?;
+                                            writer,
+                                            &serde_json::json!({"type":"token","content": state.pending}),
+                                        )
+                                        .await?;
                                     state.pending.clear();
                                     state.mode = StreamMode::Text;
                                     state.emitted_text = true;
@@ -1186,10 +1243,64 @@ async fn handle_chat_stream(
                 (Err(anyhow::anyhow!("LLM stream cancelled")), state_r)
             },
         };
+        // A consumer error only ever means a dead client socket (the
+        // consumer's only fallible operation is write_stream_event); exit
+        // immediately via `?` rather than attempt a PrivacyProxy escalation
+        // or an error write nobody on the other end can receive.
         (llm_r, state_r?)
     };
 
-    let llm_response = llm_result?;
+    let llm_response = match llm_result {
+        Ok(r) => r,
+        Err(local_err) => {
+            // #818: unlike process_chat_turn, this path used to have no
+            // PrivacyProxy fallback and no error event at all — the
+            // connection just silently closed after "start". Only attempt
+            // escalation if nothing has been shown to the client yet; once
+            // partial text has streamed, mixing in an unrelated proxy
+            // response would be more confusing than a clean error.
+            if !state.emitted_text
+                && let Some(proxy) = may_escalate(privacy_proxy, EscalationReason::LocalDecline)
+            {
+                tracing::info!(
+                    error = %local_err,
+                    "local LLM declined; escalating via PrivacyProxy (stream)"
+                );
+                match escalate_via_privacy_proxy(
+                    proxy,
+                    &messages,
+                    memory,
+                    EscalationReason::LocalDecline,
+                )
+                .await
+                {
+                    Ok(r) => {
+                        state.pending = r.clone();
+                        r
+                    }
+                    Err(proxy_err) => {
+                        tracing::warn!(
+                            error = %proxy_err,
+                            "PrivacyProxy escalation failed; returning stream error"
+                        );
+                        write_stream_event(
+                            writer,
+                            &serde_json::json!({"type":"error","message": local_err.to_string()}),
+                        )
+                        .await?;
+                        return Err(local_err);
+                    }
+                }
+            } else {
+                write_stream_event(
+                    writer,
+                    &serde_json::json!({"type":"error","message": local_err.to_string()}),
+                )
+                .await?;
+                return Err(local_err);
+            }
+        }
+    };
 
     let mut tool_name: Option<String> = None;
     let final_response = if let Some(tool_result) =
@@ -3771,6 +3882,215 @@ mod tests {
                 assert!(
                     !producer_finished_clone.load(Ordering::SeqCst),
                     "LLM producer must be cancelled on client disconnect, not run to completion"
+                );
+
+                let _ = std::fs::remove_file(&memory_path);
+                let _ = std::fs::remove_file(&conv_path);
+            })
+            .await;
+    }
+
+    /// Small helper: read HTTP response bytes off `stream` until the peer
+    /// closes the connection or a short idle timeout elapses.
+    async fn read_stream_response_to_close(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(800),
+                stream.read(&mut chunk),
+            )
+            .await
+            {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                Ok(Err(_)) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// #818: a backend failure on `/api/chat/stream` used to close the
+    /// connection right after the "start" event with no signal at all. It
+    /// must now write a `{"type":"error",...}` event when there's no
+    /// PrivacyProxy configured to escalate to.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_backend_failure_without_privacy_proxy_writes_error_event() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        use crate::connectivity::NullConnectivityController;
+        use crate::conversation::ConversationStore;
+        use crate::llm::{LlmClient, MockLlmBackend};
+        use crate::prompt::ModelFamily;
+        use crate::tools::ToolDispatcher;
+        use genie_common::config::ConnectivityConfig;
+
+        // Empty reply queue and no fallback: the very first call errors,
+        // simulating an unreachable/erroring local LLM backend.
+        let failing_backend = MockLlmBackend::new(Vec::<String>::new());
+
+        let (memory_path, conv_path) = unique_db_paths("genie-stream-error-event");
+        let system_prompt = "You are a helpful assistant.";
+        let server = super::ChatServer::new(
+            LlmClient::from_backend(failing_backend),
+            ToolDispatcher::new(None),
+            std::sync::Arc::new(NullConnectivityController::from_config(
+                &ConnectivityConfig::default(),
+            )),
+            shared_memory(&memory_path),
+            ConversationStore::open(&conv_path).unwrap(),
+            system_prompt.into(),
+            crate::prompt_sha::sha256_hex(system_prompt),
+            10,
+            ModelFamily::Phi,
+            "".into(),
+            sample_boot_harness(system_prompt),
+        )
+        .await
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let _ = server.serve_listener(listener).await;
+                });
+
+                let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .unwrap();
+
+                let body = r#"{"message":"ping, please fail"}"#;
+                let request = format!(
+                    "POST /api/chat/stream HTTP/1.1\r\n\
+                     Host: localhost\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     \r\n\
+                     {}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(request.as_bytes()).await.unwrap();
+
+                let text = read_stream_response_to_close(&mut stream).await;
+                assert!(
+                    text.contains(r#""type":"error""#),
+                    "expected an error event when the backend fails with no PrivacyProxy \
+                     configured, got: {text}"
+                );
+
+                let _ = std::fs::remove_file(&memory_path);
+                let _ = std::fs::remove_file(&conv_path);
+            })
+            .await;
+    }
+
+    /// #818: when PrivacyProxy is configured for `LocalDecline`, a backend
+    /// failure on `/api/chat/stream` must escalate and deliver the proxy's
+    /// response to the client, instead of silently closing the connection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_backend_failure_escalates_to_privacy_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        use crate::connectivity::NullConnectivityController;
+        use crate::conversation::ConversationStore;
+        use crate::llm::{LlmClient, MockLlmBackend};
+        use crate::prompt::ModelFamily;
+        use crate::tools::ToolDispatcher;
+        use genie_common::config::{ConnectivityConfig, PrivacyProxyConfig};
+
+        // Mock PrivacyProxy: accepts one connection, replies to the
+        // OpenAI-compatible chat-completions POST with a fixed response.
+        // (No memory entries exist in this test's fresh DB, so the vocab-seed
+        // step short-circuits on an empty term list and never opens a
+        // connection — only the chat completion itself is mocked here.)
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut conn, _)) = proxy_listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf).await;
+                let body = r#"{"choices":[{"message":{"role":"assistant","content":"escalated via proxy"}}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = conn.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let failing_backend = MockLlmBackend::new(Vec::<String>::new());
+        let privacy_proxy = PrivacyProxyConfig {
+            enabled: true,
+            base_url: format!("http://{proxy_addr}/v1"),
+            ..PrivacyProxyConfig::default()
+        };
+
+        let (memory_path, conv_path) = unique_db_paths("genie-stream-escalate");
+        let system_prompt = "You are a helpful assistant.";
+        let server = super::ChatServer::new(
+            LlmClient::from_backend(failing_backend),
+            ToolDispatcher::new(None),
+            std::sync::Arc::new(NullConnectivityController::from_config(
+                &ConnectivityConfig::default(),
+            )),
+            shared_memory(&memory_path),
+            ConversationStore::open(&conv_path).unwrap(),
+            system_prompt.into(),
+            crate::prompt_sha::sha256_hex(system_prompt),
+            10,
+            ModelFamily::Phi,
+            "".into(),
+            sample_boot_harness(system_prompt),
+        )
+        .await
+        .unwrap()
+        .with_privacy_proxy(privacy_proxy);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let _ = server.serve_listener(listener).await;
+                });
+
+                let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .unwrap();
+
+                let body = r#"{"message":"ping, please fail"}"#;
+                let request = format!(
+                    "POST /api/chat/stream HTTP/1.1\r\n\
+                     Host: localhost\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     \r\n\
+                     {}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(request.as_bytes()).await.unwrap();
+
+                let text = read_stream_response_to_close(&mut stream).await;
+                assert!(
+                    !text.contains(r#""type":"error""#),
+                    "escalation succeeded; there must be no error event, got: {text}"
+                );
+                assert!(
+                    text.contains("escalated via proxy"),
+                    "expected the PrivacyProxy's response to reach the client, got: {text}"
                 );
 
                 let _ = std::fs::remove_file(&memory_path);
