@@ -2836,6 +2836,33 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
         return None;
     }
 
+    // A leading cancel/stop verb asks to END a timer, not start one: the
+    // duration in "cancel the 10 minute timer" / "stop the 5 minute timer"
+    // *names* which timer, but the parse below read it as a request and did the
+    // exact opposite of what was asked — the cancellation itself started a
+    // fresh timer. There is no deterministic cancel tool, so abstain and let
+    // the LLM ground it. Only the leading verb is gated ("remind me to stop
+    // the dryer in 10 minutes" is still a set request), and a bare "cancel the
+    // timer" (no duration) already abstained via the parse below.
+    let is_cancel_command = matches!(
+        text.split_whitespace().next(),
+        Some(
+            "cancel"
+                | "stop"
+                | "end"
+                | "pause"
+                | "resume"
+                | "delete"
+                | "remove"
+                | "clear"
+                | "dismiss"
+        )
+    ) || text.starts_with("turn off ")
+        || text.starts_with("shut off ");
+    if is_cancel_command {
+        return None;
+    }
+
     // "remind me/us to <task> in <duration>" phrasing puts the task clause before
     // the duration; only these utterances get the task-first label scan so plain
     // "<X> timer …" phrasings keep their existing named-timer handling.
@@ -6934,6 +6961,37 @@ mod tests {
         let call = route("set a timer for 15 minutes").unwrap();
         assert_eq!(call.name, "set_timer");
         assert_eq!(call.arguments["seconds"], 900);
+    }
+
+    #[test]
+    fn cancel_verb_timer_commands_abstain_instead_of_setting_a_timer() {
+        // A leading cancel/stop verb asks to END a timer. The duration in "cancel
+        // the 10 minute timer" only *names* which timer; timer_request read it as
+        // a request and did the exact opposite of what was asked — the
+        // cancellation itself started a fresh 10-minute timer. There is no
+        // deterministic cancel tool, so these must abstain for the LLM.
+        for utterance in [
+            "Cancel the 10 minute timer.",
+            "Stop the 5 minute timer.",
+            "Leo: cancel my 10 minute timer",
+            "delete the 20 minute timer",
+            "pause the 10 minute timer",
+            "turn off the 10 minute timer",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} is a cancellation and must abstain, not set a new timer"
+            );
+        }
+
+        // Genuine set requests are untouched, including ones whose *label*
+        // merely contains a cancel word mid-utterance.
+        let call = route("set a 10 minute timer").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 600);
+        let call = route("remind me to stop the dryer in 10 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["label"], "stop the dryer");
     }
 
     #[test]
