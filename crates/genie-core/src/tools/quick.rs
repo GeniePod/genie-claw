@@ -1984,6 +1984,52 @@ fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>
                 return None;
             }
         }
+        // The guard above only catches a *relative* delay ("in an hour"). An
+        // absolute or event-anchored schedule sits after the value in exactly the
+        // same way and was dropped just as silently, because `parse_amount` reads
+        // "68" straight out of "68 at 9pm": "set the thermostat to 68 at 9pm",
+        // "... tonight", "... before bed" all actuated immediately and the time
+        // the caller asked for was lost. Abstain so the LLM can arm the schedule,
+        // the same resolution #828/#829 chose for the relative form.
+        //
+        // Keyed on the tail *after* the value so the device half is untouched,
+        // and only on the " to " split — `parse_temperature_target` also accepts
+        // " at " as the value separator ("set the thermostat at 68"), which must
+        // keep routing.
+        if let Some((_, value_tail)) = rest.split_once(" to ") {
+            let value_tail = format!(" {value_tail} ");
+            if value_tail.contains(" at ")
+                || value_tail.contains(" tonight ")
+                || value_tail.contains(" tomorrow ")
+                || value_tail.contains(" before ")
+                || value_tail.contains(" after ")
+                || value_tail.contains(" later ")
+            {
+                return None;
+            }
+        }
+        // Abstain on the conditional, exclusion, and whole-house phrasings that
+        // `simple_turn_request` already guards on the turn_on/turn_off path. The
+        // setpoint path never got the same check, so the qualifying clause was
+        // dropped and the setpoint fired anyway: "set the thermostat to 68 when i
+        // get home" actuated now, and "set the lights to 40 percent except the
+        // bedroom" dimmed the very room the caller excluded — the outcome
+        // `canonicalize_household_action` deliberately refuses to produce for the
+        // `*_except` verbs.
+        //
+        // " and " is intentionally absent here, unlike the turn path: on a
+        // setpoint it joins a spoken compound number ("one hundred and five"),
+        // not a second device.
+        let scoped = format!(" {rest} ");
+        if scoped.contains(" everything ")
+            || scoped.contains(" except ")
+            || scoped.contains(" only ")
+            || scoped.contains(" when ")
+            || scoped.contains(" unless ")
+            || scoped.contains(" if ")
+        {
+            return None;
+        }
         if let Some((entity, value)) = parse_temperature_target(rest) {
             // The action for a numeric setpoint depends on the device. A light
             // dims (set_brightness, #813); a thermostat/oven/heater sets
@@ -6344,6 +6390,61 @@ mod tests {
         assert_eq!(call.arguments["entity"], "thermostat");
         assert_eq!(call.arguments["action"], "set_temperature");
         assert_eq!(call.arguments["value"], 68);
+    }
+
+    #[test]
+    fn setpoint_with_an_absolute_schedule_or_condition_abstains() {
+        // The `in <duration>` guard above only covers a *relative* delay. An
+        // absolute or event-anchored schedule sits after the value the same way
+        // and was dropped just as silently, so the setpoint fired now and the
+        // time the caller asked for was lost.
+        for utterance in [
+            "set the thermostat to 68 at 9pm",
+            "set the thermostat to 68 at bedtime",
+            "set the thermostat to 68 tonight",
+            "set the thermostat to 68 tomorrow",
+            "set the thermostat to 68 before bed",
+            "set the lights to 30 percent at 9pm",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // The conditional / exclusion / whole-house phrasings that
+        // `simple_turn_request` already refuses on the turn path. The exclusion
+        // case is the worst of these: it actuated the room the caller excluded.
+        for utterance in [
+            "set the thermostat to 68 when i get home",
+            "set the thermostat to 68 unless it is cold",
+            "set the thermostat to 68 if nobody is home",
+            "set the thermostat to 68 only at night",
+            "set the lights to 40 percent except the bedroom",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+
+        // Unqualified setpoints still actuate now, including the "at" value
+        // separator and a trailing room, neither of which is a schedule.
+        for (utterance, entity, action) in [
+            ("set the thermostat to 68", "thermostat", "set_temperature"),
+            (
+                "set the thermostat to 68 in the den",
+                "thermostat",
+                "set_temperature",
+            ),
+            ("set the oven to 400 degrees", "oven", "set_temperature"),
+            ("preheat the oven to 350", "oven", "set_temperature"),
+            ("set the lights to 40 percent", "lights", "set_brightness"),
+            (
+                "set the bedroom lamp to 30 percent",
+                "bedroom lamp",
+                "set_brightness",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["action"], action, "{utterance:?}");
+        }
     }
 
     #[test]
