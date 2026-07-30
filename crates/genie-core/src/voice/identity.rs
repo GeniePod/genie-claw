@@ -352,11 +352,19 @@ fn read_wav_mono_f32(path: &Path) -> anyhow::Result<WavAudio> {
             data[offset + 7],
         ]) as usize;
         let chunk_start = offset + 8;
-        let chunk_end = chunk_start.saturating_add(chunk_size).min(data.len());
+        // Bytes actually present, which is what the reads below may rely on --
+        // a chunk header can declare more than the file contains.
+        let present = data.len() - chunk_start;
+        let chunk_end = chunk_start + chunk_size.min(present);
 
         match chunk_id {
             b"fmt " => {
-                if chunk_size < 16 || chunk_end > data.len() {
+                // Every field below is read at a fixed offset within the first
+                // 16 bytes, so require that many to be present rather than
+                // merely declared. Clamping `chunk_end` to the file length made
+                // the old `chunk_end > data.len()` guard unreachable, so a
+                // truncated `fmt ` chunk indexed past the end and panicked.
+                if chunk_size < 16 || present < 16 {
                     anyhow::bail!("invalid WAV fmt chunk");
                 }
                 audio_format = Some(u16::from_le_bytes([
@@ -828,5 +836,41 @@ mod tests {
         wav.extend_from_slice(&data_size.to_le_bytes());
         wav.extend_from_slice(&pcm);
         std::fs::write(path, wav).unwrap();
+    }
+
+    /// A `fmt ` chunk that declares 16 bytes but is truncated by the end of the
+    /// file must be rejected, not indexed past the end. The old guard compared
+    /// an already-clamped `chunk_end` against the file length, so it could never
+    /// fire and this input panicked with an out-of-bounds index.
+    #[test]
+    fn truncated_fmt_chunk_is_rejected_without_panicking() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RIFF");
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(b"WAVE");
+        data.extend_from_slice(b"JUNK");
+        data.extend_from_slice(&10u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 10]);
+        data.extend_from_slice(b"fmt ");
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 6]);
+        assert_eq!(data.len(), 44, "must clear the >= 44 byte length gate");
+
+        let dir = std::env::temp_dir().join(format!("genie-wav-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("truncated.wav");
+        std::fs::write(&path, &data).unwrap();
+
+        let result = read_wav_mono_f32(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Assert the specific rejection: any `Err` would also be produced by the
+        // later "expected 16-bit PCM" bail if the chunk were skipped rather than
+        // rejected, which would not exercise this guard.
+        let error = result.expect_err("a truncated fmt chunk must be an error");
+        assert!(
+            error.to_string().contains("invalid WAV fmt chunk"),
+            "expected the fmt-chunk rejection, got: {error}"
+        );
     }
 }
