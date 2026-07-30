@@ -3973,6 +3973,14 @@ fn asks_current_time(text: &str) -> bool {
     // the " right now" / " now" STATUS_SUFFIXES off a home_status entity.
     // Politeness comes off before the time qualifier so the two compose in the
     // natural spoken order ("what time is it right now please").
+    //
+    // A *leading* "please" is the same politeness and was missing: the set is
+    // exact, so "please what time is it" / "please tell me the date" fell
+    // through even though the trailing forms already route. Mirror scene/
+    // routine and shopping-list, which strip a leading "please" for the same
+    // reason. Leading comes off first so it composes with the trailing tails
+    // ("please what time is it right now please").
+    let text = text.strip_prefix("please ").unwrap_or(text);
     let text = text.trim_end_matches(" please").trim_end();
     let text = text
         .strip_suffix(" right now")
@@ -6819,6 +6827,38 @@ mod tests {
                 "{utterance:?} must not route to get_time"
             );
         }
+    }
+
+    #[test]
+    fn time_question_accepts_a_leading_please() {
+        // Trailing "please" is already stripped above. A leading "please" was
+        // not: the set is exact, so polite forms fell through to the LLM even
+        // though their non-"please" / trailing-"please" versions already route.
+        for utterance in [
+            "Please what time is it?",
+            "Please what's the time?",
+            "Please tell me the time",
+            "Please current time",
+            "Please what date is it?",
+            "Please tell me the date",
+            "Please today's date",
+            "Please what day is it?",
+            // Leading politeness composes with the trailing tails.
+            "Please what time is it right now?",
+            "Please what time is it please?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_time", "{utterance:?}");
+        }
+
+        // Negatives still abstain / stay off get_time: stripping "please" must
+        // not invent a clock reading for an unrelated polite request.
+        assert!(route("please help me").is_none());
+        assert!(
+            route("please what time does the store close")
+                .map(|call| call.name != "get_time")
+                .unwrap_or(true)
+        );
     }
 
     #[test]
