@@ -4,6 +4,11 @@
 
 ### Quick-router tool-call accuracy
 
+- **Scene / routine**: strip a leading `please` before the exact-match set and
+  the `activate`/`start`/`run` prefix loop, so polite forms
+  (`please activate the movie scene`, `please goodnight`, `please I am home`)
+  route the same as their non-`please` counterparts — trailing `please` was
+  already handled inside the loop (#894).
 - **Shopping list**: accept the article-less list suffix on removals
   (`take milk off shopping list` / `remove eggs from shopping list`), matching
   the add path — previously only the articled `off/from the shopping list`
@@ -12,6 +17,15 @@
   `what's the weather in Paris please` geocodes `paris`, not `paris please` —
   mirroring the other paths that already drop it. Covers both the weather and
   `will it rain in <city>` branches (#758).
+
+### Performance
+
+- **Semantic recall**: read the semantic type stamped on each embedded memory
+  at embed time (`embedded_memories.memory_type`) for the same-type score boost
+  instead of re-running the `semantic_memory_type` cascade on every row of every
+  typed recall — a content lowercase plus a few-hundred-branch substring cascade
+  per embedded memory per query becomes a column read. `DERIVATION_VERSION` is
+  bumped so existing databases restamp their embedded rows once on open.
 
 ## 1.0.0-rc.4 - 2026-07-13
 
