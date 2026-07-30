@@ -2520,15 +2520,26 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("speed limit".into());
     }
 
-    if text.contains("water pressure") {
+    // The bare-appliance branches below key on an appliance noun phrase alone
+    // ("water pressure", "sump pump", ...). Unlike the multi-word household-
+    // scenario phrases above, a *command* can plausibly contain the noun —
+    // "remind me to check the water pressure", "remind me to buy a baby
+    // monitor" — and keying on the noun alone hijacked those writes into a
+    // status *read*: the router answered with a device report instead of
+    // abstaining so the LLM can set the reminder. Require a status-question
+    // shape, exactly as the iron block below already does: the standard gate,
+    // plus the "did ..." form the gate prefixes do not cover.
+    let status_shaped = looks_like_status_query(text) || text.starts_with("did ");
+
+    if status_shaped && text.contains("water pressure") {
         return Some("water pressure".into());
     }
 
-    if text.contains("sump pump") {
+    if status_shaped && text.contains("sump pump") {
         return Some("sump pump".into());
     }
 
-    if text.contains("sous vide") {
+    if status_shaped && text.contains("sous vide") {
         return Some("sous vide".into());
     }
 
@@ -2550,7 +2561,7 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("printer ink".into());
     }
 
-    if text.contains("baby monitor") {
+    if status_shaped && text.contains("baby monitor") {
         return Some("baby monitor".into());
     }
 
@@ -2603,7 +2614,12 @@ fn home_status_target(text: &str) -> Option<String> {
         return Some("iron".into());
     }
 
-    if text.contains("water") && text.contains("hot") {
+    // "how hot is the water" is a genuine water-heater reading whose "how "
+    // prefix none of the gate shapes cover, so admit it alongside them here.
+    if (status_shaped || text.starts_with("how hot "))
+        && text.contains("water")
+        && text.contains("hot")
+    {
         return Some("water heater".into());
     }
 
@@ -5747,6 +5763,41 @@ mod tests {
         let call = route("Jared: What's the current water pressure?").unwrap();
         assert_eq!(call.name, "home_status");
         assert_eq!(call.arguments["entity"], "water pressure");
+    }
+
+    #[test]
+    fn bare_appliance_status_needs_a_status_shaped_question() {
+        // Commands that merely *contain* the appliance noun must abstain so the
+        // LLM can ground the write; on `main` each emitted a home_status read
+        // ("remind me to test the sump pump" answered with the sump-pump
+        // report instead of setting a reminder).
+        for utterance in [
+            "Remind me to check the water pressure",
+            "Remind me to test the sump pump",
+            "Remind me to buy a baby monitor",
+            "Remind me to buy a sous vide",
+            "How do I cook sous vide?",
+            "Remind me to buy hot water bottles",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} is a command, not a status question — it must abstain"
+            );
+        }
+
+        // Genuine status-shaped questions still resolve to the same entities.
+        for (utterance, entity) in [
+            ("Check the water pressure", "water pressure"),
+            ("Is the sump pump running?", "sump pump"),
+            ("Is the sous vide on?", "sous vide"),
+            ("Is the baby monitor on?", "baby monitor"),
+            ("Is the water hot?", "water heater"),
+            ("How hot is the water?", "water heater"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
     }
 
     #[test]
