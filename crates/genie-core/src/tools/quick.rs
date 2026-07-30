@@ -429,6 +429,24 @@ fn note_recall_query_from_original(original: &str) -> Option<String> {
 /// device, timer, and list deletions ("delete the alarm") keep their own routes,
 /// and a bare "forget it"/"forget that" abstains for the LLM.
 fn memory_forget_query(text: &str) -> Option<String> {
+    // A leading "please" is politeness, not part of the command. The prefix loop
+    // below is anchored at token 0 and only ever stripped a *trailing* "please",
+    // so "please forget the wifi password" matched no prefix.
+    //
+    // Unlike the sibling leading-"please" gaps, missing here does not abstain.
+    // `route` falls straight through to memory_recall_query, whose household /
+    // note / semantic matchers are `contains`-based, so the utterance was claimed
+    // by recall and the router emitted memory_recall{query: "please forget the
+    // wifi password"} — a delete request answered as a lookup, with the
+    // politeness token baked into a query that matches no stored fact. The user
+    // hears the secret read back, gets a plausible answer, and never learns the
+    // delete did not happen.
+    //
+    // Mirrors scene_or_routine_activation_request and play_media_request. The
+    // bare-pronoun abstention and the trailing-"please" trim inside the loop are
+    // unchanged, so "please forget about it" still abstains.
+    let text = text.strip_prefix("please ").unwrap_or(text);
+
     // Prefixes are longest-first; the first match wins so that, e.g.,
     // "forget about it" resolves on "forget about " (a bare-pronoun remainder ->
     // abstain) rather than falling through to "forget " and yielding "about it".
@@ -4072,6 +4090,59 @@ mod tests {
             let call = route(utterance).unwrap_or_else(|| panic!("{utterance} should route"));
             assert_eq!(call.name, "memory_forget", "{utterance}");
             assert_eq!(call.arguments["query"], query, "{utterance}");
+        }
+    }
+
+    #[test]
+    fn forget_command_accepts_a_leading_please() {
+        // The prefix loop is anchored at token 0 and only stripped a *trailing*
+        // "please", so the polite form matched no prefix. Missing here does not
+        // abstain: memory_recall_query runs next and its matchers are
+        // `contains`-based, so a delete request was answered as a lookup —
+        // memory_recall{query: "please forget the wifi password"} — reading the
+        // secret back instead of erasing it, with no signal to the user.
+        for (utterance, query) in [
+            ("please forget the wifi password", "wifi password"),
+            (
+                "please forget my old locker combination",
+                "old locker combination",
+            ),
+            ("please forget my age", "age"),
+            (
+                "please forget about my dentist appointment",
+                "dentist appointment",
+            ),
+            ("please delete what you know about my car", "my car"),
+            (
+                "please delete the note about the spare key",
+                "the spare key",
+            ),
+            // Leading and trailing politeness together.
+            ("please forget the wifi password please", "wifi password"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "memory_forget", "{utterance:?}");
+            assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
+
+        // The polite form is identical to the bare form, not merely non-empty.
+        for utterance in ["forget the wifi password", "forget my age"] {
+            let bare = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            let polite = route(&format!("please {utterance}"))
+                .unwrap_or_else(|| panic!("no route for polite {utterance:?}"));
+            assert_eq!(bare.name, polite.name, "{utterance:?}");
+            assert_eq!(bare.arguments, polite.arguments, "{utterance:?}");
+        }
+
+        // The bare-pronoun abstention still holds under a leading "please" —
+        // stripping politeness must not turn an unresolvable referent into a
+        // delete of the literal word.
+        for utterance in [
+            "please forget it",
+            "please forget that",
+            "please forget about it",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
         }
     }
 
