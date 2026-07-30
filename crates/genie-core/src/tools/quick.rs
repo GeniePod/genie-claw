@@ -2855,6 +2855,23 @@ fn home_status_target(text: &str) -> Option<String> {
 }
 
 fn timer_request(text: &str) -> Option<(u64, String)> {
+    // A leading "please" is politeness, not part of the command. The gate below
+    // mixes a substring test with two prefix tests, so the same token was
+    // harmless on one arm and fatal on the others: "please set a timer for 10
+    // minutes" routed (it still contains "timer") while "please remind me to
+    // check the pasta in 5 minutes" fell through to the LLM entirely.
+    //
+    // The strip has to precede `reminder_style` too, not just the gate. That
+    // flag is derived from the same two prefixes and selects the task-first
+    // label scan, so a `please`-prefixed reminder that squeaked past the gate on
+    // the "timer" arm would still be labelled "timer" instead of "check the
+    // pasta" — a silently degraded reminder rather than an absent one.
+    //
+    // Mirrors scene_or_routine_activation_request, play_media_request, and
+    // shopping_list_add_request; the trailing-"please" label trim below is
+    // unaffected.
+    let text = text.strip_prefix("please ").unwrap_or(text);
+
     if !(text.contains("timer") || text.starts_with("remind me ") || text.starts_with("remind us "))
     {
         return None;
@@ -6937,6 +6954,61 @@ mod tests {
         // A bare "... please" with no real label still falls to the default.
         let call = route("set a timer for 10 minutes for please").unwrap();
         assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn reminder_accepts_a_leading_please() {
+        // The timer gate mixes a substring test ("timer") with two prefix tests
+        // ("remind me "/"remind us "), so a leading "please" was harmless on one
+        // arm and fatal on the others — the polite reminder forms fell through to
+        // the LLM. The label must survive too: reminder_style is derived from the
+        // same two prefixes and selects the task-first scan, so a stripped-too-
+        // late fix would yield the generic "timer" label instead of the task.
+        for (utterance, seconds, label) in [
+            (
+                "please remind me to check the pasta in 5 minutes",
+                300,
+                "check the pasta",
+            ),
+            (
+                "please remind me to take the trash out in 20 minutes",
+                1200,
+                "take the trash out",
+            ),
+            ("please remind us to leave in 10 minutes", 600, "leave"),
+            (
+                "please remind me in 5 minutes to check the oven",
+                300,
+                "check the oven",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "set_timer", "{utterance:?}");
+            assert_eq!(call.arguments["seconds"], seconds, "{utterance:?}");
+            assert_eq!(call.arguments["label"], label, "{utterance:?}");
+        }
+
+        // The polite form matches the bare form exactly, arm for arm.
+        for utterance in [
+            "remind me to check the pasta in 5 minutes",
+            "set a timer for 10 minutes",
+            "remind us to leave in 10 minutes",
+        ] {
+            let bare = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            let polite = route(&format!("please {utterance}"))
+                .unwrap_or_else(|| panic!("no route for polite {utterance:?}"));
+            assert_eq!(bare.name, polite.name, "{utterance:?}");
+            assert_eq!(bare.arguments, polite.arguments, "{utterance:?}");
+        }
+
+        // A polite reminder with no extractable task still defaults to
+        // "reminder", not "timer" — the fallback reads the stripped text too.
+        let call = route("please remind me in 10 minutes").expect("no route");
+        assert_eq!(call.arguments["label"], "reminder");
+
+        // Stripping "please" must not invent a timer for an utterance that has no
+        // duration to parse.
+        assert!(route("please remind me to buy milk").is_none());
     }
 
     #[test]
