@@ -2025,7 +2025,6 @@ fn setpoint_has_schedule_or_condition(rest: &str) -> bool {
         || scoped.contains(" when ")
         || scoped.contains(" unless ")
         || scoped.contains(" if ")
-        || scoped.contains(" and ")
     {
         return true;
     }
