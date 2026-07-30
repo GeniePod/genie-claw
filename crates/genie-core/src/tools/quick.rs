@@ -2256,6 +2256,8 @@ fn asks_action_history(text: &str) -> bool {
         &[
             "what did you do",
             "what have you done",
+            "what did you change",
+            "what have you changed",
             "what changed",
             "recent actions",
             "recent home actions",
@@ -6760,6 +6762,21 @@ mod tests {
     fn routes_action_history_questions() {
         let call = route("what did you do?").unwrap();
         assert_eq!(call.name, "action_history");
+    }
+
+    #[test]
+    fn routes_change_verb_action_history_questions() {
+        // the transitive change-verb pair ("what did/have you change(d)") is the
+        // counterpart of the do-verb pair already in the set — the assistant
+        // reporting what it altered — but fell through to the LLM.
+        for utterance in [
+            "what did you change",
+            "What have you changed?",
+            "Jared: What did you change?",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "action_history", "{utterance:?}");
+        }
     }
 
     #[test]
