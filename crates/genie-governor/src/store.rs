@@ -5,10 +5,33 @@ use std::path::Path;
 
 /// SQLite store for tegrastats history and mode transitions.
 ///
-/// Retains 24 hours of 5-second samples (~17,280 rows/day).
-/// Older rows pruned on startup and every hour.
+/// Both tables are bounded by [`Store::prune`], which runs on startup and every
+/// hour: 24 hours of 5-second samples (~17,280 rows/day) and 30 days of mode
+/// transitions.
 pub struct Store {
     conn: Connection,
+}
+
+/// Retention for 5-second `tegrastats` samples.
+const TEGRASTATS_RETENTION_MS: u64 = 24 * 3600 * 1000;
+
+/// Retention for mode transitions. They arrive orders of magnitude more slowly
+/// than samples — tens per day rather than thousands — and the history is what
+/// makes mode flapping diagnosable after the fact, so they are kept longer while
+/// still being bounded.
+const MODE_TRANSITION_RETENTION_MS: u64 = 30 * 24 * 3600 * 1000;
+
+/// Rows removed by one [`Store::prune`] pass, per table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneCounts {
+    pub tegrastats: usize,
+    pub mode_transitions: usize,
+}
+
+impl PruneCounts {
+    pub fn total(self) -> usize {
+        self.tegrastats + self.mode_transitions
+    }
 }
 
 impl Store {
@@ -79,17 +102,37 @@ impl Store {
         Ok(())
     }
 
-    /// Remove rows older than 24 hours.
-    pub fn prune(&self) -> Result<usize> {
-        let cutoff_ms = now_ms().saturating_sub(24 * 3600 * 1000);
-        let deleted = self.conn.execute(
+    /// Remove rows past their retention window, from both tables.
+    ///
+    /// `mode_transitions` previously grew without bound: nothing ever deleted
+    /// from it, so a long-running device accumulated one row per transition for
+    /// the life of the install even though this type documented pruning. Under
+    /// memory-pressure flapping a transition can be recorded on every 5-second
+    /// tick, so the table's growth rate is not inherently lower than the sample
+    /// table's — only its typical rate is.
+    pub fn prune(&self) -> Result<PruneCounts> {
+        let now = now_ms();
+        let tegrastats = self.conn.execute(
             "DELETE FROM tegrastats WHERE ts_ms < ?1",
-            rusqlite::params![cutoff_ms],
+            rusqlite::params![now.saturating_sub(TEGRASTATS_RETENTION_MS)],
         )?;
-        if deleted > 0 {
-            tracing::debug!(deleted, "pruned old tegrastats rows");
+        let mode_transitions = self.conn.execute(
+            "DELETE FROM mode_transitions WHERE ts_ms < ?1",
+            rusqlite::params![now.saturating_sub(MODE_TRANSITION_RETENTION_MS)],
+        )?;
+
+        let counts = PruneCounts {
+            tegrastats,
+            mode_transitions,
+        };
+        if counts.total() > 0 {
+            tracing::debug!(
+                tegrastats = counts.tegrastats,
+                mode_transitions = counts.mode_transitions,
+                "pruned governor history"
+            );
         }
-        Ok(deleted)
+        Ok(counts)
     }
 }
 
