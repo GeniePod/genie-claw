@@ -240,7 +240,18 @@ pub(crate) fn extract_host(url: &str) -> String {
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
 
-    let authority = stripped.split('/').next().unwrap_or(stripped);
+    // The authority ends at the first '/', '?', '#', or '\'. Splitting on '/'
+    // alone left a query or fragment attached, and the userinfo strip below then
+    // read *into* it: "http://evil.com#@127.0.0.1" and "http://evil.com?@127.0.0.1"
+    // both yielded the host "127.0.0.1", so a remote endpoint passed both the
+    // inference-route SSRF check and the web-search egress guard. A backslash is
+    // included because WHATWG treats it as a path separator for http(s), which is
+    // how reqwest's URL parser resolves it — "http://127.0.0.1\@evil.com" really
+    // does connect to 127.0.0.1, and the old split reported "evil.com".
+    let authority = stripped
+        .split(['/', '?', '#', '\\'])
+        .next()
+        .unwrap_or(stripped);
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
     let host = if let Some(rest) = host_port.strip_prefix('[') {
         rest.find(']')
@@ -293,6 +304,30 @@ mod tests {
         assert!(validate_inference_route("http://127.evil.com:8080/v1").is_err());
         assert!(validate_inference_route("http://127.0.0.1.attacker.com:8080/v1").is_err());
         assert!(validate_inference_route("http://localhost.evil.com:8080/v1").is_err());
+    }
+
+    #[test]
+    fn reject_remote_host_hidden_behind_a_query_fragment_or_backslash() {
+        // The authority used to be split on '/' only, so a query or fragment
+        // stayed attached and the userinfo strip read into it — the '@' inside
+        // the fragment made "127.0.0.1" look like the host. Both the SSRF check
+        // here and the web-search egress guard accepted these.
+        assert!(validate_inference_route("http://evil.com#@127.0.0.1").is_err());
+        assert!(validate_inference_route("http://evil.com?@127.0.0.1").is_err());
+        assert!(validate_inference_route("http://evil.com\\@127.0.0.1").is_err());
+        assert!(validate_inference_route("http://evil.com?next=@localhost").is_err());
+        assert_eq!(extract_host("http://evil.com#@127.0.0.1"), "evil.com");
+
+        // A backslash is a path separator for http(s) under WHATWG, which is how
+        // reqwest resolves it: this really does connect to 127.0.0.1, so it must
+        // be accepted rather than misread as "evil.com" and rejected.
+        assert!(validate_inference_route("http://127.0.0.1\\@evil.com").is_ok());
+        assert_eq!(extract_host("http://127.0.0.1\\@evil.com"), "127.0.0.1");
+
+        // Genuine userinfo in the authority still resolves to the real host.
+        assert!(validate_inference_route("http://user:pass@[::1]:8080").is_ok());
+        assert!(validate_inference_route("http://user@localhost").is_ok());
+        assert!(validate_inference_route("http://localhost:1@evil.com/v1").is_err());
     }
 
     #[test]

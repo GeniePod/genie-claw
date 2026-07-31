@@ -755,6 +755,11 @@ mod tests {
             "http://127.0.0.1@evil.com/search",
             "http://127.0.0.1:8888@evil.com",
             "https://searx.example.com",
+            // The loopback text sits in a query, fragment, or backslash-delimited
+            // path — the authority is still evil.com.
+            "http://evil.com#@127.0.0.1",
+            "http://evil.com?@127.0.0.1",
+            "http://evil.com\\@127.0.0.1",
         ] {
             assert!(!is_local_base_url(url), "{url:?} must not count as local");
         }
