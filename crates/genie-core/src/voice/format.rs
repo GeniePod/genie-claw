@@ -203,11 +203,30 @@ const MIN_SENTENCE_CHARS: usize = 5;
 /// Common abbreviations whose trailing `.` is part of the token, not a sentence
 /// end, even when followed by a space. Stored lowercased and without the final
 /// dot; internal dots (e.g. `p.m`, `u.s.a`) are kept so the whole token matches.
+///
+/// Entries here are matched case-insensitively, so they must not collide with
+/// an ordinary English word — see [`CAPITALIZED_ABBREVIATIONS`] for the ones
+/// that do.
 const ABBREVIATIONS: &[&str] = &[
     "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "rev", "gen", "sen", "rep", "gov", "pres",
-    "vs", "etc", "inc", "ltd", "co", "corp", "llc", "dept", "est", "approx", "vol", "no", "fig",
-    "e.g", "i.e", "a.m", "p.m", "u.s", "u.k", "u.s.a",
+    "vs", "etc", "inc", "ltd", "co", "corp", "llc", "dept", "est", "approx", "vol", "e.g", "i.e",
+    "a.m", "p.m", "u.s", "u.k", "u.s.a",
 ];
+
+/// Abbreviations that are spelled the same as an ordinary English word and are
+/// therefore matched **case-sensitively**, in their canonical capitalized form.
+///
+/// `No.` is the number sign and `Fig.` is a figure reference; lowercase `no`
+/// and `fig` are the everyday words, and those genuinely do end sentences. With
+/// them in the case-insensitive list above, `ends_with_abbreviation("The answer
+/// is no.")` returned true, so the clause never closed — the sentence cap in
+/// [`truncate_for_voice`] silently over-ran, and `SentenceStreamer` (which
+/// shares this helper) held the clause back instead of flushing it to TTS.
+///
+/// A sentence-initial `No.` is still not split out on its own, but that is
+/// `MIN_SENTENCE_CHARS` doing the work — a 3-char clause is below the floor in
+/// both callers and merges into the next one regardless.
+const CAPITALIZED_ABBREVIATIONS: &[&str] = &["No", "Fig"];
 
 /// Truncate to at most `max_sentences` sentences for voice output.
 ///
@@ -297,6 +316,11 @@ pub(crate) fn ends_with_abbreviation(current: &str) -> bool {
     if last_token.is_empty() {
         return false;
     }
+    // Case-sensitive first: `No.`/`Fig.` are abbreviations, `no.`/`fig.` are
+    // words. Shouted forms (`NO.`) are the word too, so they close normally.
+    if CAPITALIZED_ABBREVIATIONS.contains(&last_token) {
+        return true;
+    }
     let lowered = last_token.to_ascii_lowercase();
     ABBREVIATIONS.contains(&lowered.as_str())
 }
@@ -319,4 +343,63 @@ fn clean_for_tts(text: &str) -> String {
     }
 
     result.replace("'s", "s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_word_no_is_not_an_abbreviation() {
+        // "no" was in the case-insensitive abbreviation list for the number sign
+        // "No.", so a clause ending in the ordinary word never closed. Both voice
+        // paths share this helper, so the damage was two-sided: the sentence cap
+        // over-ran here, and SentenceStreamer withheld the clause from TTS.
+        assert!(!ends_with_abbreviation("The answer is no."));
+        assert!(!ends_with_abbreviation("I said no."));
+        assert!(!ends_with_abbreviation("I ate a fig."));
+        // Shouting is still the word, not the number sign.
+        assert!(!ends_with_abbreviation("The answer is NO."));
+
+        // The canonical capitalized forms stay abbreviations.
+        assert!(ends_with_abbreviation("See No."));
+        assert!(ends_with_abbreviation("Refer to Fig."));
+
+        // Every other abbreviation keeps its case-insensitive match.
+        for clause in ["Ask Dr.", "ask dr.", "at 5 p.m.", "Acme Corp.", "e.g."] {
+            assert!(ends_with_abbreviation(clause), "{clause:?}");
+        }
+        // And ordinary words still close.
+        for clause in ["The lights are off.", "It is warm."] {
+            assert!(!ends_with_abbreviation(clause), "{clause:?}");
+        }
+    }
+
+    #[test]
+    fn a_clause_ending_in_no_counts_against_the_sentence_cap() {
+        // The cap is 3 sentences. With "no." swallowed as an abbreviation the
+        // first two clauses fused into one, so a fourth sentence slipped through
+        // — the identical text with "yes" truncated correctly, which is what
+        // makes this a bug rather than a wording preference.
+        let with_no =
+            for_voice("The answer is no. The lights are off. I checked the kitchen. And the hall.");
+        let with_yes = for_voice(
+            "The answer is yes. The lights are off. I checked the kitchen. And the hall.",
+        );
+        assert!(!with_no.contains("And the hall"), "got: {with_no}");
+        assert!(!with_yes.contains("And the hall"), "got: {with_yes}");
+        assert_eq!(
+            with_no.replace("no.", "yes."),
+            with_yes,
+            "\"no\" and \"yes\" must truncate identically"
+        );
+    }
+
+    #[test]
+    fn a_number_sign_still_does_not_split() {
+        // "See No. 5 below." is one sentence — the regression this guards is
+        // fixing the word by deleting the abbreviation outright.
+        let out = for_voice("See No. 5 below. That is the part you want. Nothing else matters.");
+        assert!(out.contains("See No. 5 below."), "got: {out}");
+    }
 }
