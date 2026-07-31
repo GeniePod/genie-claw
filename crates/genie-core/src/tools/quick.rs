@@ -6469,8 +6469,19 @@ mod tests {
             "calendar event: dentist appointment on friday"
         );
 
+        // the "an" prefix branch must route the same as "a".
+        let call = route("I've got an appointment on Monday").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "reminders");
+
         // a non-appointment "i've got" is not a calendar event and still abstains.
-        assert!(route("I've got a cold").is_none());
+        for utterance in [
+            "I've got a cold",
+            "I've got a question for you",
+            "I've got an idea",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
     }
 
     #[test]
