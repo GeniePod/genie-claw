@@ -351,6 +351,54 @@ mod tests {
     }
 
     #[test]
+    fn each_added_plural_needle_carries_its_own_transcript() {
+        // Bounding both sides cost the plural forms that prefix matching used to
+        // cover for free, so they were added back explicitly. Each one needs a
+        // transcript where it is the *only* needle present, otherwise a typo in
+        // the list would go unnoticed — "the timer in the kitchen" would pass on
+        // "kitchen" alone.
+        //
+        // Every line below is >= 9 words and starts with an article, so it
+        // reaches the ambient check; the paired control differs only in the
+        // needle word and must reject. That difference is the proof.
+        const CONTROL: &str = "the clock in the hallway went off again this morning somehow";
+        assert_eq!(
+            assess_transcript(CONTROL),
+            VoiceIntentDecision::Reject("ambient narration"),
+            "control must reject, or the cases below prove nothing"
+        );
+
+        for needle in ["timer", "timers", "alarms", "reminders"] {
+            let text = CONTROL.replace("clock", needle);
+            assert_eq!(
+                assess_transcript(&text),
+                VoiceIntentDecision::Accept,
+                "{needle:?} must be the sole reason this accepts"
+            );
+        }
+
+        const CONTROL_2: &str =
+            "the radiators in the hallway were replaced again this morning somehow";
+        assert_eq!(
+            assess_transcript(CONTROL_2),
+            VoiceIntentDecision::Reject("ambient narration")
+        );
+        for needle in ["thermostats", "lights"] {
+            let text = CONTROL_2.replace("radiators", needle);
+            assert_eq!(
+                assess_transcript(&text),
+                VoiceIntentDecision::Accept,
+                "{needle:?} must be the sole reason this accepts"
+            );
+        }
+
+        // And the singulars still do not match their own plurals, which is what
+        // makes the explicit entries necessary rather than redundant.
+        assert!(!contains_word_or_phrase("the alarms went off", "alarm"));
+        assert!(!contains_word_or_phrase("the timers went off", "timer"));
+    }
+
+    #[test]
     fn word_boundary_matcher_rejects_prefixes_and_accepts_punctuation() {
         assert!(contains_word_or_phrase("turn on the lights.", "lights"));
         assert!(contains_word_or_phrase("hey, genie", "genie"));
@@ -369,6 +417,13 @@ mod tests {
         ));
         assert!(!contains_word_or_phrase("the musical was long", "music"));
         assert!(!contains_word_or_phrase("", "play"));
+
+        // The empty-*needle* guard, which is a different branch from the
+        // empty-text case above. Without it, `match_indices("")` yields a match
+        // at every position and every needle would appear to be present.
+        assert!(!contains_word_or_phrase("turn on the lights", ""));
+        assert!(!contains_word_or_phrase("", ""));
+        assert!(!contains_any_word("turn on the lights", &[""]));
 
         // A later, properly-bounded occurrence still wins over an earlier
         // embedded one — the scan must not stop at the first rejected match.
