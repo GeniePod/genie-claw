@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Reliability
+
+- **STT (whisper-server)**: bound the HTTP response reader (shared
+  `read_response` limits + connect/request deadlines), require 2xx, and fail
+  closed on non-JSON bodies so a broken whisper-server cannot OOM the voice
+  loop or be spoken as a transcript (#936).
+
 ### Quick-router tool-call accuracy
 
 - **Scene / routine**: strip a leading `please` before the exact-match set and
