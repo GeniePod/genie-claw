@@ -1228,7 +1228,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nX-Overflow: "
                 .iter()
                 .copied()
-                .chain(std::iter::repeat(b'a').take(9 * 1024))
+                .chain(std::iter::repeat_n(b'a', 9 * 1024))
                 .chain(b"\r\n\r\n{}\r\n".iter().copied())
                 .collect::<Vec<_>>(),
         ));
