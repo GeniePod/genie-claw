@@ -358,8 +358,13 @@ mod tests {
         assert!(!ends_with_abbreviation("The answer is no."));
         assert!(!ends_with_abbreviation("I said no."));
         assert!(!ends_with_abbreviation("I ate a fig."));
-        // Shouting is still the word, not the number sign.
+        // Shouting is still the word, not the number sign — for both entries,
+        // since the case-sensitive list is matched verbatim and neither "NO"
+        // nor "FIG" is the canonical form.
         assert!(!ends_with_abbreviation("The answer is NO."));
+        assert!(!ends_with_abbreviation("I ate a FIG."));
+        // Mixed case is not the canonical form either.
+        assert!(!ends_with_abbreviation("The answer is nO."));
 
         // The canonical capitalized forms stay abbreviations.
         assert!(ends_with_abbreviation("See No."));
