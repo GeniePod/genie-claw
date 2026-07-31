@@ -6337,6 +6337,27 @@ mod tests {
     }
 
     #[test]
+    fn priority_home_control_accepts_a_leading_please() {
+        // priority_home_control_request is the second entry point, and it runs
+        // *before* the scene matcher, so it needs its own coverage. Most of its
+        // arms are `contains` tests that survive a leading token, but these two
+        // are exact matches that do not — they are the only reason the strip is
+        // needed there, so they are what has to be pinned. "warm up the car" is
+        // the other such arm but is unreachable on main too (its action does not
+        // survive canonicalize_household_action), so there is nothing for a
+        // leading "please" to change there.
+        let call = route("please run movie night").expect("no route");
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "movie night");
+        assert_eq!(call.arguments["action"], "activate");
+
+        // The polite form matches the bare form exactly, arguments included.
+        let bare = route("run movie night").expect("no route");
+        assert_eq!(bare.name, call.name);
+        assert_eq!(bare.arguments, call.arguments);
+    }
+
+    #[test]
     fn turn_command_matches_fan_as_a_whole_word_not_a_substring() {
         // The fan/fireplace gate used `entity.contains("fan")`, so a device whose
         // NAME merely contains those letters ("infant monitor", the "Infant
