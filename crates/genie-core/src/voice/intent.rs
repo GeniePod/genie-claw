@@ -79,31 +79,42 @@ fn looks_like_direct_request(text: &str) -> bool {
                 "text ",
             ],
         )
-        || contains_any(
+        // Whole words/phrases, not prefixes. These needles used to carry a
+        // leading space and nothing on the right, so each one also matched the
+        // head of a longer, unrelated word: " music" fired on "musical",
+        // " alarm" on "alarming", " assistant" on "assistants", " lights" on
+        // "lightsaber". Ordinary room chatter was then classified as a direct
+        // request and forwarded to the LLM — the exact cost the ambient filter
+        // exists to avoid. Plural forms that really are commands are listed
+        // explicitly rather than falling out of prefix matching.
+        || contains_any_word(
             text,
             &[
-                " genie",
-                " jarvis",
-                " assistant",
-                " lights",
-                " light ",
-                " thermostat",
-                " temperature",
-                " home assistant",
-                " music",
-                " tv",
-                " volume",
-                " alarm",
-                " reminder",
-                " kitchen",
-                " bedroom",
-                " living room",
-                " garage",
-                " front door",
-                " weather",
-                " time is it",
-                " status",
-                " search the web",
+                "genie",
+                "jarvis",
+                "assistant",
+                "light",
+                "lights",
+                "thermostat",
+                "thermostats",
+                "temperature",
+                "home assistant",
+                "music",
+                "tv",
+                "volume",
+                "alarm",
+                "alarms",
+                "reminder",
+                "reminders",
+                "kitchen",
+                "bedroom",
+                "living room",
+                "garage",
+                "front door",
+                "weather",
+                "time is it",
+                "status",
+                "search the web",
             ],
         )
 }
@@ -117,27 +128,33 @@ fn looks_like_ambient_narration(text: &str, words: usize) -> bool {
             ],
         )
         && !text.ends_with('?')
-        && !contains_any(
+        // Whole words, not prefixes. #854 gave "turn"/"set"/"play"/"search" a
+        // leading space so "sunset"/"returned" stopped defeating the filter,
+        // but left the right-hand side open, so the mirror-image words still
+        // did: "the playground was empty…" matched " play", "the turnout was
+        // low…" matched " turn", "the setback in negotiations…" matched " set",
+        // "the crowd remembered…" matched "remember". Bounding both sides
+        // closes the class instead of one half of it. Command-bearing
+        // inflections that prefix matching used to cover are listed explicitly.
+        && !contains_any_word(
             text,
             &[
                 "please",
                 "can you",
                 "could you",
                 "would you",
-                // Space-prefixed so an embedded substring in ordinary narration
-                // ("sunset"/"returned"/"display"/"research") doesn't defeat the
-                // ambient filter; a real command word is always mid-sentence
-                // here (the text already starts with an article/pronoun), so it
-                // keeps a leading space. Mirrors looks_like_direct_request.
-                " turn",
-                " set",
-                " play",
-                " search",
+                "turn",
+                "set",
+                "play",
+                "search",
                 "remember",
                 "forget",
                 "weather",
                 "timer",
+                "timers",
                 "remind",
+                "reminder",
+                "reminders",
                 "assistant",
                 "genie",
                 "jarvis",
@@ -196,8 +213,37 @@ fn starts_with_any(text: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|prefix| text.starts_with(prefix))
 }
 
-fn contains_any(text: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| text.contains(needle))
+/// True when any needle occurs in `text` as a whole word or whole phrase —
+/// bounded on both sides by a non-alphanumeric character (or by the ends of the
+/// string), rather than merely appearing as a substring.
+///
+/// A plain `contains` lets an unrelated longer word stand in for a command
+/// ("playground" for "play"), and a leading space alone only closes the left
+/// half of that. `text` has already been through `normalize_transcript`, which
+/// collapses whitespace and ASCII-lowercases but deliberately keeps punctuation,
+/// so the boundary test has to accept punctuation — a space-padded needle would
+/// miss the very common "turn on the lights." and "hey, genie".
+///
+/// Boundaries are tested on bytes: every needle here is ASCII, so a match always
+/// starts and ends on a char boundary, and any adjacent non-ASCII byte is
+/// treated as a boundary (never as a letter continuing the word).
+fn contains_any_word(text: &str, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| contains_word_or_phrase(text, needle))
+}
+
+fn contains_word_or_phrase(text: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    text.match_indices(needle).any(|(start, matched)| {
+        let end = start + matched.len();
+        let left_open = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let right_open = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        left_open && right_open
+    })
 }
 
 fn word_count(text: &str) -> usize {
@@ -252,6 +298,139 @@ mod tests {
             assess_transcript("the soldiers returned from the long campaign weary and changed"),
             VoiceIntentDecision::Reject("ambient narration")
         );
+    }
+
+    #[test]
+    fn rejects_ambient_narration_whose_words_merely_start_with_a_command_word() {
+        // #854 bounded "turn"/"set"/"play"/"search" on the LEFT only, so the
+        // mirror-image words still slipped through: an ordinary word that
+        // *starts with* a command word was read as a command. Every line here is
+        // plain room chatter that reached the LLM before this fix.
+        for text in [
+            // ambient-negation needles, right-hand side
+            "the playground was empty this morning after the storm passed through",
+            "the turnout for the school concert was much smaller than last year",
+            "the setback in the negotiations was severe for everyone involved today",
+            "the crowd remembered the old song and sang along together all evening",
+            "the photo reminded her of the summer they spent beside the lake",
+            // direct-request needles
+            "the musical was wonderful and everyone loved the songs performed tonight",
+            "the alarming news about the storm kept everyone awake last night",
+            "the assistants gathered in the hall before the ceremony began today",
+        ] {
+            assert_eq!(
+                assess_transcript(text),
+                VoiceIntentDecision::Reject("ambient narration"),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_accepts_the_real_command_words_the_needles_are_for() {
+        // The boundary rule must not cost a single genuine command. Punctuation
+        // counts as a boundary — normalize_transcript keeps it, so a
+        // space-padded needle would have missed the trailing-keyword forms.
+        for text in [
+            "hey genie, dim the lights.",
+            "hey genie the lights are too bright",
+            "any word on the weather",
+            "my alarm did not go off",
+            "the timer in the kitchen",
+            "the reminder about the dentist",
+            "the thermostat is set too high in the living room",
+            "the tv is still on in the bedroom",
+            "the music in the garage is too loud right now",
+        ] {
+            assert_eq!(
+                assess_transcript(text),
+                VoiceIntentDecision::Accept,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_added_plural_needle_carries_its_own_transcript() {
+        // Bounding both sides cost the plural forms that prefix matching used to
+        // cover for free, so they were added back explicitly. Each one needs a
+        // transcript where it is the *only* needle present, otherwise a typo in
+        // the list would go unnoticed — "the timer in the kitchen" would pass on
+        // "kitchen" alone.
+        //
+        // Every line below is >= 9 words and starts with an article, so it
+        // reaches the ambient check; the paired control differs only in the
+        // needle word and must reject. That difference is the proof.
+        const CONTROL: &str = "the clock in the hallway went off again this morning somehow";
+        assert_eq!(
+            assess_transcript(CONTROL),
+            VoiceIntentDecision::Reject("ambient narration"),
+            "control must reject, or the cases below prove nothing"
+        );
+
+        for needle in ["timer", "timers", "alarms", "reminders"] {
+            let text = CONTROL.replace("clock", needle);
+            assert_eq!(
+                assess_transcript(&text),
+                VoiceIntentDecision::Accept,
+                "{needle:?} must be the sole reason this accepts"
+            );
+        }
+
+        const CONTROL_2: &str =
+            "the radiators in the hallway were replaced again this morning somehow";
+        assert_eq!(
+            assess_transcript(CONTROL_2),
+            VoiceIntentDecision::Reject("ambient narration")
+        );
+        for needle in ["thermostats", "lights"] {
+            let text = CONTROL_2.replace("radiators", needle);
+            assert_eq!(
+                assess_transcript(&text),
+                VoiceIntentDecision::Accept,
+                "{needle:?} must be the sole reason this accepts"
+            );
+        }
+
+        // And the singulars still do not match their own plurals, which is what
+        // makes the explicit entries necessary rather than redundant.
+        assert!(!contains_word_or_phrase("the alarms went off", "alarm"));
+        assert!(!contains_word_or_phrase("the timers went off", "timer"));
+    }
+
+    #[test]
+    fn word_boundary_matcher_rejects_prefixes_and_accepts_punctuation() {
+        assert!(contains_word_or_phrase("turn on the lights.", "lights"));
+        assert!(contains_word_or_phrase("hey, genie", "genie"));
+        assert!(contains_word_or_phrase("genie turn on the fan", "genie"));
+        assert!(contains_word_or_phrase(
+            "the living room lamp",
+            "living room"
+        ));
+
+        assert!(!contains_word_or_phrase("the lightsaber duel", "lights"));
+        assert!(!contains_word_or_phrase("the playground was empty", "play"));
+        assert!(!contains_word_or_phrase("the sunset was gold", "set"));
+        assert!(!contains_word_or_phrase(
+            "the soldiers returned home",
+            "turn"
+        ));
+        assert!(!contains_word_or_phrase("the musical was long", "music"));
+        assert!(!contains_word_or_phrase("", "play"));
+
+        // The empty-*needle* guard, which is a different branch from the
+        // empty-text case above. Without it, `match_indices("")` yields a match
+        // at every position and every needle would appear to be present.
+        assert!(!contains_word_or_phrase("turn on the lights", ""));
+        assert!(!contains_word_or_phrase("", ""));
+        assert!(!contains_any_word("turn on the lights", &[""]));
+
+        // A later, properly-bounded occurrence still wins over an earlier
+        // embedded one — the scan must not stop at the first rejected match.
+        assert!(contains_word_or_phrase(
+            "the playground and play music",
+            "play"
+        ));
     }
 
     #[test]
