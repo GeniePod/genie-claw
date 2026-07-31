@@ -1,8 +1,10 @@
 use anyhow::Result;
+use genie_common::http::{HttpReadError, HttpResponseLimits, read_response};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
@@ -10,6 +12,13 @@ use tokio::sync::mpsc;
 /// Long enough for real utterances on Jetson CPU fallback; short enough that a
 /// hung CUDA/NvMap child cannot wedge the single per-device voice loop forever.
 const WHISPER_CLI_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Connect / full-request deadlines for whisper-server HTTP STT (#936).
+const WHISPER_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const WHISPER_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Whisper JSON transcripts are small; a generous cap still blocks OOM from a
+/// runaway/chunked body (same class as #656 for LLM/HA clients).
+const WHISPER_SERVER_MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Run `whisper-cli` under a deadline, reaping the child on timeout via
 /// `kill_on_drop`.
@@ -342,61 +351,67 @@ impl SttEngine {
 
         let content_length = text_parts.len() + file_part.len() + wav_data.len() + body_end.len();
 
-        let stream = tokio::net::TcpStream::connect(&addr).await?;
+        let stream = match tokio::time::timeout(
+            WHISPER_SERVER_CONNECT_TIMEOUT,
+            TcpStream::connect(&addr),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!(
+                "whisper-server connect timed out after {}s",
+                WHISPER_SERVER_CONNECT_TIMEOUT.as_secs()
+            ),
+        };
         let (reader, mut writer) = stream.into_split();
 
         let request = format!(
             "POST /inference HTTP/1.1\r\nHost: {addr}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
         );
 
-        writer.write_all(request.as_bytes()).await?;
-        writer.write_all(text_parts.as_bytes()).await?;
-        writer.write_all(file_part.as_bytes()).await?;
-        writer.write_all(&wav_data).await?;
-        writer.write_all(body_end.as_bytes()).await?;
+        // Bound the write + response read the same way HA/LLM outbound clients
+        // do (#655/#656). The previous hand-rolled `read_line` loop had no
+        // line/body cap, no status check, and fail-opened non-JSON into a fake
+        // transcript (#936).
+        let language_hint = self.language_hint.clone();
+        let response = match tokio::time::timeout(WHISPER_SERVER_REQUEST_TIMEOUT, async move {
+            writer.write_all(request.as_bytes()).await?;
+            writer.write_all(text_parts.as_bytes()).await?;
+            writer.write_all(file_part.as_bytes()).await?;
+            writer.write_all(&wav_data).await?;
+            writer.write_all(body_end.as_bytes()).await?;
 
-        // Read response.
-        let mut buf_reader = BufReader::new(reader);
-        let mut response_body = String::new();
-        let mut in_body = false;
-
-        loop {
-            let mut line = String::new();
-            let n = buf_reader.read_line(&mut line).await?;
-            if n == 0 {
-                break;
+            let mut buf_reader = BufReader::new(reader);
+            let limits = HttpResponseLimits::with_body_cap(WHISPER_SERVER_MAX_BODY_BYTES);
+            let response = read_response(&mut buf_reader, &limits)
+                .await
+                .map_err(|e| match e {
+                    HttpReadError::BodyTooLarge => {
+                        anyhow::anyhow!("whisper-server response exceeded body cap")
+                    }
+                    other => anyhow::anyhow!("whisper-server response read failed: {other}"),
+                })?;
+            if response.status == 0 {
+                anyhow::bail!("whisper-server returned an invalid HTTP status line");
             }
-            if in_body {
-                response_body.push_str(&line);
-            } else if line.trim().is_empty() {
-                in_body = true;
-            }
-        }
-
-        // Parse whisper server JSON response.
-        // Format: {"text": " Hello, turn on the lights."}
-        let parsed: serde_json::Value = serde_json::from_str(response_body.trim())
-            .unwrap_or_else(|_| serde_json::json!({"text": response_body.trim()}));
-
-        let text = Self::clean_hallucinations(
-            parsed
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim(),
-        );
-        let detected_language = super::language::detect_language_from_text(&text);
-
-        Ok(Transcript {
-            text,
-            duration_ms: 0,
-            language: parsed
-                .get("language")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .or_else(|| self.language_hint.clone())
-                .or(detected_language),
+            Ok::<_, anyhow::Error>(response)
         })
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!(
+                "whisper-server request timed out after {}s",
+                WHISPER_SERVER_REQUEST_TIMEOUT.as_secs()
+            ),
+        };
+
+        transcript_from_whisper_http_response(
+            response.status,
+            &response.body,
+            language_hint.as_deref(),
+        )
     }
 
     async fn transcribe_via_cli(&self, wav_path: &str) -> Result<Transcript> {
@@ -557,6 +572,51 @@ impl SttEngine {
             tracing::info!("whisper server stopped");
         }
     }
+}
+
+/// Decode a whisper-server HTTP response into a [`Transcript`].
+///
+/// Fail-closed on non-2xx and non-JSON bodies — the previous path stuffed the
+/// raw body into `{"text": ...}`, so HTML error pages could be spoken (#936).
+fn transcript_from_whisper_http_response(
+    status: u16,
+    body: &str,
+    language_hint: Option<&str>,
+) -> Result<Transcript> {
+    if !(200..300).contains(&status) {
+        let trimmed = body.trim().replace('\n', " ");
+        anyhow::bail!(
+            "whisper-server HTTP {status}{}",
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!(": {trimmed}")
+            }
+        );
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|e| anyhow::anyhow!("whisper-server returned non-JSON body: {e}"))?;
+
+    let text = SttEngine::clean_hallucinations(
+        parsed
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim(),
+    );
+    let detected_language = super::language::detect_language_from_text(&text);
+
+    Ok(Transcript {
+        text,
+        duration_ms: 0,
+        language: parsed
+            .get("language")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| language_hint.map(str::to_string))
+            .or(detected_language),
+    })
 }
 
 /// Drain stale samples from the ALSA capture queue before a real recording.
@@ -1128,6 +1188,56 @@ mod tests {
         assert_eq!(
             SttEngine::clean_hallucinations("what's the weather like"),
             "what's the weather like"
+        );
+    }
+
+    #[test]
+    fn whisper_server_http_accepts_json_transcript() {
+        let t = transcript_from_whisper_http_response(
+            200,
+            r#"{"text":" turn on the lights.","language":"en"}"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.text, "turn on the lights.");
+        assert_eq!(t.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn whisper_server_http_rejects_non_2xx() {
+        let err = transcript_from_whisper_http_response(500, "<html>error</html>", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HTTP 500"), "{err}");
+        assert!(err.contains("html"), "{err}");
+    }
+
+    #[test]
+    fn whisper_server_http_rejects_non_json_body() {
+        // Previously fail-opened into a fake transcript of the HTML/plain body.
+        let err = transcript_from_whisper_http_response(200, "Internal Server Error", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-JSON"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn whisper_server_read_rejects_oversized_header_line() {
+        // Prove the shared bounded reader is what STT now uses: an endless
+        // header line must fail closed instead of growing without bound.
+        let mut reader = BufReader::new(tokio::io::Cursor::new(
+            b"HTTP/1.1 200 OK\r\nX-Overflow: "
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(b'a').take(9 * 1024))
+                .chain(b"\r\n\r\n{}\r\n".iter().copied())
+                .collect::<Vec<_>>(),
+        ));
+        let limits = HttpResponseLimits::with_body_cap(WHISPER_SERVER_MAX_BODY_BYTES);
+        let err = read_response(&mut reader, &limits).await.unwrap_err();
+        assert!(
+            matches!(err, HttpReadError::HeaderLineTooLong),
+            "got {err:?}"
         );
     }
 }
