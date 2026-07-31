@@ -351,19 +351,17 @@ impl SttEngine {
 
         let content_length = text_parts.len() + file_part.len() + wav_data.len() + body_end.len();
 
-        let stream = match tokio::time::timeout(
-            WHISPER_SERVER_CONNECT_TIMEOUT,
-            TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => anyhow::bail!(
-                "whisper-server connect timed out after {}s",
-                WHISPER_SERVER_CONNECT_TIMEOUT.as_secs()
-            ),
-        };
+        let stream =
+            match tokio::time::timeout(WHISPER_SERVER_CONNECT_TIMEOUT, TcpStream::connect(&addr))
+                .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => anyhow::bail!(
+                    "whisper-server connect timed out after {}s",
+                    WHISPER_SERVER_CONNECT_TIMEOUT.as_secs()
+                ),
+            };
         let (reader, mut writer) = stream.into_split();
 
         let request = format!(
@@ -1067,6 +1065,7 @@ use std::sync::Arc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[tokio::test]
     async fn write_wav_header() {
@@ -1225,7 +1224,7 @@ mod tests {
     async fn whisper_server_read_rejects_oversized_header_line() {
         // Prove the shared bounded reader is what STT now uses: an endless
         // header line must fail closed instead of growing without bound.
-        let mut reader = BufReader::new(tokio::io::Cursor::new(
+        let mut reader = BufReader::new(Cursor::new(
             b"HTTP/1.1 200 OK\r\nX-Overflow: "
                 .iter()
                 .copied()
