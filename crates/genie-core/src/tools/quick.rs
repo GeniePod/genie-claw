@@ -1367,6 +1367,8 @@ fn personal_fact_store_request(text: &str) -> Option<(&'static str, String)> {
     if let Some(rest) = text
         .strip_prefix("i have a ")
         .or_else(|| text.strip_prefix("i have an "))
+        .or_else(|| text.strip_prefix("i ve got a "))
+        .or_else(|| text.strip_prefix("i ve got an "))
         && (rest.contains("appointment") || rest.contains("meeting"))
     {
         return Some(("reminders", format!("calendar event: {}", rest.trim())));
@@ -6444,6 +6446,42 @@ mod tests {
         // A device whose name merely ends in those letters is untouched.
         let call = route("Is the please light on?").unwrap();
         assert_eq!(call.arguments["entity"], "please light");
+    }
+
+    #[test]
+    fn routes_ive_got_appointment_to_memory_store() {
+        // "i've got a meeting/appointment" is the same calendar assertion as
+        // "i have a meeting/appointment", which already routes — the contraction
+        // (normalized to "i ve got a") fell through to the LLM, and the dentist
+        // form even misrouted to memory_recall.
+        let call = route("I've got a meeting on Saturday 10AM").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "reminders");
+        assert_eq!(
+            call.arguments["content"],
+            "calendar event: meeting on saturday 10am"
+        );
+
+        let call = route("I've got a dentist appointment on Friday").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(
+            call.arguments["content"],
+            "calendar event: dentist appointment on friday"
+        );
+
+        // the "an" prefix branch must route the same as "a".
+        let call = route("I've got an appointment on Monday").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "reminders");
+
+        // a non-appointment "i've got" is not a calendar event and still abstains.
+        for utterance in [
+            "I've got a cold",
+            "I've got a question for you",
+            "I've got an idea",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
     }
 
     #[test]
