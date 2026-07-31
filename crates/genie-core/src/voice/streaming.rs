@@ -460,6 +460,26 @@ mod tests {
     }
 
     #[test]
+    fn splits_at_a_clause_ending_in_the_word_no() {
+        // The streamer shares format::ends_with_abbreviation, which treated the
+        // word "no" as the number sign "No.". A clause ending in it therefore
+        // never confirmed its boundary, so the first sentence was withheld from
+        // Piper until the *next* terminator arrived — first-audio latency paid
+        // for a false abbreviation. It must emit as soon as "no. " lands.
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(&mut s, &["The answer is no. The lights are off."]);
+        assert_eq!(emitted.len(), 1, "got: {emitted:?}");
+        assert!(emitted[0].contains("no"), "got: {emitted:?}");
+        assert!(!emitted[0].contains("lights"), "got: {emitted:?}");
+
+        // The capitalized number sign still does not split.
+        let mut s = SentenceStreamer::new(3);
+        let emitted = feed_all(&mut s, &["Look at No. 5 on the list. That one."]);
+        assert_eq!(emitted.len(), 1, "got: {emitted:?}");
+        assert!(emitted[0].contains("5 on the list"), "got: {emitted:?}");
+    }
+
+    #[test]
     fn handles_partial_token_chunks() {
         let mut s = SentenceStreamer::new(3);
         let chunks = ["Hel", "lo wor", "ld, how a", "re you do", "ing today?"];
