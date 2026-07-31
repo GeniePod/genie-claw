@@ -226,7 +226,14 @@ fn find_secret_matches(text: &str, pattern: &SecretPattern) -> Vec<String> {
     matches
 }
 
-fn extract_host(url: &str) -> String {
+/// Extract the lowercased host from a URL: strip the scheme, take the
+/// authority, drop any `user[:pass]@` userinfo, and keep IPv6 literals bracketed.
+///
+/// `pub(crate)` so every on-device-only guard in this crate classifies a URL the
+/// same way. `tools::web_search` used to prefix-match its base URL instead, which
+/// let `http://localhost.attacker.example` and `http://127.0.0.1@evil.com` pass
+/// as loopback.
+pub(crate) fn extract_host(url: &str) -> String {
     let url = url.trim();
     let stripped = url
         .strip_prefix("http://")
@@ -247,7 +254,10 @@ fn extract_host(url: &str) -> String {
 
 /// True when `host` is a literal loopback target (not a hostname that merely
 /// starts with a loopback-looking prefix).
-fn is_loopback_host(host: &str) -> bool {
+///
+/// `pub(crate)` alongside [`extract_host`] so sibling guards reuse this parse
+/// rather than growing another prefix-matching copy of it.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let host = host.trim();
     if host.is_empty() {
         return false;

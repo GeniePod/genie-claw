@@ -399,14 +399,31 @@ fn searxng_search_url(base_url: &str) -> String {
     }
 }
 
+/// True when the configured SearXNG base URL points at this device.
+///
+/// This gates `allow_remote_base_url`: when the user has not opted in, every
+/// household search query must stay on-device. The check therefore has to
+/// resolve the URL's *host*, not the shape of its first few characters.
+///
+/// It used to prefix-match (`starts_with("http://localhost")`, `"http://127."`),
+/// which was wrong in both directions:
+///
+/// - Remote hosts passed as local, so queries left the device with the opt-in
+///   still off — `http://localhost.attacker.example`, `http://127.evil.example`,
+///   `https://127.0.0.1.nip.io`, and `http://127.0.0.1@evil.com`, where the
+///   loopback text is userinfo and the real host is `evil.com`.
+/// - Genuine loopback URLs were rejected, so a legitimate local SearXNG behind
+///   credentials (`http://user@localhost:8888`, `http://user:pass@[::1]:8888`)
+///   could not be used at all.
+///
+/// `security::sandbox` already parses hosts correctly for `validate_inference_route`
+/// and documents itself as matching "a literal loopback target (not a hostname
+/// that merely starts with a loopback-looking prefix)". Delegate to it instead of
+/// keeping a third, weaker copy of the same decision — `genie-common::config`
+/// hardened its own copy after this exact class regressed once already (#327).
 fn is_local_base_url(base_url: &str) -> bool {
-    let lower = base_url.trim().to_lowercase();
-    lower.starts_with("http://127.")
-        || lower.starts_with("http://localhost")
-        || lower.starts_with("http://[::1]")
-        || lower.starts_with("https://127.")
-        || lower.starts_with("https://localhost")
-        || lower.starts_with("https://[::1]")
+    let host = crate::security::sandbox::extract_host(base_url);
+    crate::security::sandbox::is_loopback_host(&host)
 }
 
 pub(crate) fn format_results(query: &str, body: &str, limit: usize) -> Result<String> {
@@ -722,6 +739,43 @@ mod tests {
         assert!(is_local_base_url("http://localhost:8888"));
         assert!(is_local_base_url("http://[::1]:8888"));
         assert!(!is_local_base_url("https://searx.example.com"));
+    }
+
+    #[test]
+    fn local_base_url_rejects_hosts_that_merely_look_loopback() {
+        // The prefix match classified all of these as on-device, so household
+        // search queries were sent to a remote SearXNG with
+        // allow_remote_base_url still false. The last one is the userinfo case:
+        // the loopback text is credentials, the real host is evil.com.
+        for url in [
+            "http://localhost.attacker.example/search",
+            "http://localhost-evil.example",
+            "http://127.evil.example/",
+            "https://127.0.0.1.nip.io/",
+            "http://127.0.0.1@evil.com/search",
+            "http://127.0.0.1:8888@evil.com",
+            "https://searx.example.com",
+        ] {
+            assert!(!is_local_base_url(url), "{url:?} must not count as local");
+        }
+    }
+
+    #[test]
+    fn local_base_url_accepts_loopback_behind_userinfo_and_the_whole_127_range() {
+        // The prefix match rejected these, so a legitimate on-device SearXNG
+        // behind credentials could not be used at all — the guard failed closed
+        // on the very configuration it exists to permit.
+        for url in [
+            "http://user@localhost:8888",
+            "http://user:pass@[::1]:8888",
+            // 127.0.0.0/8 is entirely loopback, not just 127.0.0.1 (#327).
+            "http://127.0.0.2:8888",
+            "http://127.1.2.3:9090/search",
+            // Casing and a trailing path must not matter.
+            "http://LocalHost:8888/search",
+        ] {
+            assert!(is_local_base_url(url), "{url:?} must count as local");
+        }
     }
 
     #[test]
