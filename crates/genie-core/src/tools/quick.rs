@@ -1402,6 +1402,13 @@ fn preferred_timer_request(text: &str) -> Option<(u64, String)> {
 }
 
 fn priority_home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>)> {
+    // A leading "please" is politeness, not part of the command. Most arms here
+    // are `contains` tests and survive it, but the two exact-match arms
+    // ("run movie night", "warm up the car") are anchored at token 0 and do not.
+    // Strip it so the polite form of those two routes like the bare form, and so
+    // this entry point agrees with home_control_request below.
+    let text = text.strip_prefix("please ").unwrap_or(text);
+
     if text.contains("after dinner cleanup") || text.contains("after-dinner cleanup") {
         return Some(("after-dinner cleanup".into(), "activate", None));
     }
@@ -1894,6 +1901,19 @@ fn priority_home_control_request(text: &str) -> Option<(String, &'static str, Op
 }
 
 fn home_control_request(text: &str) -> Option<(String, &'static str, Option<f64>)> {
+    // A leading "please" is politeness, not part of the command. Every matcher
+    // below — the curated exact-match device set, the `starts_with` arms, the
+    // `set `/`preheat ` setpoint parser, and `simple_turn_request` — is anchored
+    // at token 0, so one politeness token shifted the anchor and the single most
+    // common polite actuation form ("please turn off the kitchen lights") fell
+    // through to the LLM even though its bare counterpart already routes.
+    // Mirrors scene_or_routine_activation_request and play_media_request, which
+    // strip it for the same reason; a trailing "please" is already dropped by
+    // clean_control_entity. Stripping here (rather than inside each arm) also
+    // keeps the schedule/multi-clause/known-device guards applying to the
+    // stripped text, so "please turn on the lights in 5 minutes" still abstains.
+    let text = text.strip_prefix("please ").unwrap_or(text);
+
     if matches!(text, "turn off the tv" | "turn off tv") {
         return Some(("tv".into(), "turn_off", None));
     }
@@ -4760,8 +4780,12 @@ mod tests {
         assert!(route("please help me").is_none());
         // And a home_control-shaped polite request must not be claimed as a
         // scene activation either (no "activate"/"start"/"run" … "scene"/
-        // "routine" shape).
-        assert!(route("please turn on the lights").is_none());
+        // "routine" shape). It falls past this matcher to the home_control path,
+        // which strips the same leading "please" and actuates the device.
+        let call = route("please turn on the lights").expect("no route");
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "lights");
+        assert_eq!(call.arguments["action"], "turn_on");
     }
 
     #[test]
@@ -6254,6 +6278,83 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "office fan");
         assert_eq!(call.arguments["action"], "turn_on");
+    }
+
+    #[test]
+    fn home_control_accepts_a_leading_please() {
+        // Every home_control matcher is anchored at token 0 — the curated
+        // exact-match set, the `starts_with` arms, the `set `/`preheat ` setpoint
+        // parser, and simple_turn_request's "turn on "/"turn off " prefixes. One
+        // leading politeness token shifted that anchor, so the most common polite
+        // actuation forms fell through to the LLM even though their bare
+        // counterparts already route. Same fix as scene/routine and play_media.
+        for (utterance, entity, action) in [
+            (
+                "please turn off the kitchen lights",
+                "kitchen lights",
+                "turn_off",
+            ),
+            ("please turn off the lights", "lights", "turn_off"),
+            ("please turn on the bedroom lamp", "bedroom lamp", "turn_on"),
+            ("please turn on the fan", "fan", "turn_on"),
+            ("please turn off the tv", "tv", "turn_off"),
+            (
+                "please start the dishwasher",
+                "dishwasher normal cycle",
+                "activate",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["action"], action, "{utterance:?}");
+        }
+
+        // Setpoints route through the same anchor and carry their value.
+        for (utterance, entity, value) in [
+            ("please set the thermostat to 68", "thermostat", 68.0),
+            ("please preheat the oven to 400", "oven", 400.0),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_control", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+            assert_eq!(call.arguments["action"], "set_temperature", "{utterance:?}");
+            assert_eq!(call.arguments["value"], value, "{utterance:?}");
+        }
+
+        // Politeness is stripped *before* the guards, not instead of them: the
+        // schedule, multi-clause, and unknown-device abstentions must all still
+        // fire on the polite form, otherwise stripping "please" would trade one
+        // wrong answer for another.
+        for utterance in [
+            "please turn on the lights in 5 minutes",
+            "please turn off everything downstairs except the kitchen lights",
+            "please turn on the porch light and the garage light",
+            "please turn on the infant monitor",
+        ] {
+            assert!(route(utterance).is_none(), "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn priority_home_control_accepts_a_leading_please() {
+        // priority_home_control_request is the second entry point, and it runs
+        // *before* the scene matcher, so it needs its own coverage. Most of its
+        // arms are `contains` tests that survive a leading token, but these two
+        // are exact matches that do not — they are the only reason the strip is
+        // needed there, so they are what has to be pinned. "warm up the car" is
+        // the other such arm but is unreachable on main too (its action does not
+        // survive canonicalize_household_action), so there is nothing for a
+        // leading "please" to change there.
+        let call = route("please run movie night").expect("no route");
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "movie night");
+        assert_eq!(call.arguments["action"], "activate");
+
+        // The polite form matches the bare form exactly, arguments included.
+        let bare = route("run movie night").expect("no route");
+        assert_eq!(bare.name, call.name);
+        assert_eq!(bare.arguments, call.arguments);
     }
 
     #[test]
