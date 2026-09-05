@@ -12,6 +12,10 @@ const TAIL_CHUNK_BYTES: usize = 4096;
 pub const DEFAULT_MAX_JSONL_LINE_BYTES: usize = 256 * 1024;
 
 /// Return up to `limit` trailing non-empty lines from `path`, in file order.
+///
+/// Peak buffering is bounded by `max_line_bytes` regardless of how long the
+/// file's longest line is: a line is abandoned as soon as it passes the limit,
+/// not after it has been read into memory in full.
 pub fn tail_lines(
     path: &Path,
     limit: usize,
@@ -32,6 +36,14 @@ pub fn tail_lines(
 
     let mut collected: Vec<Vec<u8>> = Vec::new();
     let mut current_line: Vec<u8> = Vec::new();
+    // Set once the line under construction has passed `max_line_bytes`. From
+    // that point its remaining bytes are discarded rather than buffered: the
+    // line is already known to be droppable, so holding the rest of it only
+    // costs memory. Previously the size test happened at the terminating
+    // newline, which meant a multi-megabyte line was allocated in full and
+    // *then* thrown away — the opposite of what `max_line_bytes` documents, and
+    // the allocation lands on every poll of a log that contains one.
+    let mut current_line_oversize = false;
     let mut chunk = [0u8; TAIL_CHUNK_BYTES];
 
     while pos > 0 && collected.len() < limit {
@@ -42,19 +54,25 @@ pub fn tail_lines(
 
         for &byte in chunk[..read_size].iter().rev() {
             if byte == b'\n' {
+                if current_line_oversize {
+                    // Reached the start of an over-long line; drop it and
+                    // resume with the next one. `current_line` is already empty.
+                    current_line_oversize = false;
+                    continue;
+                }
                 if !current_line.is_empty() {
                     current_line.reverse();
-                    if current_line.len() <= max_line_bytes {
-                        collected.push(std::mem::take(&mut current_line));
-                    } else {
-                        current_line.clear();
-                    }
+                    collected.push(std::mem::take(&mut current_line));
                     if collected.len() >= limit {
                         break;
                     }
                 }
-            } else {
+            } else if !current_line_oversize {
                 current_line.push(byte);
+                if current_line.len() > max_line_bytes {
+                    current_line.clear();
+                    current_line_oversize = true;
+                }
             }
         }
 
@@ -63,11 +81,11 @@ pub fn tail_lines(
         }
     }
 
-    if collected.len() < limit && !current_line.is_empty() {
+    // A file whose first line has no leading newline leaves a trailing
+    // fragment. Skip it when it overflowed, exactly as the newline path does.
+    if collected.len() < limit && !current_line_oversize && !current_line.is_empty() {
         current_line.reverse();
-        if current_line.len() <= max_line_bytes {
-            collected.push(current_line);
-        }
+        collected.push(current_line);
     }
 
     collected.reverse();
@@ -138,6 +156,64 @@ mod tests {
             lines,
             vec![r#"{"n":1}"#.to_string(), r#"{"n":3}"#.to_string()]
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The existing oversize test uses a 512-byte line, which fits inside a
+    /// single 4096-byte read. An oversize line long enough to span many chunks
+    /// exercises the state that has to survive across loop iterations — the
+    /// abandon flag is set in one chunk and cleared by a newline several chunks
+    /// later, and the lines on either side must still come back intact.
+    #[test]
+    fn tail_lines_skips_an_oversize_line_spanning_many_chunks() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-jsonl-tail-spanning-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        // ~64 KiB of payload: 16 full TAIL_CHUNK_BYTES reads.
+        let huge = format!(r#"{{"blob":"{}"}}"#, "x".repeat(64 * 1024));
+        write_log(&path, &[r#"{"n":1}"#, &huge, r#"{"n":3}"#]);
+
+        let lines = tail_lines(&path, 5, 4096).unwrap();
+        assert_eq!(
+            lines,
+            vec![r#"{"n":1}"#.to_string(), r#"{"n":3}"#.to_string()]
+        );
+
+        // Raising the cap above the line length brings it back, so the skip is
+        // driven by `max_line_bytes` and not by the chunking.
+        let lines = tail_lines(&path, 5, 1024 * 1024).unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1], huge);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A line of exactly `max_line_bytes` is kept; one byte more is dropped.
+    /// The abandon check fires on `len > max`, so an off-by-one here would
+    /// silently start discarding lines that used to be returned.
+    #[test]
+    fn tail_lines_boundary_line_length_is_inclusive() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-jsonl-tail-boundary-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let exact = "a".repeat(32);
+        let over = "b".repeat(33);
+        write_log(&path, &[&exact, &over]);
+
+        let lines = tail_lines(&path, 5, 32).unwrap();
+        assert_eq!(lines, vec![exact]);
         let _ = std::fs::remove_file(&path);
     }
 
